@@ -1473,6 +1473,18 @@ rocblaslt_status rocblaslt_matmul_desc_set_attribute(rocblaslt_matmul_desc      
                     return rocblaslt_status_invalid_value;
                 }
                 break;
+            case ROCBLASLT_MATMUL_DESC_FUSED_EPILOGUE:
+                // Stores a non-owning pointer to a hipblasLtFusedEpilogueDescriptor. The
+                // handle's contents are validated at the hipBLASLt C-API layer before the
+                // pointer reaches here.
+                if(sizeof(void*) <= sizeInBytes)
+                    memcpy(&matmulDesc->fused_epilogue, buf, sizeof(void*));
+                else
+                {
+                    log_error(__func__, "invalid fused epilogue buf size", sizeInBytes);
+                    return rocblaslt_status_invalid_value;
+                }
+                break;
             default:
                 log_error(__func__, "invalid attribute", matmulAttr);
                 return rocblaslt_status_invalid_value;
@@ -1809,6 +1821,16 @@ rocblaslt_status rocblaslt_matmul_desc_get_attribute(rocblaslt_matmul_desc      
                     return rocblaslt_status_invalid_value;
                 }
                 memcpy(buf, &matmulDesc->streamk_tile_scheduling_ext, sizeof(int32_t));
+                break;
+            case ROCBLASLT_MATMUL_DESC_FUSED_EPILOGUE:
+                if(sizeWritten)
+                    *sizeWritten = sizeof(void*);
+                if(sizeInBytes < sizeof(void*))
+                {
+                    log_error(__func__, "invalid buf size", sizeInBytes);
+                    return rocblaslt_status_invalid_value;
+                }
+                memcpy(buf, &matmulDesc->fused_epilogue, sizeof(void*));
                 break;
             default:
                 log_error(__func__, "invalid attribute", matmulAttr);

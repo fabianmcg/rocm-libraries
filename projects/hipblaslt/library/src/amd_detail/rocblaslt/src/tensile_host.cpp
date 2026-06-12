@@ -400,6 +400,12 @@ namespace
             return TensileLite::ActivationType::Clamp;
         case ROCBLASLT_EPILOGUE_SIGMOID:
             return TensileLite::ActivationType::Sigmoid;
+        // RMSNorm fused-epilogue extension point (AIHPBLAS-3856 follow-up): the composable
+        // fused epilogue is attached via the hipblasLtFusedEpilogueDescriptor handle, not the
+        // flat rocblaslt_epilogue enum. When the TensileLite RMSNorm kernels land, map the
+        // attached fused epilogue to a dedicated solution-selection predicate /
+        // TensileLite::ActivationType::Rmsnorm here. The public hipblasLtMatmul path currently
+        // rejects an attached fused epilogue with NOT_SUPPORTED before reaching kernel selection.
         case ROCBLASLT_EPILOGUE_BIAS:
         case ROCBLASLT_EPILOGUE_DEFAULT:
         case ROCBLASLT_EPILOGUE_BGRADA:
