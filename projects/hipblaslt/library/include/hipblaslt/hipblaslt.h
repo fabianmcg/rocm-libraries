@@ -109,6 +109,36 @@ typedef enum {
 } hipblasLtEpilogue_t;
 
 /*! \ingroup types_module
+ *  \brief Components that can be composed into a fused epilogue chain.
+ *
+ *  \details
+ *  Unlike the flat ``hipblasLtEpilogue_t`` enum, these values name composable epilogue
+ *  stages that are accumulated into a ``hipblasLtFusedEpilogueDescriptor_t`` via
+ *  ``hipblasLtFusedEpilogueAdd`` and attached to a matmul descriptor through
+ *  ``HIPBLASLT_MATMUL_DESC_FUSED_EPILOGUE``.
+ */
+typedef enum {
+  HIPBLASLT_FUSEABLE_EPILOGUE_RESIDUAL_ADD = 0, /**<Reserved component: add a residual tensor to the GEMM result.*/
+  HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM      = 1, /**<Per-row RMSNorm (``x * rsqrt(mean(x^2) + eps) * gamma``). Requires gamma and eps attributes.*/
+  HIPBLASLT_FUSEABLE_EPILOGUE_AMAX         = 2, /**<Reserved component: capture the result amax side output.*/
+  HIPBLASLT_FUSEABLE_EPILOGUE_FP8_REQUANT  = 3, /**<Reserved component: requantize the result to FP8.*/
+  HIPBLASLT_FUSEABLE_EPILOGUE_SWIGLU       = 4, /**<Reserved epilogue family: SwiGLU gated linear unit.*/
+} hipblasLtFuseableEpilogue_t;
+
+/*! \ingroup types_module
+ *  \brief Attributes settable on a fused epilogue descriptor.
+ */
+typedef enum {
+  HIPBLASLT_FUSED_EPILOGUE_RMSNORM_GAMMA = 0, /**<Device pointer to the RMSNorm gamma (per-channel scale) vector of length N. Data type: ``void*``.*/
+  HIPBLASLT_FUSED_EPILOGUE_RMSNORM_EPS   = 1, /**<Epsilon added inside the RMSNorm reciprocal square root. Data type: ``float``.*/
+} hipblasLtFusedEpilogueAttribute_t;
+
+/*! \ingroup types_module
+ *  \brief Opaque handle representing a composed (fused) epilogue chain.
+ */
+typedef struct hipblasLtFusedEpilogueDescriptor* hipblasLtFusedEpilogueDescriptor_t;
+
+/*! \ingroup types_module
  *  \brief Specify the batch mode of the matrices.
  */
 
@@ -253,6 +283,7 @@ typedef enum {
   HIPBLASLT_MATMUL_DESC_EPILOGUE_ACT_ARG0_EXT,              /**<First extra argument for the activation function. Data type: ``float``. */
   HIPBLASLT_MATMUL_DESC_EPILOGUE_ACT_ARG1_EXT,              /**<Second extra argument for the activation function. Data type: ``float``. */
   HIPBLASLT_MATMUL_DESC_STREAMK_TILE_SCHEDULING_EXT = 104,      /**<Select the hipBLASLt StreamK tile scheduling mode for StreamK=5 hybrid kernels (static SK3 vs dynamic SK4 work-queue sub-paths). Provided as an ``_EXT`` attribute. Accepts values from ``hipblasLtStreamKTileSchedulingMode_t``: ``0`` (``OFF``, default) uses the SK3 static sub-path; when ``HIPBLASLT_MATMUL_DESC_SM_COUNT_TARGET`` is set to a positive value the library heuristic still runs per launch to pick SK4 when appropriate; ``1`` (``ON``) always requests the SK4 dynamic work-queue sub-path when the selected kernel supports it; ``2`` (``AUTO``) always lets the library's heuristic pick between static and dynamic per launch. Values outside ``{0, 1, 2}`` are rejected with ``HIPBLAS_STATUS_INVALID_VALUE``. Data type: ``int32_t``. */
+  HIPBLASLT_MATMUL_DESC_FUSED_EPILOGUE = 105,              /**<Attach a composable fused epilogue chain to this matmul. The value is a ``hipblasLtFusedEpilogueDescriptor_t`` handle built with ``hipblasLtFusedEpilogueCreate``/``...Add``/``...SetAttribute``. Data type: ``hipblasLtFusedEpilogueDescriptor_t``. */
   HIPBLASLT_MATMUL_DESC_MAX,
 } hipblasLtMatmulDescAttributes_t;
 
@@ -744,6 +775,78 @@ hipblasStatus_t hipblasLtMatmulDescCreate(hipblasLtMatmulDesc_t* matmulDesc,
  */
 HIPBLASLT_EXPORT
 hipblasStatus_t hipblasLtMatmulDescDestroy(const hipblasLtMatmulDesc_t matmulDesc);
+
+/*! \ingroup library_module
+ *  \brief Create a fused (composable) epilogue descriptor.
+ *
+ *  \details
+ *  Allocates an opaque handle that accumulates composable epilogue stages (see
+ *  \ref hipblasLtFuseableEpilogue_t). Build the chain with \ref hipblasLtFusedEpilogueAdd
+ *  and \ref hipblasLtFusedEpilogueSetAttribute, then attach it to a matmul descriptor via
+ *  the \ref HIPBLASLT_MATMUL_DESC_FUSED_EPILOGUE attribute. Destroy with
+ *  \ref hipblasLtFusedEpilogueDestroy.
+ *
+ *  @param[out]
+ *  desc  Pointer that receives the newly created handle.
+ *
+ *  \retval HIPBLAS_STATUS_SUCCESS If the handle was created.
+ *  \retval HIPBLAS_STATUS_INVALID_VALUE If \p desc is NULL.
+ */
+HIPBLASLT_EXPORT
+hipblasStatus_t hipblasLtFusedEpilogueCreate(hipblasLtFusedEpilogueDescriptor_t* desc);
+
+/*! \ingroup library_module
+ *  \brief Append an epilogue stage to a fused epilogue descriptor.
+ *
+ *  \details
+ *  Stages are accumulated in call order. An unrecognized or unsupported epilogue, a
+ *  duplicate stage, or a stage that breaks the supported ordering is rejected.
+ *
+ *  @param[in]
+ *  desc  A handle created by \ref hipblasLtFusedEpilogueCreate.
+ *  @param[in]
+ *  epilogue  The stage to append. See \ref hipblasLtFuseableEpilogue_t.
+ *
+ *  \retval HIPBLAS_STATUS_SUCCESS If the stage was appended.
+ *  \retval HIPBLAS_STATUS_INVALID_VALUE If \p desc is NULL, the epilogue is unrecognized or
+ *  unsupported for the current chain family, or the resulting chain is not a legal ordering.
+ */
+HIPBLASLT_EXPORT
+hipblasStatus_t hipblasLtFusedEpilogueAdd(hipblasLtFusedEpilogueDescriptor_t desc,
+                                          hipblasLtFuseableEpilogue_t        epilogue);
+
+/*! \ingroup library_module
+ *  \brief Set an attribute (e.g. RMSNorm gamma pointer or eps) on a fused epilogue descriptor.
+ *
+ *  @param[in]
+ *  desc  A handle created by \ref hipblasLtFusedEpilogueCreate.
+ *  @param[in]
+ *  attr  The attribute to set. See \ref hipblasLtFusedEpilogueAttribute_t.
+ *  @param[in]
+ *  value  Pointer to the value to set.
+ *  @param[in]
+ *  sizeInBytes  Size of \p value in bytes, for verification.
+ *
+ *  \retval HIPBLAS_STATUS_SUCCESS If the attribute was set.
+ *  \retval HIPBLAS_STATUS_INVALID_VALUE If \p desc or \p value is NULL, the attribute is
+ *  unrecognized, or \p sizeInBytes is too small.
+ */
+HIPBLASLT_EXPORT
+hipblasStatus_t hipblasLtFusedEpilogueSetAttribute(hipblasLtFusedEpilogueDescriptor_t desc,
+                                                   hipblasLtFusedEpilogueAttribute_t  attr,
+                                                   const void*                        value,
+                                                   size_t                             sizeInBytes);
+
+/*! \ingroup library_module
+ *  \brief Destroy a fused epilogue descriptor.
+ *
+ *  @param[in]
+ *  desc  A handle created by \ref hipblasLtFusedEpilogueCreate.
+ *
+ *  \retval HIPBLAS_STATUS_SUCCESS If the handle was destroyed.
+ */
+HIPBLASLT_EXPORT
+hipblasStatus_t hipblasLtFusedEpilogueDestroy(hipblasLtFusedEpilogueDescriptor_t desc);
 
 /*! \ingroup library_module
  *  \brief  Set attribute to a matrix multiply descriptor.

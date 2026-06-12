@@ -32,12 +32,14 @@
 #include "hipblaslt/hipblaslt-ext-op.h"
 #include "hipblaslt_internal.hpp"
 
+#include <cstring>
 #include <hip/hip_runtime_api.h>
 #include <iostream>
 #include <rocblaslt.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string>
+#include <vector>
 
 #include "Debug.hpp"
 
@@ -360,6 +362,135 @@ catch(...)
     return exception_to_hipblas_status();
 }
 
+// Definition of the opaque handle declared in hipblaslt.h. Owns the composed list of
+// epilogue stages plus their parameters (RMSNorm gamma/eps). Attached, non-owning, to a
+// matmul descriptor via HIPBLASLT_MATMUL_DESC_FUSED_EPILOGUE.
+struct hipblasLtFusedEpilogueDescriptor
+{
+    std::vector<hipblasLtFuseableEpilogue_t> stages;
+
+    // RMSNorm parameters.
+    void* rmsnorm_gamma = nullptr;
+    float rmsnorm_eps   = 0.f;
+    bool  eps_set       = false;
+};
+
+namespace
+{
+    // Supported RMSNorm-chain rank. A legal chain is an order-preserving subsequence of
+    // residual add -> RMSNorm -> AMax -> FP8 requant, with each stage appearing at most once.
+    // Returns -1 for unrecognized stages or stages reserved for other epilogue families.
+    int rmsnorm_chain_rank(hipblasLtFuseableEpilogue_t e)
+    {
+        switch(e)
+        {
+        case HIPBLASLT_FUSEABLE_EPILOGUE_RESIDUAL_ADD:
+            return 0;
+        case HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM:
+            return 1;
+        case HIPBLASLT_FUSEABLE_EPILOGUE_AMAX:
+            return 2;
+        case HIPBLASLT_FUSEABLE_EPILOGUE_FP8_REQUANT:
+            return 3;
+        default:
+            return -1;
+        }
+    }
+
+    bool fused_epilogue_has_stage(const hipblasLtFusedEpilogueDescriptor* d,
+                                  hipblasLtFuseableEpilogue_t             e)
+    {
+        for(auto s : d->stages)
+            if(s == e)
+                return true;
+        return false;
+    }
+}
+
+hipblasStatus_t hipblasLtFusedEpilogueCreate(hipblasLtFusedEpilogueDescriptor_t* desc)
+try
+{
+    if(desc == nullptr)
+        return HIPBLAS_STATUS_INVALID_VALUE;
+    *desc = new hipblasLtFusedEpilogueDescriptor();
+    return HIPBLAS_STATUS_SUCCESS;
+}
+catch(...)
+{
+    return exception_to_hipblas_status();
+}
+
+hipblasStatus_t hipblasLtFusedEpilogueAdd(hipblasLtFusedEpilogueDescriptor_t desc,
+                                          hipblasLtFuseableEpilogue_t        epilogue)
+try
+{
+    if(desc == nullptr)
+        return HIPBLAS_STATUS_INVALID_VALUE;
+
+    const int rank = rmsnorm_chain_rank(epilogue);
+    if(rank < 0)
+        return HIPBLAS_STATUS_INVALID_VALUE; // unrecognized or unsupported epilogue
+
+    // Reject duplicates and out-of-order additions: the accumulated chain must stay an
+    // order-preserving subsequence of the supported RMSNorm chain.
+    if(!desc->stages.empty())
+    {
+        const int prev_rank = rmsnorm_chain_rank(desc->stages.back());
+        if(rank <= prev_rank)
+            return HIPBLAS_STATUS_INVALID_VALUE;
+    }
+
+    desc->stages.push_back(epilogue);
+    return HIPBLAS_STATUS_SUCCESS;
+}
+catch(...)
+{
+    return exception_to_hipblas_status();
+}
+
+hipblasStatus_t hipblasLtFusedEpilogueSetAttribute(hipblasLtFusedEpilogueDescriptor_t desc,
+                                                   hipblasLtFusedEpilogueAttribute_t  attr,
+                                                   const void*                        value,
+                                                   size_t                             sizeInBytes)
+try
+{
+    if(desc == nullptr || value == nullptr)
+        return HIPBLAS_STATUS_INVALID_VALUE;
+
+    switch(attr)
+    {
+    case HIPBLASLT_FUSED_EPILOGUE_RMSNORM_GAMMA:
+        if(sizeInBytes < sizeof(void*))
+            return HIPBLAS_STATUS_INVALID_VALUE;
+        memcpy(&desc->rmsnorm_gamma, value, sizeof(void*));
+        break;
+    case HIPBLASLT_FUSED_EPILOGUE_RMSNORM_EPS:
+        if(sizeInBytes < sizeof(float))
+            return HIPBLAS_STATUS_INVALID_VALUE;
+        memcpy(&desc->rmsnorm_eps, value, sizeof(float));
+        desc->eps_set = true;
+        break;
+    default:
+        return HIPBLAS_STATUS_INVALID_VALUE;
+    }
+    return HIPBLAS_STATUS_SUCCESS;
+}
+catch(...)
+{
+    return exception_to_hipblas_status();
+}
+
+hipblasStatus_t hipblasLtFusedEpilogueDestroy(hipblasLtFusedEpilogueDescriptor_t desc)
+try
+{
+    delete desc;
+    return HIPBLAS_STATUS_SUCCESS;
+}
+catch(...)
+{
+    return exception_to_hipblas_status();
+}
+
 hipblasStatus_t hipblasLtMatmulDescSetAttribute(hipblasLtMatmulDesc_t           matmulDesc,
                                                 hipblasLtMatmulDescAttributes_t matmulAttr,
                                                 const void*                     buf,
@@ -367,6 +498,29 @@ hipblasStatus_t hipblasLtMatmulDescSetAttribute(hipblasLtMatmulDesc_t           
 try
 {
     rocblaslt::Debug::Instance().markerStart("hipblasLtMatmulDescSetAttribute");
+
+    // Validate a fused-epilogue handle before it is attached to the matmul descriptor.
+    // This is the API-call-time gate: an RMSNorm stage requires gamma and eps to be set.
+    if(matmulAttr == HIPBLASLT_MATMUL_DESC_FUSED_EPILOGUE)
+    {
+        if(buf == nullptr || sizeInBytes < sizeof(void*))
+        {
+            rocblaslt::Debug::Instance().markerStop();
+            return HIPBLAS_STATUS_INVALID_VALUE;
+        }
+        hipblasLtFusedEpilogueDescriptor_t fused = nullptr;
+        memcpy(&fused, buf, sizeof(void*));
+        if(fused != nullptr
+           && fused_epilogue_has_stage(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM))
+        {
+            if(fused->rmsnorm_gamma == nullptr || !fused->eps_set)
+            {
+                rocblaslt::Debug::Instance().markerStop();
+                return HIPBLAS_STATUS_INVALID_VALUE;
+            }
+        }
+    }
+
     auto status = RocBlasLtStatusToHIPStatus(
         rocblaslt_matmul_desc_set_attribute((rocblaslt_matmul_desc)matmulDesc,
                                             (rocblaslt_matmul_desc_attributes)matmulAttr,
@@ -538,6 +692,19 @@ try
 {
     rocblaslt::Debug::Instance().markerStart("hipblasLtMatmul");
     hipblasStatus_t return_status = HIPBLAS_STATUS_SUCCESS;
+
+    // Fused-epilogue guard: a composable fused epilogue (e.g. RMSNorm) attached via
+    // HIPBLASLT_MATMUL_DESC_FUSED_EPILOGUE has a validated API surface but no kernels yet.
+    // Reject it with NOT_SUPPORTED before kernel selection/launch. Remove this guard once
+    // the TensileLite RMSNorm kernels (AIHPBLAS-3856) are wired in.
+    if(auto* desc = (rocblaslt_matmul_desc)matmul_descr)
+    {
+        if(desc->fused_epilogue != nullptr)
+        {
+            rocblaslt::Debug::Instance().markerStop();
+            return HIPBLAS_STATUS_NOT_SUPPORTED;
+        }
+    }
 
     return_status = RocBlasLtStatusToHIPStatus(rocblaslt_matmul((rocblaslt_handle)handle,
                                                                 (rocblaslt_matmul_desc)matmul_descr,
