@@ -179,6 +179,122 @@ def _disableUnsupportedRuntimeStaggerU(state):
     _disableRuntimeStaggerU(state)
 
 
+def _validateRMSNorm(state, printRejectionReason):
+  """Validate RMSNorm fused epilogue constraints.
+
+  RMSNorm inserts a row-wise normalization between the GEMM accumulator and the
+  global write. Several structural requirements must hold:
+    - Subtile code path (row reduction exploits the Subtile epilogue hook).
+    - gfx950 only (ISA-specific assembly emitted in SubtileRMSNormEmit.py).
+    - bf16 I/O (milestone scope).
+    - StreamKForceDPOnly=1: ensures every WG computes a complete tile so the
+      accumulator is final at the hook (Section 4a of the plan).
+    - MacroTile1 > 0: sanity check; N==MacroTile1 (row containment) is enforced
+      at runtime by the example script.
+
+  IMPORTANT — alpha/beta ordering constraint:
+    The RMSNorm epilogue hook fires BEFORE the global write applies alpha/beta.
+    This means the actual computation is:
+
+        D = alpha * RMSNorm(A*B) + beta * C
+
+    instead of the mathematically correct:
+
+        D = RMSNorm(alpha * A*B + beta * C)
+
+    For the only supported runtime configuration (alpha=1.0, beta=0.0) the two
+    expressions are identical, so correctness is preserved.  Because alpha and
+    beta are pure runtime scalars there is no compile-time parameter to gate on;
+    the host dispatch layer MUST pass alpha=1 and beta=0 when using RMSNorm.
+  """
+  if not state["RMSNorm"]:
+    return
+  if not state["UseSubtileImpl"]:
+    reject(state, printRejectionReason, "RMSNorm requires UseSubtileImpl")
+    return
+  if state["ISA"] != (9, 5, 0):
+    reject(state, printRejectionReason, "RMSNorm is only implemented on gfx950")
+    return
+  dt = state["ProblemType"]["DataType"]
+  if not dt.isBFloat16():
+    reject(state, printRejectionReason, "RMSNorm currently supports bf16 data type only")
+    return
+  # StreamK-completeness: require full data-parallel tiles (no K-split fixup).
+  # _validateStreamKForceDPOnly() enforces StreamK=3 as a follow-up; reading the
+  # raw boolean here is intentional — it reflects the user-supplied value.
+  if not state["StreamKForceDPOnly"]:
+    reject(state, printRejectionReason,
+           "RMSNorm requires StreamKForceDPOnly=1 (complete tiles, no K-split fixup)")
+    return
+  if state["MacroTile1"] <= 0:
+    reject(state, printRejectionReason, "RMSNorm requires a positive MacroTile1")
+    return
+  # N == MacroTile1 row-containment invariant:
+  # The emitter computes 1/N using the compile-time constant MacroTile1, so the
+  # runtime problem N *must* equal MacroTile1 (each wave-group owns exactly one
+  # complete output row).  This cannot be validated at solution-generation time
+  # because N is a runtime value; it is the caller's responsibility to enforce
+  # this at launch time (e.g. by gating on N == MacroTile1 in the host dispatch
+  # logic or benchmark wrapper).
+  # MIArchVgpr=True places the D-tile in regular VGPRs (ValuC aliases D-tile),
+  # but SubtileRMSNormEmit unconditionally uses accvgpr() reads/writes.
+  # Reject until an AGPR-free code path is implemented.
+  if state["MIArchVgpr"]:
+    reject(state, printRejectionReason,
+           "RMSNorm requires MIArchVgpr=False (emitter uses AGPR read/write instructions)")
+    return
+  # OutputAmaxD inserts three extra args (AddrAmaxOut, AmaxWS, AmaxSync) between
+  # the activation args and the RMSNorm args in the Signature.  The store-sgpr
+  # loadAllKernArg path loads args contiguously by append order, so RMSNorm SGPRs
+  # would be read from wrong offsets.  Reject until a proper offset is implemented.
+  if state["ProblemType"]["OutputAmaxD"]:
+    reject(state, printRejectionReason,
+           "RMSNorm does not support OutputAmaxD (kernarg layout conflict)")
+    return
+  # MBSK/AdaptiveGemmGSUA inserts dstD/Synchronizer/GSUSync args in the same
+  # position (between activation and RMSNorm), causing the same contiguous-load
+  # misalignment.
+  if (state.get("_GlobalAccumulation") == "MultipleBufferSingleKernel" or
+      state.get("AdaptiveGemmGSUA") == 1):
+    reject(state, printRejectionReason,
+           "RMSNorm does not support MultipleBufferSingleKernel/AdaptiveGemmGSUA "
+           "(kernarg layout conflict)")
+    return
+  # MIWaveGroup[1] (wg_n) > 1 splits the N dimension across waves, so each wave
+  # owns only a fraction of the output row's columns.  The within-wave butterfly
+  # (_butterflyReduce) only reduces across the 16 column-lanes of a single wave;
+  # SubtileRMSNormEmit then combines the wg_n sibling-wave partials through LDS
+  # (_crossWaveReduce) to recover the full per-row sum-of-squares.  Two structural
+  # requirements remain:
+  wg = state["MIWaveGroup"]
+  if (state["MacroTile1"] // (16 * wg[1])) < 1:
+    reject(state, printRejectionReason,
+           "RMSNorm requires each wave to own at least one N-tile "
+           "(MacroTile1 // (16 * MIWaveGroup[1]) >= 1)")
+    return
+  if wg[1] > 1:
+    # _crossWaveReduce computes waveM = waveId & (wg_m - 1) via VAndB32, which
+    # is only correct when wg_m is a power of two.
+    if (wg[0] & (wg[0] - 1)) != 0:
+      reject(state, printRejectionReason,
+             "RMSNorm cross-wave reduction requires MIWaveGroup[0] to be a power of two "
+             "(uses bitmask for waveM)")
+      return
+    # LDS scratch for the cross-wave reduction: one f32 partial per (wave, lane,
+    # row).  num_rows = (MacroTile0 // 16 // wg_m) * 4 (4 fp32 acc rows per lane).
+    num_rows = (state["MacroTile0"] // 16 // wg[0]) * 4
+    rmsNormLdsBytes = wg[0] * wg[1] * state["WavefrontSize"] * num_rows * 4
+    # MaxLDS is resolved from -1 later in assignDerivedParameters; only enforce the
+    # budget once it holds a real device value.  The scratch reuses the main-loop
+    # LDS region (freed at the epilogue) and the final LDS budget is checked against
+    # actual usage downstream.
+    if state["MaxLDS"] > 0 and rmsNormLdsBytes > state["MaxLDS"]:
+      reject(state, printRejectionReason,
+             "RMSNorm cross-wave reduction LDS scratch (%u bytes) exceeds MaxLDS (%u)"
+             % (rmsNormLdsBytes, state["MaxLDS"]))
+      return
+
+
 def _validateStreamKForceDPOnly(state, printRejectionReason):
   if state["StreamKForceDPOnly"]:
     if state["StreamK"] != 3:
@@ -947,6 +1063,19 @@ class Solution(collections.abc.Mapping):
           reject(state, printRejectionReason, "UseSubtileImpl=1 PrefetchAcrossPersistent requires PrefetchGlobalRead=2")
         if state["DirectToVgprMXSA"] or state["DirectToVgprMXSB"]:
           reject(state, printRejectionReason, "UseSubtileImpl=1 PrefetchAcrossPersistent not supported with DirectToVgpr MX scale tensors")
+
+    # RMSNorm requires UseSubtileImpl (already resolved above) and gfx950+bf16+StreamKForceDPOnly.
+    # N==MacroTile1 (row containment) cannot be checked here (N is a runtime size); the example
+    # script asserts it at launch time.
+    _validateRMSNorm(state, printRejectionReason)
+    if not state["Valid"]:
+      return
+
+    # TODO: Support other LdsBlockSizePerPadMXSA/B for gfx1250.
+    if state["ISA"] == (12, 5, 0):
+      if ((state["LdsBlockSizePerPadMXSA"] > 0) or (state["LdsBlockSizePerPadMXSB"] > 0 )):
+        reject(state, "LdsBlockSizePerPadMXSA/LdsBlockSizePerPadMXSB support -1 and 0 for gfx1250")
+        return
 
     state["Multicast"] = False
     state["ClusterBarrier"] = False
@@ -5097,7 +5226,21 @@ class Solution(collections.abc.Mapping):
       ldsNumBytes += ldsAmaxDBytes
 
     state["LdsNumBytes"] = ldsNumBytes
-    ldsSize = ldsNumBytes
+
+    # RMSNorm cross-wave reduction guarantee:
+    # _validateRMSNorm runs early (before LdsNumBytes is finalised) so it can
+    # only check against MaxLDS.  Here, now that the reserved main-loop LDS
+    # region is finalised, ensure it is at least as large as the cross-wave
+    # scratch so the emitter's LDS writes are provably within the reserved
+    # region (freed at the epilogue).  The existing MaxLDS reject below then
+    # catches any device overflow.
+    if state.get("RMSNorm") and state["MIWaveGroup"][1] > 1:
+      wg = state["MIWaveGroup"]
+      num_rows_rms = (state["MacroTile0"] // 16 // wg[0]) * 4
+      rmsNormLdsBytes = wg[0] * wg[1] * state["WavefrontSize"] * num_rows_rms * 4
+      state["LdsNumBytes"] = max(state["LdsNumBytes"], rmsNormLdsBytes)
+
+    ldsSize = state["LdsNumBytes"]
     if ldsSize > state["MaxLDS"]:
       reject(state, printRejectionReason, "Kernel Uses %u > %u bytes of LDS" % ( ldsSize, state["MaxLDS"]))
       state["ValidDepthU"] = False

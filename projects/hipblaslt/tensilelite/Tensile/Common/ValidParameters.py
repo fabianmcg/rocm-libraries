@@ -447,6 +447,7 @@ validParameters = { # we need to make sure this matches develop
     # Enable subtile-based kernel implementation for MX FP4 (gfx950 only).
     # When True, uses a subtile scheduling strategy with DTL global reads and
     # an optimized storeD path. Automatically forced False on non-gfx950.
+    "RMSNorm": [False, True],
     "UseSubtileImpl": [False, True],
     # Load options:
     # (GRO = Global Read Offset)

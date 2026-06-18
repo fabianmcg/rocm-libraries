@@ -54,6 +54,7 @@ class UserArgumentsInfo:
     eSize: int = 0
     activationSize: int = 0
     factorDimSize: int = 0
+    rmsNormSize: int = 0
     # Total argument size
     totalSize: int = 0
 
@@ -316,6 +317,15 @@ class SignatureDefault(Signature):
             userArgumentsInfo.activationSize += userArgumentsInfo.actMaxSize
         userArgumentsInfo.activationSize += 4  # Type size
 
+        if kernel["RMSNorm"]:
+            # gamma: bf16 per-column weight vector (8-byte global buffer pointer)
+            # eps:   fp32 scalar added before rsqrt (4 bytes by value)
+            # Use bf16 value type for gamma (elements are bf16; up-converted in the kernel).
+            gammaValueType = getSrcValueType(kernel, True)  # bf16 → 'bf16'
+            signature.addArg("RMSNormGamma", SVK.SIG_GLOBALBUFFER, gammaValueType, "generic")
+            signature.addArg("RMSNormEps",   SVK.SIG_VALUE,        "f32")
+            userArgumentsInfo.rmsNormSize = 8 + 4  # 8B pointer + 4B f32
+
         # Calculate total size
         userArgumentsInfo.totalSize = userArgumentsInfo.gemmArgumentSize + \
                                       userArgumentsInfo.scaleASize + \
@@ -326,7 +336,8 @@ class SignatureDefault(Signature):
                                       userArgumentsInfo.biasSize + \
                                       userArgumentsInfo.factorDimSize + \
                                       userArgumentsInfo.eSize + \
-                                      userArgumentsInfo.activationSize
+                                      userArgumentsInfo.activationSize + \
+                                      userArgumentsInfo.rmsNormSize
 
         writer.states.userArgsInfo = userArgumentsInfo
 

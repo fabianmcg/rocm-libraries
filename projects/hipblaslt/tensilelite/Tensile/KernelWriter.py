@@ -5093,7 +5093,14 @@ class KernelWriter(metaclass=abc.ABCMeta):
       # NOT LocalSplitU
       ####################################
 
-
+      if kernel["RMSNorm"]:
+        from .Components.Subtile.SubtileRMSNormEmit import SubtileRMSNormEmitter
+        module.addComment1("RMSNorm: fused row-normalization epilogue")
+        rmsEmitter = SubtileRMSNormEmitter(self, kernel)
+        # Pass the D-tile AGPR base index (dtileInfo.vgprTiles[0].regList.indices[0])
+        # so the emitter reads/writes the correct acc registers.
+        dtile_agpr_base = dtileInfo.vgprTiles[0].regList.indices[0] if dtileInfo.vgprTiles else 0
+        module.add(rmsEmitter.emit(dtile_agpr_base))
 
       # global write indices
       module.addComment1("not-LocalSplitU: global write indices")
@@ -9692,6 +9699,13 @@ class KernelWriter(metaclass=abc.ABCMeta):
         self.states.numStoreSgprNames.append("ActivationType")
         self.states.numStoreSgprNameSizes.append(1)
       storeSgprLoad += self.states.numActivationTypeArgSize + self.states.numactivationArgTotalSize
+    if kernel["RMSNorm"]:
+      # RMSNormGamma: 64-bit pointer (2 SGPRs), RMSNormEps: 32-bit f32 scalar (1 SGPR)
+      self.states.numStoreSgprNames.append("RMSNormGamma")
+      self.states.numStoreSgprNameSizes.append(self.states.rpga)  # 2 SGPRs (64-bit ptr)
+      self.states.numStoreSgprNames.append("RMSNormEps")
+      self.states.numStoreSgprNameSizes.append(1)                 # 1 SGPR (f32)
+      storeSgprLoad += self.states.rpga + 1
     self.states.numStoreSgprToLoad = storeSgprLoad
 
 
