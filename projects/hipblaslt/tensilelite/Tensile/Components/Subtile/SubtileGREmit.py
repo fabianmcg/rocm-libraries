@@ -25,8 +25,8 @@ from rocisa.enum import RegisterType
 from rocisa.instruction import (
     BufferLoadB128,
     SAddCU32, SAddU32, SAddU64, SAndB32, SMovB32, SMovB64, SMulI32, SNop, SOrB32, SXorB32,
-    SCBranchSCC1, SCmpEQU32, SEndpgm,
-    SLShiftLeftB64, SLShiftRightB32,
+    SCBranchSCC1, SCmpEQU32, SCSelectB32, SEndpgm,
+    SLShiftLeftB64, SLShiftRightB32, SSubU32,
     VAddU32, VAndB32, VCmpXEqU32,
     VLShiftLeftB32, VLShiftRightB32, VMovB32,
     TensorLoadToLds,
@@ -683,6 +683,7 @@ def _grComputeAllOffsets(module, writer, tileInfo, colId, rowId, rowOffset):
 def graTileAssignment(writer, kernel, useSwizzling=True):
   return _graTileAssignment_legacy(writer, kernel, useSwizzling)
 
+
 # --- Legacy interleaved A+B GR offset (temporary, matches reference exactly) ---
 
 def _grComputeOffset_legacy(module, writer, tileInfo, colId, rowId, output):
@@ -699,22 +700,48 @@ def _grComputeOffset_legacy(module, writer, tileInfo, colId, rowId, output):
   module.add(VAddU32(dst=vgpr(output), src0=vgpr(colBytes), src1=vgpr(tmpVgpr), comment="%s: GR row_offset"%tc))
   writer.vgprPool.checkIn(tmpVgpr)
 
-def _grComputeSubtileOffsets_legacy(writer, module, tileInfo):
+def _grComputeSubtileOffsets_legacy(writer, module, tileInfo, swiglu_up_delta_sgpr=None, swiglu_half_n=0):
+  """Compute per-subtile-row soffset registers for B (and A) global reads.
+
+  The soffset for regId k moves the global-read pointer by k steps of
+  (numGRPerSubtile * loadRatioGR * subtileShape[0] * mmaTileShape[0]) rows in
+  the perpendicular (J/N for B, I/M for A) direction.  Combined with the wave
+  partition already embedded in sharedVgprGROffset and with the SRD base offset
+  of WG1 * NT_out (set up in globalReadAddresses), this naturally places each
+  load at the correct B column for both gate and up halves without any extra
+  per-half correction.
+
+  SwiGLU up-half correction: when swiglu_up_delta_sgpr is not None, every soffset
+  register with regId >= swiglu_half_n gets the precomputed N_out byte delta added
+  inline (single pass, no second walk).  swiglu_up_delta_sgpr must hold
+  (N_out - swiglu_half_n * rowOffset) * StrideB1J * bpe as computed by the caller.
+  """
   tc = tileInfo.tc
   strideRef = "StrideA0I" if tc == 'A' else "StrideB1J"
   subtile_size = tileInfo.subtileShape[0]*tileInfo.mmaTileShape[0]
   rowOffset = math.ceil(tileInfo.numGRPerSubtile*tileInfo.loadRatioGR*subtile_size)
   s_stride = int(rowOffset * tileInfo.bpe)
+
   for regId in range(len(tileInfo.localSubtilesRegister)):
     rl = tileInfo.localSubtilesRegister[regId]
+    applyDelta = swiglu_up_delta_sgpr is not None and regId >= swiglu_half_n and len(rl) > 0
     for i, reg in enumerate(rl):
       if rl.is_sgpr:
-        module.add(SMulI32(dst=sgpr(reg), src0=hex(s_stride * regId), src1=sgpr(strideRef), comment="%s: %u rows offset, stride %u, %u"%(tc, rowOffset, s_stride, regId)))
+        module.add(SMulI32(dst=sgpr(reg), src0=hex(s_stride * regId), src1=sgpr(strideRef),
+                           comment="%s: %u rows offset, stride %u, %u" % (tc, rowOffset, s_stride, regId)))
+        if applyDelta:
+          module.add(SAddU32(dst=sgpr(reg), src0=sgpr(reg), src1=sgpr(swiglu_up_delta_sgpr),
+                             comment="SwiGLU: up soffset += delta (regId=%d)" % regId))
       else:
         stmp = writer.sgprPool.checkOut(1, tag="_grComputeSubtileOffsets_legacy_stmp")
-        module.add(SMulI32(dst=sgpr(stmp), src0=hex(s_stride * regId), src1=sgpr(strideRef), comment="%s: %u rows offset, stride %u, %u"%(tc, rowOffset, s_stride, regId)))
+        module.add(SMulI32(dst=sgpr(stmp), src0=hex(s_stride * regId), src1=sgpr(strideRef),
+                           comment="%s: %u rows offset, stride %u, %u" % (tc, rowOffset, s_stride, regId)))
         module.add(VAddU32(dst=vgpr(reg), src0=vgpr(tileInfo.sharedVgprGROffset[i]), src1=sgpr(stmp)))
         writer.sgprPool.checkIn(stmp)
+        if applyDelta:
+          # VGPR fallback: reg already holds GRO_vgpr + soffset; add deltaS directly.
+          module.add(VAddU32(dst=vgpr(reg), src0=vgpr(reg), src1=sgpr(swiglu_up_delta_sgpr),
+                             comment="SwiGLU: up vgpr soffset += delta (regId=%d)" % regId))
 
 def _grComputeRowPartition_legacy(module, kernel, writer, tileInfo, waveId, rowOffset):
   subIterKBytes = tileInfo.subIterKBytes
@@ -852,12 +879,93 @@ def _graTileAssignment_legacy(writer, kernel, useSwizzling=True):
                           laneId, colIdA, colIdB, waveId)
   _grComputeRowPartition_legacy(module, kernel, writer, tileInfoA, waveId, rowOffsetA)
   _grComputeRowPartition_legacy(module, kernel, writer, tileInfoB, waveId, rowOffsetB)
+
   _grComputeAllOffsets_legacy(module, writer, tileInfoA, colIdA, rowId, rowOffsetA)
   _grComputeAllOffsets_legacy(module, writer, tileInfoB, colIdB, rowId, rowOffsetB)
+
+  # SwiGLU global split: each wave must see half_n gate N-tiles and half_n up
+  # N-tiles in its own accumulator.  The wave partition places wave j at B
+  # N-column j * partitionOffset, but for wg_n > 1 we need wave j at
+  # j * (partitionOffset / wg_n) so that the up-half soffset correction lands
+  # at the correct up column.  Subtract the difference from the B GRO VGPRs.
+  # The LDS write base (LocalWriteBaseAddrB) is computed separately from the
+  # full partitionOffset and is unaffected by this correction.
+  if kernel.get("SwiGLU") and kernel["MIWaveGroup"][1] > 1:
+    wg_n = kernel["MIWaveGroup"][1]
+    wg_m = kernel["MIWaveGroup"][0]
+    partitionOffset = tileInfoB.mmaTileShape[0] * int(tileInfoB.localSubtileGrid[0])
+    # correction per N-direction wave = (partitionOffset - partitionOffset//wg_n) N-cols.
+    n_col_correction = partitionOffset - partitionOffset // wg_n
+    tmpS = writer.sgprPool.checkOut(1, tag="_graTileAssignment_swiglu_s",
+                                    preventOverflow=False)
+    corrV = writer.vgprPool.checkOut(1, tag="_graTileAssignment_swiglu_v")
+    # N-axis waveId: for MIWaveGroup=[wg_m, wg_n], N-axis id = waveId // wg_m.
+    assert (wg_m & (wg_m - 1)) == 0, "waveIdN shift assumes power-of-2 MIWaveGroup[0]"
+    waveIdN = waveId  # already computed above (tmpVgpr + 5)
+    if wg_m > 1:
+      waveIdN = writer.vgprPool.checkOut(1, tag="_graTileAssignment_swiglu_waveIdN")
+      module.add(VLShiftRightB32(dst=vgpr(waveIdN), shiftHex=hex(wg_m.bit_length()-1),
+                                 src=vgpr(waveId), comment="N-axis waveId = waveId // wg_m"))
+    module.addComment0(
+        "SwiGLU: shift B GRO VGPR by waveIdN * %d N-cols to align each wave's"
+        " gate+up window" % n_col_correction)
+    module.add(SMulI32(dst=sgpr(tmpS), src0=n_col_correction, src1=sgpr("StrideB1J"),
+                       comment="%d N-col correction * StrideB1J" % n_col_correction))
+    module.add(SMulI32(dst=sgpr(tmpS), src0=sgpr(tmpS), src1=tileInfoB.bpe,
+                       comment="* bpe = byte correction per N-wave"))
+    module.add(VMulLOU32(dst=vgpr(corrV), src0=sgpr(tmpS), src1=vgpr(waveIdN),
+                         comment="waveIdN * correction"))
+    for gr_i in range(len(tileInfoB.sharedVgprGROffset)):
+      module.add(VSubU32(dst=vgpr(tileInfoB.sharedVgprGROffset[gr_i]),
+                         src0=vgpr(tileInfoB.sharedVgprGROffset[gr_i]),
+                         src1=vgpr(corrV),
+                         comment="B GRO shift for SwiGLU wg_n=%d (gr %d)" % (wg_n, gr_i)))
+    if wg_m > 1:
+      writer.vgprPool.checkIn(waveIdN)
+    writer.vgprPool.checkIn(corrV)
+    writer.sgprPool.checkIn(tmpS)
+
   writer.vgprPool.checkIn(tmpVgpr)
   _grComputeSubtileOffsets_legacy(writer, module, tileInfoA)
-  _grComputeSubtileOffsets_legacy(writer, module, tileInfoB)
+  # SwiGLU: for all wg_n, the up-half soffsets need an N_out offset.
+  # With the GRO VGPR corrected above, the natural soffset lands at
+  # wave_base + regId*row_stride N-cols.  For regId >= half_n we need +N_out
+  # N-cols.  Compute the byte delta once here and fold it into the single
+  # offset-computation pass for B (no fragile second walk over the registers).
+  swiglu_up_delta_sgpr = None
+  swiglu_half_n = 0
+  if kernel.get("SwiGLU"):
+    mt1     = kernel["MacroTile1"]
+    wg_n    = kernel["MIWaveGroup"][1]
+    mma_n   = (mt1 // 16) // wg_n  # N-tiles per wave
+    swiglu_half_n = mma_n // 2
+    subtile_K = int(tileInfoB.subtileShape[0] * tileInfoB.mmaTileShape[0])
+    row_stride = math.ceil(tileInfoB.numGRPerSubtile * tileInfoB.loadRatioGR * subtile_K)
+    natural_col_at_half_n = swiglu_half_n * row_stride  # compile-time constant
+    swiglu_up_delta_sgpr = writer.sgprPool.checkOut(
+        1, tag="_swigluUpHalfDeltaSgpr", preventOverflow=False)
+    module.addComment0(
+        "SwiGLU: up-half soffset delta = (N_out - %d) * StrideB1J * bpe"
+        " (N_out = SizesFree1/2, runtime)" % natural_col_at_half_n)
+    # delta = (SizesFree1/2 - natural_col_at_half_n) * StrideB1J * bpe
+    module.add(SLShiftRightB32(dst=sgpr(swiglu_up_delta_sgpr), src=sgpr("SizesFree+1"), shiftHex=1,
+                               comment="N_out = SizesFree1 / 2"))
+    module.add(SSubU32(dst=sgpr(swiglu_up_delta_sgpr), src0=sgpr(swiglu_up_delta_sgpr),
+                       src1=natural_col_at_half_n,
+                       comment="N_out - %d" % natural_col_at_half_n))
+    module.add(SMulI32(dst=sgpr(swiglu_up_delta_sgpr), src0=sgpr(swiglu_up_delta_sgpr),
+                       src1=sgpr("StrideB1J"),
+                       comment="(N_out - %d) * StrideB1J" % natural_col_at_half_n))
+    module.add(SMulI32(dst=sgpr(swiglu_up_delta_sgpr), src0=sgpr(swiglu_up_delta_sgpr),
+                       src1=tileInfoB.bpe,
+                       comment="* bpe = byte delta"))
+  _grComputeSubtileOffsets_legacy(writer, module, tileInfoB,
+                                  swiglu_up_delta_sgpr=swiglu_up_delta_sgpr,
+                                  swiglu_half_n=swiglu_half_n)
+  if swiglu_up_delta_sgpr is not None:
+    writer.sgprPool.checkIn(swiglu_up_delta_sgpr)
   return module
+
 
 ##################################################
 # Subroutine to generate GR load code

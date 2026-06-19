@@ -186,6 +186,12 @@ class ComputeStoreVgprsMFMA(ComputeStoreVgprs):
                 module.add(vectorStaticRemainder(dummy, tmpVgpr0, tmpVgpr0, kernel["MIWaveGroup"][1], tmpVgpr1Res, tmpSgprInfo))
             # Subtile kernels: each wave owns a contiguous block of MIWaveTile[1]*MIBShape1 cols.
             waveBlockCols = MIBShape1 * kernel["MIWaveTile"][1] if kernel.get("UseSubtileImpl") else MIBShape1
+            # SwiGLU global split: each wave owns NT_out/wg_n output columns (gate result).
+            # The accumulator compacts y into the lower N half, so the per-wave column
+            # stride in D is waveBlockCols//2 rather than waveBlockCols.
+            if kernel.get("UseSubtileImpl") and kernel.get("SwiGLU"):
+                assert waveBlockCols % 2 == 0, "swiglu per-wave N block must be even"
+                waveBlockCols //= 2
             module.add(vectorStaticMultiply(vgpr(tid1), vgpr(tmpVgpr0), waveBlockCols, tmpSgprInfo, "wave coordination offset 1"))
 
             # coord 1 : thread part
@@ -226,8 +232,13 @@ class ComputeStoreVgprsMFMA(ComputeStoreVgprs):
             module.add(VAddU32(dst=vgpr(tid0), src0=sgpr(tmpSgpr), src1=vgpr(lsuTid0), comment="coord 0 = (tid0/MI_m)*4 + waveG0*MIB_m + MT0*SG0"))
 
             # macro tile 1 part
-            module.add(SMulI32(dst=sgpr(tmpSgpr), src0=kernel["MacroTile1"], src1=sgpr(wg1), comment="wgp1 * MT1"))
-            module.add(VAddU32(dst=vgpr(tid1), src0=sgpr(tmpSgpr), src1=vgpr(lsuTid1), comment="coord 1 = (tid0%MI_m) + waveG1*MIB_n + MT1*SG1"))
+            # SwiGLU global split: WG t writes D[:,t*NT_out:(t+1)*NT_out] where NT_out=MT1/2.
+            # Halve the WG-level N base so N-tile WGs index into the half-width D buffer.
+            macroTile1Out = kernel["MacroTile1"]
+            if kernel.get("UseSubtileImpl") and kernel.get("SwiGLU"):
+                macroTile1Out = kernel["MacroTile1"] // 2
+            module.add(SMulI32(dst=sgpr(tmpSgpr), src0=macroTile1Out, src1=sgpr(wg1), comment="wgp1 * NT_out"))
+            module.add(VAddU32(dst=vgpr(tid1), src0=sgpr(tmpSgpr), src1=vgpr(lsuTid1), comment="coord 1 = (tid0%MI_m) + waveG1*MIB_n + NT_out*SG1"))
 
         # release resource
         writer.vgprPool.checkIn(dummy)

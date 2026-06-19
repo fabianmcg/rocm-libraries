@@ -399,6 +399,8 @@ namespace TensileLite
                     "I-cache); larger -> more copies loaded for the same per-kernel hot-path size. "
                     "Non-Linux: used directly as the extras count (no ELF parsing).")
                 ("use-e",                     po::value<bool>()->default_value(false), "Use E.")
+                ("swiglu",                    po::value<bool>()->default_value(false),
+                 "Fused SwiGLU epilogue: gate/up split, D has N_out = N_gemm/2 columns.")
                 ("use-gradient",              po::value<bool>()->default_value(false), "Use gradient.")
                 ("use-user-args",             po::value<bool>()->default_value(false), "Use user argument structure as kernel input.")
                 ("rotating-buffer-size",      po::value<int32_t>()->default_value(0), "Size of rotating buffer in the unit of MB.")
@@ -641,6 +643,7 @@ namespace TensileLite
             DUMP_VEC("factor-dim-args", int);
             DUMP_VEC("icache-flush-args", bool);
             DUMP_OPT("use-e", bool);
+            DUMP_OPT("swiglu", bool);
             DUMP_OPT("use-gradient", bool);
             DUMP_OPT("use-user-args", bool);
             DUMP_OPT("rotating-buffer-size", int32_t);

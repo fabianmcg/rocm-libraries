@@ -1156,6 +1156,8 @@ namespace TensileLite
 
         bool isFastPathEligible(ContractionProblemGemm const& problem)
         {
+            if(problem.swiGLU())
+                return false;
 
             // For more precise numerical correctness with XFloat32, skip this fast path.
             // If we knew at this point that the data was initialized as whole number floats,
@@ -1623,12 +1625,141 @@ namespace TensileLite
 
         }
 
+        // CPU reference for the fused SwiGLU epilogue — geometry-free global split.
+        //
+        // Global-split spec: B is (K, N_gemm = 2*N_out).  For each output column
+        // c in [0, N_out), gateCol = c and upCol = c + N_out.  The reference is
+        // independent of tile geometry (MT1, wg_n, wave layout).
+        template <typename Inputs, typename Accumulator, typename MathOpAccum>
+        void solveCPUSwiGLU(ContractionProblemGemm const& problem,
+                            ContractionInputs const&      inputs,
+                            size_t                        elementsToValidate)
+        {
+            using AType             = typename Inputs::AType;
+            using BType             = typename Inputs::BType;
+            using DType             = typename Inputs::DType;
+            using ComputeInputTypeA = typename Inputs::ComputeInputTypeA;
+            using ComputeInputTypeB = typename Inputs::ComputeInputTypeB;
+
+            AType const* aPtr = (AType const*)inputs.a;
+            BType const* bPtr = (BType const*)inputs.b;
+            DType*       dPtr = (DType*)inputs.d;
+
+            auto const& a = problem.a();
+            auto const& b = problem.b();
+            auto const& d = problem.d();
+
+            // A is (K, M) for TransposeA=True; B is (K, N_gemm) for TransposeB=False.
+            size_t indexMA = problem.freeIndicesA()[0].i;
+            size_t indexKA = problem.boundIndices()[0].a;
+            size_t indexNB = problem.freeIndicesB()[0].i;
+            size_t indexKB = problem.boundIndices()[0].b;
+            size_t indexMD = problem.freeIndices()[0].d;
+            size_t indexND = problem.freeIndices()[1].d;
+
+            size_t strideMA = a.strides()[indexMA];
+            size_t strideKA = a.strides()[indexKA];
+            size_t strideNB = b.strides()[indexNB];
+            size_t strideKB = b.strides()[indexKB];
+            size_t strideMD = d.strides()[indexMD];
+            size_t strideND = d.strides()[indexND];
+
+            int64_t sizeM     = (int64_t)a.sizes()[indexMA];
+            int64_t sizeK     = (int64_t)b.sizes()[indexKB];
+            int64_t nGemm     = (int64_t)b.sizes()[indexNB]; // full doubled N
+            int64_t nOut      = nGemm / 2;                   // output columns
+            int64_t sizeBatch = (int64_t)problem.batchSize(0);
+
+            Accumulator alpha = constVariantCast<Accumulator>(inputs.alpha);
+
+            // Handle batch strides (may be 0 for non-batched).
+            size_t strideBatchA = (problem.batchIndices().empty() ? 0
+                                   : a.strides()[problem.batchIndices()[0].a]);
+            size_t strideBatchB = (problem.batchIndices().empty() ? 0
+                                   : b.strides()[problem.batchIndices()[0].b]);
+            size_t strideBatchD = (problem.batchIndices().empty() ? 0
+                                   : d.strides()[problem.batchIndices()[0].d]);
+
+            // Honor --num-elements-to-validate: sample a strided subset of the
+            // N_out output elements using the same NextPrime scheme as the
+            // non-SwiGLU SolveCPU path.
+            size_t  totalOut             = (size_t)sizeBatch * (size_t)sizeM * (size_t)nOut;
+            size_t  validationStrideGemm = 1;
+            if(elementsToValidate > 0 && elementsToValidate < totalOut)
+                validationStrideGemm = NextPrime(totalOut / elementsToValidate);
+
+            omp_set_num_threads(MAX_OMP_THREADS);
+#pragma omp parallel for
+            for(size_t outNum = 0; outNum < totalOut; outNum += validationStrideGemm)
+            {
+                // Decompose the flat output index into (batch, m, c).
+                int64_t c     = (int64_t)(outNum % (size_t)nOut);
+                int64_t mRow  = (int64_t)((outNum / (size_t)nOut) % (size_t)sizeM);
+                int64_t batch = (int64_t)(outNum / ((size_t)nOut * (size_t)sizeM));
+
+                // Global-split pairing: gate col c, up col c + N_out.
+                int64_t gateCol = c;
+                int64_t upCol   = c + nOut;
+
+                Accumulator gate(0), up(0);
+                int64_t aBase     = (int64_t)strideBatchA * batch
+                                    + (int64_t)strideMA * mRow;
+                int64_t bBaseGate = (int64_t)strideBatchB * batch
+                                    + (int64_t)strideNB * gateCol;
+                int64_t bBaseUp   = (int64_t)strideBatchB * batch
+                                    + (int64_t)strideNB * upCol;
+                for(int64_t k = 0; k < sizeK; k++)
+                {
+                    int64_t aIdx     = aBase     + (int64_t)strideKA * k;
+                    int64_t bIdxGate = bBaseGate + (int64_t)strideKB * k;
+                    int64_t bIdxUp   = bBaseUp   + (int64_t)strideKB * k;
+                    gate += multiply<Inputs, Accumulator, MathOpAccum,
+                                     AType, BType,
+                                     ComputeInputTypeA, ComputeInputTypeB>(
+                        problem, inputs, aPtr, bPtr, aIdx, bIdxGate,
+                        false, false);
+                    up   += multiply<Inputs, Accumulator, MathOpAccum,
+                                     AType, BType,
+                                     ComputeInputTypeA, ComputeInputTypeB>(
+                        problem, inputs, aPtr, bPtr, aIdx, bIdxUp,
+                        false, false);
+                }
+                gate *= alpha;
+                up   *= alpha;
+
+                // SwiGLU: y = up * silu(gate), silu(x) = x * sigmoid(x).
+                // SwiGLU is only defined for real scalar accumulators (bf16).
+                // Complex instantiations compile but are never reached at runtime.
+                Accumulator sig{};
+                if constexpr(!std::is_same<Accumulator, std::complex<float>>()
+                             && !std::is_same<Accumulator, std::complex<double>>())
+                {
+                    sig = Accumulator(1)
+                          / (Accumulator(1) + static_cast<Accumulator>(
+                                 std::exp(-static_cast<double>(gate))));
+                }
+                Accumulator y = up * (gate * sig);
+
+                size_t dIdx = (size_t)((int64_t)strideBatchD * batch
+                              + (int64_t)strideMD * mRow
+                              + (int64_t)strideND * c);
+                dPtr[dIdx] = SaturateCast<DType>(y);
+            }
+        }
+
         template <typename Inputs, typename Accumulator, typename MathOpAccum>
         void ReferenceSolution<Inputs, Accumulator, MathOpAccum>::SolveCPU(
             ContractionProblemGemm const& problem,
             ContractionInputs const&      inputs,
             size_t                        elementsToValidate)
         {
+            if(problem.swiGLU())
+            {
+                solveCPUSwiGLU<Inputs, Accumulator, MathOpAccum>(
+                    problem, inputs, elementsToValidate);
+                return;
+            }
+
             Accumulator* ws                   = nullptr;
             size_t       validationStrideGemm = 1;
             if(problem.useGradient() && problem.useBias()

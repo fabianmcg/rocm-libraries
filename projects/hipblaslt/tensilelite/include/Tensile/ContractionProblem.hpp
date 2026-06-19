@@ -241,6 +241,11 @@ namespace TensileLite
             tensor.resize(sizes, strides);
         }
 
+        void setTensorDescriptor(int idx, TensorDescriptor const& desc)
+        {
+            m_tensors[idx] = desc;
+        }
+
         /**
          * Return vector of constant datatype.
          */
@@ -774,6 +779,8 @@ namespace TensileLite
             m_useScaleCD = useScaleCD;
         }
 
+        void setSwiGLU(bool swiGLU) { m_swiGLU = swiGLU; }
+
         void setUseScaleAlphaVec(int useScaleAlphaVec)
         {
             m_useScaleAlphaVec = useScaleAlphaVec;
@@ -803,6 +810,8 @@ namespace TensileLite
         {
             return m_useScaleCD;
         }
+
+        bool swiGLU() const { return m_swiGLU; }
 
         int useScaleAlphaVec() const
         {
@@ -1437,6 +1446,7 @@ namespace TensileLite
         int              m_useBias                 = 0;
         std::string      m_useScaleAB              = "";
         bool             m_useScaleCD              = false;
+        bool             m_swiGLU                  = false;
         int              m_useScaleAlphaVec        = 0;
         ActivationType   m_activationType          = ActivationType::None;
         bool             m_activationNoGuard       = false;

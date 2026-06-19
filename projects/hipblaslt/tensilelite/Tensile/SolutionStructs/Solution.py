@@ -179,6 +179,39 @@ def _disableUnsupportedRuntimeStaggerU(state):
     _disableRuntimeStaggerU(state)
 
 
+def _validateSubtileEpiloguePrereqs(state, printRejectionReason, epilogueName):
+  """Validate the shared prerequisites for the Subtile fused epilogues.
+
+  RMSNorm and SwiGLU share five structural requirements: the Subtile code path,
+  gfx950, bf16 I/O, StreamKForceDPOnly (complete tiles, no K-split fixup), and
+  MIArchVgpr=False (the emitters use AGPR read/write instructions).  Returns
+  True when all hold; rejects the solution and returns False otherwise.
+  """
+  if not state["UseSubtileImpl"]:
+    reject(state, printRejectionReason, "%s requires UseSubtileImpl" % epilogueName)
+    return False
+  if state["ISA"] != (9, 5, 0):
+    reject(state, printRejectionReason, "%s is only implemented on gfx950" % epilogueName)
+    return False
+  if not state["ProblemType"]["DataType"].isBFloat16():
+    reject(state, printRejectionReason, "%s currently supports bf16 data type only" % epilogueName)
+    return False
+  # StreamK-completeness: require full data-parallel tiles (no K-split fixup).
+  # Reading the raw boolean is intentional — it reflects the user-supplied value;
+  # _validateStreamKForceDPOnly() enforces StreamK=3 as a follow-up.
+  if not state["StreamKForceDPOnly"]:
+    reject(state, printRejectionReason,
+           "%s requires StreamKForceDPOnly=1 (complete tiles, no K-split fixup)" % epilogueName)
+    return False
+  # MIArchVgpr=True places the D-tile in regular VGPRs, but the emitters use
+  # accvgpr() reads/writes. Reject until an AGPR-free code path exists.
+  if state["MIArchVgpr"]:
+    reject(state, printRejectionReason,
+           "%s requires MIArchVgpr=False (emitter uses AGPR read/write instructions)" % epilogueName)
+    return False
+  return True
+
+
 def _validateRMSNorm(state, printRejectionReason):
   """Validate RMSNorm fused epilogue constraints.
 
@@ -209,22 +242,7 @@ def _validateRMSNorm(state, printRejectionReason):
   """
   if not state["RMSNorm"]:
     return
-  if not state["UseSubtileImpl"]:
-    reject(state, printRejectionReason, "RMSNorm requires UseSubtileImpl")
-    return
-  if state["ISA"] != (9, 5, 0):
-    reject(state, printRejectionReason, "RMSNorm is only implemented on gfx950")
-    return
-  dt = state["ProblemType"]["DataType"]
-  if not dt.isBFloat16():
-    reject(state, printRejectionReason, "RMSNorm currently supports bf16 data type only")
-    return
-  # StreamK-completeness: require full data-parallel tiles (no K-split fixup).
-  # _validateStreamKForceDPOnly() enforces StreamK=3 as a follow-up; reading the
-  # raw boolean here is intentional — it reflects the user-supplied value.
-  if not state["StreamKForceDPOnly"]:
-    reject(state, printRejectionReason,
-           "RMSNorm requires StreamKForceDPOnly=1 (complete tiles, no K-split fixup)")
+  if not _validateSubtileEpiloguePrereqs(state, printRejectionReason, "RMSNorm"):
     return
   if state["MacroTile1"] <= 0:
     reject(state, printRejectionReason, "RMSNorm requires a positive MacroTile1")
@@ -236,13 +254,6 @@ def _validateRMSNorm(state, printRejectionReason):
   # because N is a runtime value; it is the caller's responsibility to enforce
   # this at launch time (e.g. by gating on N == MacroTile1 in the host dispatch
   # logic or benchmark wrapper).
-  # MIArchVgpr=True places the D-tile in regular VGPRs (ValuC aliases D-tile),
-  # but SubtileRMSNormEmit unconditionally uses accvgpr() reads/writes.
-  # Reject until an AGPR-free code path is implemented.
-  if state["MIArchVgpr"]:
-    reject(state, printRejectionReason,
-           "RMSNorm requires MIArchVgpr=False (emitter uses AGPR read/write instructions)")
-    return
   # OutputAmaxD inserts three extra args (AddrAmaxOut, AmaxWS, AmaxSync) between
   # the activation args and the RMSNorm args in the Signature.  The store-sgpr
   # loadAllKernArg path loads args contiguously by append order, so RMSNorm SGPRs
@@ -293,6 +304,56 @@ def _validateRMSNorm(state, printRejectionReason):
              "RMSNorm cross-wave reduction LDS scratch (%u bytes) exceeds MaxLDS (%u)"
              % (rmsNormLdsBytes, state["MaxLDS"]))
       return
+
+
+def _validateSwiGLU(state, printRejectionReason):
+  if not state["SwiGLU"]:
+    return
+  if state["RMSNorm"]:
+    reject(state, printRejectionReason, "SwiGLU and RMSNorm are mutually exclusive")
+    return
+  if not _validateSubtileEpiloguePrereqs(state, printRejectionReason, "SwiGLU"):
+    return
+  # The epilogue emitter (SubtileSwiGLUEmit) hardcodes a 16x16 MFMA with 4 output
+  # rows per lane.  Reject any other MFMA shape so a mismatch fails at validation
+  # time instead of silently mis-indexing the accumulator AGPRs.
+  if state["MatrixInstM"] != 16 or state["MatrixInstN"] != 16:
+    reject(state, printRejectionReason,
+           "SwiGLU requires a 16x16 MFMA (MatrixInstM and MatrixInstN must be 16)")
+    return
+  rowsPerLane = (state["MatrixInstM"] * state["MatrixInstN"]) // state["WavefrontSize"]
+  if rowsPerLane != 4:
+    reject(state, printRejectionReason,
+           "SwiGLU assumes 4 output rows per lane (16x16 MFMA on a wave64 ISA)")
+    return
+  if state["MacroTile1"] <= 0:
+    reject(state, printRejectionReason, "SwiGLU requires a positive MacroTile1")
+    return
+  if state["ProblemType"]["OutputAmaxD"]:
+    reject(state, printRejectionReason, "SwiGLU does not support OutputAmaxD")
+    return
+  # SwiGLU's epilogue hook runs before alpha/beta apply, so the only valid
+  # runtime config is alpha=1, beta=0.  UseBeta=True would make the store path
+  # read C from a wrong column (waveBlockCols is halved for SwiGLU), so reject it.
+  if state["ProblemType"]["UseBeta"]:
+    reject(state, printRejectionReason, "SwiGLU does not support UseBeta (requires beta=0)")
+    return
+  if (state.get("GlobalSplitUAlgorithm") == "MultipleBufferSingleKernel" or
+      state.get("AdaptiveGemmGSUA") == 1):
+    reject(state, printRejectionReason,
+           "SwiGLU does not support MultipleBufferSingleKernel/AdaptiveGemmGSUA")
+    return
+  wg = state["MIWaveGroup"]
+  # SwiGLU supports arbitrary MIWaveGroup[1] (wg_n): each wave splits its own
+  # per-wave N slice into [gate|up] halves and compacts y into the lower half.
+  # The store path halves the per-wave coord1 N-base and the N-guard clamp so
+  # the wg_n waves pack their N_out columns contiguously into D.
+  mma_n = state["MacroTile1"] // 16 // wg[1]
+  if mma_n < 2 or (mma_n % 2) != 0:
+    reject(state, printRejectionReason,
+           "SwiGLU requires an even number of N-tiles per wave "
+           "(MacroTile1 // 16 // MIWaveGroup[1] must be even and >= 2)")
+    return
 
 
 def _validateStreamKForceDPOnly(state, printRejectionReason):
@@ -1068,6 +1129,10 @@ class Solution(collections.abc.Mapping):
     # N==MacroTile1 (row containment) cannot be checked here (N is a runtime size); the example
     # script asserts it at launch time.
     _validateRMSNorm(state, printRejectionReason)
+    if not state["Valid"]:
+      return
+
+    _validateSwiGLU(state, printRejectionReason)
     if not state["Valid"]:
       return
 

@@ -4446,6 +4446,11 @@ class KernelWriterAssembly(KernelWriter):
         if useFixedSrd2:
           # UseSubtileImpl fixedSrd2 case (including swizzle and nonSwizzle): tile start uses roundup(MT/swizzleSize0)
           mt = roundUp(kernel[tP["mt"]] / swizzleSize0)
+          # SwiGLU global split: B is (K, N_gemm) but each WG only owns NT_out=MT1/2 gate columns
+          # plus NT_out up columns at +N_out.  Halve the SRD base so WG t starts at B[:,t*NT_out]
+          # rather than B[:,t*MT1]; the up-half threads add +N_out via their per-lane GRO.
+          if tP["isB"] and kernel.get("SwiGLU"):
+            mt = mt // 2  # SwiGLU: B up-half +N_out col offset — SRD base uses NT_out=MT1/2
           module.addModuleAsFlatItems(self.s_mul_u64_u32(sgpr(tileStart+0), sgpr(tileStart+1), sgpr(tP["wg"]), mt, comment="WorkGroup[01] * roundup(MT/%u)"%swizzleSize0))
         else:
           module.addModuleAsFlatItems(self.s_mul_u64_u32(sgpr(tileStart+0), sgpr(tileStart+1), sgpr(tP["wg"]), kernel[tP["mt"]], comment="WorkGroup[01] * MT"))
@@ -4454,7 +4459,7 @@ class KernelWriterAssembly(KernelWriter):
         if not self.isConstUnitStride(strideF):
           if useFixedSrd2:
             # Tile-boundary SRD+2 for UseSubtileImpl (unified for MX scale and data A/B).
-            # Avoids 32-bit overflow from computing full tensor2dSize when N*K or M*K > 2^32.
+            # Avoids 32-bit overflow when computing the full tensor2dSize (N*K or M*K > 2^32).
             #
             # tileStart is in block units (roundUp(MT/swizzleSize0)).
             #   numLine = min(roundUp(size/swizzleSize0) - tileStart_blk, roundUp(MT/swizzleSize0)) - 1
@@ -4464,28 +4469,35 @@ class KernelWriterAssembly(KernelWriter):
             mt_units    = mt  # roundUp(MT/swizzleSize0), compile-time
             extra_bytes = swizzleBlockSize * (kernel["DepthU"] // swizzleSize1)
 
-            for i in range(0, numDim):
-              idx = indices[i]
-              if idx == kernel["ProblemType"]["Index0"] or idx == kernel["ProblemType"]["Index1"]:
-                size = self.sizeRef(idx)
-                if isSwizzledSubtile:
-                  # tileStart already in block units (WG * roundUp(MT/swizzleSize0))
-                  module.add(SAddU32(dst=sgpr(stmp+0), src0=size, src1=(swizzleSize0 - 1), comment="size + %u - 1"%swizzleSize0))
-                  module.add(SLShiftRightB32(dst=sgpr(stmp+0), src=sgpr(stmp+0), shiftHex=log2(swizzleSize0), comment="roundup(size/%u)"%swizzleSize0))
-                  module.add(SSubU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=sgpr(tileStart+0), comment="numBlkToEnd = roundUp(size/%u) - tileStart_blk"%swizzleSize0))
-                else:
-                  # tileStart in element units (WG * MT); no block rounding needed
-                  module.add(SSubU32(dst=sgpr(stmp+0), src0=size, src1=sgpr(tileStart+0), comment="numToEnd = size - WG*MT"))
-                module.add(SMinU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=mt_units, comment="min (numBlkToEnd, roundup(MT/%u))"%swizzleSize0))
-                module.add(SSubU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=1, comment="numLine = min - 1 (0-based index)"))
-                module.addModuleAsFlatItems(self.s_mul_u64_u32(sgpr(stmp+0), sgpr(stmp+1), sgpr(stmp+0), \
-                          strideF, comment="numLine * stride"))
-                if isMxSwizzledScaleLayout:
-                  module.add(SAddU32(dst=sgpr("Srd%s+2"%tc), src0=sgpr(stmp+0), src1=extra_bytes, comment="buffer_load limit for %s"%tc))
-                else:
-                  # (numLine * stride + DepthU) * bpe  -- mirrors scale path structure
-                  module.add(SAddU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=extra_bytes, comment="+ DepthU (one K step)"))
-                  module.add(scalarMultiplyBpe("Srd%s+2"%tc, stmp+0, float(tP["bpeGR"]), comment="buffer_load limit for %s (tile-boundary, avoids 32-bit overflow)"%tc))
+            # SwiGLU B global split: up-half threads reach column WG*NT_out+N_out which is
+            # runtime-dependent.  Use BufferLimit to avoid incorrect clamping; accesses stay
+            # within the physical B tensor because problem sizes are validated at launch.
+            if tP["isB"] and kernel.get("SwiGLU"):
+              module.add(SMovB32(dst=sgpr("SrdB+2"), src="BufferLimit",
+                                 comment="SwiGLU: B up-half +N_out col offset — use BufferLimit for Srd+2"))
+            else:
+              for i in range(0, numDim):
+                idx = indices[i]
+                if idx == kernel["ProblemType"]["Index0"] or idx == kernel["ProblemType"]["Index1"]:
+                  size = self.sizeRef(idx)
+                  if isSwizzledSubtile:
+                    # tileStart already in block units (WG * roundUp(MT/swizzleSize0))
+                    module.add(SAddU32(dst=sgpr(stmp+0), src0=size, src1=(swizzleSize0 - 1), comment="size + %u - 1"%swizzleSize0))
+                    module.add(SLShiftRightB32(dst=sgpr(stmp+0), src=sgpr(stmp+0), shiftHex=log2(swizzleSize0), comment="roundup(size/%u)"%swizzleSize0))
+                    module.add(SSubU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=sgpr(tileStart+0), comment="numBlkToEnd = roundUp(size/%u) - tileStart_blk"%swizzleSize0))
+                  else:
+                    # tileStart in element units (WG * MT); no block rounding needed
+                    module.add(SSubU32(dst=sgpr(stmp+0), src0=size, src1=sgpr(tileStart+0), comment="numToEnd = size - WG*MT"))
+                  module.add(SMinU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=mt_units, comment="min (numBlkToEnd, roundup(MT/%u))"%swizzleSize0))
+                  module.add(SSubU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=1, comment="numLine = min - 1 (0-based index)"))
+                  module.addModuleAsFlatItems(self.s_mul_u64_u32(sgpr(stmp+0), sgpr(stmp+1), sgpr(stmp+0), \
+                            strideF, comment="numLine * stride"))
+                  if isMxSwizzledScaleLayout:
+                    module.add(SAddU32(dst=sgpr("Srd%s+2"%tc), src0=sgpr(stmp+0), src1=extra_bytes, comment="buffer_load limit for %s"%tc))
+                  else:
+                    # (numLine * stride + DepthU) * bpe  -- mirrors scale path structure
+                    module.add(SAddU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=extra_bytes, comment="+ DepthU (one K step)"))
+                    module.add(scalarMultiplyBpe("Srd%s+2"%tc, stmp+0, float(tP["bpeGR"]), comment="buffer_load limit for %s (tile-boundary, avoids 32-bit overflow)"%tc))
           module.addModuleAsFlatItems(self.s_mul_u64_u32(sgpr(tileStart), sgpr(tileStart+1), sgpr(tileStart+0), \
                     strideF, comment="tlu=0, scaled tile-offset by stride"))
 
@@ -13120,7 +13132,13 @@ class KernelWriterAssembly(KernelWriter):
 
       assert kernel["BufferStore"]
       module.addSpaceLine()
-      module.add(SMulI32(dst=sgpr(wgMT1), src0="MT1", src1=sgpr("WorkGroup1"), comment="<- wg1*MT1"))
+      if kernel.get("UseSubtileImpl") and kernel.get("SwiGLU"):
+        # SwiGLU global split: each WG produces NT_out = MT1/2 output D-columns.
+        # WG t writes to D[:,t*NT_out:(t+1)*NT_out], so the SRD base uses WG1*NT_out.
+        mt1Out = kernel["MacroTile1"] // 2
+        module.add(SMulI32(dst=sgpr(wgMT1), src0=mt1Out, src1=sgpr("WorkGroup1"), comment="<- wg1*NT_out (SwiGLU global split)"))
+      else:
+        module.add(SMulI32(dst=sgpr(wgMT1), src0="MT1", src1=sgpr("WorkGroup1"), comment="<- wg1*MT1"))
 
       # Overall strategy is to set the SRD to the top-left of the macro-tile.
       # TT offsets are from this base (and include the column)
@@ -14646,24 +14664,65 @@ class KernelWriterAssembly(KernelWriter):
 
     # --- N guard ---
     edgeModule.addComment0("N-guard: numValid16NBlocks = min(max(validN-waveBaseN,0), waveGroupN=%d) >> 4" % waveGroupN)
-    edgeModule.add(SMulI32(dst=sgpr("SubtileNGuard"), src0=sgpr("WorkGroup1"), src1=mt1,
-                           comment="WG1 * MT1"))
-    edgeModule.add(SSubU32(dst=sgpr("SubtileNGuard"),
-                           src0=self.sizeRef(kernel["ProblemType"]["Index1"]),
-                           src1=sgpr("SubtileNGuard"),
-                           comment="validN = SizeJ - WG1*MT1"))
-    if numWavesN > 1:
-      edgeModule.add(SMulI32(dst=sgpr(tmpN), src0=sgpr(tmpN), src1=waveGroupN,
-                             comment="waveBaseN = waveIdN * waveGroupN(%d)" % waveGroupN))
-      edgeModule.add(SSubU32(dst=sgpr("SubtileNGuard"), src0=sgpr("SubtileNGuard"), src1=sgpr(tmpN),
-                             comment="validN - waveBaseN; SCC=1 if OOB"))
-      edgeModule.add(SCSelectB32(dst=sgpr("SubtileNGuard"), src0=0, src1=sgpr("SubtileNGuard"),
-                                 comment="validN_wave = 0 if OOB"))
-    # clamped = min(validN_wave, waveGroupN); SCC=1 on borrow → keep validN_wave, else waveGroupN.
-    edgeModule.add(SSubU32(dst=sgpr(tmpN), src0=sgpr("SubtileNGuard"), src1=waveGroupN,
-                           comment="validN_wave - waveGroupN; SCC=1 if validN_wave < waveGroupN"))
-    edgeModule.add(SCSelectB32(dst=sgpr("SubtileNGuard"), src0=sgpr("SubtileNGuard"), src1=waveGroupN,
-                               comment="min(validN_wave, waveGroupN)"))
+    if kernel.get("SwiGLU"):
+      # SwiGLU global split: work in D-output (half-width) coordinates throughout.
+      # Each WG t owns NT_out = MT1/2 D-columns starting at t*NT_out.
+      # Wave j within the WG owns nOutputColsPerWave = waveGroupN/2 output columns.
+      nOutputColsPerWave = waveGroupN // 2
+      mt1Out = mt1 // 2
+      # SubtileNGuard = N_out - WG1*NT_out = validN_out (remaining output cols for this WG).
+      edgeModule.add(SLShiftRightB32(dst=sgpr("SubtileNGuard"),
+                                     src=self.sizeRef(kernel["ProblemType"]["Index1"]),
+                                     shiftHex=1, comment="N_out = N_gemm >> 1"))
+      # tmpN currently holds waveIdN (set when numWavesN > 1).  We are about to
+      # clobber it with WG1*MT1_out, so preserve waveIdN in a scratch SGPR and
+      # reuse it below instead of re-deriving it with a cross-lane readfirstlane.
+      savedWaveIdN = None
+      if numWavesN > 1:
+        savedWaveIdN = self.sgprPool.checkOut(1, "subtileSavedWaveIdN", preventOverflow=False)
+        edgeModule.add(SMovB32(dst=sgpr(savedWaveIdN), src=sgpr(tmpN),
+                               comment="save waveIdN before tmpN is reused for WG1*MT1_out"))
+      edgeModule.add(SMulI32(dst=sgpr(tmpN), src0=sgpr("WorkGroup1"), src1=mt1Out,
+                             comment="WG1 * MT1_out (tmpN used as scratch; waveIdN saved)"))
+      edgeModule.add(SSubU32(dst=sgpr("SubtileNGuard"),
+                             src0=sgpr("SubtileNGuard"),
+                             src1=sgpr(tmpN),
+                             comment="validN_out = N_out - WG1*MT1_out"))
+      if numWavesN > 1:
+        # Per-wave base in output coordinates: waveIdN * nOutputColsPerWave.
+        # waveIdN was saved to savedWaveIdN above (tmpN was reused for WG1*MT1_out),
+        # so reuse the saved value instead of a cross-lane readfirstlane re-derivation.
+        edgeModule.add(SMulI32(dst=sgpr(tmpN), src0=sgpr(savedWaveIdN), src1=nOutputColsPerWave,
+                               comment="waveBaseN_out = waveIdN * nOutputColsPerWave(%d)" % nOutputColsPerWave))
+        self.sgprPool.checkIn(savedWaveIdN)
+        edgeModule.add(SSubU32(dst=sgpr("SubtileNGuard"), src0=sgpr("SubtileNGuard"), src1=sgpr(tmpN),
+                               comment="validN_out - waveBaseN_out; SCC=1 if OOB"))
+        edgeModule.add(SCSelectB32(dst=sgpr("SubtileNGuard"), src0=0, src1=sgpr("SubtileNGuard"),
+                                   comment="validN_wave_out = 0 if OOB"))
+      # clamped = min(validN_wave_out, nOutputColsPerWave).
+      edgeModule.add(SSubU32(dst=sgpr(tmpN), src0=sgpr("SubtileNGuard"), src1=nOutputColsPerWave,
+                             comment="validN_wave_out - nOutputColsPerWave; SCC=1 if less"))
+      edgeModule.add(SCSelectB32(dst=sgpr("SubtileNGuard"), src0=sgpr("SubtileNGuard"), src1=nOutputColsPerWave,
+                                 comment="SwiGLU: min(validN_wave_out, nOutputColsPerWave=%d)" % nOutputColsPerWave))
+    else:
+      edgeModule.add(SMulI32(dst=sgpr("SubtileNGuard"), src0=sgpr("WorkGroup1"), src1=mt1,
+                             comment="WG1 * MT1"))
+      edgeModule.add(SSubU32(dst=sgpr("SubtileNGuard"),
+                             src0=self.sizeRef(kernel["ProblemType"]["Index1"]),
+                             src1=sgpr("SubtileNGuard"),
+                             comment="validN = SizeJ - WG1*MT1"))
+      if numWavesN > 1:
+        edgeModule.add(SMulI32(dst=sgpr(tmpN), src0=sgpr(tmpN), src1=waveGroupN,
+                               comment="waveBaseN = waveIdN * waveGroupN(%d)" % waveGroupN))
+        edgeModule.add(SSubU32(dst=sgpr("SubtileNGuard"), src0=sgpr("SubtileNGuard"), src1=sgpr(tmpN),
+                               comment="validN - waveBaseN; SCC=1 if OOB"))
+        edgeModule.add(SCSelectB32(dst=sgpr("SubtileNGuard"), src0=0, src1=sgpr("SubtileNGuard"),
+                                   comment="validN_wave = 0 if OOB"))
+      # clamped = min(validN_wave, waveGroupN); SCC=1 on borrow → keep validN_wave, else waveGroupN.
+      edgeModule.add(SSubU32(dst=sgpr(tmpN), src0=sgpr("SubtileNGuard"), src1=waveGroupN,
+                             comment="validN_wave - waveGroupN; SCC=1 if validN_wave < waveGroupN"))
+      edgeModule.add(SCSelectB32(dst=sgpr("SubtileNGuard"), src0=sgpr("SubtileNGuard"), src1=waveGroupN,
+                                 comment="min(validN_wave, waveGroupN)"))
     if self.states.storeAlign8:
       # Keep SubtileNGuard = clamped (not shifted). At use sites:
       #   numBlocks = SubtileNGuard >> 4, partialN = SubtileNGuard & 0xF

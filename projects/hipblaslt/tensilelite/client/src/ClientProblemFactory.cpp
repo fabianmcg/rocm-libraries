@@ -180,6 +180,9 @@ namespace TensileLite
             if(args.count("use-e"))
                 m_useE = args["use-e"].as<bool>();
 
+            if(args.count("swiglu"))
+                m_swiGLU = args["swiglu"].as<bool>();
+
             if(args.count("use-gradient"))
                 m_useGradient = args["use-gradient"].as<bool>();
 
@@ -476,6 +479,36 @@ namespace TensileLite
                             rv.back().setF32XdlMathOp(m_f32XdlMathOp);
                             rv.back().setActivationComputeType(m_activationComputeType);
                             rv.back().setUseDeviceUserArguments(m_useUserArgs);
+                            rv.back().setSwiGLU(m_swiGLU);
+                            if(m_swiGLU)
+                            {
+                                double alpha = m_constantValues[ContractionProblemGemm::CONST::ALPHA];
+                                double beta  = m_constantValues[ContractionProblemGemm::CONST::BETA];
+                                if(alpha != 1.0 || beta != 0.0)
+                                    throw std::runtime_error(
+                                        "swiglu requires alpha=1 and beta=0");
+                                // SwiGLU stores only N_out = N_gemm/2 output columns.
+                                // Rebuild D with the halved N so allocation and the validator
+                                // cover only the written columns.
+                                auto const& dRef    = rv.back().tensor(ContractionProblemGemm::TENSOR::D);
+                                size_t      indexND = rv.back().freeIndices()[1].d;
+
+                                std::vector<size_t> dSizes(dRef.sizes().begin(), dRef.sizes().end());
+                                if((dSizes[indexND] % 2) != 0)
+                                    throw std::runtime_error(
+                                        "swiglu requires even gemm N; got "
+                                        + std::to_string(dSizes[indexND]));
+                                dSizes[indexND] /= 2;
+
+                                // Leave strides unchanged — the packed column stride stays valid.
+                                TensorDescriptor newD("d",
+                                                      dRef.dataType(),
+                                                      dSizes.begin(),
+                                                      dSizes.end(),
+                                                      dRef.strides().begin(),
+                                                      dRef.strides().end());
+                                rv.back().setTensorDescriptor(ContractionProblemGemm::TENSOR::D, newD);
+                            }
                             if(m_mxBlockA)
                             {
                                 rv.back().setMXScaleA(m_tensorTypes[ContractionProblemGemm::TENSOR::MXSA], m_mxBlockA, {}, m_padMXScaleTensorFreeDim);

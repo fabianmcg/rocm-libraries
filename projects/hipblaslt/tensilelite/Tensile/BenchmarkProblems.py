@@ -765,12 +765,20 @@ def _benchmarkProblemType(problemTypeConfig, problemSizeGroupConfig, problemSize
                     f"have been partially deleted; remove the parent caches/ "
                     f"directory and re-run without --use-cache.")
 
+            # Cache-hit path has no regenerated solutions; recover the SwiGLU
+            # flag from the cached step params so the client config emits the
+            # correct swiglu setting (and thus the correct reference).
+            cachedSwiGLU = (
+                bool(benchmarkStep.constantParams.get("SwiGLU", False))
+                or True in benchmarkStep.forkParams.get("SwiGLU", [])
+            )
+            cachedSolutions = [{"SwiGLU": True}] if cachedSwiGLU else None
             writeClientConfigIni(True, benchmarkStep.problemSizes, benchmarkStep.biasTypeArgs,
                                  benchmarkStep.factorDimArgs, benchmarkStep.activationArgs,
                                  benchmarkStep.icacheFlushArgs, conProblemType,
                                  sourcePath, codeObjectFiles, resultsFileName,
                                  outFile, deviceId, gfxName, libraryFile=cachedLibraryFile,
-                                 probSolMap=probSolMap)
+                                 probSolMap=probSolMap, solutions=cachedSolutions)
 
         # I think the size portion of this yaml could be removed,
         # but for now it's needed, so we update it even in the cache case

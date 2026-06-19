@@ -2511,9 +2511,15 @@ class GlobalWriteBatchWriter:
                          comment="vaddr += wave_M_off"))
 
     # Add N-wave offset: waveId1 * MIWaveTile[1] * matN * StrideD1J * bpe.
+    # SwiGLU global split: each wave's output in D spans NT_out/wg_n output columns.
+    # The accumulator compacts y into the lower N half, so the per-wave D column stride
+    # is halved: wave j starts at j*(waveN_stride//2) in the output D column space.
     if miwg1 > 1:
       wsLog2 = int(log2(ws))
       waveN_stride_bpe = self.kernel["MIWaveTile"][1] * matN * bpe
+      if self.kernel.get("UseSubtileImpl") and self.kernel.get("SwiGLU"):
+        assert waveN_stride_bpe % 2 == 0, "swiglu per-wave N stride must be even"
+        waveN_stride_bpe //= 2
       module.add(VLShiftRightB32(dst=vgpr(vPack+3), shiftHex=wsLog2, src=vgpr("Serial"),
                                  comment=f"waveId = Serial >> {wsLog2}"))
       if miwg0 & (miwg0 - 1) == 0:  # miwg0 is power of 2

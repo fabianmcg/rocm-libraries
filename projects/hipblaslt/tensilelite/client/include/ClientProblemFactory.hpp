@@ -77,6 +77,7 @@ namespace TensileLite
             int         m_biasSrc;
             std::string m_useScaleAB;
             bool        m_useScaleCD;
+            bool        m_swiGLU = false;
             int         m_useScaleAlphaVec;
             bool        m_useSynchronizer;
             bool        m_useE;

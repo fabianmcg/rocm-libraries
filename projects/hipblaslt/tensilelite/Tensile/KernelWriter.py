@@ -5102,6 +5102,13 @@ class KernelWriter(metaclass=abc.ABCMeta):
         dtile_agpr_base = dtileInfo.vgprTiles[0].regList.indices[0] if dtileInfo.vgprTiles else 0
         module.add(rmsEmitter.emit(dtile_agpr_base))
 
+      if kernel["SwiGLU"]:
+        from .Components.Subtile.SubtileSwiGLUEmit import SubtileSwiGLUEmitter
+        module.addComment1("SwiGLU: fused gated-linear-unit epilogue")
+        swigluEmitter = SubtileSwiGLUEmitter(self, kernel)
+        dtile_agpr_base = dtileInfo.vgprTiles[0].regList.indices[0] if dtileInfo.vgprTiles else 0
+        module.add(swigluEmitter.emit(dtile_agpr_base))
+
       # global write indices
       module.addComment1("not-LocalSplitU: global write indices")
       module.add(self.notLocalSplitUGlobalWriteIndices(kernel))

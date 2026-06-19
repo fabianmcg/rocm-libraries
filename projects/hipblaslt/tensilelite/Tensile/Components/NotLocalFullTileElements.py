@@ -80,6 +80,11 @@ class NotLocalFullTileElementsMFMA(NotLocalFullTileElements):
         totalTT0     = matrixInstBM * kernel["MIWaveTile"][0]
         totalTT1     = matrixInstBN * kernel["MIWaveTile"][1]
 
+        # SwiGLU global split: the epilogue compacts y = up*silu(gate) into the lower
+        # N half of the accumulator; only those N-tiles carry valid output data.
+        if kernel.get("UseSubtileImpl") and kernel.get("SwiGLU"):
+            totalTT1 //= 2
+
         totalTT0     = totalTT0                      if kernel["SourceSwap"] else (totalTT0 * outputsPerThread)
         totalTT1     = (totalTT1 * outputsPerThread) if kernel["SourceSwap"] else totalTT1
         vectorWidth0 = kernel["VectorWidthA"]        if kernel["SourceSwap"] else kernel["VectorWidthA"] * kernel["MIOutputVectorWidth"]

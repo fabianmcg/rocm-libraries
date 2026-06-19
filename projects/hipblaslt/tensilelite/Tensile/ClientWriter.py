@@ -175,7 +175,7 @@ def main(config, assembler: Assembler, cCompiler: str, isaInfoMap, outputPath: P
 
     clientParametersPaths.append(writeClientConfig(
                                   forBenchmark=False,
-                                  solutions=None,
+                                  solutions=[s.originalSolution for s in newLibrary.solutions.values()],
                                   problemSizes=problemSizes,
                                   biasTypeArgs=biasTypeArgs,
                                   factorDimArgs=factorDimArgs,
@@ -577,7 +577,7 @@ def pruneModeName(mode):
     if mode == 5: return 'Prune0X0X'
     if mode == 6: return 'Prune00XX'
 
-def writeClientConfigIni(forBenchmark, problemSizes, biasTypeArgs, factorDimArgs, activationArgs, icacheFlushArgs, problemType, sourceDir, codeObjectFiles, resultsFileName, parametersFilePath, deviceId: int, gfxName: str, libraryFile, probSolMap={}):
+def writeClientConfigIni(forBenchmark, problemSizes, biasTypeArgs, factorDimArgs, activationArgs, icacheFlushArgs, problemType, sourceDir, codeObjectFiles, resultsFileName, parametersFilePath, deviceId: int, gfxName: str, libraryFile, probSolMap={}, solutions=None):
 
     assert os.path.exists(sourceDir), f"sourceDir={sourceDir} does not exist"
     # libraryFile must point at the per-base TensileLibrary{,.yaml,.dat}; the
@@ -616,6 +616,11 @@ def writeClientConfigIni(forBenchmark, problemSizes, biasTypeArgs, factorDimArgs
         param('use-bias',   problemType.useBias)
         param('bias-source',   problemType.biasSrcWhiteList[0])
         param('use-e', problemType.useE)
+
+        # SwiGLU epilogue config: gate/up split with halved D output width.
+        hasSwiGLU = any(s.get("SwiGLU", False) for s in (solutions or []))
+        param('swiglu', hasSwiGLU)
+
         param('output-amaxD', problemType.outputAmaxD)
         param('use-scaleAB',   problemType.useScaleAB)
         param('use-scaleCD',   problemType.useScaleCD)
@@ -788,7 +793,7 @@ def writeClientConfig(
       resultsFileName = os.path.join(stepBaseDir, "../Data", stepName+".csv")
 
     newSolution = next(iter(newLibrary.solutions.values()))
-    writeClientConfigIni(forBenchmark, problemSizes, biasTypeArgs, factorDimArgs, activationArgs, icacheFlushArgs, newSolution.problemType, sourceDir, codeObjectFiles, resultsFileName, filename, deviceId, gfxName, libraryFile, probSolMap)
+    writeClientConfigIni(forBenchmark, problemSizes, biasTypeArgs, factorDimArgs, activationArgs, icacheFlushArgs, newSolution.problemType, sourceDir, codeObjectFiles, resultsFileName, filename, deviceId, gfxName, libraryFile, probSolMap, solutions=solutions)
 
     return filename
 
@@ -823,7 +828,8 @@ def CreateBenchmarkClientParametersForSizes(libraryRootPath, problemSizes, dataF
 
     libraryExt = ".yaml" if globalParameters["LibraryFormat"] == "yaml" else ".dat"
     libraryFile = str(libraryPath / ("TensileLibrary" + libraryExt))
-    writeClientConfigIni(True, problemSizes, "", "", "", "", problemType, libraryRootPath, codeObjectFiles, dataFilePath, configFile, deviceId, gfxName, libraryFile=libraryFile)
+    # No per-solution data on this path; SwiGLU benchmarking goes through BenchmarkProblems.
+    writeClientConfigIni(True, problemSizes, "", "", "", "", problemType, libraryRootPath, codeObjectFiles, dataFilePath, configFile, deviceId, gfxName, libraryFile=libraryFile, solutions=None)
 
 def getClientExecutablePath():
   clientExe = globalParameters.get("PrebuiltClient")

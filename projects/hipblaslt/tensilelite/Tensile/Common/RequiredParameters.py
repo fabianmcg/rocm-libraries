@@ -161,4 +161,5 @@ def getRequiredParametersMin() -> set:
         'UseSubtileImpl',
         'ClusterDim',
         'RMSNorm',
+        'SwiGLU',
     })
