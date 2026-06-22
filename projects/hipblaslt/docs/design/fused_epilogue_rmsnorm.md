@@ -46,6 +46,19 @@ y = x * rsqrt(mean(x^2) + eps) * gamma
   emit `mean`/`invvar` side outputs (the standalone `hipblasltExtLayerNorm` does; the fused
   RMSNorm epilogue writes only the normalized result into `D`).
 
+When a residual-add stage precedes RMSNorm, the chain has two relevant values:
+
+```
+r = gemm_out + residual
+y = rms_norm(r, gamma, eps)
+```
+
+The residual-add stage produces the intermediate sum `r`; RMSNorm then consumes `r` and
+produces the normalized value `y`. The normalized value `y` remains the main output written
+to `D`, while `r` is the updated residual stream that transformer blocks carry forward. The
+fused epilogue therefore needs an explicit write-back rule for `r`, independent of the main
+`D` output.
+
 ## 3. Composable-stage model
 
 RMSNorm is modeled as a discrete epilogue *stage*, configured by its own descriptor
@@ -105,7 +118,7 @@ descriptor.
 
 ```c
 typedef enum {
-  HIPBLASLT_FUSEABLE_EPILOGUE_RESIDUAL_ADD = 0, // reserved component
+  HIPBLASLT_FUSEABLE_EPILOGUE_RESIDUAL_ADD = 0, // residual add component
   HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM      = 1, // RMSNorm
   HIPBLASLT_FUSEABLE_EPILOGUE_AMAX         = 2, // reserved component
   HIPBLASLT_FUSEABLE_EPILOGUE_FP8_REQUANT  = 3, // reserved component
@@ -118,6 +131,13 @@ order; ordering for the RMSNorm chain (section 3.2) is enforced by an internal r
 by the numeric value. New components are added by appending enum values without renumbering.
 `HIPBLASLT_FUSEABLE_EPILOGUE_SWIGLU` is reserved for a separate epilogue family and is not a
 legal member of the RMSNorm chain.
+
+Bias is intentionally absent from this enum. It continues to be configured through the
+existing matmul descriptor attributes (`HIPBLASLT_MATMUL_DESC_BIAS_POINTER` and
+`HIPBLASLT_MATMUL_DESC_BIAS_DATA_TYPE`). When a fused-epilogue chain is attached, the
+library applies bias first (if set on the matmul descriptor), then enters the fused chain.
+The ordering in section 3.2 reflects this: bias precedes residual add logically but is not
+a member of the builder-managed chain.
 
 ### 4.2 Builder handle and functions
 
@@ -141,8 +161,16 @@ single new attribute:
 |--------------------------------------|--------------------------------------|-------------------------------|
 | `HIPBLASLT_MATMUL_DESC_FUSED_EPILOGUE` | `hipblasLtFusedEpilogueDescriptor_t` | Attach a built fused-epilogue chain |
 
-The descriptor stores a non-owning pointer to the handle; the caller owns the handle and
-destroys it after the matmul(s) that use it.
+The matmul descriptor stores a non-owning pointer to the fused-epilogue handle; the caller
+owns the handle. The handle must remain valid for as long as any matmul descriptor references
+it, until that descriptor is destroyed or the fused-epilogue attribute is replaced or set to
+`NULL`. For each `hipblasLtMatmul` call, a fused-kernel implementation must copy any needed
+scalar values and device pointers from the host handle into the launch parameters before
+returning; it must not retain the host handle for asynchronous device execution. Once no
+descriptor references the handle and all `hipblasLtMatmul` calls that used it have returned,
+the handle may be destroyed without waiting for the launched kernels to complete on the
+device. A single handle may be shared across multiple matmul descriptors, but must not be
+mutated while any referencing matmul call is in-flight on another thread.
 
 ### 4.3 Stage-specific attributes
 
@@ -151,19 +179,41 @@ the stage that consumes them:
 
 | Attribute                              | Type    | Stage   | Meaning                              |
 |----------------------------------------|---------|---------|--------------------------------------|
-| `HIPBLASLT_FUSED_EPILOGUE_RMSNORM_GAMMA` | `void*` | RMSNorm | Device pointer to gamma, length `N` |
+| `HIPBLASLT_FUSED_EPILOGUE_RMSNORM_GAMMA` | `void*` | RMSNorm | Non-null device pointer to gamma, length `N` |
 | `HIPBLASLT_FUSED_EPILOGUE_RMSNORM_EPS`   | `float` | RMSNorm | Epsilon inside the rsqrt             |
+| `HIPBLASLT_FUSED_EPILOGUE_RESIDUAL_POINTER` | `void*` | residual add | Non-null device pointer to the residual input tensor |
+| `HIPBLASLT_FUSED_EPILOGUE_RESIDUAL_OUTPUT_POINTER` | `void*` | residual add | Optional device pointer that receives the updated residual stream (`NULL` or unset = in-place) |
 
-Residual-add, AMax, and FP8-requant stage parameters (residual pointer/layout, `AMAX_D` /
-`D_SCALE` reuse) are not RMSNorm attributes; they require their own stage-specific
-attributes.
+The residual input tensor has the same logical shape `[M,N]`, layout, data type, batch
+count, and batch stride as `D` unless a future extension adds an explicit residual layout
+descriptor. This keeps the initial API narrow and matches the transformer residual-stream
+case targeted by the first RMSNorm fusion.
+
+`HIPBLASLT_FUSED_EPILOGUE_RESIDUAL_OUTPUT_POINTER` is optional. If the attribute is never
+set on the handle, or if it is explicitly set to `NULL`, the residual input pointer is also
+the write-back target and the updated residual stream is written in place. This lets callers
+clear a previously configured separate output pointer without destroying the descriptor. If
+it is set to a valid non-null device pointer, the updated residual stream is written there
+instead. The output pointer may alias the residual input pointer for explicit in-place
+operation. It must not alias `D` when a later stage such as RMSNorm or FP8 requant writes a
+different main output value to `D`; that invalid alias is rejected by kernel-specific
+validation once fused kernels are wired in.
+
+AMax and FP8-requant stage parameters (`AMAX_D` / `D_SCALE` reuse) are not RMSNorm or
+residual-add attributes; they require their own stage-specific attributes.
 
 ### 4.4 Usage sketch
 
 ```c
 hipblasLtFusedEpilogueDescriptor_t fused;
 hipblasLtFusedEpilogueCreate(&fused);
+hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RESIDUAL_ADD);
 hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM);
+hipblasLtFusedEpilogueSetAttribute(fused, HIPBLASLT_FUSED_EPILOGUE_RESIDUAL_POINTER,
+                                   &residual, sizeof(residual));
+// Optional: omit this attribute to update `residual` in place.
+hipblasLtFusedEpilogueSetAttribute(fused, HIPBLASLT_FUSED_EPILOGUE_RESIDUAL_OUTPUT_POINTER,
+                                   &residual_out, sizeof(residual_out));
 hipblasLtFusedEpilogueSetAttribute(fused, HIPBLASLT_FUSED_EPILOGUE_RMSNORM_GAMMA,
                                    &gamma, sizeof(gamma));
 hipblasLtFusedEpilogueSetAttribute(fused, HIPBLASLT_FUSED_EPILOGUE_RMSNORM_EPS,
@@ -176,8 +226,23 @@ hipblasLtFusedEpilogueDestroy(fused);
 
 ### 4.5 Datatype requirements
 
-RMSNorm supports `D` storage in FP16, BF16, or FP32. The `gamma` vector uses the compute
-type or the `D` storage type, and RMSNorm accumulation follows the FP32 rule in section 2.
+RMSNorm supports FP16, BF16, or FP32 storage for its input and normalized output. The
+residual input and residual-output write-back use the same storage type as the residual-add
+sum. The `gamma` vector must use the same storage type as the RMSNorm input/pre-requant
+value, not necessarily the final `D` storage type when a later FP8-requant stage changes the
+main output type. RMSNorm accumulation is specified to use FP32 for the sum of squares and
+reciprocal square root, even when the input, output, and gamma storage types are FP16 or
+BF16.
+
+### 4.6 Strided-batched semantics
+
+When `batch_count > 1` in a strided-batched GEMM:
+
+- `gamma` is broadcast across batches (a single vector of length `N` shared by all batches).
+- `eps` is a scalar and is always shared across batches.
+- The residual input tensor follows the same batch stride as `D`. If
+  `HIPBLASLT_FUSED_EPILOGUE_RESIDUAL_OUTPUT_POINTER` is set, the residual output also uses
+  the same batch stride as `D`.
 
 ## 5. Error conditions and return codes
 
@@ -187,13 +252,20 @@ type or the `D` storage type, and RMSNorm accumulation follows the FP32 rule in 
 | `Add` breaks the supported RMSNorm order (out-of-order stage)    | `HIPBLAS_STATUS_INVALID_VALUE`    | `Add` time             |
 | Duplicate stage added                                            | `HIPBLAS_STATUS_INVALID_VALUE`    | `Add` time             |
 | Unknown attribute passed to `SetAttribute`                       | `HIPBLAS_STATUS_INVALID_VALUE`    | `SetAttribute` time    |
-| RMSNorm stage present but `gamma` null or `eps` unset            | `HIPBLAS_STATUS_INVALID_VALUE`    | attach (`SetAttribute` of `FUSED_EPILOGUE`) |
+| Required pointer attribute explicitly set to `NULL`              | `HIPBLAS_STATUS_INVALID_VALUE`    | `SetAttribute` time    |
+| Residual-add stage present but residual pointer unset            | `HIPBLAS_STATUS_INVALID_VALUE`    | attach (`SetAttribute` of `FUSED_EPILOGUE`) |
+| RMSNorm stage present but `gamma` or `eps` unset                 | `HIPBLAS_STATUS_INVALID_VALUE`    | attach (`SetAttribute` of `FUSED_EPILOGUE`) |
 | Attached fused epilogue without a matching kernel implementation | `HIPBLAS_STATUS_NOT_SUPPORTED`    | `hipblasLtMatmul`      |
 
 The key requirement: an illegal *ordering* for the supported RMSNorm chain is rejected at the
 API-call level, incrementally as stages are added, before any codegen or kernel launch.
-RMSNorm completeness (`gamma` and `eps`) is validated when the handle is attached to the
-matmul descriptor (the C-API wrapper can see the handle struct).
+Residual completeness (`residual`) and RMSNorm completeness (`gamma` and `eps`) are
+validated when the handle is attached to the matmul descriptor via
+`HIPBLASLT_MATMUL_DESC_FUSED_EPILOGUE`. This means required stage-specific attributes must
+be set on the handle before attachment and must not be cleared or mutated after attachment.
+The matmul descriptor stores a non-owning pointer to the handle, so later optional-attribute
+updates are visible to `hipblasLtMatmul`, but callers should not rely on late updates to
+satisfy attach-time required-attribute validation.
 
 ## 6. Interaction with existing descriptors and preferences
 

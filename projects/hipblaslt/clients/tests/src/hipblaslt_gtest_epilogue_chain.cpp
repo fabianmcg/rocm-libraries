@@ -13,7 +13,11 @@
 //  - The create/add/set/destroy lifecycle returns SUCCESS.
 //  - An unrecognized or unsupported epilogue and an illegal/duplicate ordering are rejected
 //    by hipblasLtFusedEpilogueAdd (INVALID_VALUE).
-//  - Attaching an incomplete RMSNorm handle (null gamma or unset eps) is rejected at
+//  - Attaching an incomplete residual-add handle (unset residual pointer) is rejected at
+//    descriptor-set time (INVALID_VALUE). If no residual-output pointer is provided, or if
+//    it is explicitly set to NULL, the residual input is the in-place write-back target for
+//    the updated residual stream.
+//  - Attaching an incomplete RMSNorm handle (unset gamma or unset eps) is rejected at
 //    descriptor-set time (INVALID_VALUE).
 //  - A complete-but-unimplemented fused epilogue is rejected by hipblasLtMatmul with
 //    NOT_SUPPORTED before kernel selection/launch.
@@ -73,6 +77,18 @@ namespace
                       HIPBLAS_STATUS_SUCCESS);
             ASSERT_EQ(hipblasLtFusedEpilogueSetAttribute(
                           fused, HIPBLASLT_FUSED_EPILOGUE_RMSNORM_EPS, &eps, sizeof(eps)),
+                      HIPBLAS_STATUS_SUCCESS);
+        }
+
+        // Set the residual input pointer so a residual-add handle passes attach-time
+        // validation. Without a residual output pointer, the API uses this pointer as the
+        // in-place destination for the updated residual stream.
+        void completeResidual()
+        {
+            int   dummy_residual_storage = 0;
+            void* residual               = &dummy_residual_storage;
+            ASSERT_EQ(hipblasLtFusedEpilogueSetAttribute(
+                          fused, HIPBLASLT_FUSED_EPILOGUE_RESIDUAL_POINTER, &residual, sizeof(residual)),
                       HIPBLAS_STATUS_SUCCESS);
         }
 
@@ -218,7 +234,86 @@ TEST_F(FusedEpilogueTest, setUnknownAttributeRejected)
               HIPBLAS_STATUS_INVALID_VALUE);
 }
 
+TEST_F(FusedEpilogueTest, setNullResidualPointerRejected)
+{
+    void* residual = nullptr;
+    EXPECT_EQ(hipblasLtFusedEpilogueSetAttribute(
+                  fused, HIPBLASLT_FUSED_EPILOGUE_RESIDUAL_POINTER, &residual, sizeof(residual)),
+              HIPBLAS_STATUS_INVALID_VALUE);
+}
+
+TEST_F(FusedEpilogueTest, setNullRmsnormGammaRejected)
+{
+    void* gamma = nullptr;
+    EXPECT_EQ(hipblasLtFusedEpilogueSetAttribute(
+                  fused, HIPBLASLT_FUSED_EPILOGUE_RMSNORM_GAMMA, &gamma, sizeof(gamma)),
+              HIPBLAS_STATUS_INVALID_VALUE);
+}
+
+TEST_F(FusedEpilogueTest, setNullResidualOutputAcceptedAsInPlace)
+{
+    void* residual_output = nullptr;
+    EXPECT_EQ(hipblasLtFusedEpilogueSetAttribute(fused,
+                                                 HIPBLASLT_FUSED_EPILOGUE_RESIDUAL_OUTPUT_POINTER,
+                                                 &residual_output,
+                                                 sizeof(residual_output)),
+              HIPBLAS_STATUS_SUCCESS);
+}
+
 // ---- Attach-time completeness validation ----
+
+TEST_F(FusedEpilogueTest, attachResidualMissingPointerRejected)
+{
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RESIDUAL_ADD),
+              HIPBLAS_STATUS_SUCCESS);
+    // residual pointer never set -> attach must reject.
+    EXPECT_EQ(attach(), HIPBLAS_STATUS_INVALID_VALUE);
+}
+
+TEST_F(FusedEpilogueTest, attachResidualInPlaceWritebackAccepted)
+{
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RESIDUAL_ADD),
+              HIPBLAS_STATUS_SUCCESS);
+    completeResidual();
+    // No residual-output pointer is required; unset means update the residual input in place.
+    EXPECT_EQ(attach(), HIPBLAS_STATUS_SUCCESS);
+}
+
+TEST_F(FusedEpilogueTest, attachResidualSeparateWritebackAccepted)
+{
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RESIDUAL_ADD),
+              HIPBLAS_STATUS_SUCCESS);
+    completeResidual();
+    int   dummy_residual_output_storage = 0;
+    void* residual_output               = &dummy_residual_output_storage;
+    ASSERT_EQ(hipblasLtFusedEpilogueSetAttribute(fused,
+                                                 HIPBLASLT_FUSED_EPILOGUE_RESIDUAL_OUTPUT_POINTER,
+                                                 &residual_output,
+                                                 sizeof(residual_output)),
+              HIPBLAS_STATUS_SUCCESS);
+    EXPECT_EQ(attach(), HIPBLAS_STATUS_SUCCESS);
+}
+
+TEST_F(FusedEpilogueTest, attachResidualOutputCanBeClearedToInPlace)
+{
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RESIDUAL_ADD),
+              HIPBLAS_STATUS_SUCCESS);
+    completeResidual();
+    int   dummy_residual_output_storage = 0;
+    void* residual_output               = &dummy_residual_output_storage;
+    ASSERT_EQ(hipblasLtFusedEpilogueSetAttribute(fused,
+                                                 HIPBLASLT_FUSED_EPILOGUE_RESIDUAL_OUTPUT_POINTER,
+                                                 &residual_output,
+                                                 sizeof(residual_output)),
+              HIPBLAS_STATUS_SUCCESS);
+    residual_output = nullptr;
+    ASSERT_EQ(hipblasLtFusedEpilogueSetAttribute(fused,
+                                                 HIPBLASLT_FUSED_EPILOGUE_RESIDUAL_OUTPUT_POINTER,
+                                                 &residual_output,
+                                                 sizeof(residual_output)),
+              HIPBLAS_STATUS_SUCCESS);
+    EXPECT_EQ(attach(), HIPBLAS_STATUS_SUCCESS);
+}
 
 TEST_F(FusedEpilogueTest, attachRmsnormMissingGammaRejected)
 {
@@ -251,6 +346,32 @@ TEST_F(FusedEpilogueTest, attachCompleteRmsnormAccepted)
               HIPBLAS_STATUS_SUCCESS);
     completeRmsnorm();
     EXPECT_EQ(attach(), HIPBLAS_STATUS_SUCCESS);
+}
+
+TEST_F(FusedEpilogueTest, attachResidualRmsnormAccepted)
+{
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RESIDUAL_ADD),
+              HIPBLAS_STATUS_SUCCESS);
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM),
+              HIPBLAS_STATUS_SUCCESS);
+    completeResidual();
+    completeRmsnorm();
+    EXPECT_EQ(attach(), HIPBLAS_STATUS_SUCCESS);
+}
+
+TEST_F(FusedEpilogueTest, attachNullFusedEpilogueDetaches)
+{
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM),
+              HIPBLAS_STATUS_SUCCESS);
+    completeRmsnorm();
+    ASSERT_EQ(attach(), HIPBLAS_STATUS_SUCCESS);
+
+    hipblasLtFusedEpilogueDescriptor_t null_fused = nullptr;
+    EXPECT_EQ(hipblasLtMatmulDescSetAttribute(desc,
+                                              HIPBLASLT_MATMUL_DESC_FUSED_EPILOGUE,
+                                              &null_fused,
+                                              sizeof(null_fused)),
+              HIPBLAS_STATUS_SUCCESS);
 }
 
 // ---- Complete-but-unimplemented config rejected by matmul (NOT_SUPPORTED) ----

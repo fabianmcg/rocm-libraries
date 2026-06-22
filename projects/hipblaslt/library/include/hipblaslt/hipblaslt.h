@@ -118,7 +118,7 @@ typedef enum {
  *  ``HIPBLASLT_MATMUL_DESC_FUSED_EPILOGUE``.
  */
 typedef enum {
-  HIPBLASLT_FUSEABLE_EPILOGUE_RESIDUAL_ADD = 0, /**<Reserved component: add a residual tensor to the GEMM result.*/
+  HIPBLASLT_FUSEABLE_EPILOGUE_RESIDUAL_ADD = 0, /**<Add a residual tensor to the GEMM result. Requires a residual pointer attribute.*/
   HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM      = 1, /**<Per-row RMSNorm (``x * rsqrt(mean(x^2) + eps) * gamma``). Requires gamma and eps attributes.*/
   HIPBLASLT_FUSEABLE_EPILOGUE_AMAX         = 2, /**<Reserved component: capture the result amax side output.*/
   HIPBLASLT_FUSEABLE_EPILOGUE_FP8_REQUANT  = 3, /**<Reserved component: requantize the result to FP8.*/
@@ -129,8 +129,10 @@ typedef enum {
  *  \brief Attributes settable on a fused epilogue descriptor.
  */
 typedef enum {
-  HIPBLASLT_FUSED_EPILOGUE_RMSNORM_GAMMA = 0, /**<Device pointer to the RMSNorm gamma (per-channel scale) vector of length N. Data type: ``void*``.*/
+  HIPBLASLT_FUSED_EPILOGUE_RMSNORM_GAMMA = 0, /**<Non-null device pointer to the RMSNorm gamma (per-channel scale) vector of length N. Data type: ``void*``.*/
   HIPBLASLT_FUSED_EPILOGUE_RMSNORM_EPS   = 1, /**<Epsilon added inside the RMSNorm reciprocal square root. Data type: ``float``.*/
+  HIPBLASLT_FUSED_EPILOGUE_RESIDUAL_POINTER = 2, /**<Non-null device pointer to the residual input tensor. The tensor has the same logical shape, layout, and data type as D. Data type: ``void*``.*/
+  HIPBLASLT_FUSED_EPILOGUE_RESIDUAL_OUTPUT_POINTER = 3, /**<Optional device pointer that receives the updated residual stream after the residual add. If NULL or unset, the residual input tensor is updated in place. Data type: ``void*``.*/
 } hipblasLtFusedEpilogueAttribute_t;
 
 /*! \ingroup types_module
