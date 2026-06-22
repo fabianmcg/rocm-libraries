@@ -363,11 +363,16 @@ catch(...)
 }
 
 // Definition of the opaque handle declared in hipblaslt.h. Owns the composed list of
-// epilogue stages plus their parameters (RMSNorm gamma/eps). Attached, non-owning, to a
-// matmul descriptor via HIPBLASLT_MATMUL_DESC_FUSED_EPILOGUE.
+// epilogue stages plus their parameters. Attached, non-owning, to a matmul descriptor via
+// HIPBLASLT_MATMUL_DESC_FUSED_EPILOGUE.
 struct hipblasLtFusedEpilogueDescriptor
 {
     std::vector<hipblasLtFuseableEpilogue_t> stages;
+
+    // Residual-add parameters. residual_output is optional; if unset, the residual input
+    // tensor is updated in place with the post-add residual stream.
+    void* residual        = nullptr;
+    void* residual_output = nullptr;
 
     // RMSNorm parameters.
     void* rmsnorm_gamma = nullptr;
@@ -463,12 +468,26 @@ try
         if(sizeInBytes < sizeof(void*))
             return HIPBLAS_STATUS_INVALID_VALUE;
         memcpy(&desc->rmsnorm_gamma, value, sizeof(void*));
+        if(desc->rmsnorm_gamma == nullptr)
+            return HIPBLAS_STATUS_INVALID_VALUE;
         break;
     case HIPBLASLT_FUSED_EPILOGUE_RMSNORM_EPS:
         if(sizeInBytes < sizeof(float))
             return HIPBLAS_STATUS_INVALID_VALUE;
         memcpy(&desc->rmsnorm_eps, value, sizeof(float));
         desc->eps_set = true;
+        break;
+    case HIPBLASLT_FUSED_EPILOGUE_RESIDUAL_POINTER:
+        if(sizeInBytes < sizeof(void*))
+            return HIPBLAS_STATUS_INVALID_VALUE;
+        memcpy(&desc->residual, value, sizeof(void*));
+        if(desc->residual == nullptr)
+            return HIPBLAS_STATUS_INVALID_VALUE;
+        break;
+    case HIPBLASLT_FUSED_EPILOGUE_RESIDUAL_OUTPUT_POINTER:
+        if(sizeInBytes < sizeof(void*))
+            return HIPBLAS_STATUS_INVALID_VALUE;
+        memcpy(&desc->residual_output, value, sizeof(void*));
         break;
     default:
         return HIPBLAS_STATUS_INVALID_VALUE;
@@ -500,7 +519,7 @@ try
     rocblaslt::Debug::Instance().markerStart("hipblasLtMatmulDescSetAttribute");
 
     // Validate a fused-epilogue handle before it is attached to the matmul descriptor.
-    // This is the API-call-time gate: an RMSNorm stage requires gamma and eps to be set.
+    // This is the API-call-time gate for stage-specific required inputs.
     if(matmulAttr == HIPBLASLT_MATMUL_DESC_FUSED_EPILOGUE)
     {
         if(buf == nullptr || sizeInBytes < sizeof(void*))
@@ -510,6 +529,13 @@ try
         }
         hipblasLtFusedEpilogueDescriptor_t fused = nullptr;
         memcpy(&fused, buf, sizeof(void*));
+        if(fused != nullptr
+           && fused_epilogue_has_stage(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RESIDUAL_ADD)
+           && fused->residual == nullptr)
+        {
+            rocblaslt::Debug::Instance().markerStop();
+            return HIPBLAS_STATUS_INVALID_VALUE;
+        }
         if(fused != nullptr
            && fused_epilogue_has_stage(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM))
         {
