@@ -162,4 +162,5 @@ def getRequiredParametersMin() -> set:
         'ClusterDim',
         'RMSNorm',
         'SwiGLU',
+        'PartialRMS',
     })

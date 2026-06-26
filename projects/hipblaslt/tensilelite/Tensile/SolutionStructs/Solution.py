@@ -356,6 +356,70 @@ def _validateSwiGLU(state, printRejectionReason):
     return
 
 
+def _validatePartialRMS(state, printRejectionReason):
+  """Validate PartialRMS fused epilogue constraints.
+
+  PartialRMS (Phase 1 / K1) computes per-row Σx² from the GEMM accumulator
+  and writes it to a global partialBuf. It also applies gamma in-place so the
+  downstream store path writes D as bf16.
+
+  Structural requirements (mirrors _validateRMSNorm):
+    - UseSubtileImpl, gfx950, bf16, StreamKForceDPOnly: same as RMSNorm.
+    - Mutually exclusive with RMSNorm and SwiGLU.
+    - MacroTile1 > 0 (row-containment: N == MacroTile1 enforced at launch).
+    - OutputAmaxD and MBSK/AdaptiveGemmGSUA rejected (kernarg layout conflict).
+    - GroupedGemm rejected (multi-tile index arithmetic not validated).
+    - When wg_n > 1: wg_m must be power-of-two; LDS budget checked.
+  """
+  if not state["PartialRMS"]:
+    return
+  if state["RMSNorm"]:
+    reject(state, printRejectionReason, "PartialRMS and RMSNorm are mutually exclusive")
+    return
+  if state["SwiGLU"]:
+    reject(state, printRejectionReason, "PartialRMS and SwiGLU are mutually exclusive")
+    return
+  if not _validateSubtileEpiloguePrereqs(state, printRejectionReason, "PartialRMS"):
+    return
+  if state["MacroTile1"] <= 0:
+    reject(state, printRejectionReason, "PartialRMS requires a positive MacroTile1")
+    return
+  if state["ProblemType"]["OutputAmaxD"]:
+    reject(state, printRejectionReason,
+           "PartialRMS does not support OutputAmaxD (kernarg layout conflict)")
+    return
+  if (state.get("_GlobalAccumulation") == "MultipleBufferSingleKernel" or
+      state.get("AdaptiveGemmGSUA") == 1):
+    reject(state, printRejectionReason,
+           "PartialRMS does not support MultipleBufferSingleKernel/AdaptiveGemmGSUA "
+           "(kernarg layout conflict)")
+    return
+  if state["ProblemType"].get("GroupedGemm", False):
+    reject(state, printRejectionReason,
+           "PartialRMS does not support GroupedGemm")
+    return
+  wg = state["MIWaveGroup"]
+  mfma_n = 16  # validated by _validateSubtileEpiloguePrereqs gfx950 path
+  if (state["MacroTile1"] // (mfma_n * wg[1])) < 1:
+    reject(state, printRejectionReason,
+           "PartialRMS requires each wave to own at least one N-tile "
+           "(MacroTile1 // (16 * MIWaveGroup[1]) >= 1)")
+    return
+  if wg[1] > 1:
+    if (wg[0] & (wg[0] - 1)) != 0:
+      reject(state, printRejectionReason,
+             "PartialRMS cross-wave reduction requires MIWaveGroup[0] to be a power of two "
+             "(uses bitmask for waveM)")
+      return
+    num_rows = (state["MacroTile0"] // mfma_n // wg[0]) * 4
+    partialRMSLdsBytes = wg[0] * wg[1] * state["WavefrontSize"] * num_rows * 4
+    if state["MaxLDS"] > 0 and partialRMSLdsBytes > state["MaxLDS"]:
+      reject(state, printRejectionReason,
+             "PartialRMS cross-wave LDS scratch (%u bytes) exceeds MaxLDS (%u)"
+             % (partialRMSLdsBytes, state["MaxLDS"]))
+      return
+
+
 def _validateStreamKForceDPOnly(state, printRejectionReason):
   if state["StreamKForceDPOnly"]:
     if state["StreamK"] != 3:
@@ -1133,6 +1197,10 @@ class Solution(collections.abc.Mapping):
       return
 
     _validateSwiGLU(state, printRejectionReason)
+    if not state["Valid"]:
+      return
+
+    _validatePartialRMS(state, printRejectionReason)
     if not state["Valid"]:
       return
 
@@ -5304,6 +5372,13 @@ class Solution(collections.abc.Mapping):
       num_rows_rms = (state["MacroTile0"] // 16 // wg[0]) * 4
       rmsNormLdsBytes = wg[0] * wg[1] * state["WavefrontSize"] * num_rows_rms * 4
       state["LdsNumBytes"] = max(state["LdsNumBytes"], rmsNormLdsBytes)
+
+    # PartialRMS cross-wave reduction guarantee (mirrors RMSNorm block above).
+    if state.get("PartialRMS") and state["MIWaveGroup"][1] > 1:
+      wg = state["MIWaveGroup"]
+      num_rows_prms = (state["MacroTile0"] // 16 // wg[0]) * 4
+      partialRMSLdsBytes = wg[0] * wg[1] * state["WavefrontSize"] * num_rows_prms * 4
+      state["LdsNumBytes"] = max(state["LdsNumBytes"], partialRMSLdsBytes)
 
     ldsSize = state["LdsNumBytes"]
     if ldsSize > state["MaxLDS"]:

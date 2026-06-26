@@ -326,6 +326,16 @@ class SignatureDefault(Signature):
             signature.addArg("RMSNormEps",   SVK.SIG_VALUE,        "f32")
             userArgumentsInfo.rmsNormSize = 8 + 4  # 8B pointer + 4B f32
 
+        if kernel["PartialRMS"]:
+            # PartialRMS (K1) epilogue appends in this order:
+            #   RMSNormGamma: bf16 global buffer pointer (8 bytes) — per-column gamma weight.
+            #   PartialBuf:   fp32 global buffer pointer (8 bytes) — output Σx² per row.
+            # No RMSNormEps: K2 uses eps, not K1.
+            gammaValueType = getSrcValueType(kernel, True)  # bf16
+            signature.addArg("RMSNormGamma", SVK.SIG_GLOBALBUFFER, gammaValueType, "generic")
+            signature.addArg("PartialBuf",   SVK.SIG_GLOBALBUFFER, "f32",          "generic")
+            userArgumentsInfo.rmsNormSize = 8 + 8  # 8B gamma ptr + 8B partialBuf ptr
+
         # Calculate total size
         userArgumentsInfo.totalSize = userArgumentsInfo.gemmArgumentSize + \
                                       userArgumentsInfo.scaleASize + \

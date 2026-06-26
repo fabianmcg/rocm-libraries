@@ -449,6 +449,7 @@ validParameters = { # we need to make sure this matches develop
     # an optimized storeD path. Automatically forced False on non-gfx950.
     "RMSNorm": [False, True],
     "SwiGLU": [False, True],
+    "PartialRMS": [False, True],
     "UseSubtileImpl": [False, True],
     # Load options:
     # (GRO = Global Read Offset)
