@@ -450,6 +450,7 @@ validParameters = { # we need to make sure this matches develop
     "RMSNorm": [False, True],
     "SwiGLU": [False, True],
     "PartialRMS": [False, True],
+    "RstdScale": [False, True],
     "UseSubtileImpl": [False, True],
     # Load options:
     # (GRO = Global Read Offset)

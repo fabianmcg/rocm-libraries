@@ -498,6 +498,7 @@ defaultBenchmarkCommonParameters = [
     {"RMSNorm": [False]},
     {"SwiGLU": [False]},
     {"PartialRMS": [False]},
+    {"RstdScale": [False]},
     {"UseSubtileImpl": [False]},
     {"UseSgprForGRO": [-1]},
     {"UseInstOffsetForGRO": [0]},

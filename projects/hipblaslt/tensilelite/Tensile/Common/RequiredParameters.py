@@ -163,4 +163,5 @@ def getRequiredParametersMin() -> set:
         'RMSNorm',
         'SwiGLU',
         'PartialRMS',
+        'RstdScale',
     })

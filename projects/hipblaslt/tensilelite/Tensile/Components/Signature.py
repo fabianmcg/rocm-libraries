@@ -336,6 +336,12 @@ class SignatureDefault(Signature):
             signature.addArg("PartialBuf",   SVK.SIG_GLOBALBUFFER, "f32",          "generic")
             userArgumentsInfo.rmsNormSize = 8 + 8  # 8B gamma ptr + 8B partialBuf ptr
 
+        if kernel["RstdScale"]:
+            # RstdScale (K3) epilogue appends in this order:
+            #   RstdBuf: fp32 global buffer pointer (8 bytes) — pre-computed per-row rstd.
+            signature.addArg("RstdBuf", SVK.SIG_GLOBALBUFFER, "f32", "generic")
+            userArgumentsInfo.rmsNormSize = 8  # 8B rstdBuf ptr
+
         # Calculate total size
         userArgumentsInfo.totalSize = userArgumentsInfo.gemmArgumentSize + \
                                       userArgumentsInfo.scaleASize + \

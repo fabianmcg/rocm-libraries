@@ -420,6 +420,48 @@ def _validatePartialRMS(state, printRejectionReason):
       return
 
 
+def _validateRstdScale(state, printRejectionReason):
+  """Validate RstdScale fused epilogue constraints.
+
+  RstdScale (Phase 3 / K3) loads a pre-computed per-row rstd scalar from
+  rstdBuf and multiplies every accumulator element of that row in-place.
+  No reduction, no LDS, no butterfly — simplest of the three emitters.
+
+  Structural requirements (mirrors _validatePartialRMS):
+    - UseSubtileImpl, gfx950, bf16, StreamKForceDPOnly: same as PartialRMS.
+    - Mutually exclusive with RMSNorm, SwiGLU, and PartialRMS.
+    - MacroTile1 > 0 (N == MacroTile1 enforced at launch).
+    - OutputAmaxD and MBSK/AdaptiveGemmGSUA rejected (kernarg layout conflict).
+    - No cross-wave LDS needed; no wg_n constraint.
+  """
+  if not state["RstdScale"]:
+    return
+  if state["RMSNorm"]:
+    reject(state, printRejectionReason, "RstdScale and RMSNorm are mutually exclusive")
+    return
+  if state["SwiGLU"]:
+    reject(state, printRejectionReason, "RstdScale and SwiGLU are mutually exclusive")
+    return
+  if state["PartialRMS"]:
+    reject(state, printRejectionReason, "RstdScale and PartialRMS are mutually exclusive")
+    return
+  if not _validateSubtileEpiloguePrereqs(state, printRejectionReason, "RstdScale"):
+    return
+  if state["MacroTile1"] <= 0:
+    reject(state, printRejectionReason, "RstdScale requires a positive MacroTile1")
+    return
+  if state["ProblemType"]["OutputAmaxD"]:
+    reject(state, printRejectionReason,
+           "RstdScale does not support OutputAmaxD (kernarg layout conflict)")
+    return
+  if (state.get("_GlobalAccumulation") == "MultipleBufferSingleKernel" or
+      state.get("AdaptiveGemmGSUA") == 1):
+    reject(state, printRejectionReason,
+           "RstdScale does not support MultipleBufferSingleKernel/AdaptiveGemmGSUA "
+           "(kernarg layout conflict)")
+    return
+
+
 def _validateStreamKForceDPOnly(state, printRejectionReason):
   if state["StreamKForceDPOnly"]:
     if state["StreamK"] != 3:
@@ -1201,6 +1243,10 @@ class Solution(collections.abc.Mapping):
       return
 
     _validatePartialRMS(state, printRejectionReason)
+    if not state["Valid"]:
+      return
+
+    _validateRstdScale(state, printRejectionReason)
     if not state["Valid"]:
       return
 

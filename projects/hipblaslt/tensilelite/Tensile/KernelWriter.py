@@ -5116,6 +5116,13 @@ class KernelWriter(metaclass=abc.ABCMeta):
         dtile_agpr_base = dtileInfo.vgprTiles[0].regList.indices[0] if dtileInfo.vgprTiles else 0
         module.add(pRmsEmitter.emit(dtile_agpr_base))
 
+      if kernel["RstdScale"]:
+        from .Components.Subtile.SubtileRstdScaleEmit import SubtileRstdScaleEmitter
+        module.addComment1("RstdScale: per-row rstd scale epilogue")
+        rstdEmitter = SubtileRstdScaleEmitter(self, kernel)
+        dtile_agpr_base = dtileInfo.vgprTiles[0].regList.indices[0] if dtileInfo.vgprTiles else 0
+        module.add(rstdEmitter.emit(dtile_agpr_base))
+
       # global write indices
       module.addComment1("not-LocalSplitU: global write indices")
       module.add(self.notLocalSplitUGlobalWriteIndices(kernel))
@@ -9727,6 +9734,11 @@ class KernelWriter(metaclass=abc.ABCMeta):
       self.states.numStoreSgprNames.append("PartialBuf")
       self.states.numStoreSgprNameSizes.append(self.states.rpga)  # 2 SGPRs (64-bit ptr)
       storeSgprLoad += self.states.rpga * 2
+    if kernel["RstdScale"]:
+      # RstdBuf: 64-bit pointer (2 SGPRs)
+      self.states.numStoreSgprNames.append("RstdBuf")
+      self.states.numStoreSgprNameSizes.append(self.states.rpga)  # 2 SGPRs (64-bit ptr)
+      storeSgprLoad += self.states.rpga
     self.states.numStoreSgprToLoad = storeSgprLoad
 
 

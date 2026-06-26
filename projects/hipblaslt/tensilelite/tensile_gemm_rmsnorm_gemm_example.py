@@ -496,16 +496,242 @@ def run_k2(hsaco: bytes, kernel_name: str, M: int, N_hidden: int, eps: float,
 # main
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Build K3: GEMM + RstdScale solution
+# ---------------------------------------------------------------------------
+
+def build_k3_solution(chip: str, assembler, isaInfoMap,
+                      N_hidden: int, N_out: int, wg_n: int = 1):
+    """Build a bf16 GEMM2 + RstdScale kernel for gfx950.
+
+    GEMM2 operands: A = h2 (M x N_hidden, bf16), B = W1 (N_out x N_hidden, bf16).
+    TN layout (TransposeA=True, TransposeB=False), contracts over N_hidden.
+    N_out must equal MacroTile1.
+    """
+    from Tensile.Common.Architectures import gfxToIsa
+    from Tensile.Common.GlobalParameters import defaultInternalSupportParams
+    from Tensile.SolutionStructs.Solution import Solution
+    from Tensile.SolutionStructs.Validators.MatrixInstruction import (
+        matrixInstructionToMIParameters,
+        validateMIParameters,
+    )
+
+    gfx = chip.split(":")[0]
+    isa = gfxToIsa(gfx)
+
+    problem_type = {
+        "OperationType":    "GEMM",
+        "DataType":         "b",    # bf16
+        "DestDataType":     "b",    # bf16
+        "ComputeDataType":  "s",    # fp32 accumulation
+        "HighPrecisionAccumulate": True,
+        "TransposeA":       True,   # A: K×M col-major (TN layout)
+        "TransposeB":       False,  # B: K×N col-major
+        "UseBeta":          True,
+        "Batched":          True,
+        "StridedBatched":   True,
+        "GroupedGemm":      False,
+        "UseBias":          0,
+        "UseScaleAB":       "",
+        "UseScaleCD":       False,
+        "UseScaleAlphaVec": 0,
+        "Sparse":           0,
+    }
+
+    # [instM, instN, instK, instB, mi4, wt1, wt0, wg0_waves, wg1_waves]
+    mi9 = [16, 16, 32, 1, 1, 4, 4, 1, wg_n]
+
+    wavefrontSize = 64
+    mi_params = matrixInstructionToMIParameters(
+        mi9, isa, wavefrontSize, problem_type, workGroup=None, isaInfoMap=isaInfoMap
+    )
+
+    config = {
+        "ProblemType":           problem_type,
+        "InternalSupportParams": defaultInternalSupportParams,
+        "ISA":                   [isa.major, isa.minor, isa.patch],
+        "CodeObjectVersion":     "6",
+        "GlobalSplitU":          1,
+        "KernelLanguage":        "Assembly",
+        "StreamK":               3,
+        "StreamKForceDPOnly":    1,
+        "StreamKAtomic":         0,
+        "ScheduleIterAlg":       3,
+        "PrefetchGlobalRead":    1,
+        "DirectToLdsA":          1,
+        "DirectToLdsB":          1,
+        "UseSubtileImpl":        True,
+        "RstdScale":             True,
+        "StaggerU":              0,
+        "DepthU":                64,
+        "LdsPadA":               -1,
+        "LdsPadB":               -1,
+        "StoreVectorWidth":      -1,
+        "GlobalReadVectorWidthA": -1,
+        "GlobalReadVectorWidthB": -1,
+        "PreloadKernArgs":       False,
+        "_1LDSBuffer":           0,
+        "PrefetchAcrossPersistent": 0,
+    }
+    config.update(mi_params)
+
+    if not validateMIParameters(config, isaInfoMap):
+        raise RuntimeError("MI parameter validation failed for K3")
+
+    solution = Solution(
+        config,
+        splitGSU=False,
+        printSolutionRejectionReason=True,
+        printIndexAssignmentInfo=False,
+        assembler=assembler,
+        isaInfoMap=isaInfoMap,
+    )
+    if not solution["Valid"]:
+        raise RuntimeError("K3 solution was rejected — see reason above")
+    return solution
+
+
+# ---------------------------------------------------------------------------
+# Run K3: GEMM2 + RstdScale
+# ---------------------------------------------------------------------------
+
+def run_k3(hsaco: bytes, kernel_name: str, solution, M: int, N_hidden: int,
+           N_out: int, rstd_ref: np.ndarray):
+    """Execute the K3 fused GEMM2+RstdScale kernel and verify output y.
+
+    Checks:
+      y (slot 8): bf16 output, tol = 2e-2. y = (h2 @ W1.T) * rstd[:, None]
+
+    rstd_ref: pre-computed numpy fp32 array of shape (M,) — drive from K2 output
+    or a numpy reference.
+    """
+    import ml_dtypes
+
+    MT0 = solution["MacroTile0"]
+    MT1 = solution["MacroTile1"]
+
+    if N_out != MT1:
+        raise ValueError(
+            f"Row-containment violated: N_out={N_out} must equal MacroTile1={MT1}."
+        )
+
+    M_padded = math.ceil(M / MT0) * MT0
+    numWG    = math.ceil(M / MT0) * math.ceil(N_out / MT1)
+
+    rng = np.random.default_rng(99)
+    h2_f32  = np.asfortranarray(rng.random((N_hidden, M), dtype=np.float32) * 0.1)
+    w1_f32  = np.asfortranarray(rng.random((N_hidden, N_out), dtype=np.float32) * 0.1)
+
+    h2_bf16 = np.asfortranarray(h2_f32.astype(ml_dtypes.bfloat16))
+    w1_bf16 = np.asfortranarray(w1_f32.astype(ml_dtypes.bfloat16))
+
+    c_bf16 = np.zeros((M, N_out), dtype=ml_dtypes.bfloat16, order='F')
+    y_bf16 = np.zeros((M, N_out), dtype=ml_dtypes.bfloat16, order='F')
+
+    # Pad rstd to M_padded.
+    rstd_padded = np.zeros(M_padded, dtype=np.float32)
+    rstd_padded[:M] = rstd_ref[:M]
+
+    # Numpy reference.
+    h2_ref = np.asarray(h2_bf16).astype(np.float32)   # N_hidden x M
+    w1_ref = np.asarray(w1_bf16).astype(np.float32)   # N_hidden x N_out
+    h3     = h2_ref.T @ w1_ref                         # M x N_out, fp32
+    y_ref  = (h3 * rstd_ref[:M, np.newaxis]).astype(ml_dtypes.bfloat16)
+
+    sk_args      = compute_sk3_dp_args(M, N_out, N_hidden, solution)
+    stagger_u    = solution.get("StaggerU", 0)
+    su_map       = solution.get("StaggerUMapping", 0)
+    ss_shift     = solution.get("_staggerStrideShift", 0)
+    su_word      = (su_map << 13) | ((ss_shift << 8) & 0x1F00) | (stagger_u & 0xFF)
+    kernel_info0 = np.uint32((su_word << 16) | (solution["GlobalSplitU"] & 0x3FFF))
+    wgmxcc       = solution.get("WorkGroupMappingXCC", 1)
+    kernel_info1 = np.uint32((wgmxcc << 16) | (solution["WorkGroupMapping"] & 0xFFFF))
+
+    ws_dummy    = np.zeros(4, dtype=np.float32)
+    flags_dummy = np.zeros(4, dtype=np.float32)
+
+    # Argument layout (K3):
+    #   slots 0-29: same GEMM scaffolding as K1
+    #   slot 30: RstdBuf (ptr, fp32, len M_padded)
+    args = [
+        np.uint32(1),                           # 0: GemmInfo
+        kernel_info0,                           # 1: kernel_info0
+        kernel_info1,                           # 2: kernel_info1
+        np.uint32(numWG),                       # 3: numWG
+        np.uint32(M),                           # 4: SizesFree0=M
+        np.uint32(N_out),                       # 5: SizesFree1=N_out
+        np.uint32(1),                           # 6: SizesFree2=batch
+        np.uint32(N_hidden),                    # 7: SizesSum0=N_hidden (K)
+        amdgpu_exec.InOutArray(y_bf16),         # 8: D=y (bf16)
+        amdgpu_exec.InputArray(c_bf16),         # 9: C (bf16, beta=0)
+        amdgpu_exec.InputArray(h2_bf16),        # 10: A=h2 (N_hidden×M col-major)
+        amdgpu_exec.InputArray(w1_bf16),        # 11: B=W1 (N_hidden×N_out col-major)
+        amdgpu_exec.InputArray(ws_dummy),       # 12: AddressWS
+        amdgpu_exec.InputArray(flags_dummy),    # 13: AddressFlags
+        np.uint32(M), np.uint32(0),             # 14,15: strideD0=M, strideD1=0
+        np.uint32(M), np.uint32(0),             # 16,17: strideC0=M, strideC1=0
+        np.uint32(N_hidden), np.uint32(0),      # 18,19: strideA0=N_hidden, strideA1=0
+        np.uint32(N_hidden), np.uint32(0),      # 20,21: strideB0=N_hidden, strideB1=0
+        np.float32(1.0),                        # 22: alpha
+        np.float32(0.0),                        # 23: beta
+        sk_args["iters_per_tile"],              # 24: ItersPerTile
+        sk_args["magic_iters_per_tile"],        # 25: MagicNumberItersPerTile
+        sk_args["shift_iters_per_tile"],        # 26: MagicShiftItersPerTile
+        sk_args["sk_iters_per_wg"],             # 27: SKItersPerWG
+        sk_args["sk_grid"],                     # 28: skGrid
+        sk_args["sk_tiles"],                    # 29: skTiles
+        amdgpu_exec.InputArray(rstd_padded),    # 30: RstdBuf (fp32)
+    ]
+
+    result_holder = {}
+
+    def verify(arguments):
+        y_gpu_bf16 = np.asarray(arguments[8].array)
+        y_gpu_f32  = y_gpu_bf16.astype(np.float32)
+        y_ref_f32  = np.asarray(y_ref).astype(np.float32)
+
+        rtol, atol = 2e-2, 2e-2
+        diff     = np.abs(y_gpu_f32[:M] - y_ref_f32[:M])
+        tol      = atol + rtol * np.abs(y_ref_f32[:M])
+        bad      = np.where(~np.isfinite(y_gpu_f32[:M]) | (diff > tol))
+        ok       = len(bad[0]) == 0
+        max_abs  = float(np.nanmax(np.abs(y_gpu_f32[:M] - y_ref_f32[:M]))) if M > 0 else 0.0
+
+        if ok:
+            print(f"verification: PASSED  y max_abs={max_abs:.3e}")
+        else:
+            print(f"verification: FAILED  y max_abs={max_abs:.3e}  "
+                  f"mismatches={len(bad[0])}")
+            r, c = bad[0][0], bad[1][0]
+            print(f"  first bad y[{r},{c}]: gpu={y_gpu_f32[r,c]:.6f} "
+                  f"ref={y_ref_f32[r,c]:.6f}")
+
+        result_holder["ok"] = ok
+
+    amdgpu_exec.execute_hsaco(
+        hsaco=hsaco,
+        kernel_name=kernel_name,
+        arguments=args,
+        grid_dim=(numWG, 1, 1),
+        block_dim=(solution["NumThreads"], 1, 1),
+        num_iterations=1,
+        verify_fn=verify,
+    )
+    return result_holder.get("ok", False)
+
+
 def parse_args():
-    p = argparse.ArgumentParser(description="TensileLite fused GEMM+PartialRMS example")
-    p.add_argument("--phase", choices=["k1", "k2"], default="k1",
-                   help="Phase to run: k1 = GEMM+PartialRMS, k2 = aux reduction")
+    p = argparse.ArgumentParser(description="TensileLite fused GEMM+PartialRMS/RstdScale example")
+    p.add_argument("--phase", choices=["k1", "k2", "k3"], default="k1",
+                   help="Phase to run: k1=GEMM+PartialRMS, k2=aux reduction, k3=GEMM+RstdScale")
     p.add_argument("--M",        type=int,   default=2048,  help="Output rows")
     p.add_argument("--K",        type=int,   default=4096,  help="Reduction dimension (K1 only)")
     p.add_argument("--wg-n",     type=int,   default=1,     dest="wg_n",
                    help="MIWaveGroup[1]: waves splitting N (1=single, >1=cross-wave LDS)")
     p.add_argument("--N-hidden", type=int,   default=64,    dest="N_hidden",
-                   help="Hidden dimension N (K2: embedded as 1/N in assembly)")
+                   help="Hidden dimension N (K2: embedded as 1/N; K3: GEMM2 contraction dim)")
+    p.add_argument("--N-out",    type=int,   default=None,  dest="N_out",
+                   help="K3: output columns (default: 64*wg_n = MacroTile1)")
     p.add_argument("--eps",      type=float, default=1e-5,  help="Epsilon for K2 rstd")
     p.add_argument("--chip",     default=None, help="Target GPU (default: auto-detect)")
     return p.parse_args()
@@ -517,7 +743,7 @@ def main():
     print(f"device     : {chip}")
 
     if not chip.startswith("gfx950"):
-        print(f"WARNING: PartialRMS/aux-reduction is only implemented for gfx950; "
+        print(f"WARNING: PartialRMS/RstdScale is only implemented for gfx950; "
               f"current chip={chip}")
 
     if args.phase == "k1":
@@ -557,6 +783,40 @@ def main():
 
         print("Running K2 kernel...")
         ok, _rstd_gpu = run_k2(hsaco, kernel_name, args.M, args.N_hidden, args.eps)
+        sys.exit(0 if ok else 1)
+
+    if args.phase == "k3":
+        print("Setting up TensileLite...")
+        assembler, isaInfoMap, debugConfig = setup_tensile(chip)
+
+        N_out = args.N_out if args.N_out is not None else 64 * args.wg_n
+        print(f"Building K3 RstdScale solution (wg_n={args.wg_n}, "
+              f"N_hidden={args.N_hidden}, N_out={N_out})...")
+        solution = build_k3_solution(chip, assembler, isaInfoMap,
+                                     N_hidden=args.N_hidden, N_out=N_out, wg_n=args.wg_n)
+        MT1 = solution["MacroTile1"]
+        print(f"problem    : M={args.M}, N_hidden={args.N_hidden}, N_out={N_out}")
+        print(f"MacroTile  : {solution['MacroTile0']}×{MT1}")
+        print(f"MIWaveGroup: {solution['MIWaveGroup']}")
+        print(f"NumThreads : {solution['NumThreads']}")
+
+        print("Generating assembly...")
+        t0 = time.perf_counter()
+        asm_str, kernel_name = generate_asm(solution, assembler, debugConfig)
+        print(f"Gen time   : {time.perf_counter()-t0:.3f} s")
+        print(f"Kernel     : {kernel_name}")
+
+        print("Compiling to HSACO...")
+        t0 = time.perf_counter()
+        hsaco = amdgpu_exec.compile_asm_to_hsaco(asm_str, chip)
+        print(f"Compile    : {time.perf_counter()-t0:.3f} s")
+
+        # Generate synthetic rstd_ref for standalone K3 verification.
+        rng = np.random.default_rng(42)
+        rstd_ref = (rng.random(args.M, dtype=np.float32) * 0.5 + 0.5)
+
+        print("Running K3 kernel...")
+        ok = run_k3(hsaco, kernel_name, solution, args.M, args.N_hidden, MT1, rstd_ref)
         sys.exit(0 if ok else 1)
 
 
