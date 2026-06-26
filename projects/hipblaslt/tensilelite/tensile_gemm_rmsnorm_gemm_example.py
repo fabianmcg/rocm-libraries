@@ -720,10 +720,236 @@ def run_k3(hsaco: bytes, kernel_name: str, solution, M: int, N_hidden: int,
     return result_holder.get("ok", False)
 
 
+def run_pipeline(chip: str, M: int, K: int, N_hidden: int, N_out: int, eps: float, wg_n: int):
+    """Run K1 → K2 → K3 in sequence on shared device buffers and verify y.
+
+    K1 writes partialBuf and D (=h2).
+    K2 reads partialBuf and writes rstdBuf.
+    K3 reads h2 (K1's D) and rstdBuf and writes y.
+
+    Returns True if y matches the reference within bf16 tolerance.
+    """
+    import ml_dtypes
+
+    assembler, isaInfoMap, debugConfig = setup_tensile(chip)
+
+    k1_sol = build_k1_solution(chip, assembler, isaInfoMap, wg_n=wg_n)
+    k3_sol = build_k3_solution(chip, assembler, isaInfoMap,
+                               N_hidden=N_hidden, N_out=N_out, wg_n=wg_n)
+
+    k1_asm, k1_name = generate_asm(k1_sol, assembler, debugConfig)
+    k3_asm, k3_name = generate_asm(k3_sol, assembler, debugConfig)
+    _k2_asm, k2_name, k2_hsaco = build_aux_reduction_asm(chip, N_hidden)
+
+    k1_hsaco = amdgpu_exec.compile_asm_to_hsaco(k1_asm, chip)
+    k3_hsaco = amdgpu_exec.compile_asm_to_hsaco(k3_asm, chip)
+
+    MT0_k1 = k1_sol["MacroTile0"]
+    MT1_k1 = k1_sol["MacroTile1"]   # == N_hidden
+    MT0_k3 = k3_sol["MacroTile0"]
+    MT1_k3 = k3_sol["MacroTile1"]   # == N_out
+
+    M_padded_k1 = math.ceil(M / MT0_k1) * MT0_k1
+    M_padded_k3 = math.ceil(M / MT0_k3) * MT0_k3
+    M_padded_k2 = math.ceil(M / 256) * 256
+
+    numWG_k1 = math.ceil(M / MT0_k1) * math.ceil(N_hidden / MT1_k1)
+    numWG_k3 = math.ceil(M / MT0_k3) * math.ceil(N_out / MT1_k3)
+
+    rng = np.random.default_rng(42)
+
+    # K1 inputs.
+    a_f32  = np.asfortranarray(rng.random((K, M), dtype=np.float32) * 0.1)
+    w0_f32 = np.asfortranarray(rng.random((K, N_hidden), dtype=np.float32) * 0.1)
+    a_bf16  = np.asfortranarray(a_f32.astype(ml_dtypes.bfloat16))
+    w0_bf16 = np.asfortranarray(w0_f32.astype(ml_dtypes.bfloat16))
+    gamma_f32  = rng.random(N_hidden, dtype=np.float32) + 0.5
+    gamma_bf16 = gamma_f32.astype(ml_dtypes.bfloat16)
+
+    # K3 inputs.
+    w1_f32  = np.asfortranarray(rng.random((N_hidden, N_out), dtype=np.float32) * 0.1)
+    w1_bf16 = np.asfortranarray(w1_f32.astype(ml_dtypes.bfloat16))
+
+    # Shared device buffers written by K1, read by K2/K3.
+    c_k1_bf16   = np.zeros((M, N_hidden), dtype=ml_dtypes.bfloat16, order='F')
+    # K1 writes D as (M, N_hidden) Fortran order (strideD0=M).
+    d_bf16      = np.zeros((M, N_hidden), dtype=ml_dtypes.bfloat16, order='F')
+    partial_buf = np.zeros(M_padded_k1, dtype=np.float32)
+
+    # K3 needs A in (N_hidden, M) Fortran order (strideA0=N_hidden). Allocated
+    # separately; filled with d_bf16.T after K1 completes.
+    h2_for_k3   = np.zeros((N_hidden, M), dtype=ml_dtypes.bfloat16, order='F')
+
+    # K3 output.
+    c_k3_bf16 = np.zeros((M, N_out), dtype=ml_dtypes.bfloat16, order='F')
+    y_bf16    = np.zeros((M, N_out), dtype=ml_dtypes.bfloat16, order='F')
+    rstd_buf  = np.zeros(M_padded_k2, dtype=np.float32)
+
+    # Numpy reference.
+    a_ref   = np.asarray(a_bf16).astype(np.float32)
+    w0_ref  = np.asarray(w0_bf16).astype(np.float32)
+    h0      = a_ref.T @ w0_ref                     # M x N_hidden, fp32
+    h1      = h0
+    gamma_ref = np.asarray(gamma_bf16).astype(np.float32)
+    # h2 is K1's D output: bf16-rounded h1*gamma
+    h2_ref  = np.asarray((h1 * gamma_ref[np.newaxis, :]).astype(ml_dtypes.bfloat16))
+    sumsq   = np.sum(h1 ** 2, axis=1)              # M, fp32 raw sum
+    rstd_ref = 1.0 / np.sqrt(sumsq / N_hidden + eps)
+    # w1_f32 shape (N_hidden, N_out) → K3 computes h2^T (M x N_hidden) @ W1 (N_hidden x N_out).
+    # h2_ref has shape (M, N_hidden) so the product is h2_ref @ w1_ref.
+    w1_ref  = np.asarray(w1_bf16).astype(np.float32)   # N_hidden x N_out
+    h3      = h2_ref.astype(np.float32) @ w1_ref        # M x N_out, fp32
+    y_ref   = (h3 * rstd_ref[:, np.newaxis]).astype(ml_dtypes.bfloat16)
+
+    ws_dummy    = np.zeros(4, dtype=np.float32)
+    flags_dummy = np.zeros(4, dtype=np.float32)
+
+    # ---- K1 launch ----
+    sk1 = compute_sk3_dp_args(M, N_hidden, K, k1_sol)
+    su1 = k1_sol.get("StaggerU", 0)
+    su_map1 = k1_sol.get("StaggerUMapping", 0)
+    ss1 = k1_sol.get("_staggerStrideShift", 0)
+    su_word1 = (su_map1 << 13) | ((ss1 << 8) & 0x1F00) | (su1 & 0xFF)
+    ki0_k1 = np.uint32((su_word1 << 16) | (k1_sol["GlobalSplitU"] & 0x3FFF))
+    ki1_k1 = np.uint32(
+        (k1_sol.get("WorkGroupMappingXCC", 1) << 16) | (k1_sol["WorkGroupMapping"] & 0xFFFF)
+    )
+
+    d_inout  = amdgpu_exec.InOutArray(d_bf16)
+    pb_inout = amdgpu_exec.InOutArray(partial_buf)
+
+    args_k1 = [
+        np.uint32(1), ki0_k1, ki1_k1, np.uint32(numWG_k1),
+        np.uint32(M), np.uint32(N_hidden), np.uint32(1), np.uint32(K),
+        d_inout,
+        amdgpu_exec.InputArray(c_k1_bf16),
+        amdgpu_exec.InputArray(a_bf16),
+        amdgpu_exec.InputArray(w0_bf16),
+        amdgpu_exec.InputArray(ws_dummy),
+        amdgpu_exec.InputArray(flags_dummy),
+        np.uint32(M), np.uint32(0),
+        np.uint32(M), np.uint32(0),
+        np.uint32(K), np.uint32(0),
+        np.uint32(K), np.uint32(0),
+        np.float32(1.0), np.float32(0.0),
+        sk1["iters_per_tile"], sk1["magic_iters_per_tile"], sk1["shift_iters_per_tile"],
+        sk1["sk_iters_per_wg"], sk1["sk_grid"], sk1["sk_tiles"],
+        amdgpu_exec.InputArray(gamma_bf16),
+        pb_inout,
+    ]
+
+    amdgpu_exec.execute_hsaco(
+        hsaco=k1_hsaco,
+        kernel_name=k1_name,
+        arguments=args_k1,
+        grid_dim=(numWG_k1, 1, 1),
+        block_dim=(k1_sol["NumThreads"], 1, 1),
+        num_iterations=1,
+    )
+
+    # Transpose K1's D output from (M, N_hidden) col-major to (N_hidden, M) col-major
+    # for K3 which expects A in (N_hidden x M) col-major layout with strideA0=N_hidden.
+    np.copyto(h2_for_k3, d_bf16.T)
+
+    # ---- K2 launch ----
+    partial_buf_padded_k2 = np.zeros(M_padded_k2, dtype=np.float32)
+    partial_buf_padded_k2[:M] = partial_buf[:M]
+    rstd_inout = amdgpu_exec.InOutArray(rstd_buf)
+
+    args_k2 = [
+        amdgpu_exec.InputArray(partial_buf_padded_k2),
+        rstd_inout,
+        np.uint32(M),
+        np.float32(eps),
+    ]
+
+    amdgpu_exec.execute_hsaco(
+        hsaco=k2_hsaco,
+        kernel_name=k2_name,
+        arguments=args_k2,
+        grid_dim=(math.ceil(M / 256), 1, 1),
+        block_dim=(256, 1, 1),
+        num_iterations=1,
+    )
+
+    # ---- K3 launch ----
+    rstd_padded_k3 = np.zeros(M_padded_k3, dtype=np.float32)
+    rstd_padded_k3[:M] = rstd_buf[:M]
+
+    sk3 = compute_sk3_dp_args(M, N_out, N_hidden, k3_sol)
+    su3 = k3_sol.get("StaggerU", 0)
+    su_map3 = k3_sol.get("StaggerUMapping", 0)
+    ss3 = k3_sol.get("_staggerStrideShift", 0)
+    su_word3 = (su_map3 << 13) | ((ss3 << 8) & 0x1F00) | (su3 & 0xFF)
+    ki0_k3 = np.uint32((su_word3 << 16) | (k3_sol["GlobalSplitU"] & 0x3FFF))
+    ki1_k3 = np.uint32(
+        (k3_sol.get("WorkGroupMappingXCC", 1) << 16) | (k3_sol["WorkGroupMapping"] & 0xFFFF)
+    )
+
+    y_inout = amdgpu_exec.InOutArray(y_bf16)
+
+    args_k3 = [
+        np.uint32(1), ki0_k3, ki1_k3, np.uint32(numWG_k3),
+        np.uint32(M), np.uint32(N_out), np.uint32(1), np.uint32(N_hidden),
+        y_inout,
+        amdgpu_exec.InputArray(c_k3_bf16),
+        amdgpu_exec.InputArray(h2_for_k3),
+        amdgpu_exec.InputArray(w1_bf16),
+        amdgpu_exec.InputArray(ws_dummy),
+        amdgpu_exec.InputArray(flags_dummy),
+        np.uint32(M), np.uint32(0),
+        np.uint32(M), np.uint32(0),
+        np.uint32(N_hidden), np.uint32(0),
+        np.uint32(N_hidden), np.uint32(0),
+        np.float32(1.0), np.float32(0.0),
+        sk3["iters_per_tile"], sk3["magic_iters_per_tile"], sk3["shift_iters_per_tile"],
+        sk3["sk_iters_per_wg"], sk3["sk_grid"], sk3["sk_tiles"],
+        amdgpu_exec.InputArray(rstd_padded_k3),
+    ]
+
+    result_holder = {}
+
+    def verify_pipeline(arguments):
+        y_gpu_bf16 = np.asarray(arguments[8].array)
+        y_gpu_f32  = y_gpu_bf16.astype(np.float32)
+        y_ref_f32  = np.asarray(y_ref).astype(np.float32)
+
+        rtol, atol = 2e-2, 2e-2
+        diff = np.abs(y_gpu_f32[:M] - y_ref_f32[:M])
+        tol  = atol + rtol * np.abs(y_ref_f32[:M])
+        bad  = np.where(~np.isfinite(y_gpu_f32[:M]) | (diff > tol))
+        ok   = len(bad[0]) == 0
+        max_abs = float(np.nanmax(np.abs(y_gpu_f32[:M] - y_ref_f32[:M]))) if M > 0 else 0.0
+
+        if ok:
+            print(f"pipeline verification: PASSED  y max_abs={max_abs:.3e}")
+        else:
+            print(f"pipeline verification: FAILED  y max_abs={max_abs:.3e}  "
+                  f"mismatches={len(bad[0])}")
+            r, c = bad[0][0], bad[1][0]
+            print(f"  first bad y[{r},{c}]: gpu={y_gpu_f32[r,c]:.6f} "
+                  f"ref={y_ref_f32[r,c]:.6f}")
+
+        result_holder["ok"] = ok
+
+    amdgpu_exec.execute_hsaco(
+        hsaco=k3_hsaco,
+        kernel_name=k3_name,
+        arguments=args_k3,
+        grid_dim=(numWG_k3, 1, 1),
+        block_dim=(k3_sol["NumThreads"], 1, 1),
+        num_iterations=1,
+        verify_fn=verify_pipeline,
+    )
+
+    return result_holder.get("ok", False)
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="TensileLite fused GEMM+PartialRMS/RstdScale example")
-    p.add_argument("--phase", choices=["k1", "k2", "k3"], default="k1",
-                   help="Phase to run: k1=GEMM+PartialRMS, k2=aux reduction, k3=GEMM+RstdScale")
+    p.add_argument("--phase", choices=["k1", "k2", "k3", "pipeline"], default="k1",
+                   help="Phase to run: k1=GEMM+PartialRMS, k2=aux reduction, "
+                        "k3=GEMM+RstdScale, pipeline=K1→K2→K3 end-to-end")
     p.add_argument("--M",        type=int,   default=2048,  help="Output rows")
     p.add_argument("--K",        type=int,   default=4096,  help="Reduction dimension (K1 only)")
     p.add_argument("--wg-n",     type=int,   default=1,     dest="wg_n",
@@ -734,6 +960,8 @@ def parse_args():
                    help="K3: output columns (default: 64*wg_n = MacroTile1)")
     p.add_argument("--eps",      type=float, default=1e-5,  help="Epsilon for K2 rstd")
     p.add_argument("--chip",     default=None, help="Target GPU (default: auto-detect)")
+    p.add_argument("--pipeline-N-out", type=int, default=None, dest="pipeline_N_out",
+                   help="Pipeline mode: N_out for K3 (default: same as N-hidden)")
     return p.parse_args()
 
 
@@ -817,6 +1045,15 @@ def main():
 
         print("Running K3 kernel...")
         ok = run_k3(hsaco, kernel_name, solution, args.M, args.N_hidden, MT1, rstd_ref)
+        sys.exit(0 if ok else 1)
+
+    if args.phase == "pipeline":
+        N_hidden = args.N_hidden
+        N_out = args.pipeline_N_out if args.pipeline_N_out is not None else N_hidden
+        print(f"problem    : M={args.M}, K={args.K}, N_hidden={N_hidden}, N_out={N_out}")
+        print(f"eps={args.eps}, wg_n={args.wg_n}")
+        print("Running K1 → K2 → K3 pipeline...")
+        ok = run_pipeline(chip, args.M, args.K, N_hidden, N_out, args.eps, args.wg_n)
         sys.exit(0 if ok else 1)
 
 
