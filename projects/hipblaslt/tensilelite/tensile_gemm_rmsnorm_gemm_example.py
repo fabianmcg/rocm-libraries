@@ -7,8 +7,8 @@ Demonstrates the PartialRMS fused epilogue on gfx950:
   partialBuf = Σx²         (fp32, M)   where h1 = A^T * W0
 
 This is Phase 1 (K1) of a two-kernel RMSNorm pipeline. K1 computes the raw
-per-row sum of squares (not divided by N) and writes to partialBuf. K2 would
-read partialBuf, compute rstd = rsqrt(Σx²/N + eps), and apply it.
+per-row sum of squares (not divided by N) and writes to partialBuf. K2
+reads partialBuf, computes rstd = rsqrt(Σx²/N + eps), and writes rstdBuf.
 
 Row-containment constraint: N_hidden must equal MacroTile1 so each WG owns
 exactly one complete output row. This is validated at launch time.
@@ -19,8 +19,11 @@ partial fixup) so the accumulator is final at the PartialRMS epilogue hook.
 Usage:
     python tensile_gemm_rmsnorm_gemm_example.py --phase k1
     python tensile_gemm_rmsnorm_gemm_example.py --phase k1 --wg-n 2
+    python tensile_gemm_rmsnorm_gemm_example.py --phase k2 --N-hidden 64
+    python tensile_gemm_rmsnorm_gemm_example.py --phase k2 --N-hidden 4096 --eps 1e-6
 """
 import argparse
+import functools
 import math
 import os
 import sys
@@ -327,18 +330,184 @@ def run_k1(hsaco: bytes, kernel_name: str, solution, M: int, N: int, K: int):
 
 
 # ---------------------------------------------------------------------------
+# K2: auxiliary reduction kernel (GCN assembly generated via amdclang++)
+# ---------------------------------------------------------------------------
+# Kernarg layout (packed, as seen by the HIP runtime):
+#   offset  0: partialBuf ptr (fp32, 8B)
+#   offset  8: rstdBuf    ptr (fp32, 8B)
+#   offset 16: M          (u32, 4B)
+#   offset 20: eps        (f32, 4B)
+#   total = 24 bytes of user args; the gfx950 ABI pads the kernarg segment
+#   further for hidden dispatch args (block dims etc.), so the full
+#   kernarg_size is larger.
+#
+# N_hidden is NOT a runtime arg: 1.0/N_hidden is embedded as a compile-time
+# float constant in the generated assembly.
+# One thread per row: grid = (ceil(M/256), 1, 1), block = (256, 1, 1).
+
+@functools.lru_cache(maxsize=None)
+def build_aux_reduction_asm(chip: str, N_hidden: int) -> tuple:
+    """Build, assemble and return (asm_str, kernel_name, hsaco) for K2.
+
+    Uses amdclang++ to compile a HIP C++ device kernel to GCN assembly, then
+    compile_asm_to_hsaco to assemble it. The result is cached per (chip,
+    N_hidden) so repeated calls within a session compile only once.
+    """
+    import subprocess
+    import tempfile
+
+    kernel_name = f"aux_reduction_N{N_hidden}"
+    gfx = chip.split(":")[0]
+    # 1.0/N_hidden is a compile-time constant; use repr to get full precision.
+    inv_n = repr(1.0 / N_hidden) + "f"
+
+    hip_src = f"""\
+#include <hip/hip_runtime.h>
+// K2 auxiliary reduction: one thread per row, computes
+//   rstd[tid] = rsqrt(partialBuf[tid] / N_hidden + eps)
+// N_hidden is baked in as a compile-time constant for maximum throughput.
+extern "C" __global__ void {kernel_name}(
+    const float* __restrict__ partialBuf,
+    float* __restrict__ rstdBuf,
+    unsigned int M,
+    float eps
+) {{
+    constexpr float invN = {inv_n};
+    unsigned int tid = (unsigned int)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= M) return;
+    float p = partialBuf[tid] * invN + eps;
+    rstdBuf[tid] = __builtin_amdgcn_rsqf(p);
+}}
+"""
+
+    with tempfile.NamedTemporaryFile(suffix=".cpp", mode="w", delete=False) as f:
+        f.write(hip_src)
+        src_path = f.name
+
+    s_path = src_path.replace(".cpp", ".s")
+    try:
+        r = subprocess.run(
+            [
+                "amdclang++",
+                f"--offload-arch={gfx}",
+                "-O2",
+                "-x", "hip",
+                "-S",
+                "--cuda-device-only",
+                "-o", s_path,
+                src_path,
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        with open(s_path) as sf:
+            asm_str = sf.read()
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(
+            f"amdclang++ failed: {e.stderr[:500]}"
+        ) from e
+    finally:
+        if os.path.exists(src_path):
+            os.unlink(src_path)
+        if os.path.exists(s_path):
+            os.unlink(s_path)
+
+    hsaco = amdgpu_exec.compile_asm_to_hsaco(asm_str, chip)
+    return asm_str, kernel_name, hsaco
+
+
+def run_k2(hsaco: bytes, kernel_name: str, M: int, N_hidden: int, eps: float,
+           partial_buf_in=None):
+    """Execute the K2 auxiliary reduction kernel and verify outputs.
+
+    Computes per-row rstd = rsqrt(partialBuf[m] / N_hidden + eps).
+
+    If partial_buf_in is None, a random synthetic partialBuf is generated.
+    Returns (ok, rstdBuf_gpu) where rstdBuf_gpu is a numpy fp32 array of
+    length ceil(M/256)*256 (padded).
+    """
+    if partial_buf_in is None:
+        rng = np.random.default_rng(42)
+        partial_buf = rng.random(M, dtype=np.float32) * 10.0 + 1e-3
+    else:
+        partial_buf = np.asarray(partial_buf_in, dtype=np.float32)
+
+    # Pad to multiple of 256 for the GPU buffer.
+    M_padded = math.ceil(M / 256) * 256
+    partial_buf_padded = np.zeros(M_padded, dtype=np.float32)
+    partial_buf_padded[:M] = partial_buf[:M]
+
+    rstd_buf = np.zeros(M_padded, dtype=np.float32)
+
+    # Reference: fp32 rsqrt per row.
+    rstd_ref = np.array(
+        [1.0 / math.sqrt(float(partial_buf_padded[m]) / N_hidden + eps)
+         for m in range(M)],
+        dtype=np.float32,
+    )
+
+    args = [
+        amdgpu_exec.InputArray(partial_buf_padded),
+        amdgpu_exec.InOutArray(rstd_buf),
+        np.uint32(M),
+        np.float32(eps),
+    ]
+
+    grid_dim  = (math.ceil(M / 256), 1, 1)
+    block_dim = (256, 1, 1)
+
+    result_holder = {}
+
+    def verify(arguments):
+        rstd_gpu = np.asarray(arguments[1].array).copy()
+        result_holder["rstd_gpu"] = rstd_gpu
+
+        rtol, atol = 1e-4, 1e-4
+        diff   = np.abs(rstd_gpu[:M] - rstd_ref)
+        tol    = atol + rtol * np.abs(rstd_ref)
+        bad    = np.where(~np.isfinite(rstd_gpu[:M]) | (diff > tol))[0]
+        ok     = len(bad) == 0
+
+        max_abs = float(np.nanmax(np.abs(rstd_gpu[:M] - rstd_ref))) if M > 0 else 0.0
+        if ok:
+            print(f"verification: PASSED  rstdBuf max_abs={max_abs:.3e}")
+        else:
+            print(f"verification: FAILED  rstdBuf max_abs={max_abs:.3e}  "
+                  f"mismatches={len(bad)}")
+            i = bad[0]
+            print(f"    first bad rstdBuf[{i}]: gpu={rstd_gpu[i]:.6f} "
+                  f"ref={rstd_ref[i]:.6f}")
+        result_holder["ok"] = ok
+
+    amdgpu_exec.execute_hsaco(
+        hsaco=hsaco,
+        kernel_name=kernel_name,
+        arguments=args,
+        grid_dim=grid_dim,
+        block_dim=block_dim,
+        num_iterations=1,
+        verify_fn=verify,
+    )
+    return result_holder.get("ok", False), result_holder.get("rstd_gpu", rstd_buf)
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
 def parse_args():
     p = argparse.ArgumentParser(description="TensileLite fused GEMM+PartialRMS example")
-    p.add_argument("--phase", choices=["k1"], default="k1",
-                   help="Phase to run: k1 = GEMM + PartialRMS epilogue")
-    p.add_argument("--M",     type=int, default=2048, help="Output rows")
-    p.add_argument("--K",     type=int, default=4096, help="Reduction dimension")
-    p.add_argument("--wg-n",  type=int, default=1, dest="wg_n",
+    p.add_argument("--phase", choices=["k1", "k2"], default="k1",
+                   help="Phase to run: k1 = GEMM+PartialRMS, k2 = aux reduction")
+    p.add_argument("--M",        type=int,   default=2048,  help="Output rows")
+    p.add_argument("--K",        type=int,   default=4096,  help="Reduction dimension (K1 only)")
+    p.add_argument("--wg-n",     type=int,   default=1,     dest="wg_n",
                    help="MIWaveGroup[1]: waves splitting N (1=single, >1=cross-wave LDS)")
-    p.add_argument("--chip",  default=None, help="Target GPU (default: auto-detect)")
+    p.add_argument("--N-hidden", type=int,   default=64,    dest="N_hidden",
+                   help="Hidden dimension N (K2: embedded as 1/N in assembly)")
+    p.add_argument("--eps",      type=float, default=1e-5,  help="Epsilon for K2 rstd")
+    p.add_argument("--chip",     default=None, help="Target GPU (default: auto-detect)")
     return p.parse_args()
 
 
@@ -348,12 +517,13 @@ def main():
     print(f"device     : {chip}")
 
     if not chip.startswith("gfx950"):
-        print(f"WARNING: PartialRMS is only implemented for gfx950; current chip={chip}")
-
-    print("Setting up TensileLite...")
-    assembler, isaInfoMap, debugConfig = setup_tensile(chip)
+        print(f"WARNING: PartialRMS/aux-reduction is only implemented for gfx950; "
+              f"current chip={chip}")
 
     if args.phase == "k1":
+        print("Setting up TensileLite...")
+        assembler, isaInfoMap, debugConfig = setup_tensile(chip)
+
         print(f"Building K1 PartialRMS solution (wg_n={args.wg_n})...")
         solution = build_k1_solution(chip, assembler, isaInfoMap, wg_n=args.wg_n)
         N = solution["MacroTile1"]
@@ -375,6 +545,18 @@ def main():
 
         print("Running K1 kernel...")
         ok = run_k1(hsaco, kernel_name, solution, args.M, N, args.K)
+        sys.exit(0 if ok else 1)
+
+    if args.phase == "k2":
+        print(f"Building K2 aux-reduction kernel (N_hidden={args.N_hidden})...")
+        t0 = time.perf_counter()
+        _asm_str, kernel_name, hsaco = build_aux_reduction_asm(chip, args.N_hidden)
+        print(f"Compile    : {time.perf_counter()-t0:.3f} s")
+        print(f"Kernel     : {kernel_name}")
+        print(f"problem    : M={args.M}, N_hidden={args.N_hidden}, eps={args.eps}")
+
+        print("Running K2 kernel...")
+        ok, _rstd_gpu = run_k2(hsaco, kernel_name, args.M, args.N_hidden, args.eps)
         sys.exit(0 if ok else 1)
 
 
