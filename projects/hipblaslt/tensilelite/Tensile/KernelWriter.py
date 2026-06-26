@@ -9728,7 +9728,9 @@ class KernelWriter(metaclass=abc.ABCMeta):
       self.states.numStoreSgprNameSizes.append(1)                 # 1 SGPR (f32)
       storeSgprLoad += self.states.rpga + 1
     if kernel["PartialRMS"]:
-      # RMSNormGamma: 64-bit pointer (2 SGPRs), PartialBuf: 64-bit pointer (2 SGPRs)
+      # RMSNormGamma: 64-bit ptr (2 SGPRs), PartialBuf: 64-bit ptr (2 SGPRs).
+      # NTilesN is a kernarg u32 but is NOT put in the named SGPR block; instead the
+      # epilogue computes it from SizesFree[1] and the compile-time MT1 constant.
       self.states.numStoreSgprNames.append("RMSNormGamma")
       self.states.numStoreSgprNameSizes.append(self.states.rpga)  # 2 SGPRs (64-bit ptr)
       self.states.numStoreSgprNames.append("PartialBuf")

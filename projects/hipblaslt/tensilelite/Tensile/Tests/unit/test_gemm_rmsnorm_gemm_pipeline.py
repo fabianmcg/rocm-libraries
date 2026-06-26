@@ -3,14 +3,14 @@
 """End-to-end pipeline test for K1 → K2 → K3 (gfx950, bf16).
 
 Verifies that chaining:
-  K1: GEMM + PartialRMS  → D (=h2), partialBuf
-  K2: aux rsqrt          → rstdBuf
+  K1: GEMM + PartialRMS  → D (=h2), 2D partialBuf [M_padded, N_tiles_N]
+  K2: aux rsqrt          → rstdBuf[M]
   K3: GEMM + RstdScale   → y
 
 produces y matching the numpy reference within bf16 tolerance.
 
-Shapes are chosen so that N_hidden = N_out = MacroTile1 = 64 * wg_n,
-satisfying the row-containment invariant for both K1 and K3.
+partialBuf is 2D: shape (M_padded_k1, N_tiles_N), C-order fp32.
+N_tiles_N = ceil(N_hidden / MT1_k1). K2 is a single binary (N_hidden is runtime).
 
 For wg_n=1: MacroTile1=64, shapes use N_hidden=N_out=64.
 For wg_n=2: MacroTile1=128, shapes use N_hidden=N_out=128.
@@ -103,7 +103,7 @@ def pipeline_kernels(request):
 
     k1_asm, k1_name = generate_asm(k1_sol, assembler, debugConfig)
     k3_asm, k3_name = generate_asm(k3_sol, assembler, debugConfig)
-    _k2_asm, k2_name, k2_hsaco = build_aux_reduction_asm(chip, N)
+    _k2_asm, k2_name, k2_hsaco = build_aux_reduction_asm(chip)
 
     k1_hsaco = amdgpu_exec.compile_asm_to_hsaco(k1_asm, chip)
     k3_hsaco = amdgpu_exec.compile_asm_to_hsaco(k3_asm, chip)
@@ -122,12 +122,12 @@ def _run_pipeline(pipeline_kernels_fixture, M, K, eps, validate_intermediates):
     """Execute K1 → K2 → K3 on shared device buffers.
 
     Returns:
-        y_gpu_f32:  fp32 upcast of GPU y output, shape (M, N_out)
-        y_ref_f32:  fp32 upcast of numpy reference y, shape (M, N_out)
-        pb_gpu:     partialBuf from GPU (M,), fp32
-        sumsq_ref:  numpy reference sum-of-squares (M,), fp32
-        rstd_gpu:   rstdBuf from GPU (M,), fp32
-        rstd_ref:   numpy reference rstd (M,), fp32
+        y_gpu_f32:   fp32 upcast of GPU y output, shape (M, N_out)
+        y_ref_f32:   fp32 upcast of numpy reference y, shape (M, N_out)
+        pb_gpu:      2D partialBuf from GPU (M, N_tiles_N), fp32
+        sumsq_ref:   numpy 2D reference sum-of-squares (M, N_tiles_N), fp32
+        rstd_gpu:    rstdBuf from GPU (M,), fp32
+        rstd_ref:    numpy reference rstd (M,), fp32
     """
     from tensile_gemm_rmsnorm_gemm_example import compute_sk3_dp_args
 
@@ -139,13 +139,16 @@ def _run_pipeline(pipeline_kernels_fixture, M, K, eps, validate_intermediates):
     N_hidden = N
     N_out    = N
 
-    MT0_k1 = k1_sol["MacroTile0"]
-    MT0_k3 = k3_sol["MacroTile0"]
+    MT0_k1  = k1_sol["MacroTile0"]
+    MT1_k1  = k1_sol["MacroTile1"]
+    MT0_k3  = k3_sol["MacroTile0"]
     M_padded_k1 = math.ceil(M / MT0_k1) * MT0_k1
     M_padded_k3 = math.ceil(M / MT0_k3) * MT0_k3
-    M_padded_k2 = math.ceil(M / 256) * 256
+    # K2: ROWS_PER_WG=4, one wave per row.
+    M_padded_k2 = math.ceil(M / 4) * 4
+    N_tiles_N   = math.ceil(N_hidden / MT1_k1)
 
-    numWG_k1 = math.ceil(M / MT0_k1) * math.ceil(N_hidden / N_hidden)
+    numWG_k1 = math.ceil(M / MT0_k1) * N_tiles_N
     numWG_k3 = math.ceil(M / MT0_k3) * math.ceil(N_out / N_out)
 
     rng = np.random.default_rng(seed=M * 100000 + N * 100 + K)
@@ -163,15 +166,16 @@ def _run_pipeline(pipeline_kernels_fixture, M, K, eps, validate_intermediates):
     w1_bf16 = np.asfortranarray(w1_f32.astype(ml_dtypes.bfloat16))
 
     # Shared buffers.
-    c_k1_bf16   = np.zeros((M, N_hidden), dtype=ml_dtypes.bfloat16, order='F')
+    c_k1_bf16  = np.zeros((M, N_hidden), dtype=ml_dtypes.bfloat16, order='F')
     # K1 writes D as (M, N_hidden) col-major with strideD0=M.
-    d_bf16      = np.zeros((M, N_hidden), dtype=ml_dtypes.bfloat16, order='F')
-    partial_buf = np.zeros(M_padded_k1, dtype=np.float32)
-    rstd_buf    = np.zeros(M_padded_k2, dtype=np.float32)
-    c_k3_bf16   = np.zeros((M, N_out), dtype=ml_dtypes.bfloat16, order='F')
-    y_bf16      = np.zeros((M, N_out),  dtype=ml_dtypes.bfloat16, order='F')
+    d_bf16     = np.zeros((M, N_hidden), dtype=ml_dtypes.bfloat16, order='F')
+    # 2D partialBuf [M_padded_k1, N_tiles_N], C-order fp32.
+    partial_buf_2d = np.zeros((M_padded_k1, N_tiles_N), dtype=np.float32, order='C')
+    rstd_buf   = np.zeros(M_padded_k2, dtype=np.float32)
+    c_k3_bf16  = np.zeros((M, N_out), dtype=ml_dtypes.bfloat16, order='F')
+    y_bf16     = np.zeros((M, N_out),  dtype=ml_dtypes.bfloat16, order='F')
     # K3 expects A in (N_hidden, M) col-major layout; filled by transposing d_bf16.
-    h2_for_k3   = np.zeros((N_hidden, M), dtype=ml_dtypes.bfloat16, order='F')
+    h2_for_k3  = np.zeros((N_hidden, M), dtype=ml_dtypes.bfloat16, order='F')
 
     ws_dummy    = np.zeros(4, dtype=np.float32)
     flags_dummy = np.zeros(4, dtype=np.float32)
@@ -182,8 +186,13 @@ def _run_pipeline(pipeline_kernels_fixture, M, K, eps, validate_intermediates):
     h1        = a_ref.T @ w0_ref                     # M x N_hidden, fp32
     gamma_ref = np.asarray(gamma_bf16).astype(np.float32)
     h2_ref    = np.asarray((h1 * gamma_ref[np.newaxis, :]).astype(ml_dtypes.bfloat16))
-    sumsq_ref = np.sum(h1 ** 2, axis=1).astype(np.float32)
-    rstd_ref  = (1.0 / np.sqrt(sumsq_ref / N_hidden + eps)).astype(np.float32)
+    # 2D partialBuf reference: per-tile Σx² over MT1-wide column blocks.
+    sumsq_ref = np.zeros((M, N_tiles_N), dtype=np.float32)
+    for t in range(N_tiles_N):
+        col_lo = t * MT1_k1
+        col_hi = min((t + 1) * MT1_k1, N_hidden)
+        sumsq_ref[:, t] = np.sum(h1[:, col_lo:col_hi] ** 2, axis=1)
+    rstd_ref  = (1.0 / np.sqrt(sumsq_ref.sum(axis=1) / N_hidden + eps)).astype(np.float32)
     # w1_ref shape (N_hidden, N_out); K3 computes h2 @ w1_ref = (M,N_hidden)@(N_hidden,N_out).
     w1_ref    = np.asarray(w1_bf16).astype(np.float32)
     h3        = h2_ref.astype(np.float32) @ w1_ref
@@ -200,7 +209,7 @@ def _run_pipeline(pipeline_kernels_fixture, M, K, eps, validate_intermediates):
         (k1_sol.get("WorkGroupMappingXCC", 1) << 16) | (k1_sol["WorkGroupMapping"] & 0xFFFF)
     )
     d_inout  = amdgpu_exec.InOutArray(d_bf16)
-    pb_inout = amdgpu_exec.InOutArray(partial_buf)
+    pb_inout = amdgpu_exec.InOutArray(partial_buf_2d)
 
     args_k1 = [
         np.uint32(1), ki0_k1, ki1_k1, np.uint32(numWG_k1),
@@ -220,12 +229,14 @@ def _run_pipeline(pipeline_kernels_fixture, M, K, eps, validate_intermediates):
         sk1["sk_iters_per_wg"], sk1["sk_grid"], sk1["sk_tiles"],
         amdgpu_exec.InputArray(gamma_bf16),
         pb_inout,
+        np.uint32(N_tiles_N),               # NTilesN (slot 32)
     ]
 
     pb_result = {}
 
     def capture_k1(arguments):
-        pb_result["pb_gpu"] = np.asarray(arguments[31].array).copy()
+        pb_flat = np.asarray(arguments[31].array).copy()
+        pb_result["pb_gpu"] = pb_flat.reshape(M_padded_k1, N_tiles_N)
 
     amdgpu_exec.execute_hsaco(
         hsaco=k1_hsaco, kernel_name=k1_name, arguments=args_k1,
@@ -238,14 +249,18 @@ def _run_pipeline(pipeline_kernels_fixture, M, K, eps, validate_intermediates):
     np.copyto(h2_for_k3, d_bf16.T)
 
     # ---- K2 args ----
-    partial_buf_padded_k2 = np.zeros(M_padded_k2, dtype=np.float32)
-    partial_buf_padded_k2[:M] = partial_buf[:M]
+    # Pad rows to M_padded_k2; pass flat 2D array as contiguous buffer.
+    partial_buf_padded_k2 = np.zeros((M_padded_k2, N_tiles_N), dtype=np.float32, order='C')
+    partial_buf_padded_k2[:M, :] = partial_buf_2d[:M, :]
+    partial_buf_k2_flat = np.ascontiguousarray(partial_buf_padded_k2)
     rstd_inout = amdgpu_exec.InOutArray(rstd_buf)
 
     args_k2 = [
-        amdgpu_exec.InputArray(partial_buf_padded_k2),
+        amdgpu_exec.InputArray(partial_buf_k2_flat),
         rstd_inout,
         np.uint32(M),
+        np.uint32(N_tiles_N),
+        np.uint32(N_hidden),
         np.float32(eps),
     ]
 
@@ -256,7 +271,7 @@ def _run_pipeline(pipeline_kernels_fixture, M, K, eps, validate_intermediates):
 
     amdgpu_exec.execute_hsaco(
         hsaco=k2_hsaco, kernel_name=k2_name, arguments=args_k2,
-        grid_dim=(math.ceil(M / 256), 1, 1), block_dim=(256, 1, 1),
+        grid_dim=(math.ceil(M / 4), 1, 1), block_dim=(256, 1, 1),
         num_iterations=1, verify_fn=capture_k2 if validate_intermediates else None,
     )
 
@@ -305,10 +320,10 @@ def _run_pipeline(pipeline_kernels_fixture, M, K, eps, validate_intermediates):
         num_iterations=1, verify_fn=capture_k3,
     )
 
-    y_gpu_f32   = y_result["y_gpu"].astype(np.float32)
-    y_ref_f32   = np.asarray(y_ref).astype(np.float32)
-    pb_gpu      = pb_result.get("pb_gpu", partial_buf)[:M]
-    rstd_gpu    = rstd_result.get("rstd_gpu", rstd_buf)[:M]
+    y_gpu_f32 = y_result["y_gpu"].astype(np.float32)
+    y_ref_f32 = np.asarray(y_ref).astype(np.float32)
+    pb_gpu    = pb_result.get("pb_gpu", partial_buf_2d)[:M, :]
+    rstd_gpu  = rstd_result.get("rstd_gpu", rstd_buf)[:M]
 
     return y_gpu_f32, y_ref_f32, pb_gpu, sumsq_ref, rstd_gpu, rstd_ref
 
@@ -381,18 +396,21 @@ def _check_y(y_gpu_f32, y_ref_f32, M, label):
 
 
 def _check_partialBuf(pb_gpu, sumsq_ref, M, label):
-    """Assert partialBuf matches sum-of-squares reference within fp32 tolerance."""
+    """Assert 2D partialBuf matches sum-of-squares reference within fp32 tolerance.
+
+    pb_gpu and sumsq_ref have shape (M, N_tiles_N).
+    """
     rtol, atol = 1e-4, 1e-4
     bad = np.where(
-        ~np.isfinite(pb_gpu[:M]) |
-        (np.abs(pb_gpu[:M] - sumsq_ref) > atol + rtol * np.abs(sumsq_ref))
+        ~np.isfinite(pb_gpu[:M, :]) |
+        (np.abs(pb_gpu[:M, :] - sumsq_ref) > atol + rtol * np.abs(sumsq_ref))
     )
     n_bad = len(bad[0])
     assert n_bad == 0, (
-        f"partialBuf mismatch ({label}): {n_bad} rows out of tolerance. "
-        f"max_abs={np.nanmax(np.abs(pb_gpu[:M] - sumsq_ref)):.3e}, "
-        f"first bad row={bad[0][0]}: "
-        f"gpu={pb_gpu[bad[0][0]]:.6f} ref={sumsq_ref[bad[0][0]]:.6f}"
+        f"partialBuf mismatch ({label}): {n_bad} entries out of tolerance. "
+        f"max_abs={np.nanmax(np.abs(pb_gpu[:M, :] - sumsq_ref)):.3e}, "
+        f"first bad [{bad[0][0]},{bad[1][0]}]: "
+        f"gpu={pb_gpu[bad[0][0], bad[1][0]]:.6f} ref={sumsq_ref[bad[0][0], bad[1][0]]:.6f}"
     )
 
 

@@ -2,15 +2,18 @@
 # SPDX-License-Identifier: MIT
 """Pytest suite for the fused GEMM+PartialRMS (K1) Subtile epilogue (gfx950, bf16).
 
-Exercises a comprehensive set of (M, K) shapes, verifying both:
+Exercises a comprehensive set of (M, K, N_hidden) shapes, verifying both:
   - D output (bf16, tol=2e-2): h1 * gamma
-  - partialBuf (fp32, tol=1e-4): per-row Σx² (raw sum, not divided by N)
+  - partialBuf (fp32, tol=1e-4): 2D [M_padded, N_tiles_N] per-tile Σx²
 
-The fixture is parametrized over wg_n (MIWaveGroup[1]):
+partialBuf is 2D with shape [M_padded, N_tiles_N], N_tiles_N = ceil(N_hidden/MT1).
+Element (m, t) = Σ_{n in tile t columns} h1[m,n]² (raw sum, not divided by N).
+
+The fixture is parametrised over wg_n (MIWaveGroup[1]):
   wg_n=1: single-wave butterfly reduction
   wg_n=2: cross-wave LDS reduction
 
-N is pinned to MacroTile1 = 64 * wg_n (row-containment invariant).
+N_hidden is parametrised separately and is independent of MT1 (no row-containment).
 """
 
 import math
@@ -40,8 +43,10 @@ requires_gfx950 = pytest.mark.skipif(
 # MIWaveGroup[1] values to exercise: single-wave and cross-wave (LDS) reduction.
 _WG_N = [1, 2]
 
+# N_hidden values to test — may be any multiple of MT1=64 or non-multiple.
+_N_HIDDEN = [64, 128, 256]
+
 # Shape matrix: (M, K, label).
-# N is determined by MacroTile1 = 64 * wg_n (row-containment invariant).
 _SHAPES = [
     # --- full-tile M, varying K ---
     (   64,    1,  "M64_K1"),
@@ -106,15 +111,16 @@ def k1_kernel(request):
 # Helper: run one shape and return comparison data
 # ---------------------------------------------------------------------------
 
-def _run_shape(solution, kernel_name, hsaco, chip, M, K):
+def _run_shape(solution, kernel_name, hsaco, chip, M, K, N_hidden):
     from tensile_gemm_rmsnorm_gemm_example import compute_sk3_dp_args
 
     MT0 = solution["MacroTile0"]
     MT1 = solution["MacroTile1"]
-    N   = MT1   # row-containment invariant
+    N   = N_hidden
 
-    M_padded = math.ceil(M / MT0) * MT0
-    numWG    = math.ceil(M / MT0) * math.ceil(N / MT1)
+    N_tiles_N = math.ceil(N / MT1)
+    M_padded  = math.ceil(M / MT0) * MT0
+    numWG     = math.ceil(M / MT0) * N_tiles_N
 
     rng = np.random.default_rng(seed=M * 10000 + K)
 
@@ -125,7 +131,8 @@ def _run_shape(solution, kernel_name, hsaco, chip, M, K):
 
     c_bf16      = np.zeros((M, N), dtype=ml_dtypes.bfloat16, order='F')
     d_bf16      = np.zeros((M, N), dtype=ml_dtypes.bfloat16, order='F')
-    partial_buf = np.zeros(M_padded, dtype=np.float32)
+    # 2D partialBuf, C-order so flat layout is (m*N_tiles_N + t)*4.
+    partial_buf = np.zeros((M_padded, N_tiles_N), dtype=np.float32, order='C')
 
     gamma_f32  = rng.random(N, dtype=np.float32) + 0.5
     gamma_bf16 = gamma_f32.astype(ml_dtypes.bfloat16)
@@ -136,7 +143,13 @@ def _run_shape(solution, kernel_name, hsaco, chip, M, K):
     h1        = a_ref.T @ w0_ref                            # M x N, fp32
     gamma_ref = np.asarray(gamma_bf16).astype(np.float32)
     d_ref     = (h1 * gamma_ref[np.newaxis, :]).astype(ml_dtypes.bfloat16)
-    sumsq_ref = np.sum(h1 ** 2, axis=1)                    # M, fp32 (raw sum)
+
+    # 2D sumsq_ref: per-tile Σx² over MT1-wide column blocks.
+    sumsq_ref = np.zeros((M, N_tiles_N), dtype=np.float32)
+    for t in range(N_tiles_N):
+        col_lo = t * MT1
+        col_hi = min((t + 1) * MT1, N)
+        sumsq_ref[:, t] = np.sum(h1[:, col_lo:col_hi] ** 2, axis=1)
 
     sk_args      = compute_sk3_dp_args(M, N, K, solution)
     stagger_u    = solution.get("StaggerU", 0)
@@ -172,13 +185,15 @@ def _run_shape(solution, kernel_name, hsaco, chip, M, K):
         sk_args["sk_tiles"],
         amdgpu_exec.InputArray(gamma_bf16),
         amdgpu_exec.InOutArray(partial_buf),
+        np.uint32(N_tiles_N),              # NTilesN (new arg)
     ]
 
     result_holder = {}
 
     def capture(arguments):
         result_holder["d_gpu"]  = np.asarray(arguments[8].array).copy()
-        result_holder["pb_gpu"] = np.asarray(arguments[31].array).copy()
+        pb_flat = np.asarray(arguments[31].array).copy()
+        result_holder["pb_gpu"] = pb_flat.reshape(M_padded, N_tiles_N)
 
     amdgpu_exec.execute_hsaco(
         hsaco=hsaco,
@@ -190,9 +205,9 @@ def _run_shape(solution, kernel_name, hsaco, chip, M, K):
         verify_fn=capture,
     )
 
-    d_gpu_f32  = result_holder["d_gpu"].astype(np.float32)
-    d_ref_f32  = np.asarray(d_ref).astype(np.float32)
-    pb_gpu     = result_holder["pb_gpu"]
+    d_gpu_f32 = result_holder["d_gpu"].astype(np.float32)
+    d_ref_f32 = np.asarray(d_ref).astype(np.float32)
+    pb_gpu    = result_holder["pb_gpu"]
 
     return d_gpu_f32, d_ref_f32, pb_gpu, sumsq_ref, M
 
@@ -202,14 +217,17 @@ def _run_shape(solution, kernel_name, hsaco, chip, M, K):
 # ---------------------------------------------------------------------------
 
 @requires_gfx950
+@pytest.mark.parametrize("N_hidden", _N_HIDDEN, ids=[f"N{n}" for n in _N_HIDDEN])
 @pytest.mark.parametrize("M,K,label", _SHAPES, ids=[s[2] for s in _SHAPES])
-def test_k1_shape(k1_kernel, M, K, label):
-    """Verify K1 (PartialRMS) outputs D and partialBuf for shape M×N×K."""
+def test_k1_shape(k1_kernel, M, K, label, N_hidden):
+    """Verify K1 (PartialRMS) outputs D and 2D partialBuf for shape M×N_hidden×K."""
     solution, kernel_name, hsaco, chip = k1_kernel
-    N = solution["MacroTile1"]
 
     d_gpu_f32, d_ref_f32, pb_gpu, sumsq_ref, M_actual = \
-        _run_shape(solution, kernel_name, hsaco, chip, M, K)
+        _run_shape(solution, kernel_name, hsaco, chip, M, K, N_hidden)
+
+    MT1 = solution["MacroTile1"]
+    N_tiles_N = math.ceil(N_hidden / MT1)
 
     # Check D (bf16 output, always upcast to fp32 before comparing).
     rtol_d, atol_d = 2e-2, 2e-2
@@ -219,7 +237,7 @@ def test_k1_shape(k1_kernel, M, K, label):
     )
     n_bad_d = len(bad_d[0])
     assert n_bad_d == 0, (
-        f"D mismatch: M={M} N={N} K={K} ({label}): "
+        f"D mismatch: M={M} N={N_hidden} K={K} ({label}): "
         f"{n_bad_d} elements out of tolerance. "
         f"max_abs={np.nanmax(np.abs(d_gpu_f32[:M] - d_ref_f32[:M])):.3e}, "
         f"first bad row={bad_d[0][0]}, col={bad_d[1][0]}: "
@@ -227,17 +245,18 @@ def test_k1_shape(k1_kernel, M, K, label):
         f"ref={d_ref_f32[bad_d[0][0], bad_d[1][0]]:.6f}"
     )
 
-    # Check partialBuf (fp32 Σx², ignore padded rows [M:]).
+    # Check 2D partialBuf (fp32 Σx², compare first M rows).
     rtol_p, atol_p = 1e-4, 1e-4
     bad_p = np.where(
-        ~np.isfinite(pb_gpu[:M]) |
-        (np.abs(pb_gpu[:M] - sumsq_ref) > atol_p + rtol_p * np.abs(sumsq_ref))
+        ~np.isfinite(pb_gpu[:M, :]) |
+        (np.abs(pb_gpu[:M, :] - sumsq_ref) > atol_p + rtol_p * np.abs(sumsq_ref))
     )
     n_bad_p = len(bad_p[0])
     assert n_bad_p == 0, (
-        f"partialBuf mismatch: M={M} N={N} K={K} ({label}): "
-        f"{n_bad_p} rows out of tolerance. "
-        f"max_abs={np.nanmax(np.abs(pb_gpu[:M] - sumsq_ref)):.3e}, "
-        f"first bad row={bad_p[0][0]}: "
-        f"gpu={pb_gpu[bad_p[0][0]]:.6f} ref={sumsq_ref[bad_p[0][0]]:.6f}"
+        f"partialBuf mismatch: M={M} N={N_hidden} K={K} N_tiles_N={N_tiles_N} ({label}): "
+        f"{n_bad_p} entries out of tolerance. "
+        f"max_abs={np.nanmax(np.abs(pb_gpu[:M, :] - sumsq_ref)):.3e}, "
+        f"first bad [{bad_p[0][0]},{bad_p[1][0]}]: "
+        f"gpu={pb_gpu[bad_p[0][0], bad_p[1][0]]:.6f} "
+        f"ref={sumsq_ref[bad_p[0][0], bad_p[1][0]]:.6f}"
     )

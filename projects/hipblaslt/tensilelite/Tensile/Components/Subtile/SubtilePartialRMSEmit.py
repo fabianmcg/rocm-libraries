@@ -3,21 +3,26 @@
 """PartialRMS fused epilogue emitter for the Subtile kernel (gfx950, bf16).
 
 Computes per-row sum-of-squares from the fp32 GEMM accumulator (AGPRs) and
-writes one fp32 value per output row to a global partialBuf. Also applies the
-gamma weight (bf16) to the accumulator in-place. The downstream global-write
+writes one fp32 value per (row, N-tile) to a global partialBuf. Also applies
+the gamma weight (bf16) to the accumulator in-place. The downstream global-write
 path then stores D as bf16.
 
 This is Phase 1 (K1) of a two-kernel RMSNorm implementation:
-  - K1 (this kernel): computes raw Σx² per row and writes to partialBuf.
-    K1 does NOT divide by N_hidden; K2 performs that division.
-  - K2: reads partialBuf, computes rstd = rsqrt(Σx²/N + eps), applies rstd.
+  - K1 (this kernel): computes partial Σx² over MT1 columns owned by this WG
+    and writes to partialBuf[m, WorkGroup1]. K1 does NOT divide by N_hidden.
+  - K2: reads all partialBuf columns per row, reduces, computes
+    rstd = rsqrt(Σx²/N + eps), and writes rstdBuf.
 
-partialBuf layout contract:
-  - One fp32 per output row, indexed by GLOBAL row m.
-  - WG with WorkGroup0 = t writes rows [t*MT0, t*MT0 + MT0).
-  - Stores raw sum of squares (NOT mean). K2 divides by N_hidden.
-  - m_tile_start = WorkGroup0 * MT0. This is derived from sgpr("WorkGroup0")
-    multiplied by MT0 (see KernelWriterAssembly ~14642: SubtileMGuard init).
+partialBuf layout contract (2D, row-major):
+  - Logical shape [M_padded, N_tiles_N], N_tiles_N = ceil(N_hidden / MT1).
+  - partialBuf[m, t] = Σ_{n in WG t's columns} h1[m,n]²  (raw sum; K2 divides by N_hidden).
+  - Byte offset for (m, t) = (m * N_tiles_N + t) * 4.
+  - Row index m = WorkGroup0 * MT0 + intra-tile row (as before).
+  - Tile column t = WorkGroup1 (the WG's index along the N axis).
+  - N_tiles_N is passed as the runtime kernarg NTilesN (u32).
+  - N_hidden may be any multiple of MT1; the WG owns one MT1-wide N-tile.
+  - N_hidden need not divide MT1; the trailing partial N-tile is GEMM-zero-padded
+    and contributes 0 to Σx². The host passes N_tiles_N = ceil(N_hidden / MT1).
 
 Reduction stages:
   1. Within-wave butterfly across the mfma_n column-lanes.
@@ -70,9 +75,13 @@ from rocisa.instruction import (
     VCvtBF16toFP32,
     VFmaF32,
     VLShiftLeftB32,
+    SAddU32,
+    SLShiftLeftB32,
+    SLShiftRightB32,
     VMulF32,
     VMulLOU32,
     VMovB32,
+    VLShiftRightB32,
     VXorB32,
 )
 
@@ -143,11 +152,12 @@ class SubtilePartialRMSEmitter:
         col_byte    = self.writer.vgprPool.checkOut(1,             tag="pRMS_colByte")
         global_addr = self.writer.vgprPool.checkOut(1,             tag="pRMS_globalAddr")
 
-        # Allocate SGPRs: gamma SRD, partialBuf SRD, row base, saved exec.
+        # Allocate SGPRs: gamma SRD, partialBuf SRD, saved exec.
         # saved_exec and lane_mask_sgpr must be 2-aligned for 64-bit EXEC operations.
+        # row_base = WorkGroup0 * MT0 is computed into global_addr on demand (no SGPR).
+        # tile_col = sgpr("WorkGroup1"), live named SGPR, no allocation needed.
         gamma_srd      = self.writer.sgprPool.checkOutAligned(4, 4, tag="pRMS_gammaSrd")
         partial_srd    = self.writer.sgprPool.checkOutAligned(4, 4, tag="pRMS_partialSrd")
-        row_base_sgpr  = self.writer.sgprPool.checkOut(1,           tag="pRMS_rowBase")
         saved_exec     = self.writer.sgprPool.checkOutAligned(
             self.lane_sgpr_count, self.lane_sgpr_count, tag="pRMS_savedExec"
         )
@@ -158,22 +168,19 @@ class SubtilePartialRMSEmitter:
         # Flush MFMA pipeline before reading AGPRs.
         module.add(SWaitCnt(waitAll=True, comment="flush MFMA pipeline before PartialRMS"))
 
-        module.add(self._setup(
-            gamma_srd, partial_srd, lane_id, col_byte, row_base_sgpr
-        ))
+        module.add(self._setup(gamma_srd, partial_srd, lane_id, col_byte))
         module.add(self._squareAndLaneSum(accVgprBase, partials, acc_tmp))
         module.add(self._butterflyReduce(partials, perm_addr, lane_id, bfly_tmp))
         if self.wg_n > 1:
             module.add(self._crossWaveReduce(partials))
         module.add(self._writePartials(
-            partials, partial_srd, row_base_sgpr, lane_id,
+            partials, partial_srd, lane_id,
             saved_exec, lane_mask_sgpr, global_addr
         ))
         module.add(self._applyGammaOnly(accVgprBase, gamma_srd, gamma_tmp, acc_tmp, col_byte))
 
         self.writer.sgprPool.checkIn(lane_mask_sgpr)
         self.writer.sgprPool.checkIn(saved_exec)
-        self.writer.sgprPool.checkIn(row_base_sgpr)
         self.writer.sgprPool.checkIn(partial_srd)
         self.writer.sgprPool.checkIn(gamma_srd)
         self.writer.vgprPool.checkIn(global_addr)
@@ -193,13 +200,16 @@ class SubtilePartialRMSEmitter:
         partial_srd: int,
         lane_id: int,
         col_byte: int,
-        row_base_sgpr: int,
     ) -> Module:
-        """Build gamma SRD, partialBuf SRD; derive lane_id, col_byte, row base.
+        """Build gamma SRD, partialBuf SRD; derive lane_id and col_byte.
 
         Signature append order (matches Signature.py additions):
           slot N+0: RMSNormGamma  (bf16 global buffer pointer, 8 bytes)
           slot N+1: PartialBuf    (fp32 global buffer pointer, 8 bytes) [InOutArray]
+          slot N+2: NTilesN       (u32 by value, 4 bytes)
+
+        row_base = WorkGroup0 * MT0 is computed on demand in _writePartials (no SGPR).
+        tile_col = sgpr("WorkGroup1"), live named SGPR, no extra allocation needed.
         """
         module = Module("PartialRMS setup")
         module.add(SWaitCnt(kmcnt=0, comment="wait for PartialRMS kernarg s_load"))
@@ -219,15 +229,6 @@ class SubtilePartialRMSEmitter:
                            comment="partialBuf SRD limit"))
         module.add(SMovB32(dst=sgpr(partial_srd + 3), src="Srd127_96",
                            comment="partialBuf SRD flags"))
-
-        # row_base_sgpr = WorkGroup0 * MT0 (SGPR arithmetic).
-        from rocisa.instruction import SMulI32
-        module.add(SMulI32(
-            dst=sgpr(row_base_sgpr),
-            src0=sgpr("WorkGroup0"),
-            src1=self.macro_tile0,
-            comment=f"row_base = WorkGroup0 * MT0={self.macro_tile0}",
-        ))
 
         # lane_id = Serial & (wave_size - 1).
         module.add(VAndB32(dst=vgpr(lane_id), src0=vgpr("Serial"), src1=self.wave_size - 1,
@@ -259,6 +260,24 @@ class SubtilePartialRMSEmitter:
                                comment="col_byte += wave column base"))
             self.writer.vgprPool.checkIn(tmp_vgpr)
             self.writer.vgprPool.checkIn(wave_n)
+
+        # Add WorkGroup1 * MT1 * 2 to col_byte so each WG addresses its own gamma tile.
+        # MT1 * 2 is a power-of-2 because MT1 is a power-of-2 and bf16 is 2 bytes.
+        import math as _math_setup
+        wg1_shift = int(_math_setup.log2(self.macro_tile1 * 2))
+        with self.writer.allocTmpSgpr(1, tag="pRMS_setupWG1") as wg1_s:
+            module.add(SLShiftLeftB32(
+                dst=sgpr(wg1_s.idx),
+                src=sgpr("WorkGroup1"),
+                shiftHex=hex(wg1_shift),
+                comment=f"wg1_col_byte = WorkGroup1 * MT1*2 (MT1={self.macro_tile1})",
+            ))
+            module.add(VAddU32(
+                vgpr(col_byte),
+                vgpr(col_byte),
+                sgpr(wg1_s.idx),
+                comment="col_byte += WorkGroup1 * MT1 * 2",
+            ))
 
         return module
 
@@ -427,13 +446,12 @@ class SubtilePartialRMSEmitter:
         self,
         partials: int,
         partial_srd: int,
-        row_base_sgpr: int,
         lane_id: int,
         saved_exec: int,
         lane_mask_sgpr: int,
         global_addr: int,
     ) -> Module:
-        """Step 4: write per-row Σx² to global partialBuf.
+        """Step 4: write per-row Σx² to global partialBuf (2D layout).
 
         MFMA row-group layout (16x16 MFMA, wave64):
           - row group g = lane_id // mfma_n  (0..wave_size//mfma_n - 1)
@@ -441,40 +459,66 @@ class SubtilePartialRMSEmitter:
               row group g owns rows m*mfma_m + g*rows_per_lane .. m*mfma_m + g*rows_per_lane + rows_per_lane-1
 
         Each row group selects one writing lane (col_in_mma == 0, i.e., lane_id % mfma_n == 0).
-        Writing lane with row group g writes partial[m*rows_per_lane+k] to global row:
-          row_base_sgpr + m * mfma_m + g * rows_per_lane + k
+        Writing lane with row group g writes partial[m*rows_per_lane+k] to 2D address:
+          byte_off = (global_row * N_tiles_N + tile_col) * 4
+          where global_row = WorkGroup0 * MT0 + m*mfma_m + k + row_group*rows_per_lane
+                N_tiles_N  = sgpr("NTilesN")  (live named SGPR, no extra allocation)
+                tile_col   = sgpr("WorkGroup1") (live named SGPR, no extra allocation)
 
-        The address is computed per-lane using the runtime g value (derived from lane_id).
+        Row base is computed directly into global_addr per iteration (no SGPR needed).
+        N_tiles_N is moved into a VGPR once to avoid SGPR-src0 restrictions on VMulLOU32.
         """
         module = Module("PartialRMS writePartials")
-        module.addComment1("PartialRMS step 4: predicated write of Σx² to partialBuf")
+        module.addComment1("PartialRMS step 4: predicated 2D write of Σx² to partialBuf")
         module.addComment0(
-            f"  Writing lanes: lane_id % {self.mfma_n} == 0; address includes row group g"
+            f"  Writing lanes: lane_id % {self.mfma_n} == 0; 2D addr = (row*NTilesN+tile_col)*4"
         )
 
         lsc = self.lane_sgpr_count
 
         # Compute row_group = lane_id // mfma_n (runtime, per-lane).
-        row_group    = self.writer.vgprPool.checkOut(1, tag="pRMS_rowGroup")
+        row_group     = self.writer.vgprPool.checkOut(1, tag="pRMS_rowGroup")
         row_group_off = self.writer.vgprPool.checkOut(1, tag="pRMS_rowGroupOff")
+        ntiles_vgpr   = self.writer.vgprPool.checkOut(1, tag="pRMS_nTilesV")
 
         # row_group = lane_id >> log2(mfma_n)  (mfma_n must be power of 2).
         import math as _math
         log2_mfma_n = int(_math.log2(self.mfma_n))
-        from rocisa.instruction import VLShiftRightB32
         module.add(VLShiftRightB32(
             dst=vgpr(row_group),
             shiftHex=hex(log2_mfma_n),
             src=vgpr(lane_id),
             comment=f"row_group = lane_id >> {log2_mfma_n} (= lane_id // {self.mfma_n})",
         ))
-        # row_group_off = row_group * rows_per_lane (byte offset step later)
+        # row_group_off = row_group * rows_per_lane.
         module.add(VMulLOU32(
             dst=vgpr(row_group_off),
             src0=self.rows_per_lane,
             src1=vgpr(row_group),
             comment=f"row_group_off = row_group * {self.rows_per_lane}",
         ))
+
+        # Compute N_tiles_N = ceil(SizesFree[1] / MT1) into ntiles_vgpr.
+        # NTilesN is not loaded as a named SGPR (to avoid SGPR pool pressure).
+        log2_mt1 = int(_math.log2(self.macro_tile1))
+        with self.writer.allocTmpSgpr(1, tag="pRMS_nTilesS") as ntiles_s:
+            module.add(SAddU32(
+                dst=sgpr(ntiles_s.idx),
+                src0=sgpr("SizesFree+1"),
+                src1=self.macro_tile1 - 1,
+                comment=f"N + MT1-1  (MT1={self.macro_tile1})",
+            ))
+            module.add(SLShiftRightB32(
+                dst=sgpr(ntiles_s.idx),
+                shiftHex=hex(log2_mt1),
+                src=sgpr(ntiles_s.idx),
+                comment=f"N_tiles_N = ceil(N / MT1={self.macro_tile1})",
+            ))
+            module.add(VMovB32(
+                dst=vgpr(ntiles_vgpr),
+                src=sgpr(ntiles_s.idx),
+                comment="ntiles_vgpr = N_tiles_N",
+            ))
 
         # Compute lane mask: active iff lane_id % mfma_n == 0.
         col_in_mma = self.writer.vgprPool.checkOut(1, tag="pRMS_colInMma")
@@ -495,32 +539,39 @@ class SubtilePartialRMSEmitter:
             comment="save exec; set exec = writing-lane mask",
         ))
 
-        # Write each partial[m*rows_per_lane+k] to the correct global row.
-        # global_row = row_base_sgpr + m*mfma_m + row_group*rows_per_lane + k
+        # Write each partial[m*rows_per_lane+k] to 2D address in partialBuf.
+        # 2D address: byte_off = (global_row * N_tiles_N + tile_col) * 4
+        # global_row = WorkGroup0 * MT0 + m*mfma_m + k + row_group * rows_per_lane
         for m in range(self.mma_m):
             for k in range(self.rows_per_lane):
                 i = self._partial_idx(m, k)
-                # intra_tile_row = m * mfma_m + row_group * rows_per_lane + k
-                # = m * mfma_m + row_group_off + k
                 m_base = m * self.mfma_m + k
-                module.add(VMovB32(dst=vgpr(global_addr), src=sgpr(row_base_sgpr),
-                                   comment=f"global_addr = row_base for partial[{i}]"))
-                # Add m*mfma_m + k (compile-time constant).
+                # Compute global_row = WorkGroup0 * MT0 + m*mfma_m + k + row_group*rows_per_lane
+                module.add(VMulLOU32(dst=vgpr(global_addr), src0=self.macro_tile0,
+                                     src1=sgpr("WorkGroup0"),
+                                     comment=f"global_row = WorkGroup0 * MT0={self.macro_tile0}"))
                 module.add(VAddU32(vgpr(global_addr), vgpr(global_addr), m_base,
-                                   comment=f"global_addr += {m_base} (m*mfma_m + k)"))
-                # Add row_group * rows_per_lane (runtime).
+                                   comment=f"global_row += {m_base} (m*mfma_m + k)"))
                 module.add(VAddU32(vgpr(global_addr), vgpr(global_addr), vgpr(row_group_off),
-                                   comment="global_addr += row_group * rows_per_lane"))
+                                   comment="global_row += row_group * rows_per_lane"))
+                # global_row * N_tiles_N  (2D row stride multiply).
+                module.add(VMulLOU32(dst=vgpr(global_addr), src0=vgpr(ntiles_vgpr),
+                                     src1=vgpr(global_addr),
+                                     comment="global_row * N_tiles_N"))
+                # + tile_col = WorkGroup1 (named SGPR, live through epilogue).
+                module.add(VAddU32(vgpr(global_addr), vgpr(global_addr), sgpr("WorkGroup1"),
+                                   comment="+ tile_col = WorkGroup1"))
+                # * 4 (fp32 element size).
                 module.add(VLShiftLeftB32(dst=vgpr(global_addr), shiftHex=hex(2),
                                           src=vgpr(global_addr),
-                                          comment="global_addr_bytes = global_row * 4"))
+                                          comment="byte_off = (row*N_tiles_N + tile_col) * 4"))
                 module.add(BufferStoreB32(
                     src=vgpr(partials + i),
                     vaddr=vgpr(global_addr),
                     saddr=sgpr(partial_srd, 4),
                     soffset=0,
                     mubuf=MUBUFModifiers(offen=True),
-                    comment=f"partialBuf[row_base + m={m}*mfma_m + g*rpl + k={k}] = Σx²",
+                    comment=f"partialBuf[row, tile_col] = Σx² (m={m},k={k})",
                 ))
         module.add(SWaitCnt(vlcnt=0, comment="wait partialBuf stores"))
 
@@ -528,6 +579,7 @@ class SubtilePartialRMSEmitter:
         module.add(SMovB64(dst=EXEC(), src=sgpr(saved_exec, lsc),
                            comment="restore exec mask"))
 
+        self.writer.vgprPool.checkIn(ntiles_vgpr)
         self.writer.vgprPool.checkIn(row_group_off)
         self.writer.vgprPool.checkIn(row_group)
 

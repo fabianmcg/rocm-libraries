@@ -36,12 +36,15 @@ from tensile_gemm_rmsnorm_gemm_example import (
 
 
 def _build_k1_args(solution, M, N_hidden, K, a_bf16, w0_bf16, gamma_bf16,
-                   c_bf16, d_bf16, partial_buf, ws_dummy, flags_dummy):
-    """Assemble the kernel argument list for K1."""
+                   c_bf16, d_bf16, partial_buf_2d, N_tiles_N, ws_dummy, flags_dummy):
+    """Assemble the kernel argument list for K1.
+
+    partial_buf_2d is a 2D C-order array of shape (M_padded, N_tiles_N).
+    N_tiles_N is passed as the final scalar kernarg (NTilesN).
+    """
     MT0 = solution["MacroTile0"]
     MT1 = solution["MacroTile1"]
-    M_padded = math.ceil(M / MT0) * MT0
-    numWG = math.ceil(M / MT0) * math.ceil(N_hidden / MT1)
+    numWG = math.ceil(M / MT0) * N_tiles_N
 
     sk = compute_sk3_dp_args(M, N_hidden, K, solution)
     su = solution.get("StaggerU", 0)
@@ -70,20 +73,27 @@ def _build_k1_args(solution, M, N_hidden, K, a_bf16, w0_bf16, gamma_bf16,
         sk["iters_per_tile"], sk["magic_iters_per_tile"], sk["shift_iters_per_tile"],
         sk["sk_iters_per_wg"], sk["sk_grid"], sk["sk_tiles"],
         amdgpu_exec.InputArray(gamma_bf16),
-        amdgpu_exec.InOutArray(partial_buf),
+        amdgpu_exec.InOutArray(partial_buf_2d),
+        np.uint32(N_tiles_N),
     ]
     return args, numWG
 
 
-def _build_k2_args(partial_buf_padded, rstd_buf, M, eps):
-    """Assemble the kernel argument list for K2."""
+def _build_k2_args(partial_buf_2d_flat, rstd_buf, M, N_tiles_N, N_hidden, eps):
+    """Assemble the kernel argument list for K2.
+
+    partial_buf_2d_flat is a flat C-order view of a (M_padded, N_tiles_N) fp32 array.
+    Passes 6 args: partialBuf ptr, rstdBuf ptr, M, N_tiles_N, N_hidden, eps.
+    """
     args = [
-        amdgpu_exec.InputArray(partial_buf_padded),
+        amdgpu_exec.InputArray(partial_buf_2d_flat),
         amdgpu_exec.InOutArray(rstd_buf),
         np.uint32(M),
+        np.uint32(N_tiles_N),
+        np.uint32(N_hidden),
         np.float32(eps),
     ]
-    grid_dim = (math.ceil(M / 256), 1, 1)
+    grid_dim = (math.ceil(M / 4), 1, 1)
     return args, grid_dim
 
 
@@ -144,7 +154,7 @@ def benchmark(chip, M, N_hidden, N_out, K, wg_n, eps, warmup, iters):
     print("Generating assembly...")
     k1_asm, k1_name = generate_asm(k1_sol, assembler, debugConfig)
     k3_asm, k3_name = generate_asm(k3_sol, assembler, debugConfig)
-    _k2_asm, k2_name, k2_hsaco = build_aux_reduction_asm(chip, N_hidden)
+    _k2_asm, k2_name, k2_hsaco = build_aux_reduction_asm(chip)
 
     print("Compiling to HSACO...")
     k1_hsaco = amdgpu_exec.compile_asm_to_hsaco(k1_asm, chip)
@@ -152,10 +162,13 @@ def benchmark(chip, M, N_hidden, N_out, K, wg_n, eps, warmup, iters):
 
     # Buffer dimensions.
     MT0_k1 = k1_sol["MacroTile0"]
+    MT1_k1 = k1_sol["MacroTile1"]
     MT0_k3 = k3_sol["MacroTile0"]
     M_padded_k1 = math.ceil(M / MT0_k1) * MT0_k1
     M_padded_k3 = math.ceil(M / MT0_k3) * MT0_k3
-    M_padded_k2 = math.ceil(M / 256) * 256
+    # K2: ROWS_PER_WG=4 waves per workgroup (one wave per row).
+    M_padded_k2 = math.ceil(M / 4) * 4
+    N_tiles_N   = math.ceil(N_hidden / MT1_k1)
 
     rng = np.random.default_rng(0)
 
@@ -164,27 +177,31 @@ def benchmark(chip, M, N_hidden, N_out, K, wg_n, eps, warmup, iters):
     w1_bf16 = np.asfortranarray(rng.random((N_hidden, N_out), dtype=np.float32).astype(ml_dtypes.bfloat16))
     gamma_bf16 = (rng.random(N_hidden, dtype=np.float32) + 0.5).astype(ml_dtypes.bfloat16)
 
-    c_k1_bf16  = np.zeros((M, N_hidden), dtype=ml_dtypes.bfloat16, order='F')
+    c_k1_bf16 = np.zeros((M, N_hidden), dtype=ml_dtypes.bfloat16, order='F')
     # K1 writes D as (M, N_hidden) col-major; K3 needs A as (N_hidden, M) col-major.
-    d_bf16      = np.zeros((M, N_hidden), dtype=ml_dtypes.bfloat16, order='F')
-    h2_for_k3   = np.zeros((N_hidden, M), dtype=ml_dtypes.bfloat16, order='F')
-    partial_buf = np.zeros(M_padded_k1, dtype=np.float32)
+    d_bf16     = np.zeros((M, N_hidden), dtype=ml_dtypes.bfloat16, order='F')
+    h2_for_k3  = np.zeros((N_hidden, M), dtype=ml_dtypes.bfloat16, order='F')
+    # 2D partialBuf [M_padded_k1, N_tiles_N], C-order so byte offset = (m*N_tiles_N+t)*4.
+    partial_buf_2d = np.zeros((M_padded_k1, N_tiles_N), dtype=np.float32, order='C')
 
-    c_k3_bf16  = np.zeros((M, N_out), dtype=ml_dtypes.bfloat16, order='F')
-    y_bf16     = np.zeros((M, N_out),  dtype=ml_dtypes.bfloat16, order='F')
-    rstd_buf   = np.zeros(M_padded_k2, dtype=np.float32)
+    c_k3_bf16 = np.zeros((M, N_out), dtype=ml_dtypes.bfloat16, order='F')
+    y_bf16    = np.zeros((M, N_out),  dtype=ml_dtypes.bfloat16, order='F')
+    rstd_buf  = np.zeros(M_padded_k2, dtype=np.float32)
 
     ws_dummy    = np.zeros(4, dtype=np.float32)
     flags_dummy = np.zeros(4, dtype=np.float32)
 
-    partial_buf_padded_k2 = np.zeros(M_padded_k2, dtype=np.float32)
+    # K2 needs a (M_padded_k2, N_tiles_N) buffer; pad rows from partial_buf_2d.
+    partial_buf_padded_k2 = np.zeros((M_padded_k2, N_tiles_N), dtype=np.float32, order='C')
     rstd_padded_k3 = np.zeros(M_padded_k3, dtype=np.float32)
 
     args_k1, numWG_k1 = _build_k1_args(
         k1_sol, M, N_hidden, K, a_bf16, w0_bf16, gamma_bf16,
-        c_k1_bf16, d_bf16, partial_buf, ws_dummy, flags_dummy,
+        c_k1_bf16, d_bf16, partial_buf_2d, N_tiles_N, ws_dummy, flags_dummy,
     )
-    args_k2, grid_k2 = _build_k2_args(partial_buf_padded_k2, rstd_buf, M, eps)
+    args_k2, grid_k2 = _build_k2_args(
+        partial_buf_padded_k2, rstd_buf, M, N_tiles_N, N_hidden, eps,
+    )
     args_k3, numWG_k3 = _build_k3_args(
         k3_sol, M, N_hidden, N_out, h2_for_k3, w1_bf16,
         c_k3_bf16, y_bf16, rstd_padded_k3, ws_dummy, flags_dummy,
@@ -244,8 +261,8 @@ def benchmark(chip, M, N_hidden, N_out, K, wg_n, eps, warmup, iters):
 
     k1_flops = 2 * M * N_hidden * K
     k3_flops = 2 * M * N_out * N_hidden
-    # K2 reads M fp32 + writes M fp32.
-    k2_bytes = 2 * M * 4
+    # K2 reads M*N_tiles_N fp32 partials + writes M fp32 rstd values.
+    k2_bytes = (M * N_tiles_N + M) * 4
 
     def report_tflops(name, flops, times_ns):
         if not times_ns:

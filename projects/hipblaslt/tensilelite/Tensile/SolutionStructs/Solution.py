@@ -240,7 +240,7 @@ def _validateRMSNorm(state, printRejectionReason):
     beta are pure runtime scalars there is no compile-time parameter to gate on;
     the host dispatch layer MUST pass alpha=1 and beta=0 when using RMSNorm.
   """
-  if not state["RMSNorm"]:
+  if not state.get("RMSNorm", False):
     return
   if not _validateSubtileEpiloguePrereqs(state, printRejectionReason, "RMSNorm"):
     return
@@ -307,9 +307,9 @@ def _validateRMSNorm(state, printRejectionReason):
 
 
 def _validateSwiGLU(state, printRejectionReason):
-  if not state["SwiGLU"]:
+  if not state.get("SwiGLU", False):
     return
-  if state["RMSNorm"]:
+  if state.get("RMSNorm", False):
     reject(state, printRejectionReason, "SwiGLU and RMSNorm are mutually exclusive")
     return
   if not _validateSubtileEpiloguePrereqs(state, printRejectionReason, "SwiGLU"):
@@ -366,17 +366,21 @@ def _validatePartialRMS(state, printRejectionReason):
   Structural requirements (mirrors _validateRMSNorm):
     - UseSubtileImpl, gfx950, bf16, StreamKForceDPOnly: same as RMSNorm.
     - Mutually exclusive with RMSNorm and SwiGLU.
-    - MacroTile1 > 0 (row-containment: N == MacroTile1 enforced at launch).
+    - MacroTile1 > 0. N_hidden may be any multiple of MT1; the WG owns one MT1-wide
+      N-tile and writes one partial per row to partialBuf[m, WorkGroup1].
+    - partialBuf is 2D [M_padded, N_tiles_N], N_tiles_N = ceil(N_hidden / MT1).
+    - N_hidden need not divide MT1; the trailing partial N-tile is GEMM-zero-padded
+      and contributes 0 to Σx². The host passes N_tiles_N = ceil(N_hidden / MT1).
     - OutputAmaxD and MBSK/AdaptiveGemmGSUA rejected (kernarg layout conflict).
     - GroupedGemm rejected (multi-tile index arithmetic not validated).
     - When wg_n > 1: wg_m must be power-of-two; LDS budget checked.
   """
-  if not state["PartialRMS"]:
+  if not state.get("PartialRMS", False):
     return
-  if state["RMSNorm"]:
+  if state.get("RMSNorm", False):
     reject(state, printRejectionReason, "PartialRMS and RMSNorm are mutually exclusive")
     return
-  if state["SwiGLU"]:
+  if state.get("SwiGLU", False):
     reject(state, printRejectionReason, "PartialRMS and SwiGLU are mutually exclusive")
     return
   if not _validateSubtileEpiloguePrereqs(state, printRejectionReason, "PartialRMS"):
@@ -434,15 +438,15 @@ def _validateRstdScale(state, printRejectionReason):
     - OutputAmaxD and MBSK/AdaptiveGemmGSUA rejected (kernarg layout conflict).
     - No cross-wave LDS needed; no wg_n constraint.
   """
-  if not state["RstdScale"]:
+  if not state.get("RstdScale", False):
     return
-  if state["RMSNorm"]:
+  if state.get("RMSNorm", False):
     reject(state, printRejectionReason, "RstdScale and RMSNorm are mutually exclusive")
     return
-  if state["SwiGLU"]:
+  if state.get("SwiGLU", False):
     reject(state, printRejectionReason, "RstdScale and SwiGLU are mutually exclusive")
     return
-  if state["PartialRMS"]:
+  if state.get("PartialRMS", False):
     reject(state, printRejectionReason, "RstdScale and PartialRMS are mutually exclusive")
     return
   if not _validateSubtileEpiloguePrereqs(state, printRejectionReason, "RstdScale"):
