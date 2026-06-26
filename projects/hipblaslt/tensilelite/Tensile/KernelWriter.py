@@ -5143,7 +5143,12 @@ class KernelWriter(metaclass=abc.ABCMeta):
       # NOT LocalSplitU
       ####################################
 
-
+      if kernel["PartialRMS"]:
+        from .Components.Subtile.SubtilePartialRMSEmit import SubtilePartialRMSEmitter
+        module.addComment1("PartialRMS: fused partial sum-of-squares + gamma epilogue")
+        pRmsEmitter = SubtilePartialRMSEmitter(self, kernel)
+        dtile_agpr_base = dtileInfo.vgprTiles[0].regList.indices[0] if dtileInfo.vgprTiles else 0
+        module.add(pRmsEmitter.emit(dtile_agpr_base))
 
       # global write indices
       module.addComment1("not-LocalSplitU: global write indices")
@@ -9784,6 +9789,15 @@ class KernelWriter(metaclass=abc.ABCMeta):
         self.states.numStoreSgprNames.append("ActivationType")
         self.states.numStoreSgprNameSizes.append(1)
       storeSgprLoad += self.states.numActivationTypeArgSize + self.states.numactivationArgTotalSize
+    if kernel["PartialRMS"]:
+      # RMSNormGamma: 64-bit ptr (2 SGPRs), PartialBuf: 64-bit ptr (2 SGPRs).
+      # NTilesN is a kernarg u32 but is NOT put in the named SGPR block; instead the
+      # epilogue computes it from SizesFree[1] and the compile-time MT1 constant.
+      self.states.numStoreSgprNames.append("RMSNormGamma")
+      self.states.numStoreSgprNameSizes.append(self.states.rpga)  # 2 SGPRs (64-bit ptr)
+      self.states.numStoreSgprNames.append("PartialBuf")
+      self.states.numStoreSgprNameSizes.append(self.states.rpga)  # 2 SGPRs (64-bit ptr)
+      storeSgprLoad += self.states.rpga * 2
     self.states.numStoreSgprToLoad = storeSgprLoad
 
 
