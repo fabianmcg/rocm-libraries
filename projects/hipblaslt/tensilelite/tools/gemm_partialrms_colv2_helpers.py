@@ -22,9 +22,11 @@ import time
 import numpy as np
 import amdgpu_exec
 
-_TENSILE_DIR = os.path.dirname(os.path.abspath(__file__))
-if _TENSILE_DIR not in sys.path:
-    sys.path.insert(0, _TENSILE_DIR)
+_TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+_TENSILE_DIR = os.path.dirname(_TOOLS_DIR)
+for _d in (_TOOLS_DIR, _TENSILE_DIR):
+    if _d not in sys.path:
+        sys.path.insert(0, _d)
 
 
 # ---------------------------------------------------------------------------

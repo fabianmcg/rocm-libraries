@@ -55,9 +55,11 @@ from amdgpu_exec._runtime_module import (
     Ptr,
 )
 
-_TENSILE_DIR = os.path.dirname(os.path.abspath(__file__))
-if _TENSILE_DIR not in sys.path:
-    sys.path.insert(0, _TENSILE_DIR)
+_TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+_TENSILE_DIR = os.path.dirname(_TOOLS_DIR)
+for _d in (_TOOLS_DIR, _TENSILE_DIR):
+    if _d not in sys.path:
+        sys.path.insert(0, _d)
 
 from gemm_partialrms_colv2_helpers import (
     setup_tensile,
@@ -66,42 +68,42 @@ from gemm_partialrms_colv2_helpers import (
     compute_sk3_dp_args,
     _pack_kernel_info,
 )
-from Colv2Generator import build_colv2
+from PartialRmsEpilogueGenerator import build_partial_rms_epilogue
 
-COLV2_BLOCK = (256, 1, 1)
-COLV2_ROWS_PER_BLOCK = 256  # fixed by the kernel: each block handles 256 rows
+PARTIAL_RMS_EPILOGUE_BLOCK = (256, 1, 1)
+PARTIAL_RMS_EPILOGUE_ROWS_PER_BLOCK = 256  # fixed by the kernel: each block handles 256 rows
 
 
-def colv2_launch_args(buf_c: GpuBuffer, buf_d: GpuBuffer,
-                      M: int, N: int, n_d: int,
-                      inv_d: float, eps: float):
-    """Build kernel args for colv2.
+def partial_rms_epilogue_launch_args(buf_c: GpuBuffer, buf_d: GpuBuffer,
+                                     M: int, N: int, nD: int,
+                                     invD: float, eps: float):
+    """Build kernel args for partial_rms_epilogue.
 
     Argument layout (from .amdgpu_metadata offsets):
-      0  (8B): ptr_c  — bf16, col-major M×N
-      8  (8B): ptr_d  — f32,  row-major M×n_d
+      0  (8B): ptrC  — bf16, col-major M×N
+      8  (8B): ptrD  — f32,  row-major M×nD
      16  (4B): M
      20  (4B): N
-     24  (4B): n_d
-     28  (4B): inv_d  — f32 scalar (1/N_hidden)
-     32  (4B): eps    — f32 scalar
+     24  (4B): nD
+     28  (4B): invD  — f32 scalar (1/N_hidden)
+     32  (4B): eps   — f32 scalar
      36+     : hidden group/grid sizes
 
     Launch: block=(256,1,1), grid=(ceil(M/256), ceil(N/256), 1).
-    wg_id_x (s2) selects a 256-row tile; wg_id_y (s3) selects a 256-col tile.
+    wgIdX (s2) selects a 256-row tile; wgIdY (s3) selects a 256-col tile.
     """
-    grid_x = -(-M // 256)   # ceil(M/256) — row tiles → wg_id_x
-    grid_y = -(-N // 256)   # ceil(N/256) — col tiles → wg_id_y
+    gridX = -(-M // 256)   # ceil(M/256) — row tiles → wgIdX
+    gridY = -(-N // 256)   # ceil(N/256) — col tiles → wgIdY
     kp, ka, kpa = _create_kernel_args(
         buf_c, buf_d,
-        np.int32(M), np.int32(N), np.int32(n_d),
-        np.float32(inv_d), np.float32(eps),
-        np.int32(COLV2_BLOCK[0]),
-        np.int32(COLV2_BLOCK[1]),
-        np.int32(COLV2_BLOCK[2]),
-        np.int32(grid_x), np.int32(grid_y), np.int32(1),
+        np.int32(M), np.int32(N), np.int32(nD),
+        np.float32(invD), np.float32(eps),
+        np.int32(PARTIAL_RMS_EPILOGUE_BLOCK[0]),
+        np.int32(PARTIAL_RMS_EPILOGUE_BLOCK[1]),
+        np.int32(PARTIAL_RMS_EPILOGUE_BLOCK[2]),
+        np.int32(gridX), np.int32(gridY), np.int32(1),
     )
-    return kp, ka, kpa, grid_x, grid_y
+    return kp, ka, kpa, gridX, gridY
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +242,7 @@ def benchmark(chip, M, N_hidden, K, eps, warmup, iters, do_verify, wg_n):
     print(f"MacroTile       : {MT0}×{MT1}")
     print(f"N_tiles_N (n_d) : {N_tiles_N}")
     print(f"K1 grid         : ({numWG_k1}, 1, 1)  block: ({k1_sol['NumThreads']}, 1, 1)")
-    print(f"colv2 grid      : ({cd_grid_x}, {cd_grid_y}, 1)  block: {COLV2_BLOCK}")
+    print(f"partial_rms_epilogue grid: ({cd_grid_x}, {cd_grid_y}, 1)  block: {PARTIAL_RMS_EPILOGUE_BLOCK}")
     print()
 
     print("Generating K1 assembly...")
@@ -249,7 +251,7 @@ def benchmark(chip, M, N_hidden, K, eps, warmup, iters, do_verify, wg_n):
 
     print("Compiling HSACO...")
     k1_hsaco  = amdgpu_exec.compile_asm_to_hsaco(k1_asm, chip)
-    cd_asm, _ = build_colv2(chip, M=M)
+    cd_asm, _ = build_partial_rms_epilogue(chip, M=M)
     cd_hsaco  = amdgpu_exec.compile_asm_to_hsaco(cd_asm, chip)
     print()
 
@@ -282,7 +284,7 @@ def benchmark(chip, M, N_hidden, K, eps, warmup, iters, do_verify, wg_n):
     k1_mod  = GpuModule(k1_hsaco)
     k1_fn   = k1_mod.get_function(k1_name)
     cd_mod  = GpuModule(cd_hsaco)
-    cd_fn   = cd_mod.get_function("colv2")
+    cd_fn   = cd_mod.get_function("partial_rms_epilogue")
 
     stream = hip_stream_create()
 
@@ -297,11 +299,11 @@ def benchmark(chip, M, N_hidden, K, eps, warmup, iters, do_verify, wg_n):
         )
 
     def launch_col_div():
-        kp, ka, kpa, gx, gy = colv2_launch_args(
+        kp, ka, kpa, gx, gy = partial_rms_epilogue_launch_args(
             buf_d, buf_pb, M, N_hidden, N_tiles_N, inv_d, eps,
         )
         hip_module_launch_kernel(
-            cd_fn.handle, gx, gy, 1, *COLV2_BLOCK, kp,
+            cd_fn.handle, gx, gy, 1, *PARTIAL_RMS_EPILOGUE_BLOCK, kp,
         )
 
     def reset_buffers():
@@ -379,7 +381,7 @@ def benchmark(chip, M, N_hidden, K, eps, warmup, iters, do_verify, wg_n):
     print(f"{'-'*58}")
     print(f"{'K1 (GEMM+PartRMS)':<20} {med_k1/1e3:>12.1f}  "
           f"{k1_flops/med_k1*1e-3:>14.3f} TFLOPS")
-    print(f"{'colv2 (RMSNorm)':<20} {med_cd/1e3:>12.1f}  "
+    print(f"{'partRmsEpi (RMSNorm)':<20} {med_cd/1e3:>12.1f}  "
           f"{2*d_bytes/(med_cd*1e-9)/1e9:>14.1f} GB/s")
     print(f"{'-'*58}")
     print(f"{'Pipeline':<20} {med_pip/1e3:>12.1f}  "

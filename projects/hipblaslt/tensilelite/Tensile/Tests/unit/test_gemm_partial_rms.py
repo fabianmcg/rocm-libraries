@@ -30,8 +30,10 @@ import pytest
 
 SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
 TENSILE_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", ".."))
-if TENSILE_ROOT not in sys.path:
-    sys.path.insert(0, TENSILE_ROOT)
+TOOLS_DIR    = os.path.join(TENSILE_ROOT, "tools")
+for _d in (TENSILE_ROOT, TOOLS_DIR):
+    if _d not in sys.path:
+        sys.path.insert(0, _d)
 
 try:
     import amdgpu_exec

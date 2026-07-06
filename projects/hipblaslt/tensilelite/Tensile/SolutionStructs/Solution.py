@@ -233,6 +233,12 @@ def _validatePartialRMS(state, printRejectionReason):
   """
   if not state.get("PartialRMS", False):
     return
+  # RstdScale is mutually exclusive with PartialRMS; enforce when it is introduced.
+  if state.get("RstdScale", False):
+    if printRejectionReason:
+      printWarning("PartialRMS is mutually exclusive with RstdScale")
+    state["Valid"] = False
+    return
   if not _validateSubtileEpiloguePrereqs(state, printRejectionReason, "PartialRMS"):
     return
   if state["MacroTile1"] <= 0:

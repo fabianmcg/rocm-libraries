@@ -27,7 +27,7 @@ partialBuf layout contract (2D, row-major):
 Reduction stages:
   1. Within-wave butterfly across the mfma_n column-lanes.
   2. (When wg_n > 1) LDS cross-wave reduction across wg_n sibling waves.
-  3. Lanes where lane_id % mfma_n == 0 write partialBuf. Exec mask is
+  3. Lanes where laneId % mfma_n == 0 write partialBuf. Exec mask is
      narrowed to those lanes for the stores, then restored.
 
 Gamma application:
@@ -37,7 +37,7 @@ Gamma application:
 
 MFMA layout (gfx950, waveSize=64, 16x16 MFMA):
   - lane % mfma_n = N-column within MMA tile
-  - rows_per_lane = (mfma_m * mfma_n) // wave_size
+  - rows_per_lane = (mfma_m * mfma_n) // waveSize
 
 Acc VGPR ordering (N-outer, M-inner):
   acc_idx(base, m, n, k) = base + (n*mma_m + m)*rows_per_lane + k
@@ -103,8 +103,8 @@ class SubtilePartialRMSEmitter:
         # Derive all geometry from kernel params; no module-level constants.
         self.mfma_m = kernel["MatrixInstM"]
         self.mfma_n = kernel["MatrixInstN"]
-        self.wave_size = kernel["WavefrontSize"]
-        self.rows_per_lane = (self.mfma_m * self.mfma_n) // self.wave_size
+        self.waveSize = kernel["WavefrontSize"]
+        self.rows_per_lane = (self.mfma_m * self.mfma_n) // self.waveSize
 
         wg = kernel["MIWaveGroup"]
         self.wg_m = wg[0]
@@ -114,7 +114,7 @@ class SubtilePartialRMSEmitter:
         self.mma_n = (kernel["MacroTile1"] // self.mfma_n) // self.wg_n
         self.macro_tile0 = kernel["MacroTile0"]
         self.macro_tile1 = kernel["MacroTile1"]
-        self.num_rows = self.mma_m * self.rows_per_lane
+        self.numRows = self.mma_m * self.rows_per_lane
 
         # laneSGPRCount: 1 for wave32, 2 for wave64.
         self.lane_sgpr_count = writer.states.laneSGPRCount
@@ -145,25 +145,26 @@ class SubtilePartialRMSEmitter:
         )
 
         # Allocate all VGPRs for temporaries.
-        partials = self.writer.vgprPool.checkOut(self.num_rows, tag="pRMS_partials")
-        acc_tmp = self.writer.vgprPool.checkOut(1, tag="pRMS_accTmp")
-        gamma_tmp = self.writer.vgprPool.checkOut(1, tag="pRMS_gammaTmp")
-        bfly_tmp = self.writer.vgprPool.checkOut(1, tag="pRMS_bflyTmp")
-        perm_addr = self.writer.vgprPool.checkOut(1, tag="pRMS_permAddr")
-        lane_id = self.writer.vgprPool.checkOut(1, tag="pRMS_laneId")
-        col_byte = self.writer.vgprPool.checkOut(1, tag="pRMS_colByte")
-        global_addr = self.writer.vgprPool.checkOut(1, tag="pRMS_globalAddr")
+        partials = self.writer.vgprPool.checkOut(self.numRows, tag="pRMS_partials")
+        accTmp = self.writer.vgprPool.checkOut(1, tag="pRMS_accTmp")
+        gammaTmp = self.writer.vgprPool.checkOut(1, tag="pRMS_gammaTmp")
+        bflyTmp = self.writer.vgprPool.checkOut(1, tag="pRMS_bflyTmp")
+        permAddr = self.writer.vgprPool.checkOut(1, tag="pRMS_permAddr")
+        laneId = self.writer.vgprPool.checkOut(1, tag="pRMS_laneId")
+        # colByte is computed and consumed outside the EXEC-narrowed window in _writePartials.
+        colByte = self.writer.vgprPool.checkOut(1, tag="pRMS_colByte")
+        globalAddr = self.writer.vgprPool.checkOut(1, tag="pRMS_globalAddr")
 
         # Allocate SGPRs: gamma SRD, partialBuf SRD, saved exec.
-        # saved_exec and lane_mask_sgpr must be 2-aligned for 64-bit EXEC operations.
-        # row_base = WorkGroup0 * MT0 is computed into global_addr on demand (no SGPR).
-        # tile_col = sgpr("WorkGroup1"), live named SGPR, no allocation needed.
-        gamma_srd = self.writer.sgprPool.checkOutAligned(4, 4, tag="pRMS_gammaSrd")
-        partial_srd = self.writer.sgprPool.checkOutAligned(4, 4, tag="pRMS_partialSrd")
-        saved_exec = self.writer.sgprPool.checkOutAligned(
+        # savedExec and laneMaskSgpr must be 2-aligned for 64-bit EXEC operations.
+        # rowBase = WorkGroup0 * MT0 is computed into globalAddr on demand (no SGPR).
+        # tileCol = sgpr("WorkGroup1"), live named SGPR, no allocation needed.
+        gammaSrd = self.writer.sgprPool.checkOutAligned(4, 4, tag="pRMS_gammaSrd")
+        partialSrd = self.writer.sgprPool.checkOutAligned(4, 4, tag="pRMS_partialSrd")
+        savedExec = self.writer.sgprPool.checkOutAligned(
             self.lane_sgpr_count, self.lane_sgpr_count, tag="pRMS_savedExec"
         )
-        lane_mask_sgpr = self.writer.sgprPool.checkOutAligned(
+        laneMaskSgpr = self.writer.sgprPool.checkOutAligned(
             self.lane_sgpr_count, self.lane_sgpr_count, tag="pRMS_laneMask"
         )
 
@@ -172,50 +173,50 @@ class SubtilePartialRMSEmitter:
             SWaitCnt(waitAll=True, comment="flush MFMA pipeline before PartialRMS")
         )
 
-        module.add(self._setup(gamma_srd, partial_srd, lane_id, col_byte))
-        module.add(self._squareAndLaneSum(accVgprBase, partials, acc_tmp))
-        module.add(self._butterflyReduce(partials, perm_addr, lane_id, bfly_tmp))
+        module.add(self._setup(gammaSrd, partialSrd, laneId, colByte))
+        module.add(self._squareAndLaneSum(accVgprBase, partials, accTmp))
+        module.add(self._butterflyReduce(partials, permAddr, laneId, bflyTmp))
         if self.wg_n > 1:
             module.add(self._crossWaveReduce(partials))
         module.add(
             self._writePartials(
-                partials, partial_srd, lane_id, saved_exec, lane_mask_sgpr, global_addr
+                partials, partialSrd, laneId, savedExec, laneMaskSgpr, globalAddr
             )
         )
         module.add(
-            self._applyGammaOnly(accVgprBase, gamma_srd, gamma_tmp, acc_tmp, col_byte)
+            self._applyGammaOnly(accVgprBase, gammaSrd, gammaTmp, accTmp, colByte)
         )
 
-        self.writer.sgprPool.checkIn(lane_mask_sgpr)
-        self.writer.sgprPool.checkIn(saved_exec)
-        self.writer.sgprPool.checkIn(partial_srd)
-        self.writer.sgprPool.checkIn(gamma_srd)
-        self.writer.vgprPool.checkIn(global_addr)
-        self.writer.vgprPool.checkIn(col_byte)
-        self.writer.vgprPool.checkIn(lane_id)
-        self.writer.vgprPool.checkIn(perm_addr)
-        self.writer.vgprPool.checkIn(bfly_tmp)
-        self.writer.vgprPool.checkIn(gamma_tmp)
-        self.writer.vgprPool.checkIn(acc_tmp)
+        self.writer.sgprPool.checkIn(laneMaskSgpr)
+        self.writer.sgprPool.checkIn(savedExec)
+        self.writer.sgprPool.checkIn(partialSrd)
+        self.writer.sgprPool.checkIn(gammaSrd)
+        self.writer.vgprPool.checkIn(globalAddr)
+        self.writer.vgprPool.checkIn(colByte)
+        self.writer.vgprPool.checkIn(laneId)
+        self.writer.vgprPool.checkIn(permAddr)
+        self.writer.vgprPool.checkIn(bflyTmp)
+        self.writer.vgprPool.checkIn(gammaTmp)
+        self.writer.vgprPool.checkIn(accTmp)
         self.writer.vgprPool.checkIn(partials)
 
         return module
 
     def _setup(
         self,
-        gamma_srd: int,
-        partial_srd: int,
-        lane_id: int,
-        col_byte: int,
+        gammaSrd: int,
+        partialSrd: int,
+        laneId: int,
+        colByte: int,
     ) -> Module:
-        """Build gamma SRD, partialBuf SRD; derive lane_id and col_byte.
+        """Build gamma SRD, partialBuf SRD; derive laneId and colByte.
 
         Signature append order (matches Signature.py additions):
           slot N+0: RMSNormGamma  (bf16 global buffer pointer, 8 bytes)
           slot N+1: PartialBuf    (fp32 global buffer pointer, 8 bytes) [InOutArray]
 
-        row_base = WorkGroup0 * MT0 is computed on demand in _writePartials (no SGPR).
-        tile_col = sgpr("WorkGroup1"), live named SGPR, no extra allocation needed.
+        rowBase = WorkGroup0 * MT0 is computed on demand in _writePartials (no SGPR).
+        tileCol = sgpr("WorkGroup1"), live named SGPR, no extra allocation needed.
         """
         module = Module("PartialRMS setup")
         module.add(SWaitCnt(kmcnt=0, comment="wait for PartialRMS kernarg s_load"))
@@ -223,136 +224,136 @@ class SubtilePartialRMSEmitter:
         # Gamma SRD (bf16 global buffer).
         module.add(
             SMovB64(
-                dst=sgpr(gamma_srd, 2),
+                dst=sgpr(gammaSrd, 2),
                 src=sgpr("RMSNormGamma", 2),
                 comment="gamma SRD base",
             )
         )
         module.add(
-            SMovB32(dst=sgpr(gamma_srd + 2), src="BufferOOB", comment="gamma SRD limit")
+            SMovB32(dst=sgpr(gammaSrd + 2), src="BufferOOB", comment="gamma SRD limit")
         )
         module.add(
-            SMovB32(dst=sgpr(gamma_srd + 3), src="Srd127_96", comment="gamma SRD flags")
+            SMovB32(dst=sgpr(gammaSrd + 3), src="Srd127_96", comment="gamma SRD flags")
         )
 
         # PartialBuf SRD (fp32 global buffer).
         module.add(
             SMovB64(
-                dst=sgpr(partial_srd, 2),
+                dst=sgpr(partialSrd, 2),
                 src=sgpr("PartialBuf", 2),
                 comment="partialBuf SRD base",
             )
         )
         module.add(
             SMovB32(
-                dst=sgpr(partial_srd + 2),
+                dst=sgpr(partialSrd + 2),
                 src="BufferOOB",
                 comment="partialBuf SRD limit",
             )
         )
         module.add(
             SMovB32(
-                dst=sgpr(partial_srd + 3),
+                dst=sgpr(partialSrd + 3),
                 src="Srd127_96",
                 comment="partialBuf SRD flags",
             )
         )
 
-        # lane_id = Serial & (wave_size - 1).
+        # laneId = Serial & (waveSize - 1).
         module.add(
             VAndB32(
-                dst=vgpr(lane_id),
+                dst=vgpr(laneId),
                 src0=vgpr("Serial"),
-                src1=self.wave_size - 1,
-                comment="lane_id = Serial & (wave_size-1)",
+                src1=self.waveSize - 1,
+                comment="laneId = Serial & (waveSize-1)",
             )
         )
 
-        # col_byte = (lane_id % mfma_n) * 2  (byte offset into bf16 gamma per-lane).
+        # colByte = (laneId % mfma_n) * 2  (byte offset into bf16 gamma per-lane).
         module.add(
             VAndB32(
-                dst=vgpr(col_byte),
-                src0=vgpr(lane_id),
+                dst=vgpr(colByte),
+                src0=vgpr(laneId),
                 src1=self.mfma_n - 1,
-                comment=f"col_in_mma = lane_id % {self.mfma_n}",
+                comment=f"colInMma = laneId % {self.mfma_n}",
             )
         )
         module.add(
             VLShiftLeftB32(
-                dst=vgpr(col_byte),
+                dst=vgpr(colByte),
                 shiftHex=hex(1),
-                src=vgpr(col_byte),
-                comment="col_byte = col_in_mma * 2 (bf16 size)",
+                src=vgpr(colByte),
+                comment="colByte = colInMma * 2 (bf16 size)",
             )
         )
 
-        # When wg_n > 1, shift col_byte by the wave's column base.
+        # When wg_n > 1, shift colByte by the wave's column base.
         if self.wg_n > 1:
-            wave_n = self.writer.vgprPool.checkOut(1, tag="pRMS_setupWaveN")
-            tmp_vgpr = self.writer.vgprPool.checkOutAligned(2, 2, tag="pRMS_setupTmp")
-            tmp_res = ContinuousRegister(tmp_vgpr, 2)
+            waveN = self.writer.vgprPool.checkOut(1, tag="pRMS_setupWaveN")
+            tmpVgpr = self.writer.vgprPool.checkOutAligned(2, 2, tag="pRMS_setupTmp")
+            tmpRes = ContinuousRegister(tmpVgpr, 2)
             module.add(
                 vectorStaticDivide(
-                    wave_n,
+                    waveN,
                     "Serial",
-                    self.wave_size * self.wg_m,
-                    tmp_res,
-                    comment=f"wave_n = Serial / {self.wave_size * self.wg_m}",
+                    self.waveSize * self.wg_m,
+                    tmpRes,
+                    comment=f"waveN = Serial / {self.waveSize * self.wg_m}",
                 )
             )
-            col_base_bytes = self.mma_n * self.mfma_n * 2
+            colBaseBytes = self.mma_n * self.mfma_n * 2
             with self.writer.allocTmpSgpr(1, tag="pRMS_setupColBase") as tmpSgprInfo:
                 module.add(
                     SMovB32(
                         dst=sgpr(tmpSgprInfo.idx),
-                        src=hex(col_base_bytes),
-                        comment=f"col base bytes per wave ({col_base_bytes})",
+                        src=hex(colBaseBytes),
+                        comment=f"col base bytes per wave ({colBaseBytes})",
                     )
                 )
                 module.add(
                     VMulLOU32(
-                        dst=vgpr(wave_n),
+                        dst=vgpr(waveN),
                         src0=sgpr(tmpSgprInfo.idx),
-                        src1=vgpr(wave_n),
-                        comment="wave_n * mma_n * mfma_n * 2",
+                        src1=vgpr(waveN),
+                        comment="waveN * mma_n * mfma_n * 2",
                     )
                 )
             module.add(
                 VAddU32(
-                    vgpr(col_byte),
-                    vgpr(col_byte),
-                    vgpr(wave_n),
-                    comment="col_byte += wave column base",
+                    vgpr(colByte),
+                    vgpr(colByte),
+                    vgpr(waveN),
+                    comment="colByte += wave column base",
                 )
             )
-            self.writer.vgprPool.checkIn(tmp_vgpr)
-            self.writer.vgprPool.checkIn(wave_n)
+            self.writer.vgprPool.checkIn(tmpVgpr)
+            self.writer.vgprPool.checkIn(waveN)
 
-        # Add WorkGroup1 * MT1 * 2 to col_byte so each WG addresses its own gamma tile.
+        # Add WorkGroup1 * MT1 * 2 to colByte so each WG addresses its own gamma tile.
         # MT1 * 2 is a power-of-2 because MT1 is a power-of-2 and bf16 is 2 bytes.
-        wg1_shift = int(math.log2(self.macro_tile1 * 2))
-        with self.writer.allocTmpSgpr(1, tag="pRMS_setupWG1") as wg1_s:
+        wg1Shift = int(math.log2(self.macro_tile1 * 2))
+        with self.writer.allocTmpSgpr(1, tag="pRMS_setupWG1") as wg1S:
             module.add(
                 SLShiftLeftB32(
-                    dst=sgpr(wg1_s.idx),
+                    dst=sgpr(wg1S.idx),
                     src=sgpr("WorkGroup1"),
-                    shiftHex=hex(wg1_shift),
-                    comment=f"wg1_col_byte = WorkGroup1 * MT1*2 (MT1={self.macro_tile1})",
+                    shiftHex=hex(wg1Shift),
+                    comment=f"wg1ColByte = WorkGroup1 * MT1*2 (MT1={self.macro_tile1})",
                 )
             )
             module.add(
                 VAddU32(
-                    vgpr(col_byte),
-                    vgpr(col_byte),
-                    sgpr(wg1_s.idx),
-                    comment="col_byte += WorkGroup1 * MT1 * 2",
+                    vgpr(colByte),
+                    vgpr(colByte),
+                    sgpr(wg1S.idx),
+                    comment="colByte += WorkGroup1 * MT1 * 2",
                 )
             )
 
         return module
 
     def _squareAndLaneSum(
-        self, accVgprBase: int, partials: int, acc_tmp: int
+        self, accVgprBase: int, partials: int, accTmp: int
     ) -> Module:
         """Step 1: compute per-row Σx² from fp32 AGPRs across all N-tiles.
 
@@ -366,7 +367,7 @@ class SubtilePartialRMSEmitter:
                 first = self._acc_idx(accVgprBase, m, 0, k)
                 module.add(
                     VAccvgprReadB32(
-                        vgpr(acc_tmp),
+                        vgpr(accTmp),
                         accvgpr(first),
                         comment=f"read acc[m={m},n=0,k={k}]",
                     )
@@ -374,8 +375,8 @@ class SubtilePartialRMSEmitter:
                 module.add(
                     VMulF32(
                         dst=vgpr(pidx),
-                        src0=vgpr(acc_tmp),
-                        src1=vgpr(acc_tmp),
+                        src0=vgpr(accTmp),
+                        src1=vgpr(accTmp),
                         comment=f"partial[m={m},k={k}] = acc^2",
                     )
                 )
@@ -383,7 +384,7 @@ class SubtilePartialRMSEmitter:
                     a = self._acc_idx(accVgprBase, m, n, k)
                     module.add(
                         VAccvgprReadB32(
-                            vgpr(acc_tmp),
+                            vgpr(accTmp),
                             accvgpr(a),
                             comment=f"read acc[m={m},n={n},k={k}]",
                         )
@@ -391,8 +392,8 @@ class SubtilePartialRMSEmitter:
                     module.add(
                         VFmaF32(
                             dst=vgpr(pidx),
-                            src0=vgpr(acc_tmp),
-                            src1=vgpr(acc_tmp),
+                            src0=vgpr(accTmp),
+                            src1=vgpr(accTmp),
                             src2=vgpr(pidx),
                             comment=f"partial[m={m},k={k}] += acc^2",
                         )
@@ -400,7 +401,7 @@ class SubtilePartialRMSEmitter:
         return module
 
     def _butterflyReduce(
-        self, partials: int, perm_addr: int, lane_id: int, bfly_tmp: int
+        self, partials: int, permAddr: int, laneId: int, bflyTmp: int
     ) -> Module:
         """Step 2: butterfly across mfma_n column-sharing lanes.
 
@@ -416,27 +417,27 @@ class SubtilePartialRMSEmitter:
             module.addComment0(f"  butterfly stride={stride}")
             module.add(
                 VXorB32(
-                    dst=vgpr(perm_addr),
-                    src0=vgpr(lane_id),
+                    dst=vgpr(permAddr),
+                    src0=vgpr(laneId),
                     src1=stride,
-                    comment=f"partner = lane_id ^ {stride}",
+                    comment=f"partner = laneId ^ {stride}",
                 )
             )
             module.add(
                 VLShiftLeftB32(
-                    dst=vgpr(perm_addr),
+                    dst=vgpr(permAddr),
                     shiftHex=hex(2),
-                    src=vgpr(perm_addr),
-                    comment="partner_byte_addr = partner * 4",
+                    src=vgpr(permAddr),
+                    comment="partnerByteAddr = partner * 4",
                 )
             )
-            for i in range(self.num_rows):
+            for i in range(self.numRows):
                 module.add(
                     DSBPermuteB32(
-                        dst=vgpr(bfly_tmp),
-                        src0=vgpr(perm_addr),
+                        dst=vgpr(bflyTmp),
+                        src0=vgpr(permAddr),
                         src1=vgpr(partials + i),
-                        comment=f"bfly_tmp = partner's partial[{i}]",
+                        comment=f"bflyTmp = partner's partial[{i}]",
                     )
                 )
                 module.add(SWaitCnt(dscnt=0, comment="wait ds_bpermute"))
@@ -444,7 +445,7 @@ class SubtilePartialRMSEmitter:
                     VAddF32(
                         dst=vgpr(partials + i),
                         src0=vgpr(partials + i),
-                        src1=vgpr(bfly_tmp),
+                        src1=vgpr(bflyTmp),
                         comment=f"partial[{i}] += partner's value",
                     )
                 )
@@ -458,11 +459,12 @@ class SubtilePartialRMSEmitter:
         holds the full per-row Σx².
 
         Wave-id convention: waveId = waveN*wg_m + waveM.
-        Slot stride: wave_size * num_rows * 4 bytes per wave slot.
+        Slot stride: waveSize * numRows * 4 bytes per wave slot.
         """
-        stride_w = self.wave_size * self.num_rows * 4
-        row_stride = self.num_rows * 4
-        group_stride = self.wg_m * stride_w
+        strideW = self.waveSize * self.numRows * 4
+        # laneSlotBytes: byte stride between adjacent lane slots within a wave slot.
+        laneSlotBytes = self.numRows * 4
+        groupStride = self.wg_m * strideW
 
         module = Module("PartialRMS crossWaveReduce")
         module.addComment1(
@@ -476,101 +478,101 @@ class SubtilePartialRMSEmitter:
             )
         )
 
-        wave_id = self.writer.vgprPool.checkOut(1, tag="pRMS_xwWaveId")
-        wave_m = self.writer.vgprPool.checkOut(1, tag="pRMS_xwWaveM")
-        lane_loc = self.writer.vgprPool.checkOut(1, tag="pRMS_xwLane")
-        write_addr = self.writer.vgprPool.checkOut(1, tag="pRMS_xwWriteAddr")
-        read_addr = self.writer.vgprPool.checkOut(1, tag="pRMS_xwReadAddr")
-        read_tmp = self.writer.vgprPool.checkOut(self.num_rows, tag="pRMS_xwReadTmp")
-        tmp_vgpr = self.writer.vgprPool.checkOutAligned(2, 2, tag="pRMS_xwTmp")
-        tmp_res = ContinuousRegister(tmp_vgpr, 2)
+        waveId = self.writer.vgprPool.checkOut(1, tag="pRMS_xwWaveId")
+        waveM = self.writer.vgprPool.checkOut(1, tag="pRMS_xwWaveM")
+        laneLoc = self.writer.vgprPool.checkOut(1, tag="pRMS_xwLane")
+        writeAddr = self.writer.vgprPool.checkOut(1, tag="pRMS_xwWriteAddr")
+        readAddr = self.writer.vgprPool.checkOut(1, tag="pRMS_xwReadAddr")
+        readTmp = self.writer.vgprPool.checkOut(self.numRows, tag="pRMS_xwReadTmp")
+        tmpVgpr = self.writer.vgprPool.checkOutAligned(2, 2, tag="pRMS_xwTmp")
+        tmpRes = ContinuousRegister(tmpVgpr, 2)
 
         module.add(
             VAndB32(
-                dst=vgpr(lane_loc),
+                dst=vgpr(laneLoc),
                 src0=vgpr("Serial"),
-                src1=self.wave_size - 1,
-                comment="lane_id for LDS addressing",
+                src1=self.waveSize - 1,
+                comment="laneId for LDS addressing",
             )
         )
         module.add(
             vectorStaticDivide(
-                wave_id,
+                waveId,
                 "Serial",
-                self.wave_size,
-                tmp_res,
+                self.waveSize,
+                tmpRes,
                 comment="waveId = Serial / WavefrontSize",
             )
         )
         module.add(
             VAndB32(
-                dst=vgpr(wave_m),
-                src0=vgpr(wave_id),
+                dst=vgpr(waveM),
+                src0=vgpr(waveId),
                 src1=self.wg_m - 1,
                 comment=f"waveM = waveId %% {self.wg_m} (bitmask, wg_m pow2)",
             )
         )
 
-        # Compute write_addr and read_addr base (wave-level byte offsets into LDS).
+        # Compute writeAddr and readAddr base (wave-level byte offsets into LDS).
         with self.writer.allocTmpSgpr(1, tag="pRMS_xwAddrSetup") as tmpSgprInfo:
             tmpSgpr = tmpSgprInfo.idx
             module.add(
                 SMovB32(
-                    dst=sgpr(tmpSgpr), src=hex(stride_w), comment=f"stride_w={stride_w}"
+                    dst=sgpr(tmpSgpr), src=hex(strideW), comment=f"strideW={strideW}"
                 )
             )
             module.add(
                 VMulLOU32(
-                    dst=vgpr(write_addr),
+                    dst=vgpr(writeAddr),
                     src0=sgpr(tmpSgpr),
-                    src1=vgpr(wave_id),
-                    comment="write_addr = waveId * stride_w",
+                    src1=vgpr(waveId),
+                    comment="writeAddr = waveId * strideW",
                 )
             )
             module.add(
                 VMulLOU32(
-                    dst=vgpr(read_addr),
+                    dst=vgpr(readAddr),
                     src0=sgpr(tmpSgpr),
-                    src1=vgpr(wave_m),
-                    comment="read_addr = waveM * stride_w",
+                    src1=vgpr(waveM),
+                    comment="readAddr = waveM * strideW",
                 )
             )
             module.add(
                 SMovB32(
                     dst=sgpr(tmpSgpr),
-                    src=hex(row_stride),
-                    comment=f"row_stride={row_stride}",
+                    src=hex(laneSlotBytes),
+                    comment=f"laneSlotBytes={laneSlotBytes}",
                 )
             )
             module.add(
                 VMulLOU32(
-                    dst=vgpr(lane_loc),
+                    dst=vgpr(laneLoc),
                     src0=sgpr(tmpSgpr),
-                    src1=vgpr(lane_loc),
-                    comment="lane * row_stride",
+                    src1=vgpr(laneLoc),
+                    comment="lane * laneSlotBytes",
                 )
             )
             module.add(
                 VAddU32(
-                    vgpr(write_addr),
-                    vgpr(write_addr),
-                    vgpr(lane_loc),
-                    comment="write_addr += lane*row_stride",
+                    vgpr(writeAddr),
+                    vgpr(writeAddr),
+                    vgpr(laneLoc),
+                    comment="writeAddr += lane*laneSlotBytes",
                 )
             )
             module.add(
                 VAddU32(
-                    vgpr(read_addr),
-                    vgpr(read_addr),
-                    vgpr(lane_loc),
-                    comment="read_addr += lane*row_stride",
+                    vgpr(readAddr),
+                    vgpr(readAddr),
+                    vgpr(laneLoc),
+                    comment="readAddr += lane*laneSlotBytes",
                 )
             )
 
-        for i in range(self.num_rows):
+        for i in range(self.numRows):
             module.add(
                 DSStoreB32(
-                    dstAddr=vgpr(write_addr),
+                    dstAddr=vgpr(writeAddr),
                     src=vgpr(partials + i),
                     ds=DSModifiers(offset=i * 4),
                     comment=f"LDS store partial[{i}]",
@@ -580,22 +582,22 @@ class SubtilePartialRMSEmitter:
         module.add(self.writer._syncThreads(self.kernel, "partialRMS cross-wave write"))
 
         for j in range(self.wg_n):
-            for i in range(self.num_rows):
+            for i in range(self.numRows):
                 module.add(
                     DSLoadB32(
-                        dst=vgpr(read_tmp + i),
-                        src=vgpr(read_addr),
+                        dst=vgpr(readTmp + i),
+                        src=vgpr(readAddr),
                         ds=DSModifiers(offset=i * 4),
                         comment=f"LDS load wave[{j}] partial[{i}]",
                     )
                 )
             module.add(SWaitCnt(dscnt=0, comment="wait LDS reads"))
-            for i in range(self.num_rows):
+            for i in range(self.numRows):
                 if j == 0:
                     module.add(
                         VMovB32(
                             dst=vgpr(partials + i),
-                            src=vgpr(read_tmp + i),
+                            src=vgpr(readTmp + i),
                             comment=f"partial[{i}] = wave[0]",
                         )
                     )
@@ -604,7 +606,7 @@ class SubtilePartialRMSEmitter:
                         VAddF32(
                             dst=vgpr(partials + i),
                             src0=vgpr(partials + i),
-                            src1=vgpr(read_tmp + i),
+                            src1=vgpr(readTmp + i),
                             comment=f"partial[{i}] += wave[{j}]",
                         )
                     )
@@ -613,55 +615,55 @@ class SubtilePartialRMSEmitter:
                     module.add(
                         SMovB32(
                             dst=sgpr(tmpSgprInfo.idx),
-                            src=hex(group_stride),
-                            comment=f"group_stride={group_stride}",
+                            src=hex(groupStride),
+                            comment=f"groupStride={groupStride}",
                         )
                     )
                     module.add(
                         VAddU32(
-                            vgpr(read_addr),
-                            vgpr(read_addr),
+                            vgpr(readAddr),
+                            vgpr(readAddr),
                             sgpr(tmpSgprInfo.idx),
-                            comment="advance read_addr to next sibling",
+                            comment="advance readAddr to next sibling",
                         )
                     )
 
         module.add(self.writer._syncThreads(self.kernel, "partialRMS cross-wave done"))
 
-        self.writer.vgprPool.checkIn(tmp_vgpr)
-        self.writer.vgprPool.checkIn(read_tmp)
-        self.writer.vgprPool.checkIn(read_addr)
-        self.writer.vgprPool.checkIn(write_addr)
-        self.writer.vgprPool.checkIn(lane_loc)
-        self.writer.vgprPool.checkIn(wave_m)
-        self.writer.vgprPool.checkIn(wave_id)
+        self.writer.vgprPool.checkIn(tmpVgpr)
+        self.writer.vgprPool.checkIn(readTmp)
+        self.writer.vgprPool.checkIn(readAddr)
+        self.writer.vgprPool.checkIn(writeAddr)
+        self.writer.vgprPool.checkIn(laneLoc)
+        self.writer.vgprPool.checkIn(waveM)
+        self.writer.vgprPool.checkIn(waveId)
 
         return module
 
     def _writePartials(
         self,
         partials: int,
-        partial_srd: int,
-        lane_id: int,
-        saved_exec: int,
-        lane_mask_sgpr: int,
-        global_addr: int,
+        partialSrd: int,
+        laneId: int,
+        savedExec: int,
+        laneMaskSgpr: int,
+        globalAddr: int,
     ) -> Module:
         """Step 4: write per-row Σx² to global partialBuf (2D layout).
 
         MFMA row-group layout (16x16 MFMA, wave64):
-          - row group g = lane_id // mfma_n  (0..wave_size//mfma_n - 1)
+          - row group g = laneId // mfma_n  (0..waveSize//mfma_n - 1)
           - Within M-tile m, row groups are interleaved:
               row group g owns rows m*mfma_m + g*rows_per_lane .. m*mfma_m + g*rows_per_lane + rows_per_lane-1
 
-        Each row group selects one writing lane (col_in_mma == 0, i.e., lane_id % mfma_n == 0).
+        Each row group selects one writing lane (colInMma == 0, i.e., laneId % mfma_n == 0).
         Writing lane with row group g writes partial[m*rows_per_lane+k] to 2D address:
-          byte_off = (global_row * N_tiles_N + tile_col) * 4
-          where global_row = WorkGroup0 * MT0 + m*mfma_m + k + row_group*rows_per_lane
+          byteOff = (globalRow * N_tiles_N + tileCol) * 4
+          where globalRow = WorkGroup0 * MT0 + m*mfma_m + k + rowGroup*rows_per_lane
                 N_tiles_N  = ceil(SizesFree[1] / MT1), computed on device
-                tile_col   = sgpr("WorkGroup1") (live named SGPR, no extra allocation)
+                tileCol    = sgpr("WorkGroup1") (live named SGPR, no extra allocation)
 
-        Row base is computed directly into global_addr per iteration (no SGPR needed).
+        Row base is computed directly into globalAddr per iteration (no SGPR needed).
         N_tiles_N is moved into a VGPR once to avoid SGPR-src0 restrictions on VMulLOU32.
         """
         module = Module("PartialRMS writePartials")
@@ -669,43 +671,43 @@ class SubtilePartialRMSEmitter:
             "PartialRMS step 4: predicated 2D write of Σx² to partialBuf"
         )
         module.addComment0(
-            f"  Writing lanes: lane_id % {self.mfma_n} == 0; 2D addr = (row*NTilesN+tile_col)*4"
+            f"  Writing lanes: laneId % {self.mfma_n} == 0; 2D addr = (row*NTilesN+tileCol)*4"
         )
 
         lsc = self.lane_sgpr_count
 
-        # Compute row_group = lane_id // mfma_n (runtime, per-lane).
-        row_group = self.writer.vgprPool.checkOut(1, tag="pRMS_rowGroup")
-        row_group_off = self.writer.vgprPool.checkOut(1, tag="pRMS_rowGroupOff")
-        ntiles_vgpr = self.writer.vgprPool.checkOut(1, tag="pRMS_nTilesV")
+        # Compute rowGroup = laneId // mfma_n (runtime, per-lane).
+        rowGroup = self.writer.vgprPool.checkOut(1, tag="pRMS_rowGroup")
+        rowGroupOff = self.writer.vgprPool.checkOut(1, tag="pRMS_rowGroupOff")
+        ntilesVgpr = self.writer.vgprPool.checkOut(1, tag="pRMS_nTilesV")
 
-        # row_group = lane_id >> log2(mfma_n)  (mfma_n must be power of 2).
-        log2_mfma_n = int(math.log2(self.mfma_n))
+        # rowGroup = laneId >> log2(mfma_n)  (mfma_n must be power of 2).
+        log2MfmaN = int(math.log2(self.mfma_n))
         module.add(
             VLShiftRightB32(
-                dst=vgpr(row_group),
-                shiftHex=hex(log2_mfma_n),
-                src=vgpr(lane_id),
-                comment=f"row_group = lane_id >> {log2_mfma_n} (= lane_id // {self.mfma_n})",
+                dst=vgpr(rowGroup),
+                shiftHex=hex(log2MfmaN),
+                src=vgpr(laneId),
+                comment=f"rowGroup = laneId >> {log2MfmaN} (= laneId // {self.mfma_n})",
             )
         )
-        # row_group_off = row_group * rows_per_lane.
+        # rowGroupOff = rowGroup * rows_per_lane.
         module.add(
             VMulLOU32(
-                dst=vgpr(row_group_off),
+                dst=vgpr(rowGroupOff),
                 src0=self.rows_per_lane,
-                src1=vgpr(row_group),
-                comment=f"row_group_off = row_group * {self.rows_per_lane}",
+                src1=vgpr(rowGroup),
+                comment=f"rowGroupOff = rowGroup * {self.rows_per_lane}",
             )
         )
 
-        # Compute N_tiles_N = ceil(SizesFree[1] / MT1) into ntiles_vgpr.
+        # Compute N_tiles_N = ceil(SizesFree[1] / MT1) into ntilesVgpr.
         # NTilesN is not loaded as a named SGPR (to avoid SGPR pool pressure).
-        log2_mt1 = int(math.log2(self.macro_tile1))
-        with self.writer.allocTmpSgpr(1, tag="pRMS_nTilesS") as ntiles_s:
+        log2Mt1 = int(math.log2(self.macro_tile1))
+        with self.writer.allocTmpSgpr(1, tag="pRMS_nTilesS") as ntilesS:
             module.add(
                 SAddU32(
-                    dst=sgpr(ntiles_s.idx),
+                    dst=sgpr(ntilesS.idx),
                     src0=sgpr("SizesFree+1"),
                     src1=self.macro_tile1 - 1,
                     comment=f"N + MT1-1  (MT1={self.macro_tile1})",
@@ -713,208 +715,209 @@ class SubtilePartialRMSEmitter:
             )
             module.add(
                 SLShiftRightB32(
-                    dst=sgpr(ntiles_s.idx),
-                    shiftHex=hex(log2_mt1),
-                    src=sgpr(ntiles_s.idx),
+                    dst=sgpr(ntilesS.idx),
+                    shiftHex=hex(log2Mt1),
+                    src=sgpr(ntilesS.idx),
                     comment=f"N_tiles_N = ceil(N / MT1={self.macro_tile1})",
                 )
             )
             module.add(
                 VMovB32(
-                    dst=vgpr(ntiles_vgpr),
-                    src=sgpr(ntiles_s.idx),
-                    comment="ntiles_vgpr = N_tiles_N",
+                    dst=vgpr(ntilesVgpr),
+                    src=sgpr(ntilesS.idx),
+                    comment="ntilesVgpr = N_tiles_N",
                 )
             )
 
-        # Compute lane mask: active iff lane_id % mfma_n == 0.
-        col_in_mma = self.writer.vgprPool.checkOut(1, tag="pRMS_colInMma")
+        # Compute lane mask: active iff laneId % mfma_n == 0.
+        colInMma = self.writer.vgprPool.checkOut(1, tag="pRMS_colInMma")
         module.add(
             VAndB32(
-                dst=vgpr(col_in_mma),
-                src0=vgpr(lane_id),
+                dst=vgpr(colInMma),
+                src0=vgpr(laneId),
                 src1=self.mfma_n - 1,
-                comment="col_in_mma = lane_id % mfma_n",
+                comment="colInMma = laneId % mfma_n",
             )
         )
         module.add(
             VCmpEQU32(
-                dst=sgpr(lane_mask_sgpr, lsc),
+                dst=sgpr(laneMaskSgpr, lsc),
                 src0=0,
-                src1=vgpr(col_in_mma),
-                comment="lane_mask: lanes where col_in_mma == 0",
+                src1=vgpr(colInMma),
+                comment="laneMask: lanes where colInMma == 0",
             )
         )
-        self.writer.vgprPool.checkIn(col_in_mma)
+        self.writer.vgprPool.checkIn(colInMma)
 
-        # Hoist wg_row_base = WorkGroup0 * MT0 once before the exec-narrowing.
+        # Hoist wgRowBase = WorkGroup0 * MT0 once before the exec-narrowing.
         # VMulLOU32 cannot encode large integer literals in src0; move MT0 into a
         # VGPR first so both sources are registers.
-        wg_row_base = self.writer.vgprPool.checkOut(1, tag="pRMS_wgRowBase")
-        mt0_vgpr = self.writer.vgprPool.checkOut(1, tag="pRMS_mt0V")
+        wgRowBase = self.writer.vgprPool.checkOut(1, tag="pRMS_wgRowBase")
+        mt0Vgpr = self.writer.vgprPool.checkOut(1, tag="pRMS_mt0V")
         module.add(
             VMovB32(
-                dst=vgpr(mt0_vgpr),
+                dst=vgpr(mt0Vgpr),
                 src=self.macro_tile0,
                 comment=f"MT0={self.macro_tile0} → vgpr for VMulLOU32",
             )
         )
         module.add(
             VMulLOU32(
-                dst=vgpr(wg_row_base),
-                src0=vgpr(mt0_vgpr),
+                dst=vgpr(wgRowBase),
+                src0=vgpr(mt0Vgpr),
                 src1=sgpr("WorkGroup0"),
-                comment=f"wg_row_base = WorkGroup0 * MT0={self.macro_tile0}",
+                comment=f"wgRowBase = WorkGroup0 * MT0={self.macro_tile0}",
             )
         )
-        self.writer.vgprPool.checkIn(mt0_vgpr)
+        self.writer.vgprPool.checkIn(mt0Vgpr)
 
-        # Add waveM * mma_m * mfma_m to wg_row_base so each wave addresses its
+        # Add waveM * mma_m * mfma_m to wgRowBase so each wave addresses its
         # own M-row slice when wg_m > 1.
         if self.wg_m > 1:
-            wave_id = self.writer.vgprPool.checkOut(1, tag="pRMS_wpWaveId")
-            wave_m = self.writer.vgprPool.checkOut(1, tag="pRMS_wpWaveM")
-            tmp_vgpr = self.writer.vgprPool.checkOutAligned(2, 2, tag="pRMS_wpTmp")
-            tmp_res = ContinuousRegister(tmp_vgpr, 2)
+            waveId = self.writer.vgprPool.checkOut(1, tag="pRMS_wpWaveId")
+            waveM = self.writer.vgprPool.checkOut(1, tag="pRMS_wpWaveM")
+            tmpVgpr = self.writer.vgprPool.checkOutAligned(2, 2, tag="pRMS_wpTmp")
+            tmpRes = ContinuousRegister(tmpVgpr, 2)
             module.add(
                 vectorStaticDivide(
-                    wave_id,
+                    waveId,
                     "Serial",
-                    self.wave_size,
-                    tmp_res,
+                    self.waveSize,
+                    tmpRes,
                     comment="waveId = Serial / WavefrontSize",
                 )
             )
             module.add(
                 VAndB32(
-                    dst=vgpr(wave_m),
-                    src0=vgpr(wave_id),
+                    dst=vgpr(waveM),
+                    src0=vgpr(waveId),
                     src1=self.wg_m - 1,
                     comment=f"waveM = waveId %% {self.wg_m} (bitmask, wg_m pow2)",
                 )
             )
-            wave_stride = self.mma_m * self.mfma_m
-            wave_stride_vgpr = self.writer.vgprPool.checkOut(1, tag="pRMS_wpWaveStride")
+            waveStride = self.mma_m * self.mfma_m
+            waveStrideVgpr = self.writer.vgprPool.checkOut(1, tag="pRMS_wpWaveStride")
             module.add(
                 VMovB32(
-                    dst=vgpr(wave_stride_vgpr),
-                    src=wave_stride,
-                    comment=f"wave_stride = mma_m * mfma_m = {wave_stride}",
+                    dst=vgpr(waveStrideVgpr),
+                    src=waveStride,
+                    comment=f"waveStride = mma_m * mfma_m = {waveStride}",
                 )
             )
             module.add(
                 VMulLOU32(
-                    dst=vgpr(wave_m),
-                    src0=vgpr(wave_stride_vgpr),
-                    src1=vgpr(wave_m),
-                    comment="waveM_off = waveM * (mma_m * mfma_m)",
+                    dst=vgpr(waveM),
+                    src0=vgpr(waveStrideVgpr),
+                    src1=vgpr(waveM),
+                    comment="waveMOff = waveM * (mma_m * mfma_m)",
                 )
             )
             module.add(
                 VAddU32(
-                    vgpr(wg_row_base),
-                    vgpr(wg_row_base),
-                    vgpr(wave_m),
-                    comment="wg_row_base += waveM * mma_m * mfma_m",
+                    vgpr(wgRowBase),
+                    vgpr(wgRowBase),
+                    vgpr(waveM),
+                    comment="wgRowBase += waveM * mma_m * mfma_m",
                 )
             )
-            self.writer.vgprPool.checkIn(wave_stride_vgpr)
-            self.writer.vgprPool.checkIn(tmp_vgpr)
-            self.writer.vgprPool.checkIn(wave_m)
-            self.writer.vgprPool.checkIn(wave_id)
+            self.writer.vgprPool.checkIn(waveStrideVgpr)
+            self.writer.vgprPool.checkIn(tmpVgpr)
+            self.writer.vgprPool.checkIn(waveM)
+            self.writer.vgprPool.checkIn(waveId)
 
         # Save exec and narrow to writing lanes.
         module.add(
             SAndSaveExecB64(
-                dst=sgpr(saved_exec, lsc),
-                src=sgpr(lane_mask_sgpr, lsc),
+                dst=sgpr(savedExec, lsc),
+                src=sgpr(laneMaskSgpr, lsc),
                 comment="save exec; set exec = writing-lane mask",
             )
         )
 
         # Write each partial[m*rows_per_lane+k] to 2D address in partialBuf.
-        # 2D address: byte_off = (global_row * N_tiles_N + tile_col) * 4
-        # global_row = WorkGroup0 * MT0 + m*mfma_m + k + row_group * rows_per_lane
+        # 2D address: byteOff = (globalRow * N_tiles_N + tileCol) * 4
+        # globalRow = WorkGroup0 * MT0 + m*mfma_m + k + rowGroup * rows_per_lane
         for m in range(self.mma_m):
             for k in range(self.rows_per_lane):
                 i = self._partial_idx(m, k)
-                m_base = m * self.mfma_m + k
+                mBase = m * self.mfma_m + k
+                # mBase is small (< MT0), so this never wraps for M < 2^31.
                 module.add(
                     VAddU32(
-                        vgpr(global_addr),
-                        vgpr(wg_row_base),
-                        m_base,
-                        comment=f"global_row = wg_row_base + {m_base} (m*mfma_m + k)",
+                        vgpr(globalAddr),
+                        vgpr(wgRowBase),
+                        mBase,
+                        comment=f"globalRow = wgRowBase + {mBase} (m*mfma_m + k)",
                     )
                 )
                 module.add(
                     VAddU32(
-                        vgpr(global_addr),
-                        vgpr(global_addr),
-                        vgpr(row_group_off),
-                        comment="global_row += row_group * rows_per_lane",
+                        vgpr(globalAddr),
+                        vgpr(globalAddr),
+                        vgpr(rowGroupOff),
+                        comment="globalRow += rowGroup * rows_per_lane",
                     )
                 )
                 module.add(
                     VMulLOU32(
-                        dst=vgpr(global_addr),
-                        src0=vgpr(ntiles_vgpr),
-                        src1=vgpr(global_addr),
-                        comment="global_row * N_tiles_N",
+                        dst=vgpr(globalAddr),
+                        src0=vgpr(ntilesVgpr),
+                        src1=vgpr(globalAddr),
+                        comment="globalRow * N_tiles_N",
                     )
                 )
                 module.add(
                     VAddU32(
-                        vgpr(global_addr),
-                        vgpr(global_addr),
+                        vgpr(globalAddr),
+                        vgpr(globalAddr),
                         sgpr("WorkGroup1"),
-                        comment="+ tile_col = WorkGroup1",
+                        comment="+ tileCol = WorkGroup1",
                     )
                 )
                 module.add(
                     VLShiftLeftB32(
-                        dst=vgpr(global_addr),
+                        dst=vgpr(globalAddr),
                         shiftHex=hex(2),
-                        src=vgpr(global_addr),
-                        comment="byte_off = (row*N_tiles_N + tile_col) * 4",
+                        src=vgpr(globalAddr),
+                        comment="byteOff = (row*N_tiles_N + tileCol) * 4",
                     )
                 )
                 module.add(
                     BufferStoreB32(
                         src=vgpr(partials + i),
-                        vaddr=vgpr(global_addr),
-                        saddr=sgpr(partial_srd, 4),
+                        vaddr=vgpr(globalAddr),
+                        saddr=sgpr(partialSrd, 4),
                         soffset=0,
                         mubuf=MUBUFModifiers(offen=True),
-                        comment=f"partialBuf[row, tile_col] = Σx² (m={m},k={k})",
+                        comment=f"partialBuf[row, tileCol] = Σx² (m={m},k={k})",
                     )
                 )
         module.add(SWaitCnt(vlcnt=0, comment="wait partialBuf stores"))
 
         module.add(
-            SMovB64(dst=EXEC(), src=sgpr(saved_exec, lsc), comment="restore exec mask")
+            SMovB64(dst=EXEC(), src=sgpr(savedExec, lsc), comment="restore exec mask")
         )
 
-        self.writer.vgprPool.checkIn(wg_row_base)
-        self.writer.vgprPool.checkIn(ntiles_vgpr)
-        self.writer.vgprPool.checkIn(row_group_off)
-        self.writer.vgprPool.checkIn(row_group)
+        self.writer.vgprPool.checkIn(wgRowBase)
+        self.writer.vgprPool.checkIn(ntilesVgpr)
+        self.writer.vgprPool.checkIn(rowGroupOff)
+        self.writer.vgprPool.checkIn(rowGroup)
 
         return module
 
     def _applyGammaOnly(
         self,
         accVgprBase: int,
-        gamma_srd: int,
-        gamma_tmp: int,
-        acc_tmp: int,
-        col_byte: int,
+        gammaSrd: int,
+        gammaTmp: int,
+        accTmp: int,
+        colByte: int,
     ) -> Module:
         """Step 5: load gamma (bf16) and multiply each accumulator element.
 
         For each MMA N-tile n:
-          gamma_fp32 = bf16_to_fp32(gamma[n*mfma_n + lane%mfma_n])
-          for (m, k): acc[m, n, k] *= gamma_fp32
+          gammaFp32 = bf16_to_fp32(gamma[n*mfma_n + lane%mfma_n])
+          for (m, k): acc[m, n, k] *= gammaFp32
 
         No rstd multiply here; K2 applies rstd. The store path writes D as bf16.
         Gamma byte offset for N-tile n: n * mfma_n * 2 (bf16 element size = 2).
@@ -923,22 +926,22 @@ class SubtilePartialRMSEmitter:
         module.addComment1("PartialRMS step 5: apply gamma in-place (no rstd)")
 
         for n in range(self.mma_n):
-            mma_base_byte = n * self.mfma_n * 2
+            mmaBaseByte = n * self.mfma_n * 2
             module.add(
                 BufferLoadD16B16(
-                    vgpr(gamma_tmp),
-                    vgpr(col_byte),
-                    sgpr(gamma_srd, 4),
+                    vgpr(gammaTmp),
+                    vgpr(colByte),
+                    sgpr(gammaSrd, 4),
                     0,
-                    mubuf=MUBUFModifiers(offen=True, offset12=mma_base_byte),
-                    comment=f"gamma_bf16[n={n}]",
+                    mubuf=MUBUFModifiers(offen=True, offset12=mmaBaseByte),
+                    comment=f"gammaBf16[n={n}]",
                 )
             )
             module.add(SWaitCnt(vlcnt=0, comment="wait gamma load"))
             module.add(
                 VCvtBF16toFP32(
-                    vgpr(gamma_tmp),
-                    vgpr(gamma_tmp),
+                    vgpr(gammaTmp),
+                    vgpr(gammaTmp),
                     None,
                     0,
                     comment="gamma bf16 → fp32",
@@ -949,23 +952,23 @@ class SubtilePartialRMSEmitter:
                     a = self._acc_idx(accVgprBase, m, n, k)
                     module.add(
                         VAccvgprReadB32(
-                            vgpr(acc_tmp),
+                            vgpr(accTmp),
                             accvgpr(a),
                             comment=f"read acc[m={m},n={n},k={k}]",
                         )
                     )
                     module.add(
                         VMulF32(
-                            dst=vgpr(acc_tmp),
-                            src0=vgpr(acc_tmp),
-                            src1=vgpr(gamma_tmp),
+                            dst=vgpr(accTmp),
+                            src0=vgpr(accTmp),
+                            src1=vgpr(gammaTmp),
                             comment="acc *= gamma",
                         )
                     )
                     module.add(
                         VAccvgprWriteB32(
                             accvgpr(a),
-                            vgpr(acc_tmp),
+                            vgpr(accTmp),
                             comment=f"write acc[m={m},n={n},k={k}]",
                         )
                     )

@@ -323,7 +323,7 @@ class SignatureDefault(Signature):
             # No RMSNormEps: K2 uses eps, not K1.
             # NTilesN is not a kernarg: the device computes it from SizesFree[1] and the
             # compile-time MT1 constant to avoid consuming a permanent named-SGPR slot.
-            gammaValueType = getSrcValueType(kernel, True)  # bf16
+            gammaValueType = getSrcValueType(kernel, True)  # always bf16; PartialRMS validation enforces isBFloat16().
             signature.addArg("RMSNormGamma", SVK.SIG_GLOBALBUFFER, gammaValueType, "generic")
             signature.addArg("PartialBuf",   SVK.SIG_GLOBALBUFFER, "f32",          "generic")
             userArgumentsInfo.rmsNormSize = 8 + 8  # gamma ptr + partialBuf ptr
