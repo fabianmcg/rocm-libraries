@@ -118,27 +118,44 @@ typedef enum {
  *  ``HIPBLASLT_MATMUL_DESC_FUSED_EPILOGUE``.
  */
 typedef enum {
-  HIPBLASLT_FUSEABLE_EPILOGUE_RESIDUAL_ADD = 0, /**<Add a residual tensor to the GEMM result. Requires a residual pointer attribute.*/
-  HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM      = 1, /**<Per-row RMSNorm (``x * rsqrt(mean(x^2) + eps) * gamma``). Requires gamma and eps attributes.*/
-  HIPBLASLT_FUSEABLE_EPILOGUE_AMAX         = 2, /**<Reserved component: capture the result amax side output.*/
-  HIPBLASLT_FUSEABLE_EPILOGUE_FP8_REQUANT  = 3, /**<Reserved component: requantize the result to FP8.*/
-  HIPBLASLT_FUSEABLE_EPILOGUE_SWIGLU       = 4, /**<Reserved epilogue family: SwiGLU gated linear unit.*/
+  HIPBLASLT_FUSEABLE_EPILOGUE_RESIDUAL_ADD          = 0, /**<Add a residual tensor to the GEMM result. Requires a residual pointer attribute.*/
+  HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM               = 1, /**<Full per-row RMSNorm (``x * rsqrt(mean(x^2) + eps) * gamma``), realized internally as a producer plus a reduce-and-apply kernel. Requires gamma and eps attributes.*/
+  HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS = 2, /**<Decomposed flow (GEMM1 producer): emits the tile-local ``h1 * gamma`` value plus per-row RMSNorm statistics into an RMSNorm handoff descriptor. Requires gamma, eps, and stats attributes.*/
+  HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM_SCALE_APPLY   = 3, /**<Decomposed flow (GEMM2 consumer): applies the deferred per-row RMSNorm scale carried in the handoff descriptor. Requires the stats attribute.*/
+  HIPBLASLT_FUSEABLE_EPILOGUE_AMAX                  = 4, /**<Reserved component: capture the result amax side output.*/
+  HIPBLASLT_FUSEABLE_EPILOGUE_FP8_REQUANT           = 5, /**<Reserved component: requantize the result to FP8.*/
+  HIPBLASLT_FUSEABLE_EPILOGUE_SWIGLU                = 6, /**<Reserved epilogue family: SwiGLU gated linear unit.*/
 } hipblasLtFuseableEpilogue_t;
 
 /*! \ingroup types_module
  *  \brief Attributes settable on a fused epilogue descriptor.
  */
 typedef enum {
-  HIPBLASLT_FUSED_EPILOGUE_RMSNORM_GAMMA = 0, /**<Non-null device pointer to the RMSNorm gamma (per-channel scale) vector of length N. Data type: ``void*``.*/
-  HIPBLASLT_FUSED_EPILOGUE_RMSNORM_EPS   = 1, /**<Epsilon added inside the RMSNorm reciprocal square root. Data type: ``float``.*/
+  HIPBLASLT_FUSED_EPILOGUE_RMSNORM_GAMMA = 0, /**<Non-null device pointer to the RMSNorm gamma (per-channel scale) vector of length N. Used by the RMSNorm and partial-RMSNorm-stats stages. Data type: ``void*``.*/
+  HIPBLASLT_FUSED_EPILOGUE_RMSNORM_EPS   = 1, /**<Epsilon added inside the RMSNorm reciprocal square root. Used by the RMSNorm and partial-RMSNorm-stats stages. Data type: ``float``.*/
   HIPBLASLT_FUSED_EPILOGUE_RESIDUAL_POINTER = 2, /**<Non-null device pointer to the residual input tensor. The tensor has the same logical shape, layout, and data type as D. Data type: ``void*``.*/
   HIPBLASLT_FUSED_EPILOGUE_RESIDUAL_OUTPUT_POINTER = 3, /**<Optional device pointer that receives the updated residual stream after the residual add. If NULL or unset, the residual input tensor is updated in place. Data type: ``void*``.*/
+  HIPBLASLT_FUSED_EPILOGUE_RMSNORM_STATS = 4, /**<Opaque RMSNorm handoff descriptor linking the decomposed producer (partial RMSNorm stats) and consumer (RMSNorm scale-apply) matmul calls. The same object must be set on both handles. Data type: ``hipblasLtFusedEpilogueRMSNormDescriptor_t``.*/
 } hipblasLtFusedEpilogueAttribute_t;
 
 /*! \ingroup types_module
  *  \brief Opaque handle representing a composed (fused) epilogue chain.
  */
 typedef struct hipblasLtFusedEpilogueDescriptor* hipblasLtFusedEpilogueDescriptor_t;
+
+/*! \ingroup types_module
+ *  \brief Opaque, library-populated handoff descriptor for the decomposed RMSNorm flow.
+ *
+ *  \details
+ *  Links the decomposed producer stage (``HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS``
+ *  on the GEMM1 handle) to the consumer stage
+ *  (``HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM_SCALE_APPLY`` on the GEMM2 handle). The producer call
+ *  writes the finalized per-row scale and tiling-dependent metadata into this object; the
+ *  consumer call reads them back. The caller only creates it, sets it on both fused-epilogue
+ *  handles through ``HIPBLASLT_FUSED_EPILOGUE_RMSNORM_STATS``, and destroys it; the fields it
+ *  carries are internal and are not part of the public API.
+ */
+typedef struct hipblasLtFusedEpilogueRMSNormDescriptor* hipblasLtFusedEpilogueRMSNormDescriptor_t;
 
 /*! \ingroup types_module
  *  \brief Specify the batch mode of the matrices.
@@ -849,6 +866,39 @@ hipblasStatus_t hipblasLtFusedEpilogueSetAttribute(hipblasLtFusedEpilogueDescrip
  */
 HIPBLASLT_EXPORT
 hipblasStatus_t hipblasLtFusedEpilogueDestroy(hipblasLtFusedEpilogueDescriptor_t desc);
+
+/*! \ingroup library_module
+ *  \brief Create an opaque RMSNorm handoff descriptor for the decomposed RMSNorm flow.
+ *
+ *  \details
+ *  Allocates the library-populated object that links the decomposed producer
+ *  (\ref HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS) and consumer
+ *  (\ref HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM_SCALE_APPLY) matmul calls. Set the returned handle
+ *  on both fused-epilogue handles via \ref HIPBLASLT_FUSED_EPILOGUE_RMSNORM_STATS, keep it alive
+ *  across the producer and consumer matmul calls, and destroy it with
+ *  \ref hipblasLtFusedEpilogueRMSNormDescriptorDestroy.
+ *
+ *  @param[out]
+ *  desc  Pointer that receives the newly created handle.
+ *
+ *  \retval HIPBLAS_STATUS_SUCCESS If the handle was created.
+ *  \retval HIPBLAS_STATUS_INVALID_VALUE If \p desc is NULL.
+ */
+HIPBLASLT_EXPORT
+hipblasStatus_t
+    hipblasLtFusedEpilogueRMSNormDescriptorCreate(hipblasLtFusedEpilogueRMSNormDescriptor_t* desc);
+
+/*! \ingroup library_module
+ *  \brief Destroy an RMSNorm handoff descriptor.
+ *
+ *  @param[in]
+ *  desc  A handle created by \ref hipblasLtFusedEpilogueRMSNormDescriptorCreate.
+ *
+ *  \retval HIPBLAS_STATUS_SUCCESS If the handle was destroyed.
+ */
+HIPBLASLT_EXPORT
+hipblasStatus_t
+    hipblasLtFusedEpilogueRMSNormDescriptorDestroy(hipblasLtFusedEpilogueRMSNormDescriptor_t desc);
 
 /*! \ingroup library_module
  *  \brief  Set attribute to a matrix multiply descriptor.

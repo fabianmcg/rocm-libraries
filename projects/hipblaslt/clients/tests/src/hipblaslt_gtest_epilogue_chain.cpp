@@ -19,6 +19,11 @@
 //    the updated residual stream.
 //  - Attaching an incomplete RMSNorm handle (unset gamma or unset eps) is rejected at
 //    descriptor-set time (INVALID_VALUE).
+//  - The decomposed flow (partial RMSNorm stats producer + RMSNorm scale-apply consumer) is
+//    linked by an opaque, library-populated RMSNorm handoff descriptor. Its create/destroy
+//    lifecycle returns SUCCESS, full and decomposed RMSNorm stages cannot be mixed in one
+//    chain, and attaching a decomposed handle without the handoff descriptor (or, for the
+//    producer, without gamma/eps) is rejected at descriptor-set time (INVALID_VALUE).
 //  - A complete-but-unimplemented fused epilogue is rejected by hipblasLtMatmul with
 //    NOT_SUPPORTED before kernel selection/launch.
 
@@ -62,6 +67,8 @@ namespace
         {
             if(fused)
                 hipblasLtFusedEpilogueDestroy(fused);
+            if(stats)
+                hipblasLtFusedEpilogueRMSNormDescriptorDestroy(stats);
             if(desc)
                 hipblasLtMatmulDescDestroy(desc);
         }
@@ -92,6 +99,17 @@ namespace
                       HIPBLAS_STATUS_SUCCESS);
         }
 
+        // Create and set the opaque RMSNorm handoff descriptor so a decomposed producer or
+        // consumer handle passes attach-time validation.
+        void completeStats()
+        {
+            ASSERT_EQ(hipblasLtFusedEpilogueRMSNormDescriptorCreate(&stats),
+                      HIPBLAS_STATUS_SUCCESS);
+            ASSERT_EQ(hipblasLtFusedEpilogueSetAttribute(
+                          fused, HIPBLASLT_FUSED_EPILOGUE_RMSNORM_STATS, &stats, sizeof(stats)),
+                      HIPBLAS_STATUS_SUCCESS);
+        }
+
         hipblasStatus_t attach()
         {
             // The attribute value is the handle (a pointer); pass its pointer-sized storage.
@@ -101,8 +119,9 @@ namespace
                                                    sizeof(hipblasLtFusedEpilogueDescriptor_t));
         }
 
-        hipblasLtMatmulDesc_t              desc  = nullptr;
-        hipblasLtFusedEpilogueDescriptor_t fused = nullptr;
+        hipblasLtMatmulDesc_t                     desc  = nullptr;
+        hipblasLtFusedEpilogueDescriptor_t        fused = nullptr;
+        hipblasLtFusedEpilogueRMSNormDescriptor_t stats = nullptr;
     };
 }
 
@@ -165,6 +184,19 @@ TEST(FusedEpilogueLifecycle, createNullRejected)
     EXPECT_EQ(hipblasLtFusedEpilogueCreate(nullptr), HIPBLAS_STATUS_INVALID_VALUE);
 }
 
+TEST(FusedEpilogueLifecycle, rmsnormStatsCreateDestroy)
+{
+    hipblasLtFusedEpilogueRMSNormDescriptor_t stats = nullptr;
+    ASSERT_EQ(hipblasLtFusedEpilogueRMSNormDescriptorCreate(&stats), HIPBLAS_STATUS_SUCCESS);
+    EXPECT_NE(stats, nullptr);
+    EXPECT_EQ(hipblasLtFusedEpilogueRMSNormDescriptorDestroy(stats), HIPBLAS_STATUS_SUCCESS);
+}
+
+TEST(FusedEpilogueLifecycle, rmsnormStatsCreateNullRejected)
+{
+    EXPECT_EQ(hipblasLtFusedEpilogueRMSNormDescriptorCreate(nullptr), HIPBLAS_STATUS_INVALID_VALUE);
+}
+
 // ---- Add: ordering legality ----
 
 TEST_F(FusedEpilogueTest, legalOrderAccepted)
@@ -224,6 +256,56 @@ TEST_F(FusedEpilogueTest, unknownEpilogueRejected)
               HIPBLAS_STATUS_INVALID_VALUE);
 }
 
+// ---- Add: decomposed-flow ordering and family mixing ----
+
+TEST_F(FusedEpilogueTest, decomposedProducerOrderAccepted)
+{
+    // Producer chain: residual add -> partial RMSNorm stats.
+    EXPECT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RESIDUAL_ADD),
+              HIPBLAS_STATUS_SUCCESS);
+    EXPECT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS),
+              HIPBLAS_STATUS_SUCCESS);
+}
+
+TEST_F(FusedEpilogueTest, decomposedConsumerAccepted)
+{
+    // Consumer chain: RMSNorm scale-apply only.
+    EXPECT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM_SCALE_APPLY),
+              HIPBLAS_STATUS_SUCCESS);
+}
+
+TEST_F(FusedEpilogueTest, partialStatsBeforeResidualRejected)
+{
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS),
+              HIPBLAS_STATUS_SUCCESS);
+    EXPECT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RESIDUAL_ADD),
+              HIPBLAS_STATUS_INVALID_VALUE);
+}
+
+TEST_F(FusedEpilogueTest, fullRmsnormThenPartialStatsRejected)
+{
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM),
+              HIPBLAS_STATUS_SUCCESS);
+    EXPECT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS),
+              HIPBLAS_STATUS_INVALID_VALUE);
+}
+
+TEST_F(FusedEpilogueTest, partialStatsThenFullRmsnormRejected)
+{
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS),
+              HIPBLAS_STATUS_SUCCESS);
+    EXPECT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM),
+              HIPBLAS_STATUS_INVALID_VALUE);
+}
+
+TEST_F(FusedEpilogueTest, producerAndConsumerStagesInOneChainRejected)
+{
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS),
+              HIPBLAS_STATUS_SUCCESS);
+    EXPECT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM_SCALE_APPLY),
+              HIPBLAS_STATUS_INVALID_VALUE);
+}
+
 // ---- SetAttribute validation ----
 
 TEST_F(FusedEpilogueTest, setUnknownAttributeRejected)
@@ -247,6 +329,14 @@ TEST_F(FusedEpilogueTest, setNullRmsnormGammaRejected)
     void* gamma = nullptr;
     EXPECT_EQ(hipblasLtFusedEpilogueSetAttribute(
                   fused, HIPBLASLT_FUSED_EPILOGUE_RMSNORM_GAMMA, &gamma, sizeof(gamma)),
+              HIPBLAS_STATUS_INVALID_VALUE);
+}
+
+TEST_F(FusedEpilogueTest, setNullRmsnormStatsRejected)
+{
+    hipblasLtFusedEpilogueRMSNormDescriptor_t null_stats = nullptr;
+    EXPECT_EQ(hipblasLtFusedEpilogueSetAttribute(
+                  fused, HIPBLASLT_FUSED_EPILOGUE_RMSNORM_STATS, &null_stats, sizeof(null_stats)),
               HIPBLAS_STATUS_INVALID_VALUE);
 }
 
@@ -359,6 +449,55 @@ TEST_F(FusedEpilogueTest, attachResidualRmsnormAccepted)
     EXPECT_EQ(attach(), HIPBLAS_STATUS_SUCCESS);
 }
 
+// ---- Attach-time completeness validation: decomposed flow ----
+
+TEST_F(FusedEpilogueTest, attachPartialStatsMissingStatsRejected)
+{
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS),
+              HIPBLAS_STATUS_SUCCESS);
+    completeRmsnorm();
+    // stats handoff descriptor never set -> attach must reject.
+    EXPECT_EQ(attach(), HIPBLAS_STATUS_INVALID_VALUE);
+}
+
+TEST_F(FusedEpilogueTest, attachPartialStatsMissingGammaEpsRejected)
+{
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS),
+              HIPBLAS_STATUS_SUCCESS);
+    completeStats();
+    // gamma/eps never set -> attach must reject (the producer computes the partial stats).
+    EXPECT_EQ(attach(), HIPBLAS_STATUS_INVALID_VALUE);
+}
+
+TEST_F(FusedEpilogueTest, attachCompleteProducerAccepted)
+{
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RESIDUAL_ADD),
+              HIPBLAS_STATUS_SUCCESS);
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS),
+              HIPBLAS_STATUS_SUCCESS);
+    completeResidual();
+    completeRmsnorm();
+    completeStats();
+    EXPECT_EQ(attach(), HIPBLAS_STATUS_SUCCESS);
+}
+
+TEST_F(FusedEpilogueTest, attachScaleApplyMissingStatsRejected)
+{
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM_SCALE_APPLY),
+              HIPBLAS_STATUS_SUCCESS);
+    // stats handoff descriptor never set -> attach must reject.
+    EXPECT_EQ(attach(), HIPBLAS_STATUS_INVALID_VALUE);
+}
+
+TEST_F(FusedEpilogueTest, attachCompleteConsumerAccepted)
+{
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM_SCALE_APPLY),
+              HIPBLAS_STATUS_SUCCESS);
+    completeStats();
+    // scale-apply only needs the handoff descriptor; gamma/eps live on the producer.
+    EXPECT_EQ(attach(), HIPBLAS_STATUS_SUCCESS);
+}
+
 TEST_F(FusedEpilogueTest, attachNullFusedEpilogueDetaches)
 {
     ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM),
@@ -384,6 +523,32 @@ TEST_F(FusedEpilogueTest, attachedFusedEpilogueMatmulNotSupported)
     ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM),
               HIPBLAS_STATUS_SUCCESS);
     completeRmsnorm();
+    ASSERT_EQ(attach(), HIPBLAS_STATUS_SUCCESS);
+
+    EXPECT_EQ(hipblasLtMatmul(nullptr,
+                              desc,
+                              nullptr,
+                              nullptr,
+                              nullptr,
+                              nullptr,
+                              nullptr,
+                              nullptr,
+                              nullptr,
+                              nullptr,
+                              nullptr,
+                              nullptr,
+                              nullptr,
+                              nullptr,
+                              0,
+                              nullptr),
+              HIPBLAS_STATUS_NOT_SUPPORTED);
+}
+
+TEST_F(FusedEpilogueTest, attachedDecomposedConsumerMatmulNotSupported)
+{
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM_SCALE_APPLY),
+              HIPBLAS_STATUS_SUCCESS);
+    completeStats();
     ASSERT_EQ(attach(), HIPBLAS_STATUS_SUCCESS);
 
     EXPECT_EQ(hipblasLtMatmul(nullptr,

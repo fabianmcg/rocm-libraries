@@ -362,6 +362,21 @@ catch(...)
     return exception_to_hipblas_status();
 }
 
+// Opaque, library-populated handoff descriptor for the decomposed RMSNorm flow. The producer
+// call (partial RMSNorm stats) writes the finalized per-row scale and tiling-dependent metadata
+// here; the consumer call (RMSNorm scale-apply) reads them back.
+struct hipblasLtFusedEpilogueRMSNormDescriptor
+{
+    // Per-row reciprocal RMS scale (rstd), FP32, produced by the internal cross-tile reduction.
+    void* per_row_scale = nullptr;
+    // Partial-buffer column count ceil(N / MacroTile1) written by the producer.
+    int partial_cols = 0;
+    // 1/d, where d is the feature (N) count reduced over.
+    float inv_d = 0.f;
+    // Set once a producer call has populated this descriptor.
+    bool populated = false;
+};
+
 // Definition of the opaque handle declared in hipblaslt.h. Owns the composed list of
 // epilogue stages plus their parameters. Attached, non-owning, to a matmul descriptor via
 // HIPBLASLT_MATMUL_DESC_FUSED_EPILOGUE.
@@ -374,17 +389,24 @@ struct hipblasLtFusedEpilogueDescriptor
     void* residual        = nullptr;
     void* residual_output = nullptr;
 
-    // RMSNorm parameters.
+    // RMSNorm parameters (shared by the full RMSNorm and partial-RMSNorm-stats stages).
     void* rmsnorm_gamma = nullptr;
     float rmsnorm_eps   = 0.f;
     bool  eps_set       = false;
+
+    // Decomposed-flow handoff descriptor, set on both the producer and consumer handles.
+    hipblasLtFusedEpilogueRMSNormDescriptor* rmsnorm_stats = nullptr;
 };
 
 namespace
 {
-    // Supported RMSNorm-chain rank. A legal chain is an order-preserving subsequence of
-    // residual add -> RMSNorm -> AMax -> FP8 requant, with each stage appearing at most once.
-    // Returns -1 for unrecognized stages or stages reserved for other epilogue families.
+    // Supported RMSNorm-chain rank. A legal chain is an order-preserving subsequence of the
+    // supported order
+    //   residual add -> {RMSNorm | partial RMSNorm stats | RMSNorm scale-apply} -> AMax -> FP8
+    // with each stage appearing at most once. The three normalization stages share rank 1 so
+    // that at most one of them can appear in a single chain (full vs decomposed are mutually
+    // exclusive). Returns -1 for unrecognized stages or stages reserved for other epilogue
+    // families (e.g. SwiGLU).
     int rmsnorm_chain_rank(hipblasLtFuseableEpilogue_t e)
     {
         switch(e)
@@ -392,6 +414,8 @@ namespace
         case HIPBLASLT_FUSEABLE_EPILOGUE_RESIDUAL_ADD:
             return 0;
         case HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM:
+        case HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS:
+        case HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM_SCALE_APPLY:
             return 1;
         case HIPBLASLT_FUSEABLE_EPILOGUE_AMAX:
             return 2;
@@ -399,6 +423,24 @@ namespace
             return 3;
         default:
             return -1;
+        }
+    }
+
+    // Classify a stage into a chain family so full and decomposed stages cannot be mixed in a
+    // single chain (section 4.3): 0 = shared/neutral, 1 = full RMSNorm family, 2 = decomposed.
+    int rmsnorm_chain_family(hipblasLtFuseableEpilogue_t e)
+    {
+        switch(e)
+        {
+        case HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM:
+        case HIPBLASLT_FUSEABLE_EPILOGUE_AMAX:
+        case HIPBLASLT_FUSEABLE_EPILOGUE_FP8_REQUANT:
+            return 1;
+        case HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS:
+        case HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM_SCALE_APPLY:
+            return 2;
+        default:
+            return 0;
         }
     }
 
@@ -445,6 +487,20 @@ try
             return HIPBLAS_STATUS_INVALID_VALUE;
     }
 
+    // Reject mixing full and decomposed RMSNorm stages in one chain: a single chain
+    // uses either HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM or the decomposed producer/consumer
+    // stages, never both.
+    const int family = rmsnorm_chain_family(epilogue);
+    if(family != 0)
+    {
+        for(auto s : desc->stages)
+        {
+            const int existing = rmsnorm_chain_family(s);
+            if(existing != 0 && existing != family)
+                return HIPBLAS_STATUS_INVALID_VALUE;
+        }
+    }
+
     desc->stages.push_back(epilogue);
     return HIPBLAS_STATUS_SUCCESS;
 }
@@ -489,6 +545,13 @@ try
             return HIPBLAS_STATUS_INVALID_VALUE;
         memcpy(&desc->residual_output, value, sizeof(void*));
         break;
+    case HIPBLASLT_FUSED_EPILOGUE_RMSNORM_STATS:
+        if(sizeInBytes < sizeof(void*))
+            return HIPBLAS_STATUS_INVALID_VALUE;
+        memcpy(&desc->rmsnorm_stats, value, sizeof(void*));
+        if(desc->rmsnorm_stats == nullptr)
+            return HIPBLAS_STATUS_INVALID_VALUE;
+        break;
     default:
         return HIPBLAS_STATUS_INVALID_VALUE;
     }
@@ -500,6 +563,32 @@ catch(...)
 }
 
 hipblasStatus_t hipblasLtFusedEpilogueDestroy(hipblasLtFusedEpilogueDescriptor_t desc)
+try
+{
+    delete desc;
+    return HIPBLAS_STATUS_SUCCESS;
+}
+catch(...)
+{
+    return exception_to_hipblas_status();
+}
+
+hipblasStatus_t
+    hipblasLtFusedEpilogueRMSNormDescriptorCreate(hipblasLtFusedEpilogueRMSNormDescriptor_t* desc)
+try
+{
+    if(desc == nullptr)
+        return HIPBLAS_STATUS_INVALID_VALUE;
+    *desc = new hipblasLtFusedEpilogueRMSNormDescriptor();
+    return HIPBLAS_STATUS_SUCCESS;
+}
+catch(...)
+{
+    return exception_to_hipblas_status();
+}
+
+hipblasStatus_t
+    hipblasLtFusedEpilogueRMSNormDescriptorDestroy(hipblasLtFusedEpilogueRMSNormDescriptor_t desc)
 try
 {
     delete desc;
@@ -536,14 +625,29 @@ try
             rocblaslt::Debug::Instance().markerStop();
             return HIPBLAS_STATUS_INVALID_VALUE;
         }
+        // gamma and eps back both the full RMSNorm stage and the decomposed producer
+        // (partial RMSNorm stats) stage.
         if(fused != nullptr
-           && fused_epilogue_has_stage(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM))
+           && (fused_epilogue_has_stage(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM)
+               || fused_epilogue_has_stage(fused,
+                                           HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS)))
         {
             if(fused->rmsnorm_gamma == nullptr || !fused->eps_set)
             {
                 rocblaslt::Debug::Instance().markerStop();
                 return HIPBLAS_STATUS_INVALID_VALUE;
             }
+        }
+        // Both decomposed stages require the opaque RMSNorm handoff descriptor to be set so
+        // the producer and consumer calls share the same object.
+        if(fused != nullptr
+           && (fused_epilogue_has_stage(fused, HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS)
+               || fused_epilogue_has_stage(fused,
+                                           HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM_SCALE_APPLY))
+           && fused->rmsnorm_stats == nullptr)
+        {
+            rocblaslt::Debug::Instance().markerStop();
+            return HIPBLAS_STATUS_INVALID_VALUE;
         }
     }
 
