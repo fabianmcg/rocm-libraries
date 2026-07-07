@@ -472,9 +472,12 @@ def _build_kernel_body(isa: Tuple[int, int, int]) -> Tuple[Module, int, int]:
         mod.add(TextBlock(f"{bflyLabel}:\n"))
         mod.add(ri.SMovB64(dst=EXEC(), src=sgpr(sExecSave, 2), comment="restore EXEC"))
 
-        # DPP full-wave reduction: row_shr within each 16-lane row, then
-        # row_bcast:15 to cross to lanes 16-31, then row_bcast:31 to all 64 lanes.
-        # bound_ctrl=0 fills shifted-in lanes with 0 so they do not contaminate sums.
+        # DPP full-wave reduction following the waveSplitKReduction pattern:
+        # row_shr:{8,4,2,1} bound_ctrl:0 within each 16-lane row, then
+        # row_bcast:15 adds lane-15's value to lanes 16-31 (crossing the row boundary),
+        # then row_bcast:31 adds lane-31's value to all 64 lanes.
+        # The DPP modifier applies to src1; src0 reads the lane's own value.
+        mod.add(ri.SNop(waitState=0, comment="wait state before DPP reads vAcc"))
         mod.add(ri.SNop(waitState=0, comment="wait state before DPP reads vAcc"))
         for shr in (8, 4, 2, 1):
             mod.add(ri.VAddF32(
@@ -484,18 +487,19 @@ def _build_kernel_body(isa: Tuple[int, int, int]) -> Tuple[Module, int, int]:
                 dpp=DPPModifiers(row_shr=shr, bound_ctrl=0),
                 comment=f"DPP row_shr:{shr} partial sum",
             ))
-        mod.add(ri.VMovB32(
-            dst=vgpr(vBfly),
-            src=vgpr(vAcc),
+        mod.add(ri.VAddF32(
+            dst=vgpr(vAcc),
+            src0=vgpr(vAcc),
+            src1=vgpr(vAcc),
             dpp=DPPModifiers(row_bcast=15),
-            comment="broadcast lane 15 acc to lanes 16-31",
+            comment="add lane 15 sum to lanes 16-31",
         ))
         mod.add(ri.VAddF32(
             dst=vgpr(vAcc),
             src0=vgpr(vAcc),
-            src1=vgpr(vBfly),
+            src1=vgpr(vAcc),
             dpp=DPPModifiers(row_bcast=31),
-            comment="broadcast lane 31 acc to all 64 lanes",
+            comment="broadcast lane 31 total to all 64 lanes",
         ))
 
         # ------------------------------------------------------------------
