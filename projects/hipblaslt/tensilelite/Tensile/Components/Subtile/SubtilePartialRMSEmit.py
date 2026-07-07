@@ -400,20 +400,24 @@ class SubtilePartialRMSEmitter:
         """Step 2: intra-wave reduction across mfma_n column-sharing lanes via DPP.
 
         Uses v_add_f32_dpp row_shr:{stride} bound_ctrl:0, reducing within each
-        aligned 16-lane MFMA row group. bound_ctrl=0 makes lanes shifted in from
-        outside the row read 0, so no cross-row-group contamination occurs.
-        After the chain, lane 0 of each 16-lane group holds the group's full Σx².
-        row_bcast steps are omitted: cross-row-group combination is handled by
-        _crossWaveReduce via LDS.
+        aligned 16-lane MFMA row group. row_shr:N makes lane j read from lane j-N;
+        bound_ctrl=0 makes out-of-row lanes read 0, preventing cross-group contamination.
+        Strides [8,4,2,1] flow all values into lane mfma_n-1 of each group, which is
+        the writing lane selected by _writePartials. Cross-group combination is handled
+        by _crossWaveReduce via LDS.
         """
         module = Module("PartialRMS butterflyReduce")
         module.addComment1(
             f"PartialRMS step 2: DPP row_shr Σx² across {self.mfma_n} column lanes"
         )
         strides = [self.mfma_n >> i for i in range(1, self.mfma_n.bit_length())]
-        module.add(SNop(waitState=0, comment="wait state before DPP reads partials"))
-        for i in range(self.numRows):
-            for stride in strides:
+        module.add(SNop(waitState=0, comment="wait state before first DPP round"))
+        for idx, stride in enumerate(strides):
+            # When numRows == 1, there are no intervening instructions between DPP
+            # rounds on the same register; insert an explicit wait state.
+            if self.numRows == 1 and idx > 0:
+                module.add(SNop(waitState=0, comment="DPP crosslane wait"))
+            for i in range(self.numRows):
                 module.add(
                     VAddF32(
                         dst=vgpr(partials + i),
@@ -630,7 +634,7 @@ class SubtilePartialRMSEmitter:
           - Within M-tile m, row groups are interleaved:
               row group g owns rows m*mfma_m + g*rows_per_lane .. m*mfma_m + g*rows_per_lane + rows_per_lane-1
 
-        Each row group selects one writing lane (colInMma == 0, i.e., laneId % mfma_n == 0).
+        Each row group selects one writing lane (colInMma == mfma_n-1, i.e., the last lane in the group, which holds the full DPP-reduced Σx²).
         Writing lane with row group g writes partial[m*rows_per_lane+k] to 2D address:
           byteOff = (globalRow * N_tiles_N + tileCol) * 4
           where globalRow = WorkGroup0 * MT0 + m*mfma_m + k + rowGroup*rows_per_lane
@@ -645,7 +649,7 @@ class SubtilePartialRMSEmitter:
             "PartialRMS step 4: predicated 2D write of Σx² to partialBuf"
         )
         module.addComment0(
-            f"  Writing lanes: laneId % {self.mfma_n} == 0; 2D addr = (row*NTilesN+tileCol)*4"
+            f"  Writing lanes: laneId % {self.mfma_n} == {self.mfma_n - 1}; 2D addr = (row*NTilesN+tileCol)*4"
         )
 
         lsc = self.lane_sgpr_count
@@ -703,7 +707,8 @@ class SubtilePartialRMSEmitter:
                 )
             )
 
-        # Compute lane mask: active iff laneId % mfma_n == 0.
+        # Compute lane mask: active iff laneId % mfma_n == mfma_n - 1.
+        # DPP row_shr accumulates the full Σx² in the last lane of each row group.
         colInMma = self.writer.vgprPool.checkOut(1, tag="pRMS_colInMma")
         module.add(
             VAndB32(
@@ -716,9 +721,9 @@ class SubtilePartialRMSEmitter:
         module.add(
             VCmpEQU32(
                 dst=sgpr(laneMaskSgpr, lsc),
-                src0=0,
+                src0=self.mfma_n - 1,
                 src1=vgpr(colInMma),
-                comment="laneMask: lanes where colInMma == 0",
+                comment=f"laneMask: lanes where colInMma == {self.mfma_n - 1}",
             )
         )
         self.writer.vgprPool.checkIn(colInMma)
