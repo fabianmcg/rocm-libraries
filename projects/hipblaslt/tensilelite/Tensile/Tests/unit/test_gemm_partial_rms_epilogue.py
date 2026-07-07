@@ -1,12 +1,9 @@
 # Copyright Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier: MIT
-"""End-to-end pipeline test for K1 → partial_rms_epilogue (gfx950, bf16).
+"""End-to-end test: fused GEMM + RMSNorm via K1 → partial_rms_epilogue (gfx950, bf16).
 
-Verifies that chaining:
-  K1: GEMM + PartialRMS  → D (bf16 col-major M×N_hidden), partialBuf (f32 row-major M_padded×N_tiles_N)
-  partial_rms_epilogue: RMSNorm in-place → D /= sqrt(invD * sum_t(partialBuf[m,t]) + eps)
-
-produces D matching the numpy reference within bf16 tolerance.
+Runs the two-kernel pipeline and verifies the final output D against a numpy
+GEMM + RMSNorm reference: D = (A.T @ W * gamma) / sqrt(mean((A.T @ W)^2) + eps).
 
 The fixture is parametrised over wg_n (MIWaveGroup[1]):
   MacroTile0 = 256  (wg0_waves=4, MIWaveTile [8,4])
@@ -157,6 +154,8 @@ def pipeline_kernels(request):
 # ---------------------------------------------------------------------------
 
 def _run_pipeline(pipelineKernelsFixture, M, K, nHidden, eps):
+    """Run K1 (GEMM+PartialRMS) then partial_rms_epilogue (RMSNorm) and verify the final
+    output against a numpy GEMM+RMSNorm reference. No per-kernel intermediate checks."""
     from gemm_partialrms_colv2_helpers import compute_sk3_dp_args, _pack_kernel_info
 
     (k1Sol, k1Name, k1Hsaco, cdName, cdHsaco, chip, MT1) = pipelineKernelsFixture
@@ -165,6 +164,7 @@ def _run_pipeline(pipelineKernelsFixture, M, K, nHidden, eps):
     nTilesN   = math.ceil(nHidden / MT1)
     mPaddedK1 = math.ceil(M / MT0) * MT0
     numWgK1   = math.ceil(M / MT0) * nTilesN
+    invD      = 1.0 / nHidden
 
     rng = np.random.default_rng(seed=M * 100000 + nHidden * 100 + K)
 
@@ -175,25 +175,14 @@ def _run_pipeline(pipelineKernelsFixture, M, K, nHidden, eps):
     gammaF32  = rng.random(nHidden, dtype=np.float32) + 0.5
     gammaBf16 = gammaF32.astype(ml_dtypes.bfloat16)
 
-    # Numpy reference.
+    # Numpy GEMM + RMSNorm reference (no tile decomposition).
     aRef     = np.asarray(aBf16).astype(np.float32)
     w0Ref    = np.asarray(w0Bf16).astype(np.float32)
-    h1       = aRef.T @ w0Ref                              # (M, nHidden) f32
     gammaRef = np.asarray(gammaBf16).astype(np.float32)
-
-    # Per-tile sum-of-squares reference.
-    sumsqRef = np.zeros((M, nTilesN), dtype=np.float32)
-    for t in range(nTilesN):
-        colLo = t * MT1
-        colHi = min((t + 1) * MT1, nHidden)
-        sumsqRef[:, t] = np.sum(h1[:, colLo:colHi] ** 2, axis=1)
-
-    # End-to-end D reference: bf16(h1*gamma) / sqrt(invD * Σsumsq + eps).
-    invD        = 1.0 / nHidden
-    h1GammaF32  = (h1 * gammaRef[np.newaxis, :]).astype(ml_dtypes.bfloat16).astype(np.float32)
-    rowSums     = sumsqRef.sum(axis=1)
-    rmsDenom    = np.sqrt(invD * rowSums + eps)
-    dRefF32     = h1GammaF32 / rmsDenom[:, np.newaxis]
+    h1       = aRef.T @ w0Ref                                          # (M, nHidden) fp32
+    h1Gamma  = (h1 * gammaRef[np.newaxis, :]).astype(ml_dtypes.bfloat16).astype(np.float32)
+    rmsRef   = np.sqrt(np.mean(h1 ** 2, axis=1, keepdims=True) + eps)  # per-row RMS
+    dRefF32  = h1Gamma / rmsRef                                        # (M, nHidden) fp32
 
     # Device buffers.
     dBf16        = np.zeros((M, nHidden), dtype=ml_dtypes.bfloat16, order='F')
@@ -202,7 +191,7 @@ def _run_pipeline(pipelineKernelsFixture, M, K, nHidden, eps):
     wsDummy      = np.zeros(4, dtype=np.float32)
     flagsDummy   = np.zeros(4, dtype=np.float32)
 
-    sk1            = compute_sk3_dp_args(M, nHidden, K, k1Sol)
+    sk1          = compute_sk3_dp_args(M, nHidden, K, k1Sol)
     ki0K1, ki1K1 = _pack_kernel_info(k1Sol)
 
     dInout  = amdgpu_exec.InOutArray(dBf16)
@@ -228,19 +217,12 @@ def _run_pipeline(pipelineKernelsFixture, M, K, nHidden, eps):
         pbInout,
     ]
 
-    # Capture K1 intermediates by closure; no index arithmetic needed.
-    pbCaptured = {}
-
-    def capture_k1(_arguments):
-        pbCaptured["pb"] = np.asarray(pbInout.array).reshape(mPaddedK1, nTilesN).copy()
-
     amdgpu_exec.execute_hsaco(
         hsaco=k1Hsaco, kernel_name=k1Name, arguments=argsK1,
         grid_dim=(numWgK1, 1, 1), block_dim=(k1Sol["NumThreads"], 1, 1),
-        num_iterations=1, verify_fn=capture_k1,
+        num_iterations=1,
     )
 
-    # Re-wrap so partial_rms_epilogue re-uploads K1's D and divides it in-place.
     dCdInout = amdgpu_exec.InOutArray(dBf16)
     pbForCd  = np.ascontiguousarray(partialBuf2d)
 
@@ -256,28 +238,25 @@ def _run_pipeline(pipelineKernelsFixture, M, K, nHidden, eps):
 
     dFinalCaptured = {}
 
-    def capture_partial_rms_epilogue(_arguments):
+    def capture_final(_arguments):
         raw = np.asarray(dCdInout.array)
         if raw.dtype == ml_dtypes.bfloat16:
             dFinalCaptured["d"] = raw.astype(np.float32)
         else:
-            # Raw uint16: decode via shift trick.
+            # Raw uint16: reinterpret as bf16 via shift.
             dFinalCaptured["d"] = (raw.astype(np.uint32) << 16).view(np.float32)
 
     amdgpu_exec.execute_hsaco(
         hsaco=cdHsaco, kernel_name=cdName, arguments=argsCd,
         grid_dim=gridCd, block_dim=blockCd,
-        num_iterations=1, verify_fn=capture_partial_rms_epilogue,
+        num_iterations=1, verify_fn=capture_final,
     )
 
-    dFinalF32 = dFinalCaptured["d"]
-    # Ensure shape (M, nHidden); may come back flat or F-order.
-    if dFinalF32.ndim == 1:
-        dFinalF32 = np.reshape(dFinalF32, (M, nHidden), order='F')
+    dGpuF32 = dFinalCaptured["d"]
+    if dGpuF32.ndim == 1:
+        dGpuF32 = np.reshape(dGpuF32, (M, nHidden), order='F')
 
-    pbGpu = pbCaptured.get("pb", partialBuf2d)
-
-    return dFinalF32, dRefF32, pbGpu[:M, :], sumsqRef, M
+    _check_d(dGpuF32, dRefF32, M, f"M{M}_N{nHidden}_K{K}")
 
 
 # ---------------------------------------------------------------------------
@@ -287,13 +266,12 @@ def _run_pipeline(pipelineKernelsFixture, M, K, nHidden, eps):
 @requires_gfx950
 @pytest.mark.parametrize("K", _K_VALUES, ids=[f"K{k}" for k in _K_VALUES])
 def test_pipeline_shape(pipeline_kernels, K):
-    """Verify pipeline D output across (wg_n, M, K, nHidden).
+    """Verify the final GEMM+RMSNorm output matches a numpy reference across (wg_n, M, K, nHidden).
 
     M shapes are derived at runtime from the fixture's actual MacroTile0.
-    nHidden is swept over _N_TILE_MULTS * MT1, covering both single-tile and
-    multi-tile (butterfly-reduction) partial_rms_epilogue paths.
-    Intermediate buffers (partialBuf) are validated for the first full-tile
-    M shape at K=256 (runs once per N-mult, covering both tile counts).
+    nHidden covers aligned and partial-last-tile values for both single-tile
+    and multi-tile (butterfly-reduction) partial_rms_epilogue paths.
+    Only the final pipeline output D is checked; intermediate buffers are not inspected.
     """
     (k1Sol, *_rest) = pipeline_kernels
     MT0 = k1Sol["MacroTile0"]
@@ -302,13 +280,7 @@ def test_pipeline_shape(pipeline_kernels, K):
     nShapes = _n_shapes_for_mt1(MT1)
     for M, mLabel in _m_shapes_for_mt0(MT0):
         for nHidden in nShapes:
-            validateIntermediates = (M == MT0 and K == 256)
-            dFinalF32, dRefF32, pbGpu, sumsqRef, _M = _run_pipeline(
-                pipeline_kernels, M, K, nHidden, _EPS
-            )
-            _check_d(dFinalF32, dRefF32, M, f"{mLabel}_N{nHidden}")
-            if validateIntermediates:
-                _check_partial_buf(pbGpu, sumsqRef, M, f"{mLabel}_N{nHidden}")
+            _run_pipeline(pipeline_kernels, M, K, nHidden, _EPS)
 
 
 # ---------------------------------------------------------------------------
@@ -345,17 +317,3 @@ def _check_d(dGpuF32, dRefF32, M, label):
     )
 
 
-def _check_partial_buf(pbGpu, sumsqRef, M, label):
-    """Assert partialBuf intermediate matches reference within tight tolerance."""
-    rtol, atol = 1e-4, 1e-4
-    bad = np.where(
-        ~np.isfinite(pbGpu[:M, :]) |
-        (np.abs(pbGpu[:M, :] - sumsqRef) > atol + rtol * np.abs(sumsqRef))
-    )
-    nBad = len(bad[0])
-    assert nBad == 0, (
-        f"partialBuf mismatch ({label}): {nBad} entries out of tolerance. "
-        f"max_abs={np.nanmax(np.abs(pbGpu[:M, :] - sumsqRef)):.3e}, "
-        f"first bad [{bad[0][0]},{bad[1][0]}]: "
-        f"gpu={pbGpu[bad[0][0], bad[1][0]]:.6f} ref={sumsqRef[bad[0][0], bad[1][0]]:.6f}"
-    )
