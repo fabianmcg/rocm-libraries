@@ -25,7 +25,7 @@ partialBuf layout contract (2D, row-major):
     and contributes 0 to Σx². The host passes N_tiles_N = ceil(N_hidden / MT1).
 
 Reduction stages:
-  1. Within-wave butterfly across the mfma_n column-lanes.
+  1. Within-wave DPP row_shr reduction across the mfma_n column-lanes.
   2. (When wg_n > 1) LDS cross-wave reduction across wg_n sibling waves.
   3. Lanes where laneId % mfma_n == 0 write partialBuf. Exec mask is
      narrowed to those lanes for the stores, then restored.
@@ -50,6 +50,7 @@ import math
 from rocisa.code import Module
 from rocisa.container import (
     ContinuousRegister,
+    DPPModifiers,
     DSModifiers,
     EXEC,
     MUBUFModifiers,
@@ -61,12 +62,12 @@ from rocisa.functions import vectorStaticDivide
 from rocisa.instruction import (
     BufferLoadD16B16,
     BufferStoreB32,
-    DSBPermuteB32,
     DSLoadB32,
     DSStoreB32,
     SAndSaveExecB64,
     SMovB32,
     SMovB64,
+    SNop,
     SWaitCnt,
     VAccvgprReadB32,
     VAccvgprWriteB32,
@@ -84,7 +85,6 @@ from rocisa.instruction import (
     VMulLOU32,
     VMovB32,
     VLShiftRightB32,
-    VXorB32,
 )
 
 
@@ -148,8 +148,6 @@ class SubtilePartialRMSEmitter:
         partials = self.writer.vgprPool.checkOut(self.numRows, tag="pRMS_partials")
         accTmp = self.writer.vgprPool.checkOut(1, tag="pRMS_accTmp")
         gammaTmp = self.writer.vgprPool.checkOut(1, tag="pRMS_gammaTmp")
-        bflyTmp = self.writer.vgprPool.checkOut(1, tag="pRMS_bflyTmp")
-        permAddr = self.writer.vgprPool.checkOut(1, tag="pRMS_permAddr")
         laneId = self.writer.vgprPool.checkOut(1, tag="pRMS_laneId")
         # colByte is computed and consumed outside the EXEC-narrowed window in _writePartials.
         colByte = self.writer.vgprPool.checkOut(1, tag="pRMS_colByte")
@@ -175,7 +173,7 @@ class SubtilePartialRMSEmitter:
 
         module.add(self._setup(gammaSrd, partialSrd, laneId, colByte))
         module.add(self._squareAndLaneSum(accVgprBase, partials, accTmp))
-        module.add(self._butterflyReduce(partials, permAddr, laneId, bflyTmp))
+        module.add(self._butterflyReduce(partials))
         if self.wg_n > 1:
             module.add(self._crossWaveReduce(partials))
         module.add(
@@ -194,8 +192,6 @@ class SubtilePartialRMSEmitter:
         self.writer.vgprPool.checkIn(globalAddr)
         self.writer.vgprPool.checkIn(colByte)
         self.writer.vgprPool.checkIn(laneId)
-        self.writer.vgprPool.checkIn(permAddr)
-        self.writer.vgprPool.checkIn(bflyTmp)
         self.writer.vgprPool.checkIn(gammaTmp)
         self.writer.vgprPool.checkIn(accTmp)
         self.writer.vgprPool.checkIn(partials)
@@ -400,53 +396,31 @@ class SubtilePartialRMSEmitter:
                     )
         return module
 
-    def _butterflyReduce(
-        self, partials: int, permAddr: int, laneId: int, bflyTmp: int
-    ) -> Module:
-        """Step 2: butterfly across mfma_n column-sharing lanes.
+    def _butterflyReduce(self, partials: int) -> Module:
+        """Step 2: intra-wave reduction across mfma_n column-sharing lanes via DPP.
 
-        Strides computed as [mfma_n >> i for i in range(1, mfma_n.bit_length())].
-        For mfma_n=16 → [8, 4, 2, 1] (4 stages).
+        Uses v_add_f32_dpp row_shr:{stride} bound_ctrl:0, reducing within each
+        aligned 16-lane MFMA row group. bound_ctrl=0 makes lanes shifted in from
+        outside the row read 0, so no cross-row-group contamination occurs.
+        After the chain, lane 0 of each 16-lane group holds the group's full Σx².
+        row_bcast steps are omitted: cross-row-group combination is handled by
+        _crossWaveReduce via LDS.
         """
         module = Module("PartialRMS butterflyReduce")
         module.addComment1(
-            f"PartialRMS step 2: butterfly Σx² across {self.mfma_n} column lanes"
+            f"PartialRMS step 2: DPP row_shr Σx² across {self.mfma_n} column lanes"
         )
         strides = [self.mfma_n >> i for i in range(1, self.mfma_n.bit_length())]
-        for stride in strides:
-            module.addComment0(f"  butterfly stride={stride}")
-            module.add(
-                VXorB32(
-                    dst=vgpr(permAddr),
-                    src0=vgpr(laneId),
-                    src1=stride,
-                    comment=f"partner = laneId ^ {stride}",
-                )
-            )
-            module.add(
-                VLShiftLeftB32(
-                    dst=vgpr(permAddr),
-                    shiftHex=hex(2),
-                    src=vgpr(permAddr),
-                    comment="partnerByteAddr = partner * 4",
-                )
-            )
-            for i in range(self.numRows):
-                module.add(
-                    DSBPermuteB32(
-                        dst=vgpr(bflyTmp),
-                        src0=vgpr(permAddr),
-                        src1=vgpr(partials + i),
-                        comment=f"bflyTmp = partner's partial[{i}]",
-                    )
-                )
-                module.add(SWaitCnt(dscnt=0, comment="wait ds_bpermute"))
+        module.add(SNop(waitState=0, comment="wait state before DPP reads partials"))
+        for i in range(self.numRows):
+            for stride in strides:
                 module.add(
                     VAddF32(
                         dst=vgpr(partials + i),
                         src0=vgpr(partials + i),
-                        src1=vgpr(bflyTmp),
-                        comment=f"partial[{i}] += partner's value",
+                        src1=vgpr(partials + i),
+                        dpp=DPPModifiers(row_shr=stride, bound_ctrl=0),
+                        comment=f"DPP row_shr:{stride} reduce partial[{i}]",
                     )
                 )
         return module
