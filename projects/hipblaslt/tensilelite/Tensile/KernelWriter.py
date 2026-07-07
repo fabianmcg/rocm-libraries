@@ -9798,6 +9798,11 @@ class KernelWriter(metaclass=abc.ABCMeta):
       self.states.numStoreSgprNames.append("PartialBuf")
       self.states.numStoreSgprNameSizes.append(self.states.rpga)  # 2 SGPRs (64-bit ptr)
       storeSgprLoad += self.states.rpga * 2
+      if kernel["PartialRMSResidualAdd"]:
+        # ResidualBuf: 64-bit ptr (2 SGPRs) for the bf16 col-major residual tensor.
+        self.states.numStoreSgprNames.append("ResidualBuf")
+        self.states.numStoreSgprNameSizes.append(self.states.rpga)  # 2 SGPRs (64-bit ptr)
+        storeSgprLoad += self.states.rpga
     self.states.numStoreSgprToLoad = storeSgprLoad
 
 

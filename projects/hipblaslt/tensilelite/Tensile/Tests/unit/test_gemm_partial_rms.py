@@ -127,33 +127,49 @@ def _m_shapes_for_mt0(mt0):
 # Session-scoped fixture: build + compile once per (wg0_waves, wg1_waves)
 # ---------------------------------------------------------------------------
 
+_RESIDUAL_ADD = [False, True]
+
+_K1_FIXTURE_PARAMS = [(*wg, ra) for wg in _WG_CONFIGS for ra in _RESIDUAL_ADD]
+_K1_FIXTURE_IDS = [
+    f"wg{w0}x{w1}_{'res' if ra else 'nores'}"
+    for w0, w1, ra in _K1_FIXTURE_PARAMS
+]
+
+
 @pytest.fixture(
     scope="session",
-    params=_WG_CONFIGS,
-    ids=[f"wg0x{c[0]}_wg1x{c[1]}" for c in _WG_CONFIGS],
+    params=_K1_FIXTURE_PARAMS,
+    ids=_K1_FIXTURE_IDS,
 )
 def k1_kernel(request):
     """Build, assemble, and compile the K1 PartialRMS kernel for each tile config."""
     sys.path.insert(0, TENSILE_ROOT)
     from gemm_partialrms_colv2_helpers import setup_tensile, build_k1_solution, generate_asm
 
-    wg0Waves, wg1Waves = request.param
+    wg0Waves, wg1Waves, residualAdd = request.param
     chip = amdgpu_exec.get_chip()
 
     assembler, isaInfoMap, debugConfig = setup_tensile(chip)
     # wt0=4 (not 8 as in the default YAML) — use miOverride to specify the full MI spec.
     miOverride = [16, 16, 32, 1, 1, 4, 4, wg0Waves, wg1Waves]
-    solution = build_k1_solution(chip, assembler, isaInfoMap, miOverride=miOverride)
+    solution = build_k1_solution(chip, assembler, isaInfoMap,
+                                 miOverride=miOverride, residualAdd=residualAdd)
     asm_str, kernel_name = generate_asm(solution, assembler, debugConfig)
     hsaco = amdgpu_exec.compile_asm_to_hsaco(asm_str, chip)
-    return solution, kernel_name, hsaco, chip
+    return solution, kernel_name, hsaco, chip, residualAdd
 
 
 # ---------------------------------------------------------------------------
 # Helper: run one shape and return comparison data
 # ---------------------------------------------------------------------------
 
-def _run_shape(solution, kernel_name, hsaco, chip, M, K, N_hidden):
+# GPU buffer total limit for residual tests: A + W + D + residual (in bytes).
+# Nores tests can use up to ~512MB total; residual adds M*N*2 on top of that,
+# so we cap the combined footprint at 128MB to avoid OOM on 16GB cards.
+_RESIDUAL_TOTAL_MEM_LIMIT_BYTES = 128 * 1024 * 1024
+
+
+def _run_shape(solution, kernel_name, hsaco, chip, M, K, N_hidden, residualAdd=False):
     from gemm_partialrms_colv2_helpers import compute_sk3_dp_args
 
     MT0 = solution["MacroTile0"]
@@ -163,6 +179,13 @@ def _run_shape(solution, kernel_name, hsaco, chip, M, K, N_hidden):
     N_tiles_N = math.ceil(N / MT1)
     M_padded  = math.ceil(M / MT0) * MT0
     numWG     = math.ceil(M / MT0) * N_tiles_N
+
+    if residualAdd:
+        # Estimate total GPU footprint: A(K×M) + W(K×N) + D(M×N) + residual(M×N), all bf16.
+        total_bytes = (K * M + K * N + 2 * M * N) * 2
+        if total_bytes > _RESIDUAL_TOTAL_MEM_LIMIT_BYTES:
+            # Return None to signal the caller to skip this M shape without aborting the test.
+            return None
 
     rng = np.random.default_rng(seed=M * 10000 + K)
 
@@ -178,18 +201,32 @@ def _run_shape(solution, kernel_name, hsaco, chip, M, K, N_hidden):
     gamma_f32  = rng.random(N, dtype=np.float32) + 0.5
     gamma_bf16 = gamma_f32.astype(ml_dtypes.bfloat16)
 
+    # Residual tensor: bf16, col-major (Fortran order), shape [M, N].
+    if residualAdd:
+        residual_f32 = (rng.random((M, N), dtype=np.float32) - 0.5) * 0.2
+        residual_bf16 = np.asfortranarray(residual_f32.astype(ml_dtypes.bfloat16))
+    else:
+        residual_bf16 = None
+
     # Numpy reference (bf16-rounded inputs to match kernel precision).
     a_ref     = np.asarray(a_bf16).astype(np.float32)
     w0_ref    = np.asarray(w0_bf16).astype(np.float32)
-    h1        = a_ref.T @ w0_ref
+    h1        = a_ref.T @ w0_ref  # (M, N) fp32
     gamma_ref = np.asarray(gamma_bf16).astype(np.float32)
-    d_ref     = (h1 * gamma_ref[np.newaxis, :]).astype(ml_dtypes.bfloat16)
+
+    if residualAdd:
+        residual_ref = np.asarray(residual_bf16).astype(np.float32)
+        h1_with_res  = h1 + residual_ref
+    else:
+        h1_with_res = h1
+
+    d_ref = (h1_with_res * gamma_ref[np.newaxis, :]).astype(ml_dtypes.bfloat16)
 
     sumsq_ref = np.zeros((M, N_tiles_N), dtype=np.float32)
     for t in range(N_tiles_N):
         col_lo = t * MT1
         col_hi = min((t + 1) * MT1, N)
-        sumsq_ref[:, t] = np.sum(h1[:, col_lo:col_hi] ** 2, axis=1)
+        sumsq_ref[:, t] = np.sum(h1_with_res[:, col_lo:col_hi] ** 2, axis=1)
 
     sk_args      = compute_sk3_dp_args(M, N, K, solution)
     stagger_u    = solution.get("StaggerU", 0)
@@ -226,6 +263,9 @@ def _run_shape(solution, kernel_name, hsaco, chip, M, K, N_hidden):
         amdgpu_exec.InputArray(gamma_bf16),
         amdgpu_exec.InOutArray(partial_buf),
     ]
+
+    if residualAdd:
+        args.append(amdgpu_exec.InputArray(residual_bf16))
 
     result_holder = {}
 
@@ -264,14 +304,16 @@ def test_k1_shape(k1_kernel, K, N_hidden):
     M shapes are derived at runtime from the fixture's actual MacroTile0 so the
     coverage adapts automatically to any (wg0_waves, wg1_waves) configuration.
     """
-    solution, kernel_name, hsaco, chip = k1_kernel
+    solution, kernel_name, hsaco, chip, residualAdd = k1_kernel
     MT0 = solution["MacroTile0"]
     MT1 = solution["MacroTile1"]
     N_tiles_N = math.ceil(N_hidden / MT1)
 
     for M, m_label in _m_shapes_for_mt0(MT0):
-        d_gpu_f32, d_ref_f32, pb_gpu, sumsq_ref = \
-            _run_shape(solution, kernel_name, hsaco, chip, M, K, N_hidden)
+        result = _run_shape(solution, kernel_name, hsaco, chip, M, K, N_hidden, residualAdd)
+        if result is None:
+            continue  # shape skipped due to memory guard.
+        d_gpu_f32, d_ref_f32, pb_gpu, sumsq_ref = result
 
         rtol_d, atol_d = 2e-2, 2e-2
         bad_d = np.where(

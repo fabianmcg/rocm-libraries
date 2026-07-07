@@ -178,7 +178,7 @@ def load_k1_config(yamlPath):
 
 
 def build_k1_solution(chip: str, assembler, isaInfoMap, wgN: int = 2,
-                      yamlPath=_DEFAULT_K1_YAML, miOverride=None):
+                      yamlPath=_DEFAULT_K1_YAML, miOverride=None, residualAdd: bool = False):
     """Build a bf16 GEMM + PartialRMS kernel for gfx950.
 
     Loads problem type and solution parameters from yamlPath. wgN sets
@@ -197,6 +197,7 @@ def build_k1_solution(chip: str, assembler, isaInfoMap, wgN: int = 2,
     isa = gfxToIsa(gfx)
 
     problemType, params = load_k1_config(yamlPath)
+    params["PartialRMSResidualAdd"] = residualAdd
 
     if miOverride is not None:
         params["MatrixInstruction"] = miOverride

@@ -165,4 +165,5 @@ def getRequiredParametersMin() -> set:
         'UseSubtileImpl',
         'ClusterDim',
         'PartialRMS',
+        'PartialRMSResidualAdd',
     })

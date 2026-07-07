@@ -231,6 +231,11 @@ def _validatePartialRMS(state, printRejectionReason):
     - GroupedGemm rejected (multi-tile index arithmetic not validated).
     - When wg_n > 1: wg_m must be power-of-two; LDS budget checked.
   """
+  if state.get("PartialRMSResidualAdd", False) and not state.get("PartialRMS", False):
+    if printRejectionReason:
+      printWarning("PartialRMSResidualAdd requires PartialRMS")
+    state["Valid"] = False
+    return
   if not state.get("PartialRMS", False):
     return
   # RstdScale is mutually exclusive with PartialRMS; enforce when it is introduced.

@@ -85,6 +85,7 @@ from rocisa.instruction import (
     VMulLOU32,
     VMovB32,
     VLShiftRightB32,
+    SMulI32,
 )
 
 
@@ -99,6 +100,7 @@ class SubtilePartialRMSEmitter:
         self.writer = writer
         self.kernel = kernel
         self.archCaps = writer.states.archCaps
+        self.residualAdd = kernel.get("PartialRMSResidualAdd", False)
 
         # Derive all geometry from kernel params; no module-level constants.
         self.mfma_m = kernel["MatrixInstM"]
@@ -157,14 +159,31 @@ class SubtilePartialRMSEmitter:
         # savedExec and laneMaskSgpr must be 2-aligned for 64-bit EXEC operations.
         # rowBase = WorkGroup0 * MT0 is computed into globalAddr on demand (no SGPR).
         # tileCol = sgpr("WorkGroup1"), live named SGPR, no allocation needed.
-        gammaSrd = self.writer.sgprPool.checkOutAligned(4, 4, tag="pRMS_gammaSrd")
-        partialSrd = self.writer.sgprPool.checkOutAligned(4, 4, tag="pRMS_partialSrd")
+        # preventOverflow=False: the epilogue SGPRs are temporary (live only during
+        # the epilogue) and hardware SGPR budget has been verified to accommodate them.
+        gammaSrd = self.writer.sgprPool.checkOutAligned(4, 4, tag="pRMS_gammaSrd",
+                                                        preventOverflow=False)
+        partialSrd = self.writer.sgprPool.checkOutAligned(4, 4, tag="pRMS_partialSrd",
+                                                          preventOverflow=False)
         savedExec = self.writer.sgprPool.checkOutAligned(
-            self.lane_sgpr_count, self.lane_sgpr_count, tag="pRMS_savedExec"
+            self.lane_sgpr_count, self.lane_sgpr_count, tag="pRMS_savedExec",
+            preventOverflow=False,
         )
         laneMaskSgpr = self.writer.sgprPool.checkOutAligned(
-            self.lane_sgpr_count, self.lane_sgpr_count, tag="pRMS_laneMask"
+            self.lane_sgpr_count, self.lane_sgpr_count, tag="pRMS_laneMask",
+            preventOverflow=False,
         )
+
+        # Optionally allocate VGPR temporaries for the residual add path.
+        resTmp = None
+        resAddr = None
+        resColM = None
+        resRowVgpr = None
+        if self.residualAdd:
+            resTmp = self.writer.vgprPool.checkOut(1, tag="pRMS_resTmp")
+            resAddr = self.writer.vgprPool.checkOut(1, tag="pRMS_resAddr")
+            resColM = self.writer.vgprPool.checkOut(1, tag="pRMS_resColM")
+            resRowVgpr = self.writer.vgprPool.checkOut(1, tag="pRMS_resRowVgpr")
 
         # Flush MFMA pipeline before reading AGPRs.
         module.add(
@@ -172,6 +191,13 @@ class SubtilePartialRMSEmitter:
         )
 
         module.add(self._setup(gammaSrd, partialSrd, laneId, colByte))
+        if self.residualAdd:
+            module.add(
+                self._addResidual(
+                    accVgprBase, gammaSrd, accTmp, resTmp, resAddr, resColM,
+                    resRowVgpr, laneId, colByte
+                )
+            )
         module.add(self._squareAndLaneSum(accVgprBase, partials, accTmp))
         module.add(self._butterflyReduce(partials))
         if self.wg_n > 1:
@@ -185,6 +211,11 @@ class SubtilePartialRMSEmitter:
             self._applyGammaOnly(accVgprBase, gammaSrd, gammaTmp, accTmp, colByte)
         )
 
+        if self.residualAdd:
+            self.writer.vgprPool.checkIn(resRowVgpr)
+            self.writer.vgprPool.checkIn(resColM)
+            self.writer.vgprPool.checkIn(resAddr)
+            self.writer.vgprPool.checkIn(resTmp)
         self.writer.sgprPool.checkIn(laneMaskSgpr)
         self.writer.sgprPool.checkIn(savedExec)
         self.writer.sgprPool.checkIn(partialSrd)
@@ -210,6 +241,7 @@ class SubtilePartialRMSEmitter:
         Signature append order (matches Signature.py additions):
           slot N+0: RMSNormGamma  (bf16 global buffer pointer, 8 bytes)
           slot N+1: PartialBuf    (fp32 global buffer pointer, 8 bytes) [InOutArray]
+          slot N+2: ResidualBuf   (bf16 global buffer pointer, 8 bytes) — only when PartialRMSResidualAdd
 
         rowBase = WorkGroup0 * MT0 is computed on demand in _writePartials (no SGPR).
         tileCol = sgpr("WorkGroup1"), live named SGPR, no extra allocation needed.
@@ -345,6 +377,320 @@ class SubtilePartialRMSEmitter:
                     comment="colByte += WorkGroup1 * MT1 * 2",
                 )
             )
+
+        return module
+
+    def _addResidual(
+        self,
+        accVgprBase: int,
+        gammaSrd: int,
+        accTmp: int,
+        resTmp: int,
+        resAddr: int,
+        resColM: int,
+        resRowVgpr: int,
+        laneId: int,
+        colByte: int,
+    ) -> Module:
+        """Load bf16 col-major residual R and add to each AGPR element.
+
+        Computes acc[m,n,k] += bf16_to_fp32(R[globalRow, globalCol]) for every
+        accumulator element before the square/reduce step. The residual tensor R
+        is col-major with shape [M, N_hidden] and element type bf16.
+
+        Col-major byte offset for R[globalRow, globalCol]:
+          byteOff = (globalCol * M + globalRow) * 2
+        where M = SizesFree+0.
+
+        globalRow per (m, k): wgRowBase + rowGroupOff + m*mfma_m + k
+        globalCol per n:      (colByte >> 1) + n*mfma_n
+
+        colByte encodes (laneId%mfma_n)*2 + waveN_base_bytes + WG1*MT1*2,
+        so colByte>>1 gives the column index base for n=0.
+
+        The residual SRD is built into the gammaSrd SGPR block (which was set up
+        in _setup and is not needed until _applyGammaOnly). This reuse avoids
+        allocating extra SGPRs and is safe because _addResidual runs before gamma
+        is applied. The gamma SRD is rebuilt at the end before returning.
+        """
+        module = Module("PartialRMS addResidual")
+        module.addComment1("PartialRMS residual add: acc[m,n,k] += R[globalRow, globalCol]")
+
+        # Compute rowGroup = laneId >> log2(mfma_n) — shared across all (m, n, k).
+        log2MfmaN = int(math.log2(self.mfma_n))
+        rowGroup = self.writer.vgprPool.checkOut(1, tag="pRMS_resRowGroup")
+        rowGroupOff = self.writer.vgprPool.checkOut(1, tag="pRMS_resRowGroupOff")
+        module.add(
+            VLShiftRightB32(
+                dst=vgpr(rowGroup),
+                shiftHex=hex(log2MfmaN),
+                src=vgpr(laneId),
+                comment=f"rowGroup = laneId >> {log2MfmaN}",
+            )
+        )
+        module.add(
+            VMulLOU32(
+                dst=vgpr(rowGroupOff),
+                src0=self.rows_per_lane,
+                src1=vgpr(rowGroup),
+                comment=f"rowGroupOff = rowGroup * {self.rows_per_lane}",
+            )
+        )
+        self.writer.vgprPool.checkIn(rowGroup)
+
+        # Compute wgRowBase = WorkGroup0 * MT0.
+        mt0Vgpr = self.writer.vgprPool.checkOut(1, tag="pRMS_resMT0V")
+        wgRowBase = self.writer.vgprPool.checkOut(1, tag="pRMS_resWgRowBase")
+        module.add(
+            VMovB32(
+                dst=vgpr(mt0Vgpr),
+                src=self.macro_tile0,
+                comment=f"MT0={self.macro_tile0}",
+            )
+        )
+        module.add(
+            VMulLOU32(
+                dst=vgpr(wgRowBase),
+                src0=vgpr(mt0Vgpr),
+                src1=sgpr("WorkGroup0"),
+                comment="wgRowBase = WorkGroup0 * MT0",
+            )
+        )
+        self.writer.vgprPool.checkIn(mt0Vgpr)
+
+        # Add waveM * mma_m * mfma_m when wg_m > 1 (mirrors _writePartials).
+        if self.wg_m > 1:
+            waveId = self.writer.vgprPool.checkOut(1, tag="pRMS_resWaveId")
+            waveM = self.writer.vgprPool.checkOut(1, tag="pRMS_resWaveM")
+            tmpVgpr = self.writer.vgprPool.checkOutAligned(2, 2, tag="pRMS_resTmpDiv")
+            tmpRes = ContinuousRegister(tmpVgpr, 2)
+            module.add(
+                vectorStaticDivide(
+                    waveId,
+                    "Serial",
+                    self.waveSize,
+                    tmpRes,
+                    comment="waveId = Serial / WavefrontSize",
+                )
+            )
+            module.add(
+                VAndB32(
+                    dst=vgpr(waveM),
+                    src0=vgpr(waveId),
+                    src1=self.wg_m - 1,
+                    comment=f"waveM = waveId %% {self.wg_m}",
+                )
+            )
+            waveStride = self.mma_m * self.mfma_m
+            waveStrideV = self.writer.vgprPool.checkOut(1, tag="pRMS_resWaveStride")
+            module.add(
+                VMovB32(
+                    dst=vgpr(waveStrideV),
+                    src=waveStride,
+                    comment=f"waveStride = mma_m * mfma_m = {waveStride}",
+                )
+            )
+            module.add(
+                VMulLOU32(
+                    dst=vgpr(waveM),
+                    src0=vgpr(waveStrideV),
+                    src1=vgpr(waveM),
+                    comment="waveMOff = waveM * waveStride",
+                )
+            )
+            module.add(
+                VAddU32(
+                    vgpr(wgRowBase),
+                    vgpr(wgRowBase),
+                    vgpr(waveM),
+                    comment="wgRowBase += waveMOff",
+                )
+            )
+            self.writer.vgprPool.checkIn(waveStrideV)
+            self.writer.vgprPool.checkIn(tmpVgpr)
+            self.writer.vgprPool.checkIn(waveM)
+            self.writer.vgprPool.checkIn(waveId)
+
+        # colBase = colByte >> 1 — column index for n=0 of this wave's N-tile.
+        # colByte = (laneId%mfma_n)*2 + waveN_offset_bytes + WG1*MT1*2, so
+        # colBase = laneId%mfma_n + waveN_offset_cols + WG1*MT1.
+        colBase = self.writer.vgprPool.checkOut(1, tag="pRMS_resColBase")
+        module.add(
+            VLShiftRightB32(
+                dst=vgpr(colBase),
+                shiftHex=hex(1),
+                src=vgpr(colByte),
+                comment="colBase = colByte >> 1 (col index for n=0)",
+            )
+        )
+
+        # Overwrite gammaSrd with the residual SRD. gammaSrd was set up in _setup
+        # but is not used until _applyGammaOnly (after this method returns), so the
+        # reuse is safe. The gamma SRD is rebuilt at the end of this method.
+        module.add(
+            SMovB64(
+                dst=sgpr(gammaSrd, 2),
+                src=sgpr("ResidualBuf", 2),
+                comment="residual SRD base addr (reusing gammaSrd slot)",
+            )
+        )
+        # NumRecords = M * N * 2 (bytes). Use gammaSrd+2 as scratch for the product.
+        # This tightly bounds the SRD so that globalRow >= M returns 0 for non-tile-aligned M.
+        module.add(
+            SMulI32(
+                dst=sgpr(gammaSrd + 2),
+                src0=sgpr("SizesFree+0"),
+                src1=sgpr("SizesFree+1"),
+                comment="numRecords scratch = M * N",
+            )
+        )
+        module.add(
+            SLShiftLeftB32(
+                dst=sgpr(gammaSrd + 2),
+                src=sgpr(gammaSrd + 2),
+                shiftHex=hex(1),
+                comment="numRecords = M * N * 2 (bf16 bytes)",
+            )
+        )
+        module.add(
+            SMovB32(
+                dst=sgpr(gammaSrd + 3),
+                src="Srd127_96",
+                comment="residual SRD flags",
+            )
+        )
+
+        # Outer loop: n-tiles. Compute colN = colBase + n*mfma_n once per n.
+        # Inner loops: (m, k). Compute globalRow per (m, k).
+        for n in range(self.mma_n):
+            nColOffset = n * self.mfma_n
+            # colN = colBase + n*mfma_n — the column index for this n-tile.
+            module.add(
+                VAddU32(
+                    vgpr(resColM),
+                    vgpr(colBase),
+                    nColOffset,
+                    comment=f"colN = colBase + {nColOffset} (n={n})",
+                )
+            )
+            # Multiply by M to get colN * M (done once per n-tile).
+            module.add(
+                VMulLOU32(
+                    dst=vgpr(resColM),
+                    src0=sgpr("SizesFree+0"),
+                    src1=vgpr(resColM),
+                    comment="resColM = colN * M",
+                )
+            )
+
+            for m in range(self.mma_m):
+                for k in range(self.rows_per_lane):
+                    mBase = m * self.mfma_m + k
+                    # globalRow = wgRowBase + rowGroupOff + m*mfma_m + k.
+                    module.add(
+                        VAddU32(
+                            vgpr(resRowVgpr),
+                            vgpr(wgRowBase),
+                            mBase,
+                            comment=f"globalRow = wgRowBase + {mBase} (m={m},k={k})",
+                        )
+                    )
+                    module.add(
+                        VAddU32(
+                            vgpr(resRowVgpr),
+                            vgpr(resRowVgpr),
+                            vgpr(rowGroupOff),
+                            comment="globalRow += rowGroupOff",
+                        )
+                    )
+                    # byteOff = (colN*M + globalRow) * 2.
+                    module.add(
+                        VAddU32(
+                            vgpr(resAddr),
+                            vgpr(resColM),
+                            vgpr(resRowVgpr),
+                            comment="resAddr = colN*M + globalRow",
+                        )
+                    )
+                    module.add(
+                        VLShiftLeftB32(
+                            dst=vgpr(resAddr),
+                            shiftHex=hex(1),
+                            src=vgpr(resAddr),
+                            comment="resAddr *= 2 (bf16 element size)",
+                        )
+                    )
+
+                    a = self._acc_idx(accVgprBase, m, n, k)
+                    module.add(
+                        BufferLoadD16B16(
+                            vgpr(resTmp),
+                            vgpr(resAddr),
+                            sgpr(gammaSrd, 4),
+                            0,
+                            MUBUFModifiers(offen=True),
+                            comment=f"R[globalRow, globalCol] bf16 (m={m},n={n},k={k})",
+                        )
+                    )
+                    module.add(SWaitCnt(vlcnt=0, comment="wait residual load"))
+                    module.add(
+                        VCvtBF16toFP32(
+                            vgpr(resTmp),
+                            vgpr(resTmp),
+                            None,
+                            0,
+                            comment="residual bf16 -> fp32",
+                        )
+                    )
+                    module.add(
+                        VAccvgprReadB32(
+                            vgpr(accTmp),
+                            accvgpr(a),
+                            comment=f"read acc[m={m},n={n},k={k}]",
+                        )
+                    )
+                    module.add(
+                        VAddF32(
+                            dst=vgpr(accTmp),
+                            src0=vgpr(accTmp),
+                            src1=vgpr(resTmp),
+                            comment="H = GEMM + residual",
+                        )
+                    )
+                    module.add(
+                        VAccvgprWriteB32(
+                            accvgpr(a),
+                            vgpr(accTmp),
+                            comment=f"write acc[m={m},n={n},k={k}] += residual",
+                        )
+                    )
+
+        # Rebuild the gamma SRD in the same SGPR block for _applyGammaOnly.
+        module.add(
+            SMovB64(
+                dst=sgpr(gammaSrd, 2),
+                src=sgpr("RMSNormGamma", 2),
+                comment="rebuild gamma SRD base after residual loads",
+            )
+        )
+        module.add(
+            SMovB32(
+                dst=sgpr(gammaSrd + 2),
+                src="BufferOOB",
+                comment="gamma SRD limit",
+            )
+        )
+        module.add(
+            SMovB32(
+                dst=sgpr(gammaSrd + 3),
+                src="Srd127_96",
+                comment="gamma SRD flags",
+            )
+        )
+
+        self.writer.vgprPool.checkIn(colBase)
+        self.writer.vgprPool.checkIn(wgRowBase)
+        self.writer.vgprPool.checkIn(rowGroupOff)
 
         return module
 

@@ -327,6 +327,9 @@ class SignatureDefault(Signature):
             signature.addArg("RMSNormGamma", SVK.SIG_GLOBALBUFFER, gammaValueType, "generic")
             signature.addArg("PartialBuf",   SVK.SIG_GLOBALBUFFER, "f32",          "generic")
             userArgumentsInfo.rmsNormSize = 8 + 8  # gamma ptr + partialBuf ptr
+            if kernel["PartialRMSResidualAdd"]:
+                signature.addArg("ResidualBuf", SVK.SIG_GLOBALBUFFER, gammaValueType, "generic")
+                userArgumentsInfo.rmsNormSize += 8  # residual ptr
 
         # Calculate total size
         userArgumentsInfo.totalSize = userArgumentsInfo.gemmArgumentSize + \
