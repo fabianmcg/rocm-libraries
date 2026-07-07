@@ -2888,6 +2888,9 @@ namespace TensileLite
             inputs->Synchronizer  = (void*)ptrs[ContractionProblemGemm::TENSOR::Synchronizer];
             inputs->amaxD         = (void*)ptrs[ContractionProblemGemm::TENSOR::AMAXD];
             inputs->compressed    = (void*)ptrs[ContractionProblemGemm::TENSOR::COMPRESSED];
+            inputs->partialBuf    = (void*)ptrs[ContractionProblemGemm::TENSOR::PARTIALBUF];
+            inputs->rmsGamma      = (void*)ptrs[ContractionProblemGemm::TENSOR::RMSGAMMA];
+            inputs->residual      = (void*)ptrs[ContractionProblemGemm::TENSOR::RESIDUAL];
 
             inputs->batchA    = (void**)batchPtrs[ContractionProblemGemm::TENSOR::A];
             inputs->batchB    = (void**)batchPtrs[ContractionProblemGemm::TENSOR::B];
@@ -3172,6 +3175,12 @@ namespace TensileLite
                 newInputs.e,
                 rotatingPtr,
                 problem.tensors()[ContractionProblemGemm::TENSOR::E].totalAllocatedBytes(),
+                offset,
+                stream);
+            newInputs.partialBuf = copyRotatingInput(
+                newInputs.partialBuf,
+                rotatingPtr,
+                problem.tensors()[ContractionProblemGemm::TENSOR::PARTIALBUF].totalAllocatedBytes(),
                 offset,
                 stream);
             newInputs.scaleA = copyRotatingInput(

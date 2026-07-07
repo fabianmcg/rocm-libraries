@@ -181,6 +181,9 @@ namespace TensileLite
         // kernels (e.g. rejecting them for small K).
         bool useSubtileImpl = false;
 
+        bool partialRMS            = false;
+        bool partialRMSResidualAdd = false;
+
         int NonTemporalD = 0;
         int WaveSeparateGlobalReadA = 0;
         int WaveSeparateGlobalReadB = 0;

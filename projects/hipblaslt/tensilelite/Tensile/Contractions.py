@@ -72,7 +72,8 @@ class ProblemType:
                  'highPrecisionAccumulate', 'useInitialStridesAB', 'useInitialStridesCD', 'stridedBatched', 'groupedGemm',
                  'useGradient', 'activationType', 'activationArgLength', 'activationComputeDataType', 'activationNoGuard',
                  'sparse', 'f32XdlMathOp', 'supportDeviceUserArguments', 'outputAmaxD', 'swizzleTensorA', 'swizzleTensorB', 'metadataLayout',
-                 'mxBlockA', 'mxBlockB', 'mxTypeA', 'mxTypeB', 'mxScaleFormat']
+                 'mxBlockA', 'mxBlockB', 'mxTypeA', 'mxTypeB', 'mxScaleFormat',
+                 'usePartialRMS', 'partialRMSResidualAdd']
     @classmethod
     def FromOriginalState(cls, d):
         indices = [None]*d['TotalIndices']
@@ -244,6 +245,9 @@ class ProblemType:
         rv.outputAmaxD = False
         if 'OutputAmaxD' in d:
             rv.outputAmaxD = d['OutputAmaxD']
+
+        rv.usePartialRMS = bool(d.get('UsePartialRMS', False))
+        rv.partialRMSResidualAdd = bool(d.get('PartialRMSResidualAdd', False))
 
         rv.useScaleAB = ""
         if 'UseScaleAB' in d:
@@ -648,6 +652,8 @@ class SizeMapping:
                  'adaptiveGemmNTAB',
                  'customMainLoopScheduling',
                  'useSubtileImpl',
+                 'PartialRMS',
+                 'PartialRMSResidualAdd',
                  'NonTemporalD',
                  'WaveSeparateGlobalReadA',
                  'WaveSeparateGlobalReadB',
@@ -743,6 +749,8 @@ class SizeMapping:
                    adaptiveGemmNTAB         = d['AdaptiveGemmNTAB'] if 'AdaptiveGemmNTAB' in d else 0,
                    customMainLoopScheduling = d['UseCustomMainLoopSchedule'],
                    useSubtileImpl           = bool(d.get('UseSubtileImpl', False)),
+                   PartialRMS               = bool(d.get('PartialRMS', False)),
+                   PartialRMSResidualAdd    = bool(d.get('PartialRMSResidualAdd', False)),
                    NonTemporalD             = d['NonTemporalD'],
                    WaveSeparateGlobalReadA  = d['WaveSeparateGlobalReadA'],
                    WaveSeparateGlobalReadB  = d['WaveSeparateGlobalReadB'],

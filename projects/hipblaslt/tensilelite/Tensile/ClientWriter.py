@@ -617,6 +617,8 @@ def writeClientConfigIni(forBenchmark, problemSizes, biasTypeArgs, factorDimArgs
         param('bias-source',   problemType.biasSrcWhiteList[0])
         param('use-e', problemType.useE)
         param('output-amaxD', problemType.outputAmaxD)
+        param('use-partial-rms',          getattr(problemType, 'usePartialRMS',         False))
+        param('partial-rms-residual-add', getattr(problemType, 'partialRMSResidualAdd',  False))
         param('use-scaleAB',   problemType.useScaleAB)
         param('use-scaleCD',   problemType.useScaleCD)
         param('use-scaleAlphaVec',   problemType.useScaleAlphaVec)

@@ -1219,6 +1219,11 @@ namespace TensileLite
                 return rejectFast("amaxD");
             }
 
+            if(problem.usePartialRMS())
+            {
+                return rejectFast("partialRMS");
+            }
+
             if(problem.useE())
             {
                 return rejectFast("useE");
@@ -2028,6 +2033,49 @@ namespace TensileLite
                     ws[dIndex] = resultD;
                 }
                 dPtr[dIndex] = SaturateCast<typename Inputs::DType>(resultD);
+
+                if constexpr(notCmplxAmaxD)
+                {
+                    if(problem.usePartialRMS() && inputs.partialBuf != nullptr
+                       && inputs.rmsGamma != nullptr)
+                    {
+                        // mCoord is the M index, nCoord is the N index in D.
+                        size_t mCoord = dCoord[0];
+                        size_t nCoord = dCoord[1];
+
+                        float hF = static_cast<float>(resultD);
+                        if(problem.partialRMSResidualAdd() && inputs.residual != nullptr)
+                        {
+                            // residual is col-major [M x N_hidden]: element offset = n*M + m.
+                            size_t residualIdx = nCoord * d.sizes()[0] + mCoord;
+                            float  resVal = static_cast<float>(
+                                GetValue<float>(rocisa::DataType::BFloat16,
+                                                inputs.residual, (int)residualIdx, aConjugate));
+                            hF += resVal;
+                        }
+
+                        // bf16-round H to match the kernel which stores to bf16 then reads back.
+                        BFloat16 hBf = static_cast<BFloat16>(hF);
+                        float    hF2 = static_cast<float>(hBf);
+
+                        // D = bf16(H * gamma).
+                        float gammaVal = static_cast<float>(
+                            GetValue<float>(rocisa::DataType::BFloat16,
+                                            inputs.rmsGamma, (int)nCoord, aConjugate));
+                        dPtr[dIndex] = SaturateCast<typename Inputs::DType>(
+                            static_cast<float>(static_cast<BFloat16>(hF2 * gammaVal)));
+
+                        // Accumulate into partialBuf: row-major [M_padded x nTilesN].
+                        size_t mt0     = problem.partialRMSMT0() > 0 ? problem.partialRMSMT0() : 16;
+                        size_t mt1     = problem.partialRMSMT1() > 0 ? problem.partialRMSMT1() : 16;
+                        size_t nTilesN = (d.sizes()[1] + mt1 - 1) / mt1;
+                        size_t tileIdx = nCoord / mt1;
+                        size_t pbIdx   = mCoord * nTilesN + tileIdx;
+                        float* pb      = static_cast<float*>(inputs.partialBuf);
+#pragma omp atomic
+                        pb[pbIdx] += hF2 * hF2;
+                    }
+                }
             }
 
             if(problem.outputAmaxD())

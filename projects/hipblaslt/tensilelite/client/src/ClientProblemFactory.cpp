@@ -186,6 +186,15 @@ namespace TensileLite
             if(args.count("output-amaxD"))
                 m_outputAmaxD = args["output-amaxD"].as<bool>();
 
+            if(args.count("use-partial-rms"))
+                m_usePartialRMS = args["use-partial-rms"].as<bool>();
+            if(args.count("partial-rms-residual-add"))
+                m_partialRMSResidualAdd = args["partial-rms-residual-add"].as<bool>();
+            if(args.count("partial-rms-mt0"))
+                m_partialRMSMT0Override = args["partial-rms-mt0"].as<size_t>();
+            if(args.count("partial-rms-mt1"))
+                m_partialRMSMT1Override = args["partial-rms-mt1"].as<size_t>();
+
             if(args.count("bias-type-args"))
                 m_biasTypeArgs = args["bias-type-args"].as<std::vector<rocisa::DataType>>();
             if(args.count("factor-dim-args"))
@@ -380,6 +389,8 @@ namespace TensileLite
                             rv.back().setUseBias(m_useBias);
                             rv.back().setUseE(m_useE);
                             rv.back().setOutputAmaxD(m_outputAmaxD);
+                            rv.back().setUsePartialRMS(m_usePartialRMS);
+                            rv.back().setPartialRMSResidualAdd(m_partialRMSResidualAdd);
                             rv.back().setKernelLanguage(m_kernelLanguage);
                             rv.back().setPerformanceMetric(m_performanceMetric);
                             rv.back().setDeterministicMode(m_deterministicMode);
@@ -432,6 +443,23 @@ namespace TensileLite
                             {
                                 rv.back().setSynchronizer(
                                     m_constantTypes[ContractionProblemGemm::CONST::ALPHA], 409600);
+                            }
+                            if(m_usePartialRMS)
+                            {
+                                size_t M       = rv.back().d().sizes()[0];
+                                size_t nHidden = rv.back().d().sizes()[1];
+
+                                // Conservative upper bound for allocation (smallest possible MT=16).
+                                size_t mt0     = m_partialRMSMT0Override > 0 ? m_partialRMSMT0Override : 16;
+                                size_t mt1     = m_partialRMSMT1Override > 0 ? m_partialRMSMT1Override : 16;
+                                size_t mPadded = ((M      + mt0 - 1) / mt0) * mt0;
+                                size_t nTilesN = (nHidden + mt1 - 1) / mt1;
+
+                                auto bf16Type = rocisa::DataType::BFloat16;
+                                rv.back().setRMSGamma(bf16Type, nHidden);
+                                rv.back().setPartialBuf(mPadded, nTilesN);
+                                if(m_partialRMSResidualAdd)
+                                    rv.back().setResidual(bf16Type, M, nHidden);
                             }
                             if(j < m_activationEnumArg.size())
                             {

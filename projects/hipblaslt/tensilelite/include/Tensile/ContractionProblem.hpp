@@ -348,6 +348,9 @@ namespace TensileLite
             COMPRESSED    = 14,
             MXSA          = 15,
             MXSB          = 16,
+            RMSGAMMA      = 17, // bf16 input: RMSNorm gamma (N_hidden elements)
+            PARTIALBUF    = 18, // f32 output: partial sum-of-squares [M_padded x nTilesN] row-major
+            RESIDUAL      = 19, // bf16 input: residual tensor [M x N_hidden] col-major (optional)
             TENSOR_COUNT
         };
 
@@ -758,6 +761,16 @@ namespace TensileLite
             m_outputAmaxD = outputAmaxD;
         }
 
+        void setUsePartialRMS(bool v)           { m_usePartialRMS = v; }
+        void setPartialRMSResidualAdd(bool v)   { m_partialRMSResidualAdd = v; }
+        void setPartialRMSMT0(size_t v)         { m_partialRMSMT0 = v; }
+        void setPartialRMSMT1(size_t v)         { m_partialRMSMT1 = v; }
+
+        bool   usePartialRMS()         const { return m_usePartialRMS; }
+        bool   partialRMSResidualAdd() const { return m_partialRMSResidualAdd; }
+        size_t partialRMSMT0()         const { return m_partialRMSMT0; }
+        size_t partialRMSMT1()         const { return m_partialRMSMT1; }
+
         void setUseBias(int useBias)
         {
             m_useBias = useBias;
@@ -928,6 +941,30 @@ namespace TensileLite
                 m_tensors[ContractionProblemGemm::TENSOR::AMAXD] = {"amaxD", type, {1}, {1, 1}};
                 m_tensors[ContractionProblemGemm::TENSOR::AMAXD].setAsOutput(isOutput);
             }
+        }
+
+        void setRMSGamma(rocisa::DataType type, size_t nHidden)
+        {
+            if(m_usePartialRMS)
+                m_tensors[ContractionProblemGemm::TENSOR::RMSGAMMA]
+                    = {"rmsGamma", type, {nHidden}, {1}};
+        }
+
+        void setPartialBuf(size_t mPadded, size_t nTilesN)
+        {
+            if(m_usePartialRMS)
+            {
+                m_tensors[ContractionProblemGemm::TENSOR::PARTIALBUF]
+                    = {"partialBuf", rocisa::DataType::Float, {mPadded, nTilesN}, {nTilesN, 1}};
+                m_tensors[ContractionProblemGemm::TENSOR::PARTIALBUF].setAsOutput(true);
+            }
+        }
+
+        void setResidual(rocisa::DataType type, size_t M, size_t nHidden)
+        {
+            if(m_usePartialRMS && m_partialRMSResidualAdd)
+                m_tensors[ContractionProblemGemm::TENSOR::RESIDUAL]
+                    = {"residual", type, {M, nHidden}, {1, M}};
         }
 
         void setSynchronizer(rocisa::DataType type, size_t length)
@@ -1431,6 +1468,10 @@ namespace TensileLite
         bool             m_useE                    = false;
         rocisa::DataType m_auxType                 = rocisa::DataType::None;
         bool             m_outputAmaxD             = false;
+        bool             m_usePartialRMS           = false;
+        bool             m_partialRMSResidualAdd   = false;
+        size_t           m_partialRMSMT0           = 0;
+        size_t           m_partialRMSMT1           = 0;
         bool             m_swizzleTensorA          = false;
         bool             m_swizzleTensorB          = false;
         int              m_useBias                 = 0;
@@ -1567,6 +1608,10 @@ namespace TensileLite
         void*       d     = nullptr;
         void*       e     = nullptr;
         void*       amaxD = nullptr;
+
+        void*       partialBuf = nullptr;
+        void const* rmsGamma   = nullptr;
+        void const* residual   = nullptr;
 
         void const* const* batchA    = nullptr;
         void const* const* batchB    = nullptr;

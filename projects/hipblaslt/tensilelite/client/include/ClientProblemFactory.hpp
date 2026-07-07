@@ -82,6 +82,10 @@ namespace TensileLite
             bool        m_useE;
             bool        m_useGradient = false;
             bool        m_outputAmaxD;
+            bool        m_usePartialRMS         = false;
+            bool        m_partialRMSResidualAdd  = false;
+            size_t      m_partialRMSMT0Override  = 0;
+            size_t      m_partialRMSMT1Override  = 0;
 
             int                              m_sparse;
             KernelLanguage                   m_kernelLanguage;

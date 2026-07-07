@@ -507,7 +507,12 @@ namespace TensileLite
                     refPtr = reference.amaxD;
                     resPtr = result.amaxD;
                 }
-
+                break;
+                case ContractionProblemGemm::TENSOR::PARTIALBUF:
+                {
+                    refPtr = reference.partialBuf;
+                    resPtr = result.partialBuf;
+                }
                 break;
                 default:
                     throw std::runtime_error("Unrecognized output tensor.");

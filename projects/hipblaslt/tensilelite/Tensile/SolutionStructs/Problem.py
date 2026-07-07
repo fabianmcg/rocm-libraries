@@ -422,6 +422,8 @@ _defaultProblemType = {
     # in:f32, intermediate:xf32, out:f32. f32 = xf32(f32) * xf32(f32)
     "UseBeta": True,  # =True use beta parameter (asm will check for B=0 and optimize the write for that), =False don't use beta parameter
     "UseE": False,  # =True use output E to output gemm results before activation
+    "UsePartialRMS":         False,
+    "PartialRMSResidualAdd": False,
     "Gradient": False,  # =True set globalWriteElements to gradient mode
     "UseBias": 0,  # =1 support bias vector on M direction, =2 support bias vector on N direction, =3 support bias vector on both M,N direction
     "BiasSrc": "D",  # This parameter is used in gradient + bias. Support A, B, D.
