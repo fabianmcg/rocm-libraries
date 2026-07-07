@@ -11,7 +11,7 @@ Algorithm — Phase 1 (reduction, one wave = 64 lanes per row subgroup):
   Each block of 256 threads is organised as 4 waves x 64 lanes.  The outer
   loop (sIter = 0..63) assigns one global row per iteration.  All 64 lanes
   of the wave collectively load one element each from partialBuf for that row.
-  A hybrid reduction (4× DPP row_shr + 2× ds_bpermute) sums the 64 partial values.  All lanes
+  A 6-stage ds_bpermute butterfly then sums the 64 partial values.  All lanes
   with row < M write rsqrt(invD * total + eps) to LDS at address
   (waveId * 256 + sIter * 4).
 
@@ -41,7 +41,7 @@ from typing import List, Optional, Tuple
 import yaml
 
 from rocisa.code import Module, TextBlock, SrdUpperValue
-from rocisa.container import DPPModifiers, EXEC, MUBUFModifiers, vgpr, sgpr
+from rocisa.container import EXEC, MUBUFModifiers, vgpr, sgpr
 from rocisa.enum import RegisterType
 from rocisa.register import RegisterPool
 import rocisa.instruction as ri
@@ -467,27 +467,16 @@ def _build_kernel_body(isa: Tuple[int, int, int]) -> Tuple[Module, int, int]:
         mod.add(ri.SCBranchSCC0(innerLoop, comment="loop while active lanes remain"))
 
         # ------------------------------------------------------------------
-        # Step 5: restore EXEC then hybrid reduction (4× DPP + 2× ds_bpermute).
-        # All lanes now hold the full 64-lane sum in vAcc.
+        # Step 5: restore EXEC then 6-stage butterfly (strides 1..32).
+        # All lanes now hold their partial sum in vAcc.
         # ------------------------------------------------------------------
         mod.add(TextBlock(f"{bflyLabel}:\n"))
         mod.add(ri.SMovB64(dst=EXEC(), src=sgpr(sExecSave, 2), comment="restore EXEC"))
 
-        # Hybrid reduction: 4 DPP row_shr stages (register-to-register, no LDS
-        # crossbar) reduce within each aligned 16-lane row, then 2 ds_bpermute
-        # stages cross the 32- and 64-lane boundaries where DPP has no operator.
-        # After all 6 stages every lane holds the full 64-lane sum.
-        mod.add(ri.SNop(waitState=0, comment="wait state before DPP reads vAcc"))
-        mod.add(ri.SNop(waitState=0, comment="wait state before DPP reads vAcc"))
-        for shr in (8, 4, 2, 1):
-            mod.add(ri.VAddF32(
-                dst=vgpr(vAcc),
-                src0=vgpr(vAcc),
-                src1=vgpr(vAcc),
-                dpp=DPPModifiers(row_shr=shr, bound_ctrl=0),
-                comment=f"DPP row_shr:{shr} intra-row partial sum",
-            ))
-        for stride in (16, 32):
+        # 6-stage XOR butterfly: each lane exchanges with its XOR partner and
+        # accumulates. After all 6 stages every lane holds the full 64-lane sum.
+        # ds_bpermute uses the LDS crossbar (no LDS storage, no barrier needed).
+        for stride in (1, 2, 4, 8, 16, 32):
             mod.add(ri.VXorB32(
                 dst=vgpr(vPerm),
                 src0=vgpr(vLane),
