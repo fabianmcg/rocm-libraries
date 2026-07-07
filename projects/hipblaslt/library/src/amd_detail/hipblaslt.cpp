@@ -32,6 +32,7 @@
 #include "hipblaslt/hipblaslt-ext-op.h"
 #include "hipblaslt_internal.hpp"
 
+#include <cmath>
 #include <cstring>
 #include <hip/hip_runtime_api.h>
 #include <iostream>
@@ -867,6 +868,215 @@ catch(...)
     return exception_to_hipblas_status();
 }
 
+#ifdef __cplusplus
+} // extern "C" -- the shim helpers below need C++ linkage (overloads + templates).
+#endif
+
+namespace
+{
+    // CPU "shim" for the fused-epilogue chain. Until the TensileLite fused kernels
+    // (AIHPBLAS-3856) land, hipblasLtMatmul runs the base GEMM on device, then applies the
+    // fused epilogue on the host so the advertised API returns correct answers. Only the full
+    // flow (any subsequence of {residual add, RMSNorm}) on column-major FP32/FP16/BF16 D is
+    // emulated; other chains fall through to NOT_SUPPORTED.
+    bool fused_epilogue_cpu_shim_supported(const hipblasLtFusedEpilogueDescriptor* d)
+    {
+        for(auto s : d->stages)
+        {
+            if(s != HIPBLASLT_FUSEABLE_EPILOGUE_RESIDUAL_ADD
+               && s != HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM)
+                return false;
+        }
+        return true;
+    }
+
+    // FP32-accumulation load/store helpers for the supported storage types.
+    inline float shim_load(const float& v)
+    {
+        return v;
+    }
+    inline float shim_load(const _Float16& v)
+    {
+        return static_cast<float>(v);
+    }
+    inline float shim_load(const hip_bfloat16& v)
+    {
+        return static_cast<float>(v);
+    }
+    inline void shim_store(float& d, float v)
+    {
+        d = v;
+    }
+    inline void shim_store(_Float16& d, float v)
+    {
+        d = static_cast<_Float16>(v);
+    }
+    inline void shim_store(hip_bfloat16& d, float v)
+    {
+        d = hip_bfloat16(v);
+    }
+
+    // Apply residual add (optional) and RMSNorm (optional) over each row of a column-major
+    // [M,N] tensor with leading dimension ld, using FP32 accumulation. RMSNorm reduces over N.
+    template <typename T>
+    void fused_epilogue_apply_host(T*             d_data,
+                                   const T*       residual_data,
+                                   T*             residual_out_data,
+                                   const T*       gamma_data,
+                                   uint64_t       m,
+                                   uint64_t       n,
+                                   int64_t        ld,
+                                   int32_t        batch_count,
+                                   int64_t        batch_stride,
+                                   float          eps,
+                                   bool           has_residual,
+                                   bool           has_rmsnorm)
+    {
+        for(int32_t b = 0; b < batch_count; ++b)
+        {
+            const int64_t base = static_cast<int64_t>(b) * batch_stride;
+            for(uint64_t i = 0; i < m; ++i)
+            {
+                float sum_sq = 0.0f;
+                for(uint64_t j = 0; j < n; ++j)
+                {
+                    const int64_t e
+                        = base + static_cast<int64_t>(j) * ld + static_cast<int64_t>(i);
+                    float z = shim_load(d_data[e]);
+                    if(has_residual)
+                    {
+                        z += shim_load(residual_data[e]);
+                        // z is the updated residual stream and the RMSNorm input.
+                        shim_store(residual_out_data[e], z);
+                        shim_store(d_data[e], z);
+                    }
+                    sum_sq += z * z;
+                }
+                if(has_rmsnorm)
+                {
+                    const float rstd = 1.0f / std::sqrt(sum_sq / static_cast<float>(n) + eps);
+                    for(uint64_t j = 0; j < n; ++j)
+                    {
+                        const int64_t e
+                            = base + static_cast<int64_t>(j) * ld + static_cast<int64_t>(i);
+                        const float y = shim_load(d_data[e]) * rstd * shim_load(gamma_data[j]);
+                        shim_store(d_data[e], y);
+                    }
+                }
+            }
+        }
+    }
+
+    template <typename T>
+    hipblasStatus_t fused_epilogue_cpu_shim_typed(const hipblasLtFusedEpilogueDescriptor* fused,
+                                              void*                                   d_device,
+                                              uint64_t                                m,
+                                              uint64_t                                n,
+                                              int64_t                                 ld,
+                                              int32_t                                 batch_count,
+                                              int64_t                                 batch_stride,
+                                              hipStream_t                             stream)
+    {
+        const bool has_residual
+            = fused_epilogue_has_stage(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RESIDUAL_ADD);
+        const bool has_rmsnorm
+            = fused_epilogue_has_stage(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM);
+
+        if(batch_count < 1)
+            batch_count = 1;
+
+        // Element span that covers every referenced (row, col, batch) position so untouched
+        // leading-dimension padding round-trips unchanged.
+        const size_t span
+            = static_cast<size_t>(batch_count - 1) * static_cast<size_t>(batch_stride)
+              + static_cast<size_t>(n - 1) * static_cast<size_t>(ld) + static_cast<size_t>(m);
+
+        std::vector<T> h_d(span);
+        std::vector<T> h_res, h_res_out, h_gamma;
+
+        if(hipStreamSynchronize(stream) != hipSuccess)
+            return HIPBLAS_STATUS_INTERNAL_ERROR;
+        if(hipMemcpy(h_d.data(), d_device, span * sizeof(T), hipMemcpyDeviceToHost) != hipSuccess)
+            return HIPBLAS_STATUS_INTERNAL_ERROR;
+
+        if(has_residual)
+        {
+            h_res.resize(span);
+            if(hipMemcpy(h_res.data(), fused->residual, span * sizeof(T), hipMemcpyDeviceToHost)
+               != hipSuccess)
+                return HIPBLAS_STATUS_INTERNAL_ERROR;
+            // Seed the residual-out buffer with residual so untouched padding round-trips.
+            h_res_out = h_res;
+        }
+        if(has_rmsnorm)
+        {
+            h_gamma.resize(n);
+            if(hipMemcpy(
+                   h_gamma.data(), fused->rmsnorm_gamma, n * sizeof(T), hipMemcpyDeviceToHost)
+               != hipSuccess)
+                return HIPBLAS_STATUS_INTERNAL_ERROR;
+        }
+
+        fused_epilogue_apply_host<T>(h_d.data(),
+                                     has_residual ? h_res.data() : nullptr,
+                                     has_residual ? h_res_out.data() : nullptr,
+                                     has_rmsnorm ? h_gamma.data() : nullptr,
+                                     m,
+                                     n,
+                                     ld,
+                                     batch_count,
+                                     batch_stride,
+                                     fused->rmsnorm_eps,
+                                     has_residual,
+                                     has_rmsnorm);
+
+        if(hipMemcpy(d_device, h_d.data(), span * sizeof(T), hipMemcpyHostToDevice) != hipSuccess)
+            return HIPBLAS_STATUS_INTERNAL_ERROR;
+        if(has_residual)
+        {
+            void* res_out = fused->residual_output ? fused->residual_output : fused->residual;
+            if(hipMemcpy(res_out, h_res_out.data(), span * sizeof(T), hipMemcpyHostToDevice)
+               != hipSuccess)
+                return HIPBLAS_STATUS_INTERNAL_ERROR;
+        }
+        return HIPBLAS_STATUS_SUCCESS;
+    }
+
+    hipblasStatus_t fused_epilogue_cpu_shim(const hipblasLtFusedEpilogueDescriptor* fused,
+                                        const _rocblaslt_matrix_layout*         layoutD,
+                                        void*                                   d_device,
+                                        hipStream_t                             stream)
+    {
+        const uint64_t m            = layoutD->m;
+        const uint64_t n            = layoutD->n;
+        const int64_t  ld           = layoutD->ld;
+        const int32_t  batch_count  = layoutD->batch_count;
+        const int64_t  batch_stride = layoutD->batch_stride;
+
+        if(m == 0 || n == 0)
+            return HIPBLAS_STATUS_SUCCESS;
+
+        switch(layoutD->type)
+        {
+        case HIP_R_32F:
+            return fused_epilogue_cpu_shim_typed<float>(
+                fused, d_device, m, n, ld, batch_count, batch_stride, stream);
+        case HIP_R_16F:
+            return fused_epilogue_cpu_shim_typed<_Float16>(
+                fused, d_device, m, n, ld, batch_count, batch_stride, stream);
+        case HIP_R_16BF:
+            return fused_epilogue_cpu_shim_typed<hip_bfloat16>(
+                fused, d_device, m, n, ld, batch_count, batch_stride, stream);
+        default:
+            return HIPBLAS_STATUS_NOT_SUPPORTED;
+        }
+    }
+}
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 hipblasStatus_t hipblasLtMatmul(hipblasLtHandle_t            handle,
                                 hipblasLtMatmulDesc_t        matmul_descr,
                                 const void*                  alpha,
@@ -888,16 +1098,53 @@ try
     rocblaslt::Debug::Instance().markerStart("hipblasLtMatmul");
     hipblasStatus_t return_status = HIPBLAS_STATUS_SUCCESS;
 
-    // Fused-epilogue guard: a composable fused epilogue (e.g. RMSNorm) attached via
-    // HIPBLASLT_MATMUL_DESC_FUSED_EPILOGUE has a validated API surface but no kernels yet.
-    // Reject it with NOT_SUPPORTED before kernel selection/launch. Remove this guard once
-    // the TensileLite RMSNorm kernels (AIHPBLAS-3856) are wired in.
+    // Fused-epilogue path: a composable fused epilogue (e.g. RMSNorm) attached via
+    // HIPBLASLT_MATMUL_DESC_FUSED_EPILOGUE has no TensileLite kernels yet (AIHPBLAS-3856).
+    // A CPU shim runs the base GEMM and applies the supported full-flow chain on the host so
+    // the API returns correct answers; unsupported chains/types still return NOT_SUPPORTED.
     if(auto* desc = (rocblaslt_matmul_desc)matmul_descr)
     {
         if(desc->fused_epilogue != nullptr)
         {
+            const auto* fused   = desc->fused_epilogue;
+            auto*       layoutD = (rocblaslt_matrix_layout)matD;
+            if(!fused_epilogue_cpu_shim_supported(fused) || layoutD == nullptr
+               || layoutD->order != HIPBLASLT_ORDER_COL
+               || !(layoutD->type == HIP_R_32F || layoutD->type == HIP_R_16F
+                    || layoutD->type == HIP_R_16BF))
+            {
+                rocblaslt::Debug::Instance().markerStop();
+                return HIPBLAS_STATUS_NOT_SUPPORTED;
+            }
+
+            // Compute the base GEMM first (rocblaslt_matmul ignores the fused-epilogue handle),
+            // then apply the fused epilogue chain on the host.
+            return_status = RocBlasLtStatusToHIPStatus(
+                rocblaslt_matmul((rocblaslt_handle)handle,
+                                 (rocblaslt_matmul_desc)matmul_descr,
+                                 alpha,
+                                 A,
+                                 (rocblaslt_matrix_layout)matA,
+                                 B,
+                                 (rocblaslt_matrix_layout)matB,
+                                 beta,
+                                 C,
+                                 (rocblaslt_matrix_layout)matC,
+                                 D,
+                                 (rocblaslt_matrix_layout)matD,
+                                 (const rocblaslt_matmul_algo*)algo,
+                                 workspace,
+                                 workspaceSizeInBytes,
+                                 stream));
+            if(return_status != HIPBLAS_STATUS_SUCCESS)
+            {
+                rocblaslt::Debug::Instance().markerStop();
+                return return_status;
+            }
+
+            return_status = fused_epilogue_cpu_shim(fused, layoutD, D, stream);
             rocblaslt::Debug::Instance().markerStop();
-            return HIPBLAS_STATUS_NOT_SUPPORTED;
+            return return_status;
         }
     }
 
