@@ -11,7 +11,7 @@ Algorithm — Phase 1 (reduction, one wave = 64 lanes per row subgroup):
   Each block of 256 threads is organised as 4 waves x 64 lanes.  The outer
   loop (sIter = 0..63) assigns one global row per iteration.  All 64 lanes
   of the wave collectively load one element each from partialBuf for that row.
-  A 6-stage ds_bpermute butterfly then sums the 64 partial values.  All lanes
+  A 6-instruction DPP reduction (row_shr:{8,4,2,1} + row_bcast:15/31) sums the 64 partial values.  All lanes
   with row < M write rsqrt(invD * total + eps) to LDS at address
   (waveId * 256 + sIter * 4).
 
@@ -41,7 +41,7 @@ from typing import List, Optional, Tuple
 import yaml
 
 from rocisa.code import Module, TextBlock, SrdUpperValue
-from rocisa.container import EXEC, MUBUFModifiers, vgpr, sgpr
+from rocisa.container import DPPModifiers, EXEC, MUBUFModifiers, vgpr, sgpr
 from rocisa.enum import RegisterType
 from rocisa.register import RegisterPool
 import rocisa.instruction as ri
@@ -235,8 +235,7 @@ def _build_kernel_body(isa: Tuple[int, int, int]) -> Tuple[Module, int, int]:
     vAcc = vgprPool.checkOut(1)        # f32 accumulator (phase 1)
     vOff = vgprPool.checkOut(1)        # byte-offset scratch
     vTmp = vgprPool.checkOut(1)        # general temp
-    vPerm = vgprPool.checkOut(1)       # butterfly permute byte addr
-    vBfly = vgprPool.checkOut(1)       # butterfly fetched value
+    vBfly = vgprPool.checkOut(1)       # scratch (butterfly phase 1, D-scale phase 2)
     vRstd = vgprPool.checkOut(1)       # per-thread rstd from LDS
     vLdsAddr = vgprPool.checkOut(1)    # LDS byte address
     vRowIter = vgprPool.checkOut(1)    # global row for current iteration
@@ -467,38 +466,37 @@ def _build_kernel_body(isa: Tuple[int, int, int]) -> Tuple[Module, int, int]:
         mod.add(ri.SCBranchSCC0(innerLoop, comment="loop while active lanes remain"))
 
         # ------------------------------------------------------------------
-        # Step 5: restore EXEC then 6-stage butterfly (strides 1..32).
-        # All lanes now hold their partial sum in vAcc.
+        # Step 5: restore EXEC then DPP full-wave reduction.
+        # All lanes now hold the total sum in vAcc.
         # ------------------------------------------------------------------
         mod.add(TextBlock(f"{bflyLabel}:\n"))
         mod.add(ri.SMovB64(dst=EXEC(), src=sgpr(sExecSave, 2), comment="restore EXEC"))
 
-        for stride in (1, 2, 4, 8, 16, 32):
-            mod.add(ri.VXorB32(
-                dst=vgpr(vPerm),
-                src0=vgpr(vLane),
-                src1=stride,
-                comment=f"partner = laneId ^ {stride}",
-            ))
-            mod.add(ri.VLShiftLeftB32(
-                dst=vgpr(vPerm),
-                shiftHex=hex(2),
-                src=vgpr(vPerm),
-                comment="partnerByte = partner * 4",
-            ))
-            mod.add(ri.DSBPermuteB32(
-                dst=vgpr(vBfly),
-                src0=vgpr(vPerm),
-                src1=vgpr(vAcc),
-                comment=f"bfly = partner acc (stride={stride})",
-            ))
-            mod.add(ri.SWaitCnt(dscnt=0, comment="wait ds_bpermute"))
+        # DPP full-wave reduction: row_shr within each 16-lane row, then
+        # row_bcast:15 to cross to lanes 16-31, then row_bcast:31 to all 64 lanes.
+        # bound_ctrl=0 fills shifted-in lanes with 0 so they do not contaminate sums.
+        mod.add(ri.SNop(waitState=0, comment="wait state before DPP reads vAcc"))
+        for shr in (8, 4, 2, 1):
             mod.add(ri.VAddF32(
                 dst=vgpr(vAcc),
                 src0=vgpr(vAcc),
-                src1=vgpr(vBfly),
-                comment="acc += partner",
+                src1=vgpr(vAcc),
+                dpp=DPPModifiers(row_shr=shr, bound_ctrl=0),
+                comment=f"DPP row_shr:{shr} partial sum",
             ))
+        mod.add(ri.VMovB32(
+            dst=vgpr(vBfly),
+            src=vgpr(vAcc),
+            dpp=DPPModifiers(row_bcast=15),
+            comment="broadcast lane 15 acc to lanes 16-31",
+        ))
+        mod.add(ri.VAddF32(
+            dst=vgpr(vAcc),
+            src0=vgpr(vAcc),
+            src1=vgpr(vBfly),
+            dpp=DPPModifiers(row_bcast=31),
+            comment="broadcast lane 31 acc to all 64 lanes",
+        ))
 
         # ------------------------------------------------------------------
         # Step 6: rstd = rsqrt(invD * acc + eps).
