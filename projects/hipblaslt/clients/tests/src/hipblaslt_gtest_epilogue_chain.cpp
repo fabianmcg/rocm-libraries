@@ -24,11 +24,15 @@
 //    lifecycle returns SUCCESS, full and decomposed RMSNorm stages cannot be mixed in one
 //    chain, and attaching a decomposed handle without the handoff descriptor (or, for the
 //    producer, without gamma/eps) is rejected at descriptor-set time (INVALID_VALUE).
-//  - A complete-but-unimplemented fused epilogue is rejected by hipblasLtMatmul with
-//    NOT_SUPPORTED before kernel selection/launch.
+//  - A chain the CPU shim does not implement (decomposed stages, AMax, FP8 requant) is
+//    rejected by hipblasLtMatmul with NOT_SUPPORTED before kernel selection/launch.
+//  - The CPU shim (until the TensileLite fused kernels land) makes hipblasLtMatmul return
+//    correct answers for the full residual+RMSNorm flow; an end-to-end test compares device
+//    output against the CPU reference on a real GEMM (skipped when no HIP device is present).
 
 #include <cmath>
 #include <gtest/gtest.h>
+#include <hip/hip_runtime.h>
 #include <hipblaslt/hipblaslt.h>
 #include <vector>
 
@@ -551,14 +555,19 @@ TEST_F(FusedEpilogueTest, attachCompleteRequantAccepted)
     EXPECT_EQ(attach(), HIPBLAS_STATUS_SUCCESS);
 }
 
-// ---- Complete-but-unimplemented config rejected by matmul (NOT_SUPPORTED) ----
+// ---- Chains the CPU shim does not implement are rejected by matmul (NOT_SUPPORTED) ----
 //
-// The hipblasLtMatmul wrapper guards an attached fused epilogue before kernel selection,
-// so this returns NOT_SUPPORTED without requiring a GPU or valid layouts.
+// The hipblasLtMatmul wrapper checks whether the attached chain is shim-supported before
+// kernel selection, so an unsupported chain returns NOT_SUPPORTED without requiring a GPU or
+// valid layouts. The full residual+RMSNorm flow IS shim-supported and is exercised for
+// correctness by the end-to-end test below instead.
 
-TEST_F(FusedEpilogueTest, attachedFusedEpilogueMatmulNotSupported)
+TEST_F(FusedEpilogueTest, attachedUnsupportedChainMatmulNotSupported)
 {
+    // RMSNorm + AMax: legal ordering, but AMax is not emulated by the CPU shim.
     ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM),
+              HIPBLAS_STATUS_SUCCESS);
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_AMAX),
               HIPBLAS_STATUS_SUCCESS);
     completeRmsnorm();
     ASSERT_EQ(attach(), HIPBLAS_STATUS_SUCCESS);
@@ -606,4 +615,179 @@ TEST_F(FusedEpilogueTest, attachedDecomposedConsumerMatmulNotSupported)
                               0,
                               nullptr),
               HIPBLAS_STATUS_NOT_SUPPORTED);
+}
+
+// ---- End-to-end correctness of the CPU shim (full residual + RMSNorm flow) ----
+//
+// Runs a real column-major BF16 GEMM with an attached residual+RMSNorm fused epilogue and
+// compares the device output against a CPU reference. The reference mirrors the shim's BF16
+// rounding at each storage point (GEMM output, residual sum, normalized output) so the compare
+// stays tight. Skipped when no HIP device is present.
+
+TEST(FusedEpilogueEndToEnd, residualRmsnormFullFlowMatchesReference)
+{
+    int deviceCount = 0;
+    if(hipGetDeviceCount(&deviceCount) != hipSuccess || deviceCount == 0)
+        GTEST_SKIP() << "no HIP device available";
+
+    // BF16 storage for A/B/C/D, residual, and gamma; FP32 compute/accumulation.
+    using bf16 = hip_bfloat16;
+    auto toF   = [](bf16 v) { return static_cast<float>(v); };
+    auto toBf  = [](float f) { return bf16(f); };
+    auto rndBf = [](float f) { return static_cast<float>(bf16(f)); }; // value on the BF16 grid
+
+    // D = [m, n], contraction dim k. Column-major throughout.
+    const int64_t m = 64, n = 48, k = 32;
+    const float   eps   = 1e-5f;
+    float         alpha = 1.0f, beta = 0.0f;
+
+    std::vector<bf16> hA(m * k), hB(k * n), hC(m * n, toBf(0.0f)), hResidual(m * n), hGamma(n);
+    for(int64_t i = 0; i < m * k; ++i)
+        hA[i] = toBf(static_cast<float>((i % 13) - 6) * 0.05f);
+    for(int64_t i = 0; i < k * n; ++i)
+        hB[i] = toBf(static_cast<float>((i % 11) - 5) * 0.04f);
+    for(int64_t i = 0; i < m * n; ++i)
+        hResidual[i] = toBf(static_cast<float>((i % 7) - 3) * 0.1f);
+    for(int64_t j = 0; j < n; ++j)
+        hGamma[j] = toBf(0.5f + static_cast<float>(j % 5) * 0.1f);
+
+    void *dA = nullptr, *dB = nullptr, *dC = nullptr, *dD = nullptr, *dResidual = nullptr,
+         *dGamma = nullptr, *dWorkspace = nullptr;
+    const size_t maxWorkspace = 32 * 1024 * 1024;
+    ASSERT_EQ(hipMalloc(&dA, hA.size() * sizeof(bf16)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&dB, hB.size() * sizeof(bf16)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&dC, hC.size() * sizeof(bf16)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&dD, hC.size() * sizeof(bf16)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&dResidual, hResidual.size() * sizeof(bf16)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&dGamma, hGamma.size() * sizeof(bf16)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&dWorkspace, maxWorkspace), hipSuccess);
+    ASSERT_EQ(hipMemcpy(dA, hA.data(), hA.size() * sizeof(bf16), hipMemcpyHostToDevice),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpy(dB, hB.data(), hB.size() * sizeof(bf16), hipMemcpyHostToDevice),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpy(dC, hC.data(), hC.size() * sizeof(bf16), hipMemcpyHostToDevice),
+              hipSuccess);
+    ASSERT_EQ(
+        hipMemcpy(dResidual, hResidual.data(), hResidual.size() * sizeof(bf16), hipMemcpyHostToDevice),
+        hipSuccess);
+    ASSERT_EQ(hipMemcpy(dGamma, hGamma.data(), hGamma.size() * sizeof(bf16), hipMemcpyHostToDevice),
+              hipSuccess);
+
+    hipblasLtHandle_t handle = nullptr;
+    ASSERT_EQ(hipblasLtCreate(&handle), HIPBLAS_STATUS_SUCCESS);
+
+    hipblasLtMatrixLayout_t matA = nullptr, matB = nullptr, matC = nullptr, matD = nullptr;
+    ASSERT_EQ(hipblasLtMatrixLayoutCreate(&matA, HIP_R_16BF, m, k, m), HIPBLAS_STATUS_SUCCESS);
+    ASSERT_EQ(hipblasLtMatrixLayoutCreate(&matB, HIP_R_16BF, k, n, k), HIPBLAS_STATUS_SUCCESS);
+    ASSERT_EQ(hipblasLtMatrixLayoutCreate(&matC, HIP_R_16BF, m, n, m), HIPBLAS_STATUS_SUCCESS);
+    ASSERT_EQ(hipblasLtMatrixLayoutCreate(&matD, HIP_R_16BF, m, n, m), HIPBLAS_STATUS_SUCCESS);
+
+    hipblasLtMatmulDesc_t matmul = nullptr;
+    ASSERT_EQ(hipblasLtMatmulDescCreate(&matmul, HIPBLAS_COMPUTE_32F, HIP_R_32F),
+              HIPBLAS_STATUS_SUCCESS);
+    hipblasOperation_t opN = HIPBLAS_OP_N;
+    ASSERT_EQ(
+        hipblasLtMatmulDescSetAttribute(matmul, HIPBLASLT_MATMUL_DESC_TRANSA, &opN, sizeof(opN)),
+        HIPBLAS_STATUS_SUCCESS);
+    ASSERT_EQ(
+        hipblasLtMatmulDescSetAttribute(matmul, HIPBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN)),
+        HIPBLAS_STATUS_SUCCESS);
+
+    hipblasLtFusedEpilogueDescriptor_t fused = nullptr;
+    ASSERT_EQ(hipblasLtFusedEpilogueCreate(&fused), HIPBLAS_STATUS_SUCCESS);
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RESIDUAL_ADD),
+              HIPBLAS_STATUS_SUCCESS);
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM),
+              HIPBLAS_STATUS_SUCCESS);
+    ASSERT_EQ(hipblasLtFusedEpilogueSetAttribute(
+                  fused, HIPBLASLT_FUSED_EPILOGUE_RESIDUAL_POINTER, &dResidual, sizeof(dResidual)),
+              HIPBLAS_STATUS_SUCCESS);
+    ASSERT_EQ(hipblasLtFusedEpilogueSetAttribute(
+                  fused, HIPBLASLT_FUSED_EPILOGUE_RMSNORM_GAMMA, &dGamma, sizeof(dGamma)),
+              HIPBLAS_STATUS_SUCCESS);
+    ASSERT_EQ(hipblasLtFusedEpilogueSetAttribute(
+                  fused, HIPBLASLT_FUSED_EPILOGUE_RMSNORM_EPS, &eps, sizeof(eps)),
+              HIPBLAS_STATUS_SUCCESS);
+    ASSERT_EQ(hipblasLtMatmulDescSetAttribute(
+                  matmul, HIPBLASLT_MATMUL_DESC_FUSED_EPILOGUE, &fused, sizeof(fused)),
+              HIPBLAS_STATUS_SUCCESS);
+
+    hipblasLtMatmulPreference_t pref = nullptr;
+    ASSERT_EQ(hipblasLtMatmulPreferenceCreate(&pref), HIPBLAS_STATUS_SUCCESS);
+    ASSERT_EQ(hipblasLtMatmulPreferenceSetAttribute(pref,
+                                                    HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                                    &maxWorkspace,
+                                                    sizeof(maxWorkspace)),
+              HIPBLAS_STATUS_SUCCESS);
+
+    hipblasLtMatmulHeuristicResult_t heuristic[1];
+    int                              returnedAlgoCount = 0;
+    ASSERT_EQ(hipblasLtMatmulAlgoGetHeuristic(
+                  handle, matmul, matA, matB, matC, matD, pref, 1, heuristic, &returnedAlgoCount),
+              HIPBLAS_STATUS_SUCCESS);
+    if(returnedAlgoCount == 0)
+        GTEST_SKIP() << "no GEMM solution found for the test shape";
+
+    ASSERT_EQ(hipblasLtMatmul(handle,
+                              matmul,
+                              &alpha,
+                              dA,
+                              matA,
+                              dB,
+                              matB,
+                              &beta,
+                              dC,
+                              matC,
+                              dD,
+                              matD,
+                              &heuristic[0].algo,
+                              dWorkspace,
+                              maxWorkspace,
+                              hipStream_t(0)),
+              HIPBLAS_STATUS_SUCCESS);
+
+    std::vector<bf16> hD(m * n, toBf(0.0f));
+    ASSERT_EQ(hipMemcpy(hD.data(), dD, hD.size() * sizeof(bf16), hipMemcpyDeviceToHost),
+              hipSuccess);
+
+    // CPU reference: y = RMSNorm(alpha * (A@B) + residual, gamma, eps), column-major, mirroring
+    // the BF16 rounding the device path applies at each storage point.
+    std::vector<float> ref(m * n, 0.0f);
+    for(int64_t i = 0; i < m; ++i)
+    {
+        float              sumSq = 0.0f;
+        std::vector<float> zStored(n); // z after being stored back to D as BF16
+        for(int64_t j = 0; j < n; ++j)
+        {
+            float acc = 0.0f;
+            for(int64_t l = 0; l < k; ++l)
+                acc += toF(hA[l * m + i]) * toF(hB[j * k + l]);
+            const float gemm = rndBf(alpha * acc); // GEMM writes D as BF16
+            const float zf   = gemm + toF(hResidual[j * m + i]);
+            zStored[j]       = rndBf(zf); // shim stores z back to D as BF16
+            sumSq += zf * zf;             // shim accumulates the pre-store FP32 z
+        }
+        const float rstd = 1.0f / std::sqrt(sumSq / static_cast<float>(n) + eps);
+        for(int64_t j = 0; j < n; ++j)
+            ref[j * m + i] = rndBf(zStored[j] * rstd * toF(hGamma[j]));
+    }
+
+    for(int64_t idx = 0; idx < m * n; ++idx)
+        EXPECT_NEAR(toF(hD[idx]), ref[idx], 2e-2f) << "mismatch at flat index " << idx;
+
+    hipblasLtFusedEpilogueDestroy(fused);
+    hipblasLtMatmulPreferenceDestroy(pref);
+    hipblasLtMatmulDescDestroy(matmul);
+    hipblasLtMatrixLayoutDestroy(matA);
+    hipblasLtMatrixLayoutDestroy(matB);
+    hipblasLtMatrixLayoutDestroy(matC);
+    hipblasLtMatrixLayoutDestroy(matD);
+    hipblasLtDestroy(handle);
+    static_cast<void>(hipFree(dA));
+    static_cast<void>(hipFree(dB));
+    static_cast<void>(hipFree(dC));
+    static_cast<void>(hipFree(dD));
+    static_cast<void>(hipFree(dResidual));
+    static_cast<void>(hipFree(dGamma));
+    static_cast<void>(hipFree(dWorkspace));
 }
