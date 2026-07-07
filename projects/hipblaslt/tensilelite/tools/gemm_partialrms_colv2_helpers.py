@@ -28,6 +28,8 @@ for _d in (_TOOLS_DIR, _TENSILE_DIR):
     if _d not in sys.path:
         sys.path.insert(0, _d)
 
+_DEFAULT_K1_YAML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gemm_partial_rms_k1.yaml")
+
 
 # ---------------------------------------------------------------------------
 # Magic-number fast-division helpers (mirrors ContractionSolution.cpp alg 2)
@@ -146,11 +148,42 @@ def _pack_kernel_info(solution) -> tuple:
 # ---------------------------------------------------------------------------
 
 
-def build_k1_solution(chip: str, assembler, isaInfoMap, wg_n: int = 2):
+def load_k1_config(yamlPath):
+    """Load K1 problem type and flat solution parameters from a benchmark YAML.
+
+    Returns (problemType, flatParams) where flatParams is a dict with all
+    BenchmarkCommonParameters and ForkParameters merged into a single level.
+    Each single-element list value is unwrapped to its scalar; MatrixInstruction
+    keeps its 9-element list form.
+    """
+    from Tensile import LibraryIO
+
+    data = LibraryIO.readYAML(yamlPath)
+    problemType = data["BenchmarkProblems"][0][0]
+    grp = data["BenchmarkProblems"][0][1]
+
+    flatParams = {}
+    for section in ("BenchmarkCommonParameters", "ForkParameters"):
+        for entry in grp.get(section, []):
+            for key, value in entry.items():
+                if key == "MatrixInstruction":
+                    # Keep the inner list as-is (9-element MI spec).
+                    flatParams[key] = value[0]
+                elif isinstance(value, list) and len(value) == 1:
+                    flatParams[key] = value[0]
+                else:
+                    flatParams[key] = value
+
+    return problemType, flatParams
+
+
+def build_k1_solution(chip: str, assembler, isaInfoMap, wgN: int = 2,
+                      yamlPath=_DEFAULT_K1_YAML, miOverride=None):
     """Build a bf16 GEMM + PartialRMS kernel for gfx950.
 
-    Mirror of build_rmsnorm_solution from tensile_rmsnorm_example.py, with
-    PartialRMS=True instead of RMSNorm=True.
+    Loads problem type and solution parameters from yamlPath. wgN sets
+    MIWaveGroup[1] (last element of the 9-element MI spec). miOverride
+    replaces the full 9-element MI list when provided.
     """
     from Tensile.Common.Architectures import gfxToIsa
     from Tensile.Common.GlobalParameters import defaultInternalSupportParams
@@ -163,63 +196,28 @@ def build_k1_solution(chip: str, assembler, isaInfoMap, wg_n: int = 2):
     gfx = chip.split(":")[0]
     isa = gfxToIsa(gfx)
 
-    problem_type = {
-        "OperationType": "GEMM",
-        "DataType": "b",  # bf16
-        "DestDataType": "b",  # bf16
-        "ComputeDataType": "s",  # fp32 accumulation
-        "HighPrecisionAccumulate": True,
-        "TransposeA": True,  # A: K×M col-major (TN layout)
-        "TransposeB": False,  # B: K×N col-major
-        "UseBeta": True,
-        "Batched": True,
-        "StridedBatched": True,
-        "GroupedGemm": False,
-        "UseBias": 0,
-        "UseScaleAB": "",
-        "UseScaleCD": False,
-        "UseScaleAlphaVec": 0,
-        "Sparse": 0,
-    }
+    problemType, params = load_k1_config(yamlPath)
 
-    # [instM, instN, instK, instB, mi4, wt1, wt0, wg0_waves, wg1_waves]
-    # wg0_waves=4 → MIWaveGroup[0]=4; wg_n=wg1_waves → MIWaveGroup[1]=wg_n.
-    # Default wg_n=2: MacroTile0=256, MacroTile1=256 (MIWaveTile [8,4]).
-    mi9 = [16, 16, 32, 1, 1, 4, 8, 4, wg_n]
+    if miOverride is not None:
+        params["MatrixInstruction"] = miOverride
+    else:
+        # Apply wgN sugar: last element is MIWaveGroup[1].
+        params["MatrixInstruction"][-1] = wgN
 
+    mi9 = params.pop("MatrixInstruction")
     wavefrontSize = 64
-    mi_params = matrixInstructionToMIParameters(
-        mi9, isa, wavefrontSize, problem_type, workGroup=None, isaInfoMap=isaInfoMap
+    miParams = matrixInstructionToMIParameters(
+        mi9, isa, wavefrontSize, problemType, workGroup=None, isaInfoMap=isaInfoMap
     )
 
     config = {
-        "ProblemType": problem_type,
+        "ProblemType": problemType,
         "InternalSupportParams": defaultInternalSupportParams,
         "ISA": [isa.major, isa.minor, isa.patch],
         "CodeObjectVersion": "6",
-        "GlobalSplitU": 1,
-        "KernelLanguage": "Assembly",
-        "StreamK": 3,
-        "StreamKForceDPOnly": 1,
-        "StreamKAtomic": 0,
-        "ScheduleIterAlg": 3,
-        "PrefetchGlobalRead": 2,
-        "DirectToLdsA": 1,
-        "DirectToLdsB": 1,
-        "UseSubtileImpl": True,
-        "PartialRMS": True,
-        "StaggerU": 0,
-        "DepthU": 64,
-        "LdsPadA": -1,
-        "LdsPadB": -1,
-        "StoreVectorWidth": -1,
-        "GlobalReadVectorWidthA": -1,
-        "GlobalReadVectorWidthB": -1,
-        "PreloadKernArgs": False,
-        "_1LDSBuffer": 0,
-        "PrefetchAcrossPersistent": 0,
     }
-    config.update(mi_params)
+    config.update(params)
+    config.update(miParams)
 
     if not validateMIParameters(config, isaInfoMap):
         raise RuntimeError("MI parameter validation failed")

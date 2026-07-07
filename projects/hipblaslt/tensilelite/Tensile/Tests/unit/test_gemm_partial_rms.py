@@ -124,104 +124,6 @@ def _m_shapes_for_mt0(mt0):
 
 
 # ---------------------------------------------------------------------------
-# Solution builder — builds directly from (wg0_waves, wg1_waves), not via the
-# example helper, so the fixture is independent of example-script defaults.
-# ---------------------------------------------------------------------------
-
-def _build_k1_solution(chip, wg0_waves, wg1_waves):
-    from pathlib import Path
-    from Tensile.Toolchain.Validators import validateToolchain
-    from Tensile.Toolchain.Component import Assembler
-    from Tensile.Common.Architectures import gfxToIsa
-    from Tensile.Common.Capabilities import makeIsaInfoMap
-    from Tensile.Common.GlobalParameters import assignGlobalParameters, defaultInternalSupportParams
-    from Tensile.Common.Types import DebugConfig
-    from Tensile.SolutionStructs.Solution import Solution
-    from Tensile.SolutionStructs.Validators.MatrixInstruction import (
-        matrixInstructionToMIParameters,
-        validateMIParameters,
-    )
-
-    gfx = chip.split(":")[0]
-    cxx = validateToolchain("amdclang++")
-    isa = gfxToIsa(gfx)
-    isaInfoMap = makeIsaInfoMap([isa], cxx)
-    assignGlobalParameters({}, isaInfoMap)
-    assembler = Assembler(Path(cxx), co_version="6")
-    debugConfig = DebugConfig()
-
-    problem_type = {
-        "OperationType": "GEMM",
-        "DataType": "b",
-        "DestDataType": "b",
-        "ComputeDataType": "s",
-        "HighPrecisionAccumulate": True,
-        "TransposeA": True,
-        "TransposeB": False,
-        "UseBeta": True,
-        "Batched": True,
-        "StridedBatched": True,
-        "GroupedGemm": False,
-        "UseBias": 0,
-        "UseScaleAB": "",
-        "UseScaleCD": False,
-        "UseScaleAlphaVec": 0,
-        "Sparse": 0,
-    }
-
-    # [instM, instN, instK, instB, mi4, wt1, wt0, wg0_waves, wg1_waves]
-    mi9 = [16, 16, 32, 1, 1, 4, 4, wg0_waves, wg1_waves]
-    mi_params = matrixInstructionToMIParameters(
-        mi9, isa, 64, problem_type, workGroup=None, isaInfoMap=isaInfoMap
-    )
-
-    config = {
-        "ProblemType": problem_type,
-        "InternalSupportParams": defaultInternalSupportParams,
-        "ISA": [isa.major, isa.minor, isa.patch],
-        "CodeObjectVersion": "6",
-        "GlobalSplitU": 1,
-        "KernelLanguage": "Assembly",
-        "StreamK": 3,
-        "StreamKForceDPOnly": 1,
-        "StreamKAtomic": 0,
-        "ScheduleIterAlg": 3,
-        "PrefetchGlobalRead": 2,
-        "DirectToLdsA": 1,
-        "DirectToLdsB": 1,
-        "UseSubtileImpl": True,
-        "PartialRMS": True,
-        "StaggerU": 0,
-        "DepthU": 64,
-        "LdsPadA": -1,
-        "LdsPadB": -1,
-        "StoreVectorWidth": -1,
-        "GlobalReadVectorWidthA": -1,
-        "GlobalReadVectorWidthB": -1,
-        "PreloadKernArgs": False,
-        "_1LDSBuffer": 0,
-        "PrefetchAcrossPersistent": 0,
-    }
-    config.update(mi_params)
-
-    assert validateMIParameters(config, isaInfoMap), \
-        f"MI validation failed for wg0={wg0_waves} wg1={wg1_waves}"
-
-    solution = Solution(
-        config,
-        splitGSU=False,
-        printSolutionRejectionReason=True,
-        printIndexAssignmentInfo=False,
-        assembler=assembler,
-        isaInfoMap=isaInfoMap,
-    )
-    assert solution["Valid"], \
-        f"Solution rejected for wg0={wg0_waves} wg1={wg1_waves}"
-
-    return solution, assembler, debugConfig
-
-
-# ---------------------------------------------------------------------------
 # Session-scoped fixture: build + compile once per (wg0_waves, wg1_waves)
 # ---------------------------------------------------------------------------
 
@@ -233,12 +135,15 @@ def _build_k1_solution(chip, wg0_waves, wg1_waves):
 def k1_kernel(request):
     """Build, assemble, and compile the K1 PartialRMS kernel for each tile config."""
     sys.path.insert(0, TENSILE_ROOT)
-    from gemm_partialrms_colv2_helpers import generate_asm
+    from gemm_partialrms_colv2_helpers import setup_tensile, build_k1_solution, generate_asm
 
-    wg0_waves, wg1_waves = request.param
+    wg0Waves, wg1Waves = request.param
     chip = amdgpu_exec.get_chip()
 
-    solution, assembler, debugConfig = _build_k1_solution(chip, wg0_waves, wg1_waves)
+    assembler, isaInfoMap, debugConfig = setup_tensile(chip)
+    # wt0=4 (not 8 as in the default YAML) — use miOverride to specify the full MI spec.
+    miOverride = [16, 16, 32, 1, 1, 4, 4, wg0Waves, wg1Waves]
+    solution = build_k1_solution(chip, assembler, isaInfoMap, miOverride=miOverride)
     asm_str, kernel_name = generate_asm(solution, assembler, debugConfig)
     hsaco = amdgpu_exec.compile_asm_to_hsaco(asm_str, chip)
     return solution, kernel_name, hsaco, chip

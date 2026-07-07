@@ -138,7 +138,7 @@ def pipeline_kernels(request):
     chip = amdgpu_exec.get_chip()
 
     assembler, isaInfoMap, debugConfig = setup_tensile(chip)
-    k1Sol = build_k1_solution(chip, assembler, isaInfoMap, wg_n=wgN)
+    k1Sol = build_k1_solution(chip, assembler, isaInfoMap, wgN=wgN)
     k1Asm, k1Name = generate_asm(k1Sol, assembler, debugConfig)
     k1Hsaco = amdgpu_exec.compile_asm_to_hsaco(k1Asm, chip)
 

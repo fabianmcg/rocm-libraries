@@ -216,7 +216,7 @@ def verify_pipeline(d_host, partial_host, M, N_hidden, N_tiles_N, MT1,
 # ---------------------------------------------------------------------------
 
 
-def benchmark(chip, M, N_hidden, K, eps, warmup, iters, do_verify, wg_n):
+def benchmark(chip, M, N_hidden, K, eps, warmup, iters, do_verify, wg_n, config=None):
     import ml_dtypes
 
     inv_d = 1.0 / N_hidden
@@ -230,7 +230,10 @@ def benchmark(chip, M, N_hidden, K, eps, warmup, iters, do_verify, wg_n):
     assembler, isaInfoMap, debugConfig = setup_tensile(chip)
 
     print(f"Building K1 solution (wg_n={wg_n})...")
-    k1_sol = build_k1_solution(chip, assembler, isaInfoMap, wg_n=wg_n)
+    kwargs = {}
+    if config:
+        kwargs["yamlPath"] = config
+    k1_sol = build_k1_solution(chip, assembler, isaInfoMap, wgN=wg_n, **kwargs)
     MT0 = k1_sol["MacroTile0"]
     MT1 = k1_sol["MacroTile1"]
     N_tiles_N = math.ceil(N_hidden / MT1)
@@ -398,6 +401,8 @@ def parse_args():
     p.add_argument("--K",          type=int,   default=4096)
     p.add_argument("--wg-n",       type=int,   default=2, dest="wg_n",
                    help="MIWaveGroup[1] (default 2 → MT1=128)")
+    p.add_argument("--config",     default=None,
+                   help="Path to K1 YAML config (default: tools/gemm_partial_rms_k1.yaml)")
     p.add_argument("--eps",        type=float, default=1e-5)
     p.add_argument("--warmup",     type=int,   default=3)
     p.add_argument("--iters",      type=int,   default=10)
@@ -423,6 +428,7 @@ def main():
         iters=args.iters,
         do_verify=not args.no_verify,
         wg_n=args.wg_n,
+        config=args.config,
     )
 
 
