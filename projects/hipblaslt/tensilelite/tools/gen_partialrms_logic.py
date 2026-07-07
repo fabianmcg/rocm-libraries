@@ -24,8 +24,14 @@ for _d in (_TOOLS_DIR, _TENSILELITE):
 from gemm_partialrms_colv2_helpers import setup_tensile, build_k1_solution
 from Tensile.SolutionStructs.Naming import getKernelNameMin
 
-# gfx950 device IDs recognised by TensileCreateLibrary.
-_GFX950_DEVICE_IDS = ["Device 74a1", "Device 75a8", "Device 75a3", "Device 75a2"]
+# All gfx950 device IDs (see Tensile/Common/Architectures.py).
+_GFX950_DEVICE_IDS = [
+    "Device 74a1",
+    "Device 75a0", "Device 75b0",
+    "Device 75a2", "Device 75b2",
+    "Device 75a3", "Device 75b3",
+    "Device 75a8", "Device 75b8",
+]
 
 
 def _to_primitive(v):

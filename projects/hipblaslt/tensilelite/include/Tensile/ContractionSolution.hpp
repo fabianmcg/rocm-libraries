@@ -641,6 +641,9 @@ namespace TensileLite
             // The host (DataInitialization) consults this to decide whether to
             // apply the K-dimension swizzle on the MX scale tensor before upload.
             int mxScaleFormat = 0;
+
+            bool usePartialRMS         = false;
+            bool partialRMSResidualAdd = false;
         };
 
         struct LinearModel
