@@ -387,6 +387,13 @@ struct hipblasLtFusedEpilogueRMSNormDescriptor
     void* per_row_scale = nullptr;
     // Set after the producer reduction has populated per_row_scale.
     bool populated = false;
+
+    // CPU-shim storage for the finalized per-row scale (rstd), laid out as
+    // [batch * rows + row], FP32. The producer (partial RMSNorm stats) fills this; the
+    // consumer (RMSNorm scale-apply) reads it. Not part of the eventual on-device layout.
+    std::vector<float> host_scale;
+    uint64_t           rows  = 0;
+    int32_t            batch = 1;
 };
 
 // Definition of the opaque handle declared in hipblaslt.h. Owns the composed list of
@@ -876,15 +883,17 @@ namespace
 {
     // CPU "shim" for the fused-epilogue chain. Until the TensileLite fused kernels
     // (AIHPBLAS-3856) land, hipblasLtMatmul runs the base GEMM on device, then applies the
-    // fused epilogue on the host so the advertised API returns correct answers. Only the full
-    // flow (any subsequence of {residual add, RMSNorm}) on column-major FP32/FP16/BF16 D is
-    // emulated; other chains fall through to NOT_SUPPORTED.
+    // fused epilogue on the host so the advertised API returns correct answers. The shim
+    // emulates the full flow (residual add, RMSNorm) and the decomposed flow (partial RMSNorm
+    // stats producer + RMSNorm scale-apply consumer) on column-major FP32/FP16/BF16 D. Stages
+    // reserved for future kernels (AMax, FP8 requant, SwiGLU) fall through to NOT_SUPPORTED.
     bool fused_epilogue_cpu_shim_supported(const hipblasLtFusedEpilogueDescriptor* d)
     {
         for(auto s : d->stages)
         {
-            if(s != HIPBLASLT_FUSEABLE_EPILOGUE_RESIDUAL_ADD
-               && s != HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM)
+            if(s == HIPBLASLT_FUSEABLE_EPILOGUE_AMAX
+               || s == HIPBLASLT_FUSEABLE_EPILOGUE_FP8_REQUANT
+               || s == HIPBLASLT_FUSEABLE_EPILOGUE_SWIGLU)
                 return false;
         }
         return true;
@@ -916,21 +925,28 @@ namespace
         d = hip_bfloat16(v);
     }
 
-    // Apply residual add (optional) and RMSNorm (optional) over each row of a column-major
-    // [M,N] tensor with leading dimension ld, using FP32 accumulation. RMSNorm reduces over N.
+    // Reduce path over each row of a column-major [M,N] tensor (leading dimension ld), using
+    // FP32 accumulation. Applies residual add (optional), then per-row RMSNorm reducing over N:
+    //  - has_residual: z = d + residual, written to residual_out and back to d.
+    //  - do_norm:      rstd = rsqrt(mean(z^2) + eps); the downstream value is z*gamma, scaled by
+    //                  rstd when apply_scale is set (full flow) or left unscaled when it is not
+    //                  (decomposed producer, which defers the scale to the consuming GEMM).
+    //  - scale_out:    when non-null, receives rstd per (batch,row) as [batch*m + row].
     template <typename T>
-    void fused_epilogue_apply_host(T*             d_data,
-                                   const T*       residual_data,
-                                   T*             residual_out_data,
-                                   const T*       gamma_data,
-                                   uint64_t       m,
-                                   uint64_t       n,
-                                   int64_t        ld,
-                                   int32_t        batch_count,
-                                   int64_t        batch_stride,
-                                   float          eps,
-                                   bool           has_residual,
-                                   bool           has_rmsnorm)
+    void fused_epilogue_reduce_host(T*       d_data,
+                                   const T* residual_data,
+                                   T*       residual_out_data,
+                                   const T* gamma_data,
+                                   uint64_t m,
+                                   uint64_t n,
+                                   int64_t  ld,
+                                   int32_t  batch_count,
+                                   int64_t  batch_stride,
+                                   float    eps,
+                                   bool     has_residual,
+                                   bool     do_norm,
+                                   bool     apply_scale,
+                                   float*   scale_out)
     {
         for(int32_t b = 0; b < batch_count; ++b)
         {
@@ -952,35 +968,74 @@ namespace
                     }
                     sum_sq += z * z;
                 }
-                if(has_rmsnorm)
+                if(do_norm)
                 {
                     const float rstd = 1.0f / std::sqrt(sum_sq / static_cast<float>(n) + eps);
                     for(uint64_t j = 0; j < n; ++j)
                     {
                         const int64_t e
                             = base + static_cast<int64_t>(j) * ld + static_cast<int64_t>(i);
-                        const float y = shim_load(d_data[e]) * rstd * shim_load(gamma_data[j]);
-                        shim_store(d_data[e], y);
+                        float v = shim_load(d_data[e]) * shim_load(gamma_data[j]);
+                        if(apply_scale)
+                            v *= rstd;
+                        shim_store(d_data[e], v);
                     }
+                    if(scale_out)
+                        scale_out[static_cast<size_t>(b) * m + i] = rstd;
                 }
             }
         }
     }
 
+    // Consumer path: multiply each row of a column-major [M,N] tensor by the deferred per-row
+    // scale carried in the handoff descriptor (broadcast across the N columns).
     template <typename T>
-    hipblasStatus_t fused_epilogue_cpu_shim_typed(const hipblasLtFusedEpilogueDescriptor* fused,
-                                              void*                                   d_device,
-                                              uint64_t                                m,
-                                              uint64_t                                n,
-                                              int64_t                                 ld,
-                                              int32_t                                 batch_count,
-                                              int64_t                                 batch_stride,
-                                              hipStream_t                             stream)
+    void fused_epilogue_apply_scale_host(T*           d_data,
+                                         const float* scale,
+                                         uint64_t     m,
+                                         uint64_t     n,
+                                         int64_t      ld,
+                                         int32_t      batch_count,
+                                         int64_t      batch_stride)
+    {
+        for(int32_t b = 0; b < batch_count; ++b)
+        {
+            const int64_t base = static_cast<int64_t>(b) * batch_stride;
+            for(uint64_t i = 0; i < m; ++i)
+            {
+                const float s = scale[static_cast<size_t>(b) * m + i];
+                for(uint64_t j = 0; j < n; ++j)
+                {
+                    const int64_t e
+                        = base + static_cast<int64_t>(j) * ld + static_cast<int64_t>(i);
+                    shim_store(d_data[e], shim_load(d_data[e]) * s);
+                }
+            }
+        }
+    }
+
+    // Full flow (RMSNorm) and decomposed producer (partial RMSNorm stats): residual add + the
+    // per-row RMSNorm reduction. The full flow applies the scale to D; the producer instead
+    // stashes the per-row scale into the handoff descriptor and defers the multiply.
+    template <typename T>
+    hipblasStatus_t fused_epilogue_cpu_shim_reduce_typed(
+        const hipblasLtFusedEpilogueDescriptor* fused,
+        void*                                   d_device,
+        uint64_t                                m,
+        uint64_t                                n,
+        int64_t                                 ld,
+        int32_t                                 batch_count,
+        int64_t                                 batch_stride,
+        hipStream_t                             stream)
     {
         const bool has_residual
             = fused_epilogue_has_stage(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RESIDUAL_ADD);
-        const bool has_rmsnorm
+        const bool has_full
             = fused_epilogue_has_stage(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM);
+        const bool has_producer
+            = fused_epilogue_has_stage(fused, HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS);
+        const bool do_norm     = has_full || has_producer;
+        const bool apply_scale = has_full;
 
         if(batch_count < 1)
             batch_count = 1;
@@ -1008,7 +1063,7 @@ namespace
             // Seed the residual-out buffer with residual so untouched padding round-trips.
             h_res_out = h_res;
         }
-        if(has_rmsnorm)
+        if(do_norm)
         {
             h_gamma.resize(n);
             if(hipMemcpy(
@@ -1017,10 +1072,14 @@ namespace
                 return HIPBLAS_STATUS_INTERNAL_ERROR;
         }
 
-        fused_epilogue_apply_host<T>(h_d.data(),
+        std::vector<float> scale;
+        if(has_producer)
+            scale.resize(static_cast<size_t>(batch_count) * m);
+
+        fused_epilogue_reduce_host<T>(h_d.data(),
                                      has_residual ? h_res.data() : nullptr,
                                      has_residual ? h_res_out.data() : nullptr,
-                                     has_rmsnorm ? h_gamma.data() : nullptr,
+                                     do_norm ? h_gamma.data() : nullptr,
                                      m,
                                      n,
                                      ld,
@@ -1028,7 +1087,9 @@ namespace
                                      batch_stride,
                                      fused->rmsnorm_eps,
                                      has_residual,
-                                     has_rmsnorm);
+                                     do_norm,
+                                     apply_scale,
+                                     has_producer ? scale.data() : nullptr);
 
         if(hipMemcpy(d_device, h_d.data(), span * sizeof(T), hipMemcpyHostToDevice) != hipSuccess)
             return HIPBLAS_STATUS_INTERNAL_ERROR;
@@ -1039,13 +1100,65 @@ namespace
                != hipSuccess)
                 return HIPBLAS_STATUS_INTERNAL_ERROR;
         }
+        if(has_producer)
+        {
+            // Hand the finalized per-row scale to the consuming GEMM via the handoff descriptor.
+            auto* stats        = fused->rmsnorm_stats;
+            stats->host_scale  = std::move(scale);
+            stats->rows        = m;
+            stats->batch       = batch_count;
+            stats->populated   = true;
+        }
+        return HIPBLAS_STATUS_SUCCESS;
+    }
+
+    // Decomposed consumer (RMSNorm scale-apply): multiply GEMM2's output by the deferred per-row
+    // scale carried in the handoff descriptor.
+    template <typename T>
+    hipblasStatus_t fused_epilogue_cpu_shim_apply_typed(
+        const hipblasLtFusedEpilogueDescriptor* fused,
+        void*                                   d_device,
+        uint64_t                                m,
+        uint64_t                                n,
+        int64_t                                 ld,
+        int32_t                                 batch_count,
+        int64_t                                 batch_stride,
+        hipStream_t                             stream)
+    {
+        if(batch_count < 1)
+            batch_count = 1;
+
+        const auto* stats = fused->rmsnorm_stats;
+        // A scale-apply consuming a stats descriptor no producer populated is an error.
+        if(stats == nullptr || !stats->populated)
+            return HIPBLAS_STATUS_INVALID_VALUE;
+        // The deferred per-row scale must match the consuming GEMM's row/batch counts.
+        if(stats->rows != m || stats->batch != batch_count
+           || stats->host_scale.size() < static_cast<size_t>(batch_count) * m)
+            return HIPBLAS_STATUS_INVALID_VALUE;
+
+        const size_t span
+            = static_cast<size_t>(batch_count - 1) * static_cast<size_t>(batch_stride)
+              + static_cast<size_t>(n - 1) * static_cast<size_t>(ld) + static_cast<size_t>(m);
+
+        std::vector<T> h_d(span);
+        if(hipStreamSynchronize(stream) != hipSuccess)
+            return HIPBLAS_STATUS_INTERNAL_ERROR;
+        if(hipMemcpy(h_d.data(), d_device, span * sizeof(T), hipMemcpyDeviceToHost) != hipSuccess)
+            return HIPBLAS_STATUS_INTERNAL_ERROR;
+
+        fused_epilogue_apply_scale_host<T>(
+            h_d.data(), stats->host_scale.data(), m, n, ld, batch_count, batch_stride);
+
+        if(hipMemcpy(d_device, h_d.data(), span * sizeof(T), hipMemcpyHostToDevice) != hipSuccess)
+            return HIPBLAS_STATUS_INTERNAL_ERROR;
         return HIPBLAS_STATUS_SUCCESS;
     }
 
     hipblasStatus_t fused_epilogue_cpu_shim(const hipblasLtFusedEpilogueDescriptor* fused,
-                                        const _rocblaslt_matrix_layout*         layoutD,
-                                        void*                                   d_device,
-                                        hipStream_t                             stream)
+                                            const _rocblaslt_matrix_layout*         layoutD,
+                                            void*                                   d_device,
+                                            hipStream_t                             stream)
     {
         const uint64_t m            = layoutD->m;
         const uint64_t n            = layoutD->n;
@@ -1056,17 +1169,28 @@ namespace
         if(m == 0 || n == 0)
             return HIPBLAS_STATUS_SUCCESS;
 
+        // The decomposed consumer applies a deferred per-row scale; every other supported chain
+        // goes through the residual/RMSNorm reduce path.
+        const bool is_consumer
+            = fused_epilogue_has_stage(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM_SCALE_APPLY);
+
         switch(layoutD->type)
         {
         case HIP_R_32F:
-            return fused_epilogue_cpu_shim_typed<float>(
-                fused, d_device, m, n, ld, batch_count, batch_stride, stream);
+            return is_consumer ? fused_epilogue_cpu_shim_apply_typed<float>(
+                       fused, d_device, m, n, ld, batch_count, batch_stride, stream)
+                               : fused_epilogue_cpu_shim_reduce_typed<float>(
+                                   fused, d_device, m, n, ld, batch_count, batch_stride, stream);
         case HIP_R_16F:
-            return fused_epilogue_cpu_shim_typed<_Float16>(
-                fused, d_device, m, n, ld, batch_count, batch_stride, stream);
+            return is_consumer ? fused_epilogue_cpu_shim_apply_typed<_Float16>(
+                       fused, d_device, m, n, ld, batch_count, batch_stride, stream)
+                               : fused_epilogue_cpu_shim_reduce_typed<_Float16>(
+                                   fused, d_device, m, n, ld, batch_count, batch_stride, stream);
         case HIP_R_16BF:
-            return fused_epilogue_cpu_shim_typed<hip_bfloat16>(
-                fused, d_device, m, n, ld, batch_count, batch_stride, stream);
+            return is_consumer ? fused_epilogue_cpu_shim_apply_typed<hip_bfloat16>(
+                       fused, d_device, m, n, ld, batch_count, batch_stride, stream)
+                               : fused_epilogue_cpu_shim_reduce_typed<hip_bfloat16>(
+                                   fused, d_device, m, n, ld, batch_count, batch_stride, stream);
         default:
             return HIPBLAS_STATUS_NOT_SUPPORTED;
         }
@@ -1100,8 +1224,9 @@ try
 
     // Fused-epilogue path: a composable fused epilogue (e.g. RMSNorm) attached via
     // HIPBLASLT_MATMUL_DESC_FUSED_EPILOGUE has no TensileLite kernels yet (AIHPBLAS-3856).
-    // A CPU shim runs the base GEMM and applies the supported full-flow chain on the host so
-    // the API returns correct answers; unsupported chains/types still return NOT_SUPPORTED.
+    // A CPU shim runs the base GEMM and applies the supported chain (full residual+RMSNorm or
+    // the decomposed producer/consumer stages) on the host so the API returns correct answers;
+    // unsupported chains/types still return NOT_SUPPORTED.
     if(auto* desc = (rocblaslt_matmul_desc)matmul_descr)
     {
         if(desc->fused_epilogue != nullptr)
