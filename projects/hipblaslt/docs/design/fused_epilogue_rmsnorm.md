@@ -141,9 +141,9 @@ Kernel 3:  h3 = h2 @ W1;   y = r ⊙ h3           # GEMM2 + CODA scale-apply epi
 
 Kernel 1 and the GEMM in Kernel 3 are both GEMM kernels produced by the single codegen option,
 selecting different epilogue options. The reduction (Kernel 2) is a small custom kernel; it does
-slightly different work in the two flows (apply vs return). The per-row scale and all
-tiling-dependent metadata are carried between calls in an opaque descriptor, so the caller never
-has to compute or observe tile-shape details such as the partial-buffer column count.
+slightly different work in the two flows (apply vs return). In the decomposed flow, only the
+finalized per-row scale crosses the call boundary in an opaque descriptor; tiling-dependent
+metadata such as the partial-buffer column count remains internal to the producer call.
 
 ### 3.3 Choosing a flow
 
@@ -323,11 +323,15 @@ hipblasStatus_t hipblasLtFusedEpilogueRMSNormDescriptorCreate(hipblasLtFusedEpil
 hipblasStatus_t hipblasLtFusedEpilogueRMSNormDescriptorDestroy(hipblasLtFusedEpilogueRMSNormDescriptor_t desc);
 ```
 
-The producer call (`partial RMSNorm stats`) writes the finalized per-row scale and all
-tiling-dependent metadata into this descriptor; the consumer call (`RMSNorm scale-apply`)
-reads them back. The fields it carries -- the per-row scale buffer, the partial-buffer column
-count `ceil(N / MacroTile1)`, `1/d`, and the `h2` shape -- are internal and are not part of
-the public API.
+The producer matmul call runs Kernel 1 plus the cross-tile reduction, and the reduction folds
+`1/d` and `eps` into the finalized per-row scale before the call returns. The **only** state that
+must cross the API boundary into the consumer call (`RMSNorm scale-apply`) is therefore small:
+
+- the per-row scale (`rstd`) buffer, FP32, tightly packed `[M * batch]` (one value per valid
+  output row, per batch).
+- a populated/validity token, so a `RMSNorm scale-apply` chain attached to a descriptor that no
+  producer has written is rejected at `hipblasLtMatmul` time.
+
 
 `Add` accumulates stages in call order. The chain is attached to a matmul descriptor with a
 single new attribute:
@@ -381,13 +385,19 @@ output value to `D`; that invalid alias is rejected by kernel-specific validatio
 kernels are wired in. The same restriction applies when a later single-call stage such as FP8
 requant changes the main output storage value written to `D`.
 
+For the full flow, `gamma` and `eps` are set on the single `RMSNorm` handle and no handoff
+descriptor is created: the library derives `1/d` and the tiling metadata from the selected
+solution and keeps the `partialBuf` scratch in the matmul preference workspace for the duration
+of the single call. The reduction applies the per-row scale to `D` in place, so no per-row-scale
+buffer is materialized.
+
 For the decomposed flow, `gamma` and `eps` are set on the producer handle: `gamma` is applied
 tile-locally in Kernel 1, and `eps` (together with `1/d`, which the library derives from the
 problem shape) is consumed by the internal reduction that finalizes the per-row scale. The
 handoff descriptor is set on both the producer and consumer handles and must refer to the same
-object. The per-row scale and the partial sum-of-squares scratch are carried inside the
-handoff descriptor and the matmul preference workspace; they are not caller-supplied buffers
-and the caller never computes their shapes.
+object. Only the finalized per-row scale is carried inside the handoff descriptor (which owns
+that one cross-call allocation); the partial sum-of-squares scratch stays in the matmul
+preference workspace and is consumed by the reduction inside the producer call.
 
 AMax and FP8-requant stage parameters (`AMAX_D` / `D_SCALE` reuse) are not RMSNorm or
 residual-add attributes; they require their own stage-specific attributes.
@@ -395,7 +405,9 @@ residual-add attributes; they require their own stage-specific attributes.
 ### 5.4 Usage sketch
 
 Full RMSNorm, exposed as a single `hipblasLtMatmul` call (the library runs the producer and
-the reduce-and-apply internally):
+the reduce-and-apply internally). Note there is no handoff descriptor: the internal producer ->
+reduce-and-apply state lives in the preference workspace for the duration of the call
+(section 5.2):
 
 ```c
 hipblasLtFusedEpilogueDescriptor_t fused;
@@ -522,10 +534,12 @@ fully validated at `hipblasLtMatmul` time.
   type (`hipblasLtFusedEpilogueRMSNormDescriptor_t`) that is only passed across calls, never
   inspected by the caller.
 - `hipblasLtMatmulPreference_t` is unchanged. Workspace and SM-count hints apply as usual.
-  The decomposed flow has no caller-allocated normalization buffers: the per-row scale rides
-  in the handoff descriptor, and the partial-stats scratch plus any synchronizer/flag buffer
-  are internal and drawn from the matmul preference workspace, sized via the workspace-size
-  query.
+  Neither flow has caller-allocated normalization buffers. In the full flow, `partialBuf` and any
+  synchronizer/flag buffer are transient and drawn from the matmul preference workspace for the
+  single call; Kernel 2 applies the row scale to `D` in place, so no per-row-scale buffer is
+  materialized. In the decomposed flow, the handoff descriptor owns only the finalized per-row
+  scale used by GEMM2. The producer's `partialBuf` scratch and any synchronizer/flag buffer remain
+  internal, transient workspace sized through the workspace-size query.
 - On the codegen side, the GEMM kernels for both flows come from a single TensileLite option
   (`FusedEpilogues = 1`) that bundles the optional-residual, RMSNorm-producer, and
   RMSNorm-scale-apply epilogue options and selects among them at runtime. The cross-tile

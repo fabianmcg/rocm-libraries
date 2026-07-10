@@ -368,6 +368,54 @@ namespace
             }
         }
     }
+    // SKETCH (AIHPBLAS-3856 follow-up) -- shared Kernel 1 / Kernel 2 arg-packing for the fused
+    // RMSNorm producer. Both flows use ONE packing path; see the internal RmsNormHandoff struct in
+    // amd_detail/hipblaslt.cpp and docs/design/fused_epilogue_rmsnorm.md section 5.2.
+    //
+    // Given the attached hipblasLtFusedEpilogueDescriptor (fused) and the selected solution, build
+    // the producer's RmsNormHandoff, then map it onto the TensileLite ContractionProblemGemm the
+    // same way for both flows (kernel-arg names mirror the SubtilePartialRMSEmit / Contraction
+    // Solution kernel arguments: RMSNormGamma, PartialBuf, ResidualBuf):
+    //
+    //   const bool residualAdd = fused_epilogue_has_stage(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RESIDUAL_ADD);
+    //   const int64_t N  = problem.freeSizeB();                 // feature (N) dim reduced over
+    //   const int64_t M  = problem.freeSizeA();
+    //   const int64_t mPadded = roundUp(M, solution.macroTile0); // ceil(M / MT0) * MT0 (alloc only)
+    //
+    //   // Build K2's explicit argument bundle once (both flows fill it the same way).
+    //   RmsNormHandoff h;
+    //   h.M       = M;
+    //   h.N       = N;
+    //   h.nTilesN = ceilDiv(N, solution.macroTile1);            // ceil(N / MacroTile1) -> kernarg "nD"
+    //   h.invD    = 1.0f / static_cast<float>(N);
+    //   h.eps     = fused->rmsnorm_eps;
+    //   h.partialBuf = carveWorkspace(ws, mPadded * h.nTilesN * sizeof(float)); // transient
+    //
+    //   // Kernel 1 (Tensile GEMM): inputs flow through the Tensile problem, not through h.
+    //   problem.setUsePartialRMS(true);
+    //   problem.setPartialRMSResidualAdd(residualAdd);
+    //   problem.setPartialRMSMT0(solution.macroTile0);
+    //   problem.setPartialRMSMT1(solution.macroTile1);
+    //   problem.setRMSGamma(bf16, N);
+    //   problem.setPartialBuf(mPadded, h.nTilesN);
+    //   if(residualAdd) problem.setResidual(bf16, M, N);
+    //   inputs.rmsGamma   = fused->rmsnorm_gamma;   // -> kernel arg "RMSNormGamma"
+    //   inputs.partialBuf = h.partialBuf;           // -> kernel arg "PartialBuf"
+    //   inputs.residual   = fused->residual;        // -> kernel arg "ResidualBuf" (if residualAdd)
+    //
+    //   // Kernel 2 (custom reduction), args {ptrC=D, ptrD=partialBuf, M, N, nD, invD, eps}:
+    //   if(!scaleApplyDeferred) {            // full flow: reduce and apply to D in place
+    //       launchRmsNormReduceApply(inputs.D, h);
+    //   } else {                             // decomposed follow-up: reduce and return the scale
+    //       auto* stats = fused->rmsnorm_stats;
+    //       stats->per_row_scale = deviceAlloc(M * problem.batchCount() * sizeof(float)); // tight, owned by descriptor
+    //       stats->populated = true;         // consumer derives M/batch from its own GEMM2 problem
+    //       launchRmsNormReduceReturn(stats->per_row_scale, h);
+    //   }
+    //
+    // The consumer (RMSNORM_SCALE_APPLY / GEMM2) reads fused->rmsnorm_stats->per_row_scale and
+    // applies it in its epilogue, using its own M/batch (which the decomposed flow requires to
+    // match the producer's).
     inline TensileLite::ActivationType getTensileActivationType(rocblaslt_epilogue epilogue)
     {
         switch(epilogue)
