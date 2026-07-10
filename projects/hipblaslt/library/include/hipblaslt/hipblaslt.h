@@ -147,13 +147,12 @@ typedef struct hipblasLtFusedEpilogueDescriptor* hipblasLtFusedEpilogueDescripto
  *  \brief Opaque, library-populated handoff descriptor for the decomposed RMSNorm flow.
  *
  *  \details
- *  Links the decomposed producer stage (``HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS``
- *  on the GEMM1 handle) to the consumer stage
- *  (``HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM_SCALE_APPLY`` on the GEMM2 handle). The producer call
- *  writes the finalized per-row scale and tiling-dependent metadata into this object; the
- *  consumer call reads them back. The caller only creates it, sets it on both fused-epilogue
- *  handles through ``HIPBLASLT_FUSED_EPILOGUE_RMSNORM_STATS``, and destroys it; the fields it
- *  carries are internal and are not part of the public API.
+ *  Used only by the decomposed flow: the producer stage
+ *  (``HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS``) writes the finalized per-row scale,
+ *  and the consumer stage (``HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM_SCALE_APPLY``) reads it in the
+ *  GEMM2 epilogue. The caller creates one descriptor, sets the same handle on both fused-epilogue
+ *  chains through ``HIPBLASLT_FUSED_EPILOGUE_RMSNORM_STATS``, and destroys it after both calls.
+ *  The full ``HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM`` flow does not use this descriptor.
  */
 typedef struct hipblasLtFusedEpilogueRMSNormDescriptor* hipblasLtFusedEpilogueRMSNormDescriptor_t;
 

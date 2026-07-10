@@ -362,18 +362,29 @@ catch(...)
     return exception_to_hipblas_status();
 }
 
-// Opaque, library-populated handoff descriptor for the decomposed RMSNorm flow. The producer
-// call (partial RMSNorm stats) writes the finalized per-row scale and tiling-dependent metadata
-// here; the consumer call (RMSNorm scale-apply) reads them back.
+// Per-call handoff from the RMSNorm producer GEMM (K1) to the cross-tile reduction (K2).
+// K1 writes partialBuf through the normal Tensile problem inputs; K2 consumes that buffer plus
+// the by-value arguments below. Full RMSNorm reduces and applies immediately, while the
+// decomposed flow has K2 write the final row scale into the descriptor below for GEMM2.
+struct RmsNormHandoff
+{
+    void*   partialBuf = nullptr; // f32 partial sums, row-major [M_padded, nTilesN]
+    int32_t M          = 0;       // logical rows; padded rows in partialBuf are ignored
+    int32_t N          = 0;       // feature dimension reduced by RMSNorm
+    int32_t nTilesN    = 0;       // columns of partialBuf, ceil(N / MacroTile1)
+    float   invD       = 0.f;     // 1 / N
+    float   eps        = 0.f;     // RMSNorm epsilon
+};
+
+// Cross-call state for the decomposed RMSNorm flow. The producer reduction materializes the
+// finalized rstd here, and the later GEMM2 scale-apply epilogue consumes it. The full flow never
+// creates this handle because its reduction applies rstd to D in the same matmul call.
 struct hipblasLtFusedEpilogueRMSNormDescriptor
 {
-    // Per-row reciprocal RMS scale (rstd), FP32, produced by the internal cross-tile reduction.
+    // FP32 rstd, tightly packed [M * batch]. M and batch are implicit in the consumer GEMM2
+    // problem, which must match the producer for the decomposed flow.
     void* per_row_scale = nullptr;
-    // Partial-buffer column count ceil(N / MacroTile1) written by the producer.
-    int partial_cols = 0;
-    // 1/d, where d is the feature (N) count reduced over.
-    float inv_d = 0.f;
-    // Set once a producer call has populated this descriptor.
+    // Set after the producer reduction has populated per_row_scale.
     bool populated = false;
 };
 
