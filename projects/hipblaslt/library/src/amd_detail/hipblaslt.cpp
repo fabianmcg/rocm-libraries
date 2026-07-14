@@ -30,8 +30,10 @@
 #include "exceptions.hpp"
 #include "handle.h"
 #include "hipblaslt/hipblaslt-ext-op.h"
+#include "hipblaslt/hipblaslt_float8.h"
 #include "hipblaslt_internal.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <hip/hip_runtime_api.h>
@@ -489,6 +491,11 @@ namespace
         return granularity == HIPBLASLT_REQUANT_SCALE_PER_TENSOR
                || granularity == HIPBLASLT_REQUANT_SCALE_PER_ROW;
     }
+
+    bool fused_epilogue_has_requant(const hipblasLtFusedEpilogueDescriptor* d)
+    {
+        return fused_epilogue_has_stage(d, HIPBLASLT_FUSEABLE_EPILOGUE_REQUANT);
+    }
 }
 
 hipblasStatus_t hipblasLtFusedEpilogueCreate(hipblasLtFusedEpilogueDescriptor_t* desc)
@@ -884,17 +891,24 @@ namespace
     // CPU "shim" for the fused-epilogue chain. Until the TensileLite fused kernels
     // (AIHPBLAS-3856) land, hipblasLtMatmul runs the base GEMM on device, then applies the
     // fused epilogue on the host so the advertised API returns correct answers. The shim
-    // emulates the full flow (residual add, RMSNorm) and the decomposed flow (partial RMSNorm
-    // stats producer + RMSNorm scale-apply consumer) on column-major FP32/FP16/BF16 D. Stages
-    // reserved for future kernels (AMax, FP8 requant, SwiGLU) fall through to NOT_SUPPORTED.
+    // emulates the full flow (residual add, RMSNorm), the full flow plus static per-tensor FP8
+    // requant, and the decomposed flow (partial RMSNorm stats producer + RMSNorm scale-apply
+    // consumer) on column-major tensors. Unsupported stages/policies fall through to
+    // NOT_SUPPORTED.
     bool fused_epilogue_cpu_shim_supported(const hipblasLtFusedEpilogueDescriptor* d)
     {
+        const bool has_requant = fused_epilogue_has_requant(d);
         for(auto s : d->stages)
         {
             if(s == HIPBLASLT_FUSEABLE_EPILOGUE_AMAX
-               || s == HIPBLASLT_FUSEABLE_EPILOGUE_FP8_REQUANT
                || s == HIPBLASLT_FUSEABLE_EPILOGUE_SWIGLU)
                 return false;
+        }
+        if(has_requant)
+        {
+            return fused_epilogue_has_stage(d, HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM)
+                   && d->requant_compute_mode == HIPBLASLT_REQUANT_SCALE_STATIC
+                   && d->requant_granularity == HIPBLASLT_REQUANT_SCALE_PER_TENSOR;
         }
         return true;
     }
@@ -1112,6 +1126,103 @@ namespace
         return HIPBLAS_STATUS_SUCCESS;
     }
 
+    template <typename QuantT, typename WorkT>
+    hipblasStatus_t fused_epilogue_cpu_shim_requant_typed(
+        const hipblasLtFusedEpilogueDescriptor* fused,
+        void*                                   work_device,
+        void*                                   d_device,
+        uint64_t                                m,
+        uint64_t                                n,
+        int64_t                                 ld,
+        int32_t                                 batch_count,
+        int64_t                                 batch_stride,
+        hipStream_t                             stream)
+    {
+        if(batch_count < 1)
+            batch_count = 1;
+
+        float dequant_scale = 0.0f;
+        if(hipMemcpy(
+               &dequant_scale, fused->requant_scale, sizeof(float), hipMemcpyDeviceToHost)
+           != hipSuccess)
+            return HIPBLAS_STATUS_INTERNAL_ERROR;
+        if(dequant_scale == 0.0f)
+            return HIPBLAS_STATUS_INVALID_VALUE;
+
+        const bool has_residual
+            = fused_epilogue_has_stage(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RESIDUAL_ADD);
+        const size_t span
+            = static_cast<size_t>(batch_count - 1) * static_cast<size_t>(batch_stride)
+              + static_cast<size_t>(n - 1) * static_cast<size_t>(ld) + static_cast<size_t>(m);
+
+        if(hipStreamSynchronize(stream) != hipSuccess)
+            return HIPBLAS_STATUS_INTERNAL_ERROR;
+
+        std::vector<WorkT> h_work(span);
+        std::vector<WorkT> h_res, h_res_out, h_gamma;
+        if(hipMemcpy(h_work.data(), work_device, span * sizeof(WorkT), hipMemcpyDeviceToHost)
+           != hipSuccess)
+            return HIPBLAS_STATUS_INTERNAL_ERROR;
+
+        if(has_residual)
+        {
+            h_res.resize(span);
+            if(hipMemcpy(h_res.data(), fused->residual, span * sizeof(WorkT), hipMemcpyDeviceToHost)
+               != hipSuccess)
+                return HIPBLAS_STATUS_INTERNAL_ERROR;
+            h_res_out = h_res;
+        }
+
+        h_gamma.resize(n);
+        if(hipMemcpy(h_gamma.data(), fused->rmsnorm_gamma, n * sizeof(WorkT), hipMemcpyDeviceToHost)
+           != hipSuccess)
+            return HIPBLAS_STATUS_INTERNAL_ERROR;
+
+        fused_epilogue_reduce_host<WorkT>(h_work.data(),
+                                          has_residual ? h_res.data() : nullptr,
+                                          has_residual ? h_res_out.data() : nullptr,
+                                          h_gamma.data(),
+                                          m,
+                                          n,
+                                          ld,
+                                          batch_count,
+                                          batch_stride,
+                                          fused->rmsnorm_eps,
+                                          has_residual,
+                                          /*do_norm=*/true,
+                                          /*apply_scale=*/true,
+                                          nullptr);
+
+        if(has_residual)
+        {
+            void* res_out = fused->residual_output ? fused->residual_output : fused->residual;
+            if(hipMemcpy(res_out, h_res_out.data(), span * sizeof(WorkT), hipMemcpyHostToDevice)
+               != hipSuccess)
+                return HIPBLAS_STATUS_INTERNAL_ERROR;
+        }
+
+        float               amax = 0.0f;
+        std::vector<QuantT> h_quant(span);
+        for(size_t idx = 0; idx < span; ++idx)
+        {
+            const float x = shim_load(h_work[idx]);
+            amax          = std::max(amax, std::fabs(x));
+            h_quant[idx]  = QuantT(x / dequant_scale);
+        }
+
+        if(fused->requant_amax != nullptr)
+        {
+            if(hipMemcpy(fused->requant_amax, &amax, sizeof(float), hipMemcpyHostToDevice)
+               != hipSuccess)
+                return HIPBLAS_STATUS_INTERNAL_ERROR;
+        }
+
+        if(hipMemcpy(d_device, h_quant.data(), span * sizeof(QuantT), hipMemcpyHostToDevice)
+           != hipSuccess)
+            return HIPBLAS_STATUS_INTERNAL_ERROR;
+        return HIPBLAS_STATUS_SUCCESS;
+    }
+
     // Decomposed consumer (RMSNorm scale-apply): multiply GEMM2's output by the deferred per-row
     // scale carried in the handoff descriptor.
     template <typename T>
@@ -1224,22 +1335,141 @@ try
 
     // Fused-epilogue path: a composable fused epilogue (e.g. RMSNorm) attached via
     // HIPBLASLT_MATMUL_DESC_FUSED_EPILOGUE has no TensileLite kernels yet (AIHPBLAS-3856).
-    // A CPU shim runs the base GEMM and applies the supported chain (full residual+RMSNorm or
-    // the decomposed producer/consumer stages) on the host so the API returns correct answers;
-    // unsupported chains/types still return NOT_SUPPORTED.
+    // A CPU shim runs the base GEMM and applies supported chains (full residual+RMSNorm,
+    // full residual+RMSNorm+requant, or the decomposed producer/consumer stages) on the host
+    // so the API returns correct answers; unsupported chains/types still return NOT_SUPPORTED.
     if(auto* desc = (rocblaslt_matmul_desc)matmul_descr)
     {
         if(desc->fused_epilogue != nullptr)
         {
             const auto* fused   = desc->fused_epilogue;
             auto*       layoutD = (rocblaslt_matrix_layout)matD;
+            const bool  has_requant = fused_epilogue_has_requant(fused);
             if(!fused_epilogue_cpu_shim_supported(fused) || layoutD == nullptr
                || layoutD->order != HIPBLASLT_ORDER_COL
-               || !(layoutD->type == HIP_R_32F || layoutD->type == HIP_R_16F
+               || (!has_requant && !(layoutD->type == HIP_R_32F || layoutD->type == HIP_R_16F
                     || layoutD->type == HIP_R_16BF))
+               || (has_requant && layoutD->type != HIP_R_8F_E4M3))
             {
                 rocblaslt::Debug::Instance().markerStop();
                 return HIPBLAS_STATUS_NOT_SUPPORTED;
+            }
+
+            if(has_requant)
+            {
+                const int32_t batch_count
+                    = layoutD->batch_count < 1 ? 1 : layoutD->batch_count;
+                const int64_t batch_stride = layoutD->batch_stride;
+                const size_t  span
+                    = static_cast<size_t>(batch_count - 1) * static_cast<size_t>(batch_stride)
+                      + static_cast<size_t>(layoutD->n - 1) * static_cast<size_t>(layoutD->ld)
+                      + static_cast<size_t>(layoutD->m);
+
+                void*                  tmpD       = nullptr;
+                hipblasLtMatrixLayout_t tmpLayoutD = nullptr;
+                hipblasLtMatmulPreference_t tmpPref = nullptr;
+                auto cleanup = [&]() {
+                    if(tmpD)
+                        static_cast<void>(hipFree(tmpD));
+                    if(tmpLayoutD)
+                        hipblasLtMatrixLayoutDestroy(tmpLayoutD);
+                    if(tmpPref)
+                        hipblasLtMatmulPreferenceDestroy(tmpPref);
+                };
+
+                if(hipMalloc(&tmpD, span * sizeof(hip_bfloat16)) != hipSuccess
+                   || hipblasLtMatrixLayoutCreate(
+                          &tmpLayoutD, HIP_R_16BF, layoutD->m, layoutD->n, layoutD->ld)
+                          != HIPBLAS_STATUS_SUCCESS)
+                {
+                    cleanup();
+                    rocblaslt::Debug::Instance().markerStop();
+                    return HIPBLAS_STATUS_INTERNAL_ERROR;
+                }
+                if(batch_count != 1)
+                {
+                    if(hipblasLtMatrixLayoutSetAttribute(tmpLayoutD,
+                                                         HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
+                                                         &batch_count,
+                                                         sizeof(batch_count))
+                           != HIPBLAS_STATUS_SUCCESS
+                       || hipblasLtMatrixLayoutSetAttribute(
+                              tmpLayoutD,
+                              HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+                              &batch_stride,
+                              sizeof(batch_stride))
+                              != HIPBLAS_STATUS_SUCCESS)
+                    {
+                        cleanup();
+                        rocblaslt::Debug::Instance().markerStop();
+                        return HIPBLAS_STATUS_INTERNAL_ERROR;
+                    }
+                }
+
+                if(hipblasLtMatmulPreferenceCreate(&tmpPref) != HIPBLAS_STATUS_SUCCESS
+                   || hipblasLtMatmulPreferenceSetAttribute(
+                          tmpPref,
+                          HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                          &workspaceSizeInBytes,
+                          sizeof(workspaceSizeInBytes))
+                          != HIPBLAS_STATUS_SUCCESS)
+                {
+                    cleanup();
+                    rocblaslt::Debug::Instance().markerStop();
+                    return HIPBLAS_STATUS_INTERNAL_ERROR;
+                }
+
+                hipblasLtMatmulHeuristicResult_t heuristic[1];
+                int                              algo_count = 0;
+                return_status = hipblasLtMatmulAlgoGetHeuristic(handle,
+                                                                matmul_descr,
+                                                                matA,
+                                                                matB,
+                                                                matC,
+                                                                tmpLayoutD,
+                                                                tmpPref,
+                                                                1,
+                                                                heuristic,
+                                                                &algo_count);
+                if(return_status != HIPBLAS_STATUS_SUCCESS || algo_count == 0)
+                {
+                    cleanup();
+                    rocblaslt::Debug::Instance().markerStop();
+                    return algo_count == 0 ? HIPBLAS_STATUS_NOT_SUPPORTED : return_status;
+                }
+
+                return_status = RocBlasLtStatusToHIPStatus(
+                    rocblaslt_matmul((rocblaslt_handle)handle,
+                                     (rocblaslt_matmul_desc)matmul_descr,
+                                     alpha,
+                                     A,
+                                     (rocblaslt_matrix_layout)matA,
+                                     B,
+                                     (rocblaslt_matrix_layout)matB,
+                                     beta,
+                                     C,
+                                     (rocblaslt_matrix_layout)matC,
+                                     tmpD,
+                                     (rocblaslt_matrix_layout)tmpLayoutD,
+                                     (const rocblaslt_matmul_algo*)&heuristic[0].algo,
+                                     workspace,
+                                     workspaceSizeInBytes,
+                                     stream));
+                if(return_status == HIPBLAS_STATUS_SUCCESS)
+                    return_status = fused_epilogue_cpu_shim_requant_typed<hipblaslt_f8,
+                                                                          hip_bfloat16>(
+                        fused,
+                        tmpD,
+                        D,
+                        layoutD->m,
+                        layoutD->n,
+                        layoutD->ld,
+                        batch_count,
+                        batch_stride,
+                        stream);
+                cleanup();
+                rocblaslt::Debug::Instance().markerStop();
+                return return_status;
             }
 
             // Compute the base GEMM first (rocblaslt_matmul ignores the fused-epilogue handle),
