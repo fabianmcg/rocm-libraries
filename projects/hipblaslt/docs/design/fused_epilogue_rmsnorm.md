@@ -2,7 +2,7 @@
 
 This document specifies the hipBLASLt API extensions for fused epilogues, starting with
 RMSNorm, and the composable epilogue-chain mechanism that lets RMSNorm compose with
-optional residual add, AMax capture, and FP8 requantization. It also reserves the design points
+optional residual add, AMax capture, and output requantization (e.g. FP8). It also reserves the design points
 required so that Gated Linear Units (SwiGLU/GeGLU/ReGLU) can be added later without
 reworking the API.
 
@@ -16,7 +16,7 @@ D = Activation(alpha * op(A) * op(B) + beta * op(C) + bias)
 
 Today the epilogue is selected by a single combinatorial enum `hipblasLtEpilogue_t`
 (e.g. `HIPBLASLT_EPILOGUE_RELU_AUX_BIAS`). That model does not scale to ordered chains of
-post-GEMM operations such as `GEMM -> residual -> RMSNorm -> FP8 requant`, because every
+post-GEMM operations such as `GEMM -> residual -> RMSNorm -> requant`, because every
 combination would require a distinct enum value.
 
 This design defines:
@@ -184,7 +184,7 @@ for the target model shapes and dtypes before enabling them by default.
 RMSNorm is modeled as a discrete epilogue *stage*, configured by its own descriptor
 attributes, rather than as another value baked into the combinatorial `hipblasLtEpilogue_t`
 enum. Its stage-specific inputs are `gamma` and `eps`. Other epilogue components, such as
-residual add, AMax, and FP8 requant, can use the same descriptor mechanism with their own
+residual add, AMax, and requant, can use the same descriptor mechanism with their own
 stage-specific attributes instead of new enum combinations. The decomposed cross-tile flow of
 section 3 is expressed with the same mechanism, using two additional stages plus an opaque
 handoff descriptor.
@@ -200,7 +200,7 @@ family:
 | Shape-preserving      | `[M,N] -> [M,N]`                                             | bias, activation, residual add, RMSNorm |
 | Side-output reduction | `[M,N] -> [M,N]` plus per-row side output                    | AMax capture, partial RMSNorm stats     |
 | Deferred scale        | `[M,N] -> [M,N]` scaled by a per-row vector produced earlier | RMSNorm scale-apply                     |
-| Type-changing         | `[M,N] -> [M,N]` with different storage type                 | FP8 requant                             |
+| Type-changing         | `[M,N] -> [M,N]` with different storage type                 | requant (e.g. FP8)                      |
 | Shape-changing        | `[M,2N] -> [M,N]`                                            | GLU / SwiGLU (split-activate-gate)      |
 
 RMSNorm (single-stage) performs an internal row reduction to compute the reciprocal RMS scale,
@@ -226,16 +226,16 @@ and are not part of either ordering rule.
 The library defines a supported order for the single-call RMSNorm chain:
 
 ```
-bias -> residual add -> RMSNorm -> AMax -> FP8 requant
+bias -> residual add -> RMSNorm -> AMax -> requant
 ```
 
 A user-specified RMSNorm chain is **legal** if and only if it is an order-preserving
 subsequence of this supported order, with each stage appearing at most once. This one rule
 produces the allowed/disallowed examples:
 
-- Allowed: `GEMM + residual + RMSNorm + FP8 requant`
+- Allowed: `GEMM + residual + RMSNorm + requant`
   (subsequence of the supported RMSNorm order)
-- Disallowed: `GEMM + residual + FP8 requant + RMSNorm`
+- Disallowed: `GEMM + residual + requant + RMSNorm`
   (requant precedes RMSNorm, violating the supported RMSNorm order)
 
 ### 4.3 Decomposed cross-call chains
@@ -276,8 +276,8 @@ typedef enum {
   HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM               = 1, // full RMSNorm (library realizes internally)
   HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS = 2, // GEMM1: producer, emits per-row RMSNorm stats
   HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM_SCALE_APPLY   = 3, // GEMM2: apply deferred per-row RMSNorm scale
-  HIPBLASLT_FUSEABLE_EPILOGUE_AMAX                  = 4, // reserved component
-  HIPBLASLT_FUSEABLE_EPILOGUE_FP8_REQUANT           = 5, // reserved component
+  HIPBLASLT_FUSEABLE_EPILOGUE_AMAX                  = 4, // capture result AMax as a side output
+  HIPBLASLT_FUSEABLE_EPILOGUE_REQUANT               = 5, // requantize result to D's narrow type (e.g. FP8)
   HIPBLASLT_FUSEABLE_EPILOGUE_SWIGLU                = 6, // reserved epilogue family
 } hipblasLtFuseableEpilogue_t;
 ```
@@ -359,15 +359,14 @@ descriptor alive across both.
 ### 5.3 Stage-specific attributes
 
 Stage parameters are set on the handle (not on the matmul descriptor), so they travel with
-the stage that consumes them:
+the stage that consumes them. They are grouped by stage below.
 
-| Attribute                                           | Type                                        | Stage                       | Meaning                                                                                        |
-|-----------------------------------------------------|---------------------------------------------|-----------------------------|------------------------------------------------------------------------------------------------|
-| `HIPBLASLT_FUSED_EPILOGUE_RESIDUAL_POINTER`         | `void*`                                     | residual add                | Non-null device pointer to the residual input tensor                                           |
-| `HIPBLASLT_FUSED_EPILOGUE_RESIDUAL_OUTPUT_POINTER`  | `void*`                                     | residual add                | Optional device pointer that receives the updated residual stream (`NULL` or unset = in-place) |
-| `HIPBLASLT_FUSED_EPILOGUE_RMSNORM_GAMMA`            | `void*`                                     | RMSNorm / partial stats     | Non-null device pointer to gamma, length `N`                                                   |
-| `HIPBLASLT_FUSED_EPILOGUE_RMSNORM_EPS`              | `float`                                     | RMSNorm / partial stats     | Epsilon inside the rsqrt                                                                       |
-| `HIPBLASLT_FUSED_EPILOGUE_RMSNORM_STATS`            | `hipblasLtFusedEpilogueRMSNormDescriptor_t` | partial stats / scale apply | Opaque handoff object; producer writes it, consumer reads it (same object on both handles)     |
+#### 5.3.1 Residual-add attributes
+
+| Attribute                                          | Type    | Meaning                                                                                        |
+|----------------------------------------------------|---------|------------------------------------------------------------------------------------------------|
+| `HIPBLASLT_FUSED_EPILOGUE_RESIDUAL_POINTER`        | `void*` | Non-null device pointer to the residual input tensor                                           |
+| `HIPBLASLT_FUSED_EPILOGUE_RESIDUAL_OUTPUT_POINTER` | `void*` | Optional device pointer that receives the updated residual stream (`NULL` or unset = in-place) |
 
 The residual input tensor has the same logical shape `[M,N]`, layout, data type, batch
 count, and batch stride as `D` unless a future extension adds an explicit residual layout
@@ -382,8 +381,18 @@ it is set to a valid non-null device pointer, the updated residual stream is wri
 instead. The output pointer may alias the residual input pointer for explicit in-place
 operation. It must not alias `D` when a later stage such as RMSNorm writes a different main
 output value to `D`; that invalid alias is rejected by kernel-specific validation once fused
-kernels are wired in. The same restriction applies when a later single-call stage such as FP8
+kernels are wired in. The same restriction applies when a later single-call stage such as
 requant changes the main output storage value written to `D`.
+
+#### 5.3.2 RMSNorm attributes
+
+These attributes apply to full RMSNorm and the decomposed producer/consumer stages.
+
+| Attribute                                | Type                                        | Stage                       | Meaning                                                                                    |
+|------------------------------------------|---------------------------------------------|-----------------------------|--------------------------------------------------------------------------------------------|
+| `HIPBLASLT_FUSED_EPILOGUE_RMSNORM_GAMMA` | `void*`                                     | RMSNorm / partial stats     | Non-null device pointer to gamma, length `N`                                               |
+| `HIPBLASLT_FUSED_EPILOGUE_RMSNORM_EPS`   | `float`                                     | RMSNorm / partial stats     | Epsilon inside the rsqrt                                                                    |
+| `HIPBLASLT_FUSED_EPILOGUE_RMSNORM_STATS` | `hipblasLtFusedEpilogueRMSNormDescriptor_t` | partial stats / scale apply | Opaque handoff object; producer writes it, consumer reads it (same object on both handles) |
 
 For the full flow, `gamma` and `eps` are set on the single `RMSNorm` handle and no handoff
 descriptor is created: the library derives `1/d` and the tiling metadata from the selected
@@ -399,10 +408,61 @@ object. Only the finalized per-row scale is carried inside the handoff descripto
 that one cross-call allocation); the partial sum-of-squares scratch stays in the matmul
 preference workspace and is consumed by the reduction inside the producer call.
 
-AMax and FP8-requant stage parameters (`AMAX_D` / `D_SCALE` reuse) are not RMSNorm or
-residual-add attributes; they require their own stage-specific attributes.
+#### 5.3.3 Requant attributes
+
+| Attribute                                                | Type                                    | Meaning                                                                                                                                |
+|----------------------------------------------------------|-----------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------|
+| `HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_POINTER`     | `void*` (f32)                           | Device pointer to the dequant scale; read-only input in static mode, written in dynamic mode. Element count follows the granularity |
+| `HIPBLASLT_FUSED_EPILOGUE_REQUANT_AMAX_POINTER`      | `void*` (f32)                           | Optional device pointer receiving the result amax side output, same granularity as the scale (`NULL`/unset = no amax written)          |
+| `HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_COMPUTE_MODE`| `hipblasLtRequantScaleComputeMode_t` | Static caller-provided scale vs dynamic-from-amax (default: static)                                                                    |
+| `HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_GRANULARITY` | `hipblasLtRequantScaleGranularity_t` | Scale/amax shape: per-tensor, per-row, or block (default: per-tensor)                                                                  |
+
+##### Requant policy
+
+The motivating model path is:
+
+```text
+RMSNorm output (BF16/FP16) -> requantize to FP8 activation -> next GEMM
+```
+
+Observed model paths motivate scalar scale support for different compute modes, for example, 
+Mixtral FP8 uses a checkpoint-provided scalar f32 scale (`STATIC` + `PER_TENSOR`), while 
+Llama3 FP8 uses a scalar scale derived from the result amax (`DYNAMIC_FROM_AMAX` + `PER_TENSOR`).
+
+The public scale convention is always a **dequant scale**, matching the scale carried with the
+observed FP8 activations and consumed by the next GEMM:
+
+```text
+x_approx = quantized_value * dequant_scale
+```
+
+This scale is passed forward to `A_SCALE_POINTER` / `B_SCALE_POINTER`; the producer derives the
+reciprocal quant multiplier internally, so no public scale-direction attribute is needed.
+
+The requant attributes define the policy that is not captured by the stage enum:
+
+- `SCALE_POINTER` supplies the dequant scale in `STATIC` mode and receives the derived scale in
+  `DYNAMIC_FROM_AMAX` mode.
+- `SCALE_COMPUTE_MODE` separates checkpoint-provided static scales from dynamic scales derived
+  from the result amax.
+- `SCALE_GRANULARITY` records the scale/amax shape: `PER_TENSOR` (`[1]`) for the observed scalar
+  policies, `PER_ROW` (`[M]`) for per-token policies, and block modes for finer-grained schemes.
+- `AMAX_POINTER` is an optional f32 side output with the same granularity as the scale. It is
+  not needed for a static-scale path, but is useful when the caller wants the raw result amax
+  for dynamic scaling or delayed-scaling bookkeeping.
+
+##### Relationship to the existing matmul-descriptor scale/amax attributes
+
+The stage-level attributes intentionally mirror existing matmul-descriptor concepts:
+`HIPBLASLT_MATMUL_DESC_D_SCALE_POINTER` and `HIPBLASLT_MATMUL_DESC_AMAX_D_POINTER`. They are kept
+on the fused-epilogue descriptor because requant is part of the epilogue chain and needs its own
+policy (`SCALE_COMPUTE_MODE`, `SCALE_GRANULARITY`). The implementation should reuse the existing
+D-scale / AMax-D plumbing where the policy matches, rather than introduce a separate low-level
+path.
 
 ### 5.4 Usage sketch
+
+#### 5.4.1 Full RMSNorm
 
 Full RMSNorm, exposed as a single `hipblasLtMatmul` call (the library runs the producer and
 the reduce-and-apply internally). Note there is no handoff descriptor: the internal producer ->
@@ -429,6 +489,38 @@ hipblasLtMatmulDescSetAttribute(matmulDesc, HIPBLASLT_MATMUL_DESC_FUSED_EPILOGUE
 // Internally launches GEMM producer + auxiliary reduce-and-apply kernel.
 hipblasLtFusedEpilogueDestroy(fused);
 ```
+
+#### 5.4.2 Full RMSNorm + requant
+
+Full RMSNorm followed by dynamic per-tensor FP8 requant, capturing the derived dequant scale
+(which can feed a consuming GEMM as its `A_SCALE_POINTER`) and, optionally, the amax:
+
+```c
+hipblasLtFusedEpilogueDescriptor_t fused;
+hipblasLtFusedEpilogueCreate(&fused);
+hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM);
+hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_REQUANT);
+hipblasLtFusedEpilogueSetAttribute(fused, HIPBLASLT_FUSED_EPILOGUE_RMSNORM_GAMMA,
+                                   &gamma, sizeof(gamma));
+hipblasLtFusedEpilogueSetAttribute(fused, HIPBLASLT_FUSED_EPILOGUE_RMSNORM_EPS,
+                                   &eps, sizeof(eps));
+// The default is STATIC + PER_TENSOR; opt into dynamic scale derivation explicitly.
+hipblasLtRequantScaleComputeMode_t mode = HIPBLASLT_REQUANT_SCALE_DYNAMIC_FROM_AMAX;
+hipblasLtFusedEpilogueSetAttribute(fused, HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_COMPUTE_MODE,
+                                   &mode, sizeof(mode));
+// Dynamic mode writes the derived scale here (f32[1] for per-tensor).
+hipblasLtFusedEpilogueSetAttribute(fused, HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_POINTER,
+                                   &d_scale, sizeof(d_scale));
+// Optional amax side output (f32[1] for per-tensor).
+hipblasLtFusedEpilogueSetAttribute(fused, HIPBLASLT_FUSED_EPILOGUE_REQUANT_AMAX_POINTER,
+                                   &d_amax, sizeof(d_amax));
+hipblasLtMatmulDescSetAttribute(matmulDesc, HIPBLASLT_MATMUL_DESC_FUSED_EPILOGUE,
+                                &fused, sizeof(fused));
+// ... hipblasLtMatmul(...) writes FP8 D plus the scale (and amax) side outputs ...
+hipblasLtFusedEpilogueDestroy(fused);
+```
+
+#### 5.4.3 Decomposed RMSNorm handoff
 
 Decomposed flow for `GEMM -> residual -> RMSNorm -> GEMM`, using the opaque handoff descriptor:
 
@@ -477,7 +569,7 @@ hipblasLtFusedEpilogueRMSNormDescriptorDestroy(stats);
 The initial release targets BF16/FP16 storage for the RMSNorm input and normalized output. The
 residual input and residual-output write-back use the same storage type as the residual-add
 sum. The `gamma` vector must use the same storage type as the RMSNorm input/pre-requant value,
-not necessarily the final `D` storage type when a later single-call FP8-requant stage changes
+not necessarily the final `D` storage type when a later single-call requant stage changes
 the main output type. Regardless of the BF16/FP16 storage type, RMSNorm accumulation uses FP32
 for the sum of squares and the reciprocal square root.
 
@@ -511,14 +603,17 @@ When `batch_count > 1` in a strided-batched GEMM:
 | Residual-add stage present but residual pointer unset                     | `HIPBLAS_STATUS_INVALID_VALUE` | attach (`SetAttribute` of `FUSED_EPILOGUE`) |
 | RMSNorm stage present but `gamma` or `eps` unset                          | `HIPBLAS_STATUS_INVALID_VALUE` | attach (`SetAttribute` of `FUSED_EPILOGUE`) |
 | Partial-stats or scale-apply stage present but stats descriptor unset     | `HIPBLAS_STATUS_INVALID_VALUE` | attach                                      |
+| Requant stage present but scale pointer unset                             | `HIPBLAS_STATUS_INVALID_VALUE` | attach                                      |
+| Requant scale compute mode or granularity is outside the enum range       | `HIPBLAS_STATUS_INVALID_VALUE` | `SetAttribute` time / attach                |
 | Scale-apply consumes a stats descriptor not populated by a producer       | `HIPBLAS_STATUS_INVALID_VALUE` | `hipblasLtMatmul`                           |
 | Attached fused epilogue without a matching kernel implementation          | `HIPBLAS_STATUS_NOT_SUPPORTED` | `hipblasLtMatmul`                           |
 
 The key requirement: an illegal *ordering* for a supported RMSNorm chain is rejected at the
 API-call level, incrementally as stages are added, before any codegen or kernel launch.
-Residual completeness (`residual`), RMSNorm completeness (`gamma` and `eps`), and
-decomposed-flow completeness (a set stats descriptor) are validated when the handle is
-attached to the matmul descriptor via `HIPBLASLT_MATMUL_DESC_FUSED_EPILOGUE`. This means
+Residual completeness (`residual`), RMSNorm completeness (`gamma` and `eps`), requant
+completeness (`scale` and valid policy enums), and decomposed-flow completeness (a set stats
+descriptor) are validated when the handle is attached to the matmul descriptor via
+`HIPBLASLT_MATMUL_DESC_FUSED_EPILOGUE`. This means
 required stage-specific attributes must be set on the handle before attachment and must not be
 cleared or mutated after attachment. The matmul descriptor stores a non-owning pointer to the
 handle, so later optional-attribute updates are visible to `hipblasLtMatmul`, but callers

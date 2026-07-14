@@ -122,10 +122,37 @@ typedef enum {
   HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM               = 1, /**<Full per-row RMSNorm (``x * rsqrt(mean(x^2) + eps) * gamma``), realized internally as a producer plus a reduce-and-apply kernel. Requires gamma and eps attributes.*/
   HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS = 2, /**<Decomposed flow (GEMM1 producer): emits the tile-local ``h1 * gamma`` value plus per-row RMSNorm statistics into an RMSNorm handoff descriptor. Requires gamma, eps, and stats attributes.*/
   HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM_SCALE_APPLY   = 3, /**<Decomposed flow (GEMM2 consumer): applies the deferred per-row RMSNorm scale carried in the handoff descriptor. Requires the stats attribute.*/
-  HIPBLASLT_FUSEABLE_EPILOGUE_AMAX                  = 4, /**<Reserved component: capture the result amax side output.*/
-  HIPBLASLT_FUSEABLE_EPILOGUE_FP8_REQUANT           = 5, /**<Reserved component: requantize the result to FP8.*/
+  HIPBLASLT_FUSEABLE_EPILOGUE_AMAX                  = 4, /**<Capture the result AMax (maximum absolute value) as a side output.*/
+  HIPBLASLT_FUSEABLE_EPILOGUE_REQUANT               = 5, /**<Requantize the result to a narrow output type (chosen by D's data type, e.g. FP8). Configured by the requant scale, amax, compute-mode, and granularity attributes.*/
   HIPBLASLT_FUSEABLE_EPILOGUE_SWIGLU                = 6, /**<Reserved epilogue family: SwiGLU gated linear unit.*/
 } hipblasLtFuseableEpilogue_t;
+
+/*! \ingroup types_module
+ *  \brief How the requant output scale is obtained.
+ *
+ *  \details
+ *  Selects whether the fused ``HIPBLASLT_FUSEABLE_EPILOGUE_REQUANT`` stage consumes a
+ *  caller-provided scale or derives one from the result ``amax`` while writing the quantized
+ *  output. This is independent of the narrow output format (FP8, FP4, ...), which is chosen by
+ *  D's data type.
+ */
+typedef enum {
+  HIPBLASLT_REQUANT_SCALE_STATIC            = 0, /**<Use a fixed caller-provided scale. The scale pointer is read-only and no amax reduction is required in the epilogue.*/
+  HIPBLASLT_REQUANT_SCALE_DYNAMIC_FROM_AMAX = 1, /**<Derive the scale from the result amax computed in the epilogue and write it to the scale pointer.*/
+} hipblasLtRequantScaleComputeMode_t;
+
+/*! \ingroup types_module
+ *  \brief Granularity (shape) of the requant scale, and of any amax side output.
+ *
+ *  \details
+ *  Determines how many scale/amax values are shared across the ``[M,N]`` result. Per-tensor uses a
+ *  single value; per-row uses one value per output row (``[M]``). Block granularities can be added
+ *  later when there is a concrete model and kernel requirement.
+ */
+typedef enum {
+  HIPBLASLT_REQUANT_SCALE_PER_TENSOR    = 0, /**<One scalar scale for the whole result tensor. Scale/amax shape ``[1]``.*/
+  HIPBLASLT_REQUANT_SCALE_PER_ROW       = 1, /**<One scale per output row/token. Scale/amax shape ``[M]``.*/
+} hipblasLtRequantScaleGranularity_t;
 
 /*! \ingroup types_module
  *  \brief Attributes settable on a fused epilogue descriptor.
@@ -136,6 +163,10 @@ typedef enum {
   HIPBLASLT_FUSED_EPILOGUE_RESIDUAL_POINTER = 2, /**<Non-null device pointer to the residual input tensor. The tensor has the same logical shape, layout, and data type as D. Data type: ``void*``.*/
   HIPBLASLT_FUSED_EPILOGUE_RESIDUAL_OUTPUT_POINTER = 3, /**<Optional device pointer that receives the updated residual stream after the residual add. If NULL or unset, the residual input tensor is updated in place. Data type: ``void*``.*/
   HIPBLASLT_FUSED_EPILOGUE_RMSNORM_STATS = 4, /**<Opaque RMSNorm handoff descriptor linking the decomposed producer (partial RMSNorm stats) and consumer (RMSNorm scale-apply) matmul calls. The same object must be set on both handles. Data type: ``hipblasLtFusedEpilogueRMSNormDescriptor_t``.*/
+  HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_POINTER = 5, /**<Device pointer to the requant dequant scale. In static mode it is read-only input; in dynamic mode it receives the derived scale. Its element count follows the scale granularity. Data type: ``void*`` (f32 elements).*/
+  HIPBLASLT_FUSED_EPILOGUE_REQUANT_AMAX_POINTER = 6, /**<Optional device pointer that receives the result amax side output, with the same granularity as the scale. If unset in dynamic mode, amax is computed internally only to derive the scale. Data type: ``void*`` (f32 elements).*/
+  HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_COMPUTE_MODE = 7, /**<How the output scale is obtained (static vs dynamic-from-amax). Defaults to static. Data type: ``hipblasLtRequantScaleComputeMode_t``.*/
+  HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_GRANULARITY = 8, /**<Shape shared by the scale and amax outputs (per-tensor or per-row). Defaults to per-tensor. Data type: ``hipblasLtRequantScaleGranularity_t``.*/
 } hipblasLtFusedEpilogueAttribute_t;
 
 /*! \ingroup types_module
