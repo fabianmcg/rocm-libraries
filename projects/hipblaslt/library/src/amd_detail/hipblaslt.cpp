@@ -407,13 +407,19 @@ struct hipblasLtFusedEpilogueDescriptor
 
     // Decomposed-flow handoff descriptor, set on both the producer and consumer handles.
     hipblasLtFusedEpilogueRMSNormDescriptor* rmsnorm_stats = nullptr;
+
+    // Requant parameters and policy.
+    void*                              requant_scale        = nullptr;
+    void*                              requant_amax         = nullptr;
+    hipblasLtRequantScaleComputeMode_t requant_compute_mode = HIPBLASLT_REQUANT_SCALE_STATIC;
+    hipblasLtRequantScaleGranularity_t requant_granularity  = HIPBLASLT_REQUANT_SCALE_PER_TENSOR;
 };
 
 namespace
 {
     // Supported RMSNorm-chain rank. A legal chain is an order-preserving subsequence of the
     // supported order
-    //   residual add -> {RMSNorm | partial RMSNorm stats | RMSNorm scale-apply} -> AMax -> FP8
+    //   residual add -> {RMSNorm | partial RMSNorm stats | RMSNorm scale-apply} -> AMax -> requant
     // with each stage appearing at most once. The three normalization stages share rank 1 so
     // that at most one of them can appear in a single chain (full vs decomposed are mutually
     // exclusive). Returns -1 for unrecognized stages or stages reserved for other epilogue
@@ -430,7 +436,7 @@ namespace
             return 1;
         case HIPBLASLT_FUSEABLE_EPILOGUE_AMAX:
             return 2;
-        case HIPBLASLT_FUSEABLE_EPILOGUE_FP8_REQUANT:
+        case HIPBLASLT_FUSEABLE_EPILOGUE_REQUANT:
             return 3;
         default:
             return -1;
@@ -445,7 +451,7 @@ namespace
         {
         case HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM:
         case HIPBLASLT_FUSEABLE_EPILOGUE_AMAX:
-        case HIPBLASLT_FUSEABLE_EPILOGUE_FP8_REQUANT:
+        case HIPBLASLT_FUSEABLE_EPILOGUE_REQUANT:
             return 1;
         case HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS:
         case HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM_SCALE_APPLY:
@@ -462,6 +468,18 @@ namespace
             if(s == e)
                 return true;
         return false;
+    }
+
+    bool requant_compute_mode_valid(hipblasLtRequantScaleComputeMode_t mode)
+    {
+        return mode == HIPBLASLT_REQUANT_SCALE_STATIC
+               || mode == HIPBLASLT_REQUANT_SCALE_DYNAMIC_FROM_AMAX;
+    }
+
+    bool requant_granularity_valid(hipblasLtRequantScaleGranularity_t granularity)
+    {
+        return granularity == HIPBLASLT_REQUANT_SCALE_PER_TENSOR
+               || granularity == HIPBLASLT_REQUANT_SCALE_PER_ROW;
     }
 }
 
@@ -563,6 +581,32 @@ try
         if(desc->rmsnorm_stats == nullptr)
             return HIPBLAS_STATUS_INVALID_VALUE;
         break;
+    case HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_POINTER:
+        if(sizeInBytes < sizeof(void*))
+            return HIPBLAS_STATUS_INVALID_VALUE;
+        memcpy(&desc->requant_scale, value, sizeof(void*));
+        if(desc->requant_scale == nullptr)
+            return HIPBLAS_STATUS_INVALID_VALUE;
+        break;
+    case HIPBLASLT_FUSED_EPILOGUE_REQUANT_AMAX_POINTER:
+        if(sizeInBytes < sizeof(void*))
+            return HIPBLAS_STATUS_INVALID_VALUE;
+        memcpy(&desc->requant_amax, value, sizeof(void*));
+        break;
+    case HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_COMPUTE_MODE:
+        if(sizeInBytes < sizeof(hipblasLtRequantScaleComputeMode_t))
+            return HIPBLAS_STATUS_INVALID_VALUE;
+        memcpy(&desc->requant_compute_mode, value, sizeof(hipblasLtRequantScaleComputeMode_t));
+        if(!requant_compute_mode_valid(desc->requant_compute_mode))
+            return HIPBLAS_STATUS_INVALID_VALUE;
+        break;
+    case HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_GRANULARITY:
+        if(sizeInBytes < sizeof(hipblasLtRequantScaleGranularity_t))
+            return HIPBLAS_STATUS_INVALID_VALUE;
+        memcpy(&desc->requant_granularity, value, sizeof(hipblasLtRequantScaleGranularity_t));
+        if(!requant_granularity_valid(desc->requant_granularity))
+            return HIPBLAS_STATUS_INVALID_VALUE;
+        break;
     default:
         return HIPBLAS_STATUS_INVALID_VALUE;
     }
@@ -659,6 +703,16 @@ try
         {
             rocblaslt::Debug::Instance().markerStop();
             return HIPBLAS_STATUS_INVALID_VALUE;
+        }
+        if(fused != nullptr && fused_epilogue_has_stage(fused, HIPBLASLT_FUSEABLE_EPILOGUE_REQUANT))
+        {
+            if(fused->requant_scale == nullptr
+               || !requant_compute_mode_valid(fused->requant_compute_mode)
+               || !requant_granularity_valid(fused->requant_granularity))
+            {
+                rocblaslt::Debug::Instance().markerStop();
+                return HIPBLAS_STATUS_INVALID_VALUE;
+            }
         }
     }
 

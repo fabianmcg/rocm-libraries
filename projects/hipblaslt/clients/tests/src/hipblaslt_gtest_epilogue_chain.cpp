@@ -207,22 +207,22 @@ TEST_F(FusedEpilogueTest, legalOrderAccepted)
               HIPBLAS_STATUS_SUCCESS);
     EXPECT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_AMAX),
               HIPBLAS_STATUS_SUCCESS);
-    EXPECT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_FP8_REQUANT),
+    EXPECT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_REQUANT),
               HIPBLAS_STATUS_SUCCESS);
 }
 
 TEST_F(FusedEpilogueTest, illegalOrderRejected)
 {
-    // FP8 requant then RMSNorm violates the supported RMSNorm order (requant must come last).
-    ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_FP8_REQUANT),
+    // Requant then RMSNorm violates the supported RMSNorm order (requant must come last).
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_REQUANT),
               HIPBLAS_STATUS_SUCCESS);
     EXPECT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM),
               HIPBLAS_STATUS_INVALID_VALUE);
 }
 
-TEST_F(FusedEpilogueTest, amaxAfterFp8Rejected)
+TEST_F(FusedEpilogueTest, amaxAfterRequantRejected)
 {
-    ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_FP8_REQUANT),
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_REQUANT),
               HIPBLAS_STATUS_SUCCESS);
     EXPECT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_AMAX),
               HIPBLAS_STATUS_INVALID_VALUE);
@@ -348,6 +348,24 @@ TEST_F(FusedEpilogueTest, setNullResidualOutputAcceptedAsInPlace)
                                                  &residual_output,
                                                  sizeof(residual_output)),
               HIPBLAS_STATUS_SUCCESS);
+}
+
+TEST_F(FusedEpilogueTest, setInvalidRequantComputeModeRejected)
+{
+    auto mode = static_cast<hipblasLtRequantScaleComputeMode_t>(999);
+    EXPECT_EQ(hipblasLtFusedEpilogueSetAttribute(
+                  fused, HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_COMPUTE_MODE, &mode, sizeof(mode)),
+              HIPBLAS_STATUS_INVALID_VALUE);
+}
+
+TEST_F(FusedEpilogueTest, setInvalidRequantGranularityRejected)
+{
+    auto granularity = static_cast<hipblasLtRequantScaleGranularity_t>(999);
+    EXPECT_EQ(hipblasLtFusedEpilogueSetAttribute(fused,
+                                                 HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_GRANULARITY,
+                                                 &granularity,
+                                                 sizeof(granularity)),
+              HIPBLAS_STATUS_INVALID_VALUE);
 }
 
 // ---- Attach-time completeness validation ----
@@ -511,6 +529,26 @@ TEST_F(FusedEpilogueTest, attachNullFusedEpilogueDetaches)
                                               &null_fused,
                                               sizeof(null_fused)),
               HIPBLAS_STATUS_SUCCESS);
+}
+
+TEST_F(FusedEpilogueTest, attachRequantMissingScaleRejected)
+{
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_REQUANT),
+              HIPBLAS_STATUS_SUCCESS);
+    // scale pointer never set -> attach must reject.
+    EXPECT_EQ(attach(), HIPBLAS_STATUS_INVALID_VALUE);
+}
+
+TEST_F(FusedEpilogueTest, attachCompleteRequantAccepted)
+{
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_REQUANT),
+              HIPBLAS_STATUS_SUCCESS);
+    int   dummy_scale_storage = 0;
+    void* scale               = &dummy_scale_storage;
+    ASSERT_EQ(hipblasLtFusedEpilogueSetAttribute(
+                  fused, HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_POINTER, &scale, sizeof(scale)),
+              HIPBLAS_STATUS_SUCCESS);
+    EXPECT_EQ(attach(), HIPBLAS_STATUS_SUCCESS);
 }
 
 // ---- Complete-but-unimplemented config rejected by matmul (NOT_SUPPORTED) ----
