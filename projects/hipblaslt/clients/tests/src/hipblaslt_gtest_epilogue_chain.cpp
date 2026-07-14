@@ -24,7 +24,7 @@
 //    lifecycle returns SUCCESS, full and decomposed RMSNorm stages cannot be mixed in one
 //    chain, and attaching a decomposed handle without the handoff descriptor (or, for the
 //    producer, without gamma/eps) is rejected at descriptor-set time (INVALID_VALUE).
-//  - A chain the CPU shim does not implement (decomposed stages, AMax, FP8 requant) is
+//  - A chain or policy the CPU shim does not implement (for example AMax) is
 //    rejected by hipblasLtMatmul with NOT_SUPPORTED before kernel selection/launch.
 //  - The CPU shim (until the TensileLite fused kernels land) makes hipblasLtMatmul return
 //    correct answers for the full residual+RMSNorm flow; an end-to-end test compares device
@@ -34,6 +34,7 @@
 #include <gtest/gtest.h>
 #include <hip/hip_runtime.h>
 #include <hipblaslt/hipblaslt.h>
+#include <hipblaslt/hipblaslt_float8.h>
 #include <vector>
 
 namespace
@@ -120,6 +121,61 @@ namespace
                                      hipStream_t(0));
 
         hipblasLtMatmulPreferenceDestroy(pref);
+        hipblasLtMatmulDescDestroy(matmul);
+        hipblasLtMatrixLayoutDestroy(matA);
+        hipblasLtMatrixLayoutDestroy(matB);
+        hipblasLtMatrixLayoutDestroy(matC);
+        hipblasLtMatrixLayoutDestroy(matD);
+        return status;
+    }
+
+    // Runs an FP8 inference GEMM: FP8 (E4M3 FNUZ) A/B inputs, a BF16 C operand, and an attached
+    // fused epilogue that requantizes the normalized result to FP8 D. The base GEMM accumulates
+    // in FP32 and the shim writes FP8 D on the host.
+    hipblasStatus_t runFp8GemmWithFusedEpilogue(hipblasLtHandle_t                   handle,
+                                                int64_t                            m,
+                                                int64_t                            n,
+                                                int64_t                            k,
+                                                void*                              dA,
+                                                void*                              dB,
+                                                void*                              dC,
+                                                void*                              dD,
+                                                hipblasLtFusedEpilogueDescriptor_t fused,
+                                                void*                              dWorkspace,
+                                                size_t                             maxWorkspace)
+    {
+        hipblasLtMatrixLayout_t matA = nullptr, matB = nullptr, matC = nullptr, matD = nullptr;
+        hipblasLtMatrixLayoutCreate(&matA, HIP_R_8F_E4M3_FNUZ, m, k, m);
+        hipblasLtMatrixLayoutCreate(&matB, HIP_R_8F_E4M3_FNUZ, k, n, k);
+        hipblasLtMatrixLayoutCreate(&matC, HIP_R_16BF, m, n, m);
+        hipblasLtMatrixLayoutCreate(&matD, HIP_R_8F_E4M3, m, n, m);
+
+        hipblasLtMatmulDesc_t matmul = nullptr;
+        hipblasLtMatmulDescCreate(&matmul, HIPBLAS_COMPUTE_32F, HIP_R_32F);
+        hipblasOperation_t opN = HIPBLAS_OP_N;
+        hipblasLtMatmulDescSetAttribute(matmul, HIPBLASLT_MATMUL_DESC_TRANSA, &opN, sizeof(opN));
+        hipblasLtMatmulDescSetAttribute(matmul, HIPBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN));
+        hipblasLtMatmulDescSetAttribute(
+            matmul, HIPBLASLT_MATMUL_DESC_FUSED_EPILOGUE, &fused, sizeof(fused));
+
+        const float alpha = 1.0f, beta = 0.0f;
+        hipblasStatus_t status = hipblasLtMatmul(handle,
+                                                 matmul,
+                                                 &alpha,
+                                                 dA,
+                                                 matA,
+                                                 dB,
+                                                 matB,
+                                                 &beta,
+                                                 dC,
+                                                 matC,
+                                                 dD,
+                                                 matD,
+                                                 nullptr,
+                                                 dWorkspace,
+                                                 maxWorkspace,
+                                                 hipStream_t(0));
+
         hipblasLtMatmulDescDestroy(matmul);
         hipblasLtMatrixLayoutDestroy(matA);
         hipblasLtMatrixLayoutDestroy(matB);
@@ -831,6 +887,150 @@ TEST(FusedEpilogueEndToEnd, residualRmsnormFullFlowMatchesReference)
     static_cast<void>(hipFree(dD));
     static_cast<void>(hipFree(dResidual));
     static_cast<void>(hipFree(dGamma));
+    static_cast<void>(hipFree(dWorkspace));
+}
+
+// ---- End-to-end correctness of the CPU shim (FP8 GEMM + residual + RMSNorm + FP8 requant) ----
+//
+// Runs an FP8 inference layer: FP8 (E4M3 FNUZ) A/B inputs, a BF16 C operand, and an
+// attached residual+RMSNorm+requant fused epilogue that writes FP8 (E4M3) D. The base GEMM
+// contracts the FP8 inputs in FP32 and RMSNorm runs in the BF16/FP32 domain; the static
+// per-tensor dequant scale then quantizes the normalized result to FP8. The reference mirrors the
+// shim's rounding at each storage point and requantizes with the same scale, so the FP8 bytes and
+// the amax side output compare exactly. Skipped when no HIP device is present.
+
+TEST(FusedEpilogueEndToEnd, residualRmsnormRequantFullFlowMatchesReference)
+{
+    int deviceCount = 0;
+    if(hipGetDeviceCount(&deviceCount) != hipSuccess || deviceCount == 0)
+        GTEST_SKIP() << "no HIP device available";
+
+    // FP8 (E4M3 FNUZ) storage for A/B inputs; BF16 for C, residual, and gamma; FP8 (E4M3) D;
+    // FP32 compute.
+    using bf16 = hip_bfloat16;
+    using fp8  = hipblaslt_f8_fnuz;
+    auto toBf  = [](float f) { return bf16(f); };
+    auto toF8  = [](float f) { return fp8(f); };
+    auto f8ToF = [](fp8 v) { return static_cast<float>(static_cast<_Float16>(v)); };
+
+    // D = [m, n], contraction dim k. Column-major throughout. dequantScale is the static
+    // per-tensor dequant scale (x_approx = fp8 * dequantScale) shipped by the caller.
+    const int64_t m = 64, n = 48, k = 32;
+    const float   eps = 1e-5f;
+    const float   dequantScale = 0.125f;
+
+    std::vector<fp8>  hA(m * k), hB(k * n);
+    std::vector<bf16> hC(m * n, toBf(0.0f)), hResidual(m * n), hGamma(n);
+    for(int64_t i = 0; i < m * k; ++i)
+        hA[i] = toF8(static_cast<float>((i % 13) - 6) * 0.05f);
+    for(int64_t i = 0; i < k * n; ++i)
+        hB[i] = toF8(static_cast<float>((i % 11) - 5) * 0.04f);
+    for(int64_t i = 0; i < m * n; ++i)
+        hResidual[i] = toBf(static_cast<float>((i % 7) - 3) * 0.1f);
+    for(int64_t j = 0; j < n; ++j)
+        hGamma[j] = toBf(0.5f + static_cast<float>(j % 5) * 0.1f);
+
+    void *dA = nullptr, *dB = nullptr, *dC = nullptr, *dD = nullptr, *dResidual = nullptr,
+         *dGamma = nullptr, *dScale = nullptr, *dAmax = nullptr, *dWorkspace = nullptr;
+    const size_t maxWorkspace = 32 * 1024 * 1024;
+    ASSERT_EQ(hipMalloc(&dA, hA.size() * sizeof(fp8)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&dB, hB.size() * sizeof(fp8)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&dC, hC.size() * sizeof(bf16)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&dD, hC.size() * sizeof(hipblaslt_f8)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&dResidual, hResidual.size() * sizeof(bf16)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&dGamma, hGamma.size() * sizeof(bf16)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&dScale, sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&dAmax, sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&dWorkspace, maxWorkspace), hipSuccess);
+    ASSERT_EQ(hipMemcpy(dA, hA.data(), hA.size() * sizeof(fp8), hipMemcpyHostToDevice),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpy(dB, hB.data(), hB.size() * sizeof(fp8), hipMemcpyHostToDevice),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpy(dC, hC.data(), hC.size() * sizeof(bf16), hipMemcpyHostToDevice),
+              hipSuccess);
+    ASSERT_EQ(
+        hipMemcpy(dResidual, hResidual.data(), hResidual.size() * sizeof(bf16), hipMemcpyHostToDevice),
+        hipSuccess);
+    ASSERT_EQ(hipMemcpy(dGamma, hGamma.data(), hGamma.size() * sizeof(bf16), hipMemcpyHostToDevice),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpy(dScale, &dequantScale, sizeof(float), hipMemcpyHostToDevice), hipSuccess);
+
+    hipblasLtHandle_t handle = nullptr;
+    ASSERT_EQ(hipblasLtCreate(&handle), HIPBLAS_STATUS_SUCCESS);
+
+    // Full flow: residual add + RMSNorm + static per-tensor FP8 requant on a single matmul call.
+    hipblasLtFusedEpilogueDescriptor_t fused = nullptr;
+    ASSERT_EQ(hipblasLtFusedEpilogueCreate(&fused), HIPBLAS_STATUS_SUCCESS);
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RESIDUAL_ADD),
+              HIPBLAS_STATUS_SUCCESS);
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM),
+              HIPBLAS_STATUS_SUCCESS);
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_REQUANT),
+              HIPBLAS_STATUS_SUCCESS);
+    ASSERT_EQ(hipblasLtFusedEpilogueSetAttribute(
+                  fused, HIPBLASLT_FUSED_EPILOGUE_RESIDUAL_POINTER, &dResidual, sizeof(dResidual)),
+              HIPBLAS_STATUS_SUCCESS);
+    ASSERT_EQ(hipblasLtFusedEpilogueSetAttribute(
+                  fused, HIPBLASLT_FUSED_EPILOGUE_RMSNORM_GAMMA, &dGamma, sizeof(dGamma)),
+              HIPBLAS_STATUS_SUCCESS);
+    ASSERT_EQ(hipblasLtFusedEpilogueSetAttribute(
+                  fused, HIPBLASLT_FUSED_EPILOGUE_RMSNORM_EPS, &eps, sizeof(eps)),
+              HIPBLAS_STATUS_SUCCESS);
+    ASSERT_EQ(hipblasLtFusedEpilogueSetAttribute(
+                  fused, HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_POINTER, &dScale, sizeof(dScale)),
+              HIPBLAS_STATUS_SUCCESS);
+    // Optional amax side output. It is not used to derive the scale in static mode (the caller
+    // supplies that); it just captures max(|result|) before requant for delayed-scaling
+    // bookkeeping.
+    ASSERT_EQ(hipblasLtFusedEpilogueSetAttribute(
+                  fused, HIPBLASLT_FUSED_EPILOGUE_REQUANT_AMAX_POINTER, &dAmax, sizeof(dAmax)),
+              HIPBLAS_STATUS_SUCCESS);
+
+    // Run the FP8 GEMM with the fused epilogue attached. Skip if the shape has no FP8 GEMM solution.
+    const hipblasStatus_t status = runFp8GemmWithFusedEpilogue(
+        handle, m, n, k, dA, dB, dC, dD, fused, dWorkspace, maxWorkspace);
+    if(status == HIPBLAS_STATUS_NOT_SUPPORTED)
+        GTEST_SKIP() << "no FP8 base GEMM solution found for the test shape";
+    ASSERT_EQ(status, HIPBLAS_STATUS_SUCCESS);
+
+    std::vector<hipblaslt_f8> hD(m * n);
+    float                    hAmax = 0.0f;
+    ASSERT_EQ(hipMemcpy(hD.data(), dD, hD.size() * sizeof(hipblaslt_f8), hipMemcpyDeviceToHost),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpy(&hAmax, dAmax, sizeof(float), hipMemcpyDeviceToHost), hipSuccess);
+
+    // CPU reference: dequantize the FP8 A/B inputs to their exact numeric values, then
+    // y = RMSNorm(A@B + residual, gamma, eps) in the BF16/FP32 domain (mirroring the shim's
+    // rounding at each storage point), then fp8 = round(y / dequantScale) and
+    // amax = max(|y|) taken before the requant scale is applied.
+    std::vector<float> hAf(hA.size()), hBf(hB.size());
+    for(size_t i = 0; i < hA.size(); ++i)
+        hAf[i] = f8ToF(hA[i]);
+    for(size_t i = 0; i < hB.size(); ++i)
+        hBf[i] = f8ToF(hB[i]);
+    const std::vector<float> gemm = cpuGemmBf16(hAf, hBf, m, n, k);
+    std::vector<float>       ref, rstd;
+    cpuResidualRmsnormRef(gemm, hResidual, hGamma, m, n, eps, /*apply_scale=*/true, ref, rstd);
+
+    float refAmax = 0.0f;
+    for(int64_t idx = 0; idx < m * n; ++idx)
+    {
+        refAmax = std::max(refAmax, std::fabs(ref[idx]));
+        const hipblaslt_f8 expected(ref[idx] / dequantScale);
+        EXPECT_EQ(hD[idx].__x, expected.__x) << "mismatch at flat index " << idx;
+    }
+    EXPECT_NEAR(hAmax, refAmax, 1e-6f);
+
+    hipblasLtFusedEpilogueDestroy(fused);
+    hipblasLtDestroy(handle);
+    static_cast<void>(hipFree(dA));
+    static_cast<void>(hipFree(dB));
+    static_cast<void>(hipFree(dC));
+    static_cast<void>(hipFree(dD));
+    static_cast<void>(hipFree(dResidual));
+    static_cast<void>(hipFree(dGamma));
+    static_cast<void>(hipFree(dScale));
+    static_cast<void>(hipFree(dAmax));
     static_cast<void>(hipFree(dWorkspace));
 }
 
