@@ -1,0 +1,270 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+#
+# Specialization of Tensile/Tests/common/gemm/gfx950/subtile_bf16.yaml for:
+#   - ProblemSize: [8192, 8192, 1, 8192]
+#   - UsePartialRMS: True (no residual add)
+#
+# PartialRMS requires both MacroTile0 and MacroTile1 to be multiples of 64.
+# Groups are split by MT1 as required by the PartialRMS validator.
+
+GlobalParameters:
+  SyncsPerBenchmark: 5
+  PrintSolutionRejectionReason: True
+  NumElementsToValidate: 128
+  MinimumRequiredVersion: 5.0.0
+  PrintLevel: 3
+  Device: 0
+  CMakeBuildType: Release
+  KernelTime: True
+  MaxWorkspaceSize: 13421772800
+  DataInitTypeA: 3
+  DataInitTypeB: 3
+  DataInitTypeC: 3
+  DataInitTypeAlpha: 1
+  DataInitTypeBeta: 2
+  DataInitTypeBias: 1
+  DataInitTypeMXSA: 3
+  DataInitTypeMXSB: 3
+  MXScaleFormat: 1
+  BoundsCheck: 0
+  KeepBuildTmp: True
+  CpuThreads: 1
+  RotatingBufferSize: 0
+
+BenchmarkProblems:
+
+  # ── MT1=128 ─────────────────────────────────────────────────────────────────
+  -
+    - &prms_pt
+      OperationType: GEMM
+      DataType: b
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: True
+      TransposeB: False
+      UseBeta: True
+      Batched: True
+      ActivationFuncCall: True
+      UsePartialRMS: True
+      PartialRMSResidualAdd: False
+
+    - BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 32, 1, 1,  4,  4,  2, 2]  # MT0=128 MT1=128  2x2 WG
+          - [16, 16, 32, 1, 1, 16,  4,  2, 2]  # MT0=512 MT1=128  2x2 WG
+          - [16, 16, 32, 1, 1,  8,  8,  4, 1]  # MT0=512 MT1=128  4x1 WG
+          - [16, 16, 32, 1, 1, 32,  2,  1, 4]  # MT0=512 MT1=128  1x4 WG
+        - PartialRMS: [True]
+        - PartialRMSResidualAdd: [False]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0]
+        - PrefetchGlobalRead: [0, 1, 2]
+        - PrefetchLocalRead: [0]
+        - DepthU: [64]
+        - ScheduleIterAlg: [3]
+        - DirectToLds: [1]
+        - StreamK: [0, 3]
+        - StaggerU: [0]
+        - UseSubtileImpl: [true]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [8192, 8192, 1, 8192]
+
+  # ── MT1=192 ─────────────────────────────────────────────────────────────────
+  -
+    - *prms_pt
+    - BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 32, 1, 1,  2,  6,  2, 2]  # MT0=64  MT1=192  2x2 WG
+          - [16, 16, 32, 1, 1,  8,  6,  2, 2]  # MT0=256 MT1=192  2x2 WG
+          - [16, 16, 32, 1, 1,  6,  6,  2, 2]  # MT0=192 MT1=192  2x2 WG
+        - PartialRMS: [True]
+        - PartialRMSResidualAdd: [False]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0]
+        - PrefetchGlobalRead: [0, 1, 2]
+        - PrefetchLocalRead: [0]
+        - DepthU: [64]
+        - ScheduleIterAlg: [3]
+        - DirectToLds: [1]
+        - StreamK: [0, 3]
+        - StaggerU: [0]
+        - UseSubtileImpl: [true]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [8192, 8192, 1, 8192]
+
+  # ── MT1=256 ─────────────────────────────────────────────────────────────────
+  -
+    - *prms_pt
+    - BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 32, 1, 1,  8,  8,  2, 2]  # MT0=256 MT1=256  2x2 WG
+        - PartialRMS: [True]
+        - PartialRMSResidualAdd: [False]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0]
+        - PrefetchGlobalRead: [0, 1, 2]
+        - PrefetchLocalRead: [0]
+        - DepthU: [64]
+        - ScheduleIterAlg: [3]
+        - DirectToLds: [1]
+        - StreamK: [0, 3]
+        - StaggerU: [0]
+        - UseSubtileImpl: [true]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [8192, 8192, 1, 8192]
+
+  # ── MT1=320 ─────────────────────────────────────────────────────────────────
+  -
+    - *prms_pt
+    - BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 32, 1, 1, 10, 10,  2, 2]  # MT0=320 MT1=320  2x2 WG
+        - PartialRMS: [True]
+        - PartialRMSResidualAdd: [False]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0]
+        - PrefetchGlobalRead: [0, 1, 2]
+        - PrefetchLocalRead: [0]
+        - DepthU: [64]
+        - ScheduleIterAlg: [3]
+        - DirectToLds: [1]
+        - StreamK: [0, 3]
+        - StaggerU: [0]
+        - UseSubtileImpl: [true]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [8192, 8192, 1, 8192]
+
+  # ── MT1=384 ─────────────────────────────────────────────────────────────────
+  -
+    - *prms_pt
+    - BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 32, 1, 1,  2, 24,  4, 1]  # MT0=128 MT1=384  4x1 WG
+          - [16, 16, 32, 1, 1,  8, 12,  2, 2]  # MT0=256 MT1=384  2x2 WG
+          - [16, 16, 32, 1, 1, 16,  6,  1, 4]  # MT0=256 MT1=384  1x4 WG
+        - PartialRMS: [True]
+        - PartialRMSResidualAdd: [False]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0]
+        - PrefetchGlobalRead: [0, 1, 2]
+        - PrefetchLocalRead: [0]
+        - DepthU: [64]
+        - ScheduleIterAlg: [3]
+        - DirectToLds: [1]
+        - StreamK: [0, 3]
+        - StaggerU: [0]
+        - UseSubtileImpl: [true]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [8192, 8192, 1, 8192]
+
+  # ── MT1=512 ─────────────────────────────────────────────────────────────────
+  -
+    - *prms_pt
+    - BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 32, 1, 1,  4, 16,  2, 2]  # MT0=128 MT1=512  2x2 WG
+          - [16, 16, 32, 1, 1,  8,  8,  1, 4]  # MT0=128 MT1=512  1x4 WG
+          - [16, 16, 32, 1, 1,  1, 32,  4, 1]  # MT0=64  MT1=512  4x1 WG
+        - PartialRMS: [True]
+        - PartialRMSResidualAdd: [False]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0]
+        - PrefetchGlobalRead: [0, 1, 2]
+        - PrefetchLocalRead: [0]
+        - DepthU: [64]
+        - ScheduleIterAlg: [3]
+        - DirectToLds: [1]
+        - StreamK: [0, 3]
+        - StaggerU: [0]
+        - UseSubtileImpl: [true]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [8192, 8192, 1, 8192]
+
+  # ── MT1=576 ─────────────────────────────────────────────────────────────────
+  -
+    - *prms_pt
+    - BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 32, 1, 1,  4,  9,  1, 4]  # MT0=64  MT1=576  1x4 WG
+        - PartialRMS: [True]
+        - PartialRMSResidualAdd: [False]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0]
+        - PrefetchGlobalRead: [0, 1, 2]
+        - PrefetchLocalRead: [0]
+        - DepthU: [64]
+        - ScheduleIterAlg: [3]
+        - DirectToLds: [1]
+        - StreamK: [0, 3]
+        - StaggerU: [0]
+        - UseSubtileImpl: [true]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [8192, 8192, 1, 8192]
+
+  ########################################
+  # Large DU groups — MT1-split
+  # Adapted from subtile_bf16.yaml group 2 (DU=128, 192).
+  # K=8192 is a multiple of both 128 and 192.
+  ########################################
+
+  # ── DU=128, MT1=128 ─────────────────────────────────────────────────────────
+  # DU=192 dropped: MT128x128 × DU=192 requires 196608 bytes of LDS which
+  # exceeds the gfx950 limit of 163840 bytes.
+  -
+    - *prms_pt
+    - BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 32, 1, 1,  4,  4,  2, 2]  # MT0=128 MT1=128  2x2 WG
+        - PartialRMS: [True]
+        - PartialRMSResidualAdd: [False]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0]
+        - PrefetchGlobalRead: [0, 1, 2]
+        - PrefetchLocalRead: [0]
+        - DepthU: [128]
+        - ScheduleIterAlg: [3]
+        - DirectToLds: [1]
+        - StreamK: [0, 3]
+        - StaggerU: [0]
+        - UseSubtileImpl: [true]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [8192, 8192, 1, 8192]
+
+LibraryLogic:
+  ScheduleName: "subtile_bf16_prms_8192"
+  DeviceNames: ["Device 74a1", "Device 75a0", "Device 75b0", "Device 75a2", "Device 75b2", "Device 75a3", "Device 75b3", "Device 75a8", "Device 75b8"]
+  ArchitectureName: "gfx950"

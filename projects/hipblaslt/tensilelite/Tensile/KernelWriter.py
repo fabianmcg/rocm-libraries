@@ -5223,7 +5223,17 @@ class KernelWriter(metaclass=abc.ABCMeta):
       # NOT LocalSplitU
       ####################################
 
+      if kernel["PartialRMS"]:
+        from .Components.Subtile.SubtilePartialRMSEmit import SubtilePartialRMSEmitter
+        module.addComment1("PartialRMS: fused partial sum-of-squares + gamma epilogue")
+        pRmsEmitter = SubtilePartialRMSEmitter(self, kernel)
+        module.add(pRmsEmitter.emit(dtileInfo.vgprTiles))
 
+      if kernel["RstdScale"]:
+        from .Components.Subtile.SubtileRstdScaleEmit import SubtileRstdScaleEmitter
+        module.addComment1("RstdScale: per-row rstd scale epilogue")
+        rstdEmitter = SubtileRstdScaleEmitter(self, kernel)
+        module.add(rstdEmitter.emit(dtileInfo.vgprTiles))
 
       # global write indices
       module.addComment1("not-LocalSplitU: global write indices")
@@ -10146,6 +10156,49 @@ class KernelWriter(metaclass=abc.ABCMeta):
         self.states.numStoreSgprNames.append("ActivationType")
         self.states.numStoreSgprNameSizes.append(1)
       storeSgprLoad += self.states.numActivationTypeArgSize + self.states.numactivationArgTotalSize
+    if kernel["PartialRMS"]:
+      # RMSNormGamma: 64-bit ptr (2 SGPRs), PartialBuf: 64-bit ptr (2 SGPRs).
+      # NTilesN is a kernarg u32 but is NOT put in the named SGPR block; instead the
+      # epilogue computes it from SizesFree[1] and the compile-time MT1 constant.
+      # Guarantee even alignment for the 64-bit pointers: checkOutMulti packs entries
+      # sequentially, so insert a 1-SGPR pad when the running offset is odd.
+      if sum(self.states.numStoreSgprNameSizes) % 2:
+        self.states.numStoreSgprNames.append("PartialRMSPad")
+        self.states.numStoreSgprNameSizes.append(1)
+        storeSgprLoad += 1
+      self.states.numStoreSgprNames.append("RMSNormGamma")
+      self.states.numStoreSgprNameSizes.append(self.states.rpga)  # 2 SGPRs (64-bit ptr)
+      self.states.numStoreSgprNames.append("PartialBuf")
+      self.states.numStoreSgprNameSizes.append(self.states.rpga)  # 2 SGPRs (64-bit ptr)
+      storeSgprLoad += self.states.rpga * 2
+      if kernel["PartialRMSResidualAdd"]:
+        # ResidualBuf: 64-bit ptr (2 SGPRs) for the bf16 row-major residual tensor.
+        self.states.numStoreSgprNames.append("ResidualBuf")
+        self.states.numStoreSgprNameSizes.append(self.states.rpga)  # 2 SGPRs (64-bit ptr)
+        storeSgprLoad += self.states.rpga
+    if kernel["RstdScale"]:
+      # RstdBuf: 64-bit pointer (2 SGPRs)
+      if sum(self.states.numStoreSgprNameSizes) % 2:
+        self.states.numStoreSgprNames.append("RstdScalePad")
+        self.states.numStoreSgprNameSizes.append(1)
+        storeSgprLoad += 1
+      self.states.numStoreSgprNames.append("RstdBuf")
+      self.states.numStoreSgprNameSizes.append(self.states.rpga)  # 2 SGPRs (64-bit ptr)
+      storeSgprLoad += self.states.rpga
+    self.states.numStoreSgprToLoad = storeSgprLoad
+
+
+    if self.states.useGateResidual:
+      self.states.numSgprAddressGate = self.states.rpga # 64-bit
+      self.states.numStoreSgprNames.append("AddressGate")
+      self.states.numStoreSgprNameSizes.append(self.states.numSgprAddressGate)
+      self.states.GateType   = 1
+      self.states.GateStride = self.states.gate.numSgprStrides
+      self.states.numStoreSgprNames.append("GateType")
+      self.states.numStoreSgprNameSizes.append(self.states.GateType)
+      self.states.numStoreSgprNames.append("GateStride")
+      self.states.numStoreSgprNameSizes.append(self.states.GateStride)
+      storeSgprLoad += self.states.numSgprAddressGate + self.states.GateType + self.states.GateStride
   
     self.states.numStoreSgprToLoad = storeSgprLoad      
     if self.db["InitLds"] : print ("\n***WARNING: InitLds enabled, may impact performance\n")

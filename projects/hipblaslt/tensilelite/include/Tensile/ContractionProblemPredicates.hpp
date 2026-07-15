@@ -2086,6 +2086,142 @@ namespace TensileLite
                 }
             };
 
+            struct UsePartialRMSEqual
+                : public Predicate_CRTP<UsePartialRMSEqual, ContractionProblemGemm>
+            {
+                enum
+                {
+                    HasIndex = false,
+                    HasValue = true
+                };
+                bool value;
+
+                UsePartialRMSEqual() = default;
+                UsePartialRMSEqual(bool value)
+                    : value(value)
+                {
+                }
+
+                static std::string Type()
+                {
+                    return "UsePartialRMS";
+                }
+
+                virtual bool operator()(ContractionProblemGemm const& problem) const override
+                {
+                    return problem.usePartialRMS() == value;
+                }
+
+                virtual bool debugEval(ContractionProblemGemm const& problem,
+                                       std::ostream&                 stream) const override
+                {
+                    return debugEvalCmp(
+                        problem, stream, "prob", problem.usePartialRMS(), "==", "sol", value);
+                }
+            };
+
+            struct UseRstdScaleEqual
+                : public Predicate_CRTP<UseRstdScaleEqual, ContractionProblemGemm>
+            {
+                enum
+                {
+                    HasIndex = false,
+                    HasValue = true
+                };
+                bool value;
+
+                UseRstdScaleEqual() = default;
+                UseRstdScaleEqual(bool value)
+                    : value(value)
+                {
+                }
+
+                static std::string Type()
+                {
+                    return "UseRstdScale";
+                }
+
+                virtual bool operator()(ContractionProblemGemm const& problem) const override
+                {
+                    return problem.useRstdScale() == value;
+                }
+
+                virtual bool debugEval(ContractionProblemGemm const& problem,
+                                       std::ostream&                 stream) const override
+                {
+                    return debugEvalCmp(
+                        problem, stream, "prob", problem.useRstdScale(), "==", "sol", value);
+                }
+            };
+
+            struct UsePartialRMSResidualAddEqual
+                : public Predicate_CRTP<UsePartialRMSResidualAddEqual, ContractionProblemGemm>
+            {
+                enum
+                {
+                    HasIndex = false,
+                    HasValue = true
+                };
+                bool value;
+
+                UsePartialRMSResidualAddEqual() = default;
+                UsePartialRMSResidualAddEqual(bool value)
+                    : value(value)
+                {
+                }
+
+                static std::string Type()
+                {
+                    return "UsePartialRMSResidualAdd";
+                }
+
+                virtual bool operator()(ContractionProblemGemm const& problem) const override
+                {
+                    return problem.partialRMSResidualAdd() == value;
+                }
+
+                virtual bool debugEval(ContractionProblemGemm const& problem,
+                                       std::ostream&                 stream) const override
+                {
+                    return debugEvalCmp(
+                        problem, stream, "prob", problem.partialRMSResidualAdd(), "==", "sol", value);
+                }
+            };
+
+            struct UsePartialRMSQuantEqual
+                : public Predicate_CRTP<UsePartialRMSQuantEqual, ContractionProblemGemm>
+            {
+                enum
+                {
+                    HasIndex = false,
+                    HasValue = true
+                };
+                bool value;
+
+                UsePartialRMSQuantEqual() = default;
+                UsePartialRMSQuantEqual(bool value)
+                    : value(value)
+                {
+                }
+
+                static std::string Type()
+                {
+                    return "UsePartialRMSQuant";
+                }
+
+                virtual bool operator()(ContractionProblemGemm const& problem) const override
+                {
+                    return problem.partialRMSQuant() == value;
+                }
+
+                virtual bool debugEval(ContractionProblemGemm const& problem,
+                                       std::ostream&                 stream) const override
+                {
+                    return debugEvalCmp(
+                        problem, stream, "prob", problem.partialRMSQuant(), "==", "sol", value);
+                }
+            };
+
             // Activation
             struct ActivationCheck : public Predicate_CRTP<ActivationCheck, ContractionProblemGemm>
             {

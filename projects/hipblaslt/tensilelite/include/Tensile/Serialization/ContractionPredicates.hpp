@@ -109,6 +109,10 @@ namespace TensileLite
                      Base::template Pair<Predicates::Contraction::FreeSizeMatching>(),
                      Base::template Pair<Predicates::Contraction::PredictionMatching>(),
                      Base::template Pair<Predicates::Contraction::GridBasedMatching>(),
+                     Base::template Pair<Predicates::Contraction::UsePartialRMSEqual>(),
+                     Base::template Pair<Predicates::Contraction::UseRstdScaleEqual>(),
+                     Base::template Pair<Predicates::Contraction::UsePartialRMSResidualAddEqual>(),
+                     Base::template Pair<Predicates::Contraction::UsePartialRMSQuantEqual>(),
                      Base::template Pair<Predicates::Contraction::UseGradientEqual>(),
                      Base::template Pair<Predicates::Contraction::ActivationCheck>(),
                      Base::template Pair<Predicates::Contraction::ActivationComputeTypeEqual>(),
@@ -443,6 +447,30 @@ namespace TensileLite
         template <typename IO>
         struct MappingTraits<Predicates::Contraction::UseGradientEqual, IO>
             : public AutoMappingTraits<Predicates::Contraction::UseGradientEqual, IO>
+        {
+        };
+
+        template <typename IO>
+        struct MappingTraits<Predicates::Contraction::UsePartialRMSEqual, IO>
+            : public AutoMappingTraits<Predicates::Contraction::UsePartialRMSEqual, IO>
+        {
+        };
+
+        template <typename IO>
+        struct MappingTraits<Predicates::Contraction::UseRstdScaleEqual, IO>
+            : public AutoMappingTraits<Predicates::Contraction::UseRstdScaleEqual, IO>
+        {
+        };
+
+        template <typename IO>
+        struct MappingTraits<Predicates::Contraction::UsePartialRMSResidualAddEqual, IO>
+            : public AutoMappingTraits<Predicates::Contraction::UsePartialRMSResidualAddEqual, IO>
+        {
+        };
+
+        template <typename IO>
+        struct MappingTraits<Predicates::Contraction::UsePartialRMSQuantEqual, IO>
+            : public AutoMappingTraits<Predicates::Contraction::UsePartialRMSQuantEqual, IO>
         {
         };
 

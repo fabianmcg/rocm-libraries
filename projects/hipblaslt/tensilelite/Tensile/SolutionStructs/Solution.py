@@ -227,6 +227,174 @@ def _validateSubtileGRKPartition(state, printRejectionReason):
   return True
 
 
+def _validateSubtileEpiloguePrereqs(state, printRejectionReason, epilogueName):
+  """Validate the shared prerequisites for the Subtile fused epilogues.
+
+  PartialRMS and RstdScale share five structural requirements: the Subtile code
+  path, gfx950, bf16 I/O, StreamKForceDPOnly (complete tiles, no K-split
+  fixup), and MIArchVgpr=False (the emitters use AGPR read/write instructions).
+  Returns True when all hold; rejects the solution and returns False otherwise.
+  """
+  if not state["UseSubtileImpl"]:
+    reject(state, printRejectionReason, "%s requires UseSubtileImpl" % epilogueName)
+    return False
+  if state["ISA"] != (9, 5, 0):
+    reject(state, printRejectionReason, "%s is only implemented on gfx950" % epilogueName)
+    return False
+  if not state["ProblemType"]["DataType"].isBFloat16():
+    reject(state, printRejectionReason, "%s currently supports bf16 data type only" % epilogueName)
+    return False
+  # StreamK-completeness: when StreamK is active, require full data-parallel
+  # tiles (no K-split fixup). Non-StreamK solutions are always complete-tile;
+  # assignDerivedParameters clears StreamKForceDPOnly for them, so only check
+  # when StreamK != 0. _validateStreamKForceDPOnly() enforces StreamK=3 next.
+  if state["StreamK"] and not state["StreamKForceDPOnly"]:
+    reject(state, printRejectionReason,
+           "%s requires StreamKForceDPOnly=1 (complete tiles, no K-split fixup)" % epilogueName)
+    return False
+  # MIArchVgpr=True places the D-tile in regular VGPRs, but the emitters use
+  # accvgpr() reads/writes. Reject until an AGPR-free code path exists.
+  if state["MIArchVgpr"]:
+    reject(state, printRejectionReason,
+           "%s requires MIArchVgpr=False (emitter uses AGPR read/write instructions)" % epilogueName)
+    return False
+  return True
+
+
+def _validatePartialRMS(state, printRejectionReason):
+  """Validate PartialRMS fused epilogue constraints.
+
+  PartialRMS (Phase 1 / K1) computes per-row Σx² from the GEMM accumulator
+  and writes it to a global partialBuf. It also applies gamma in-place so the
+  downstream store path writes D as bf16.
+
+  Structural requirements:
+    - UseSubtileImpl, gfx950, bf16, StreamKForceDPOnly.
+    - Mutually exclusive with RstdScale.
+    - MacroTile0 and MacroTile1 must be multiples of 64.
+    - free0 = N_hidden (the reduced axis); free1 = M_tokens. Each WG reduces its
+      own MT0-wide free0 tile and writes one partial per token to
+      partialBuf[token, WorkGroup0].
+    - partialBuf is 2D row-major [M_padded, n_d], n_d = ceil(SizesFree0 / MT0)
+      columns (one column per free0 tile, i.e. per WorkGroup0). Byte offset for
+      (token, t) = (token * n_d + t) * 4.
+    - n_d is computed on device from SizesFree0; it is not a kernarg.
+    - OutputAmaxD and MBSK/AdaptiveGemmGSUA rejected (kernarg layout conflict).
+    - GroupedGemm rejected (multi-tile index arithmetic not validated).
+    - When wg_n > 1: wg_m must be power-of-two; LDS budget checked.
+    - PartialRMSQuant requires PartialRMS.
+  """
+  if state.get("PartialRMSResidualAdd", False) and not state.get("PartialRMS", False):
+    reject(state, printRejectionReason, "PartialRMSResidualAdd requires PartialRMS")
+    return
+  if state.get("PartialRMSQuant", False) and not state.get("PartialRMS", False):
+    reject(state, printRejectionReason, "PartialRMSQuant requires PartialRMS")
+    return
+  if not state.get("PartialRMS", False):
+    return
+  # RstdScale is mutually exclusive with PartialRMS; enforce when it is introduced.
+  if state.get("RstdScale", False):
+    reject(state, printRejectionReason, "PartialRMS is mutually exclusive with RstdScale")
+    return
+  if not _validateSubtileEpiloguePrereqs(state, printRejectionReason, "PartialRMS"):
+    return
+  # The Subtile PAP path does not call papDtlSaveLdsBank, so LDS-bank alignment
+  # is broken on the next persistent tile. This corrupts the AGPR accumulators,
+  # which then produces out-of-bounds partialBuf stores that fault on a read-only
+  # page. Reject until PAP and PartialRMS are co-validated.
+  if state.get("PrefetchAcrossPersistent", 0):
+    reject(state, printRejectionReason,
+           "PartialRMS is not supported with PrefetchAcrossPersistent")
+    return
+  if state["MacroTile1"] <= 0:
+    reject(state, printRejectionReason, "PartialRMS requires a positive MacroTile1")
+    return
+  if state["ProblemType"]["OutputAmaxD"]:
+    reject(state, printRejectionReason,
+           "PartialRMS does not support OutputAmaxD (kernarg layout conflict)")
+    return
+  if (state.get("_GlobalAccumulation") == "MultipleBufferSingleKernel" or
+      state.get("AdaptiveGemmGSUA") == 1):
+    reject(state, printRejectionReason,
+           "PartialRMS does not support MultipleBufferSingleKernel/AdaptiveGemmGSUA "
+           "(kernarg layout conflict)")
+    return
+  if state["ProblemType"].get("GroupedGemm", False):
+    reject(state, printRejectionReason,
+           "PartialRMS does not support GroupedGemm")
+    return
+  wg = state["MIWaveGroup"]
+  mfma_n        = state["MatrixInstN"]
+
+  mt0 = state["MacroTile0"]
+  if mt0 <= 0 or mt0 % 64 != 0:
+    reject(state, printRejectionReason,
+           "PartialRMS requires MacroTile0 to be a multiple of 64")
+    return
+  mt1 = state["MacroTile1"]
+  if mt1 <= 0 or mt1 % 64 != 0:
+    reject(state, printRejectionReason,
+           "PartialRMS requires MacroTile1 to be a multiple of 64")
+    return
+  if (state["MacroTile0"] // (state["MatrixInstM"] * wg[0])) < 1:
+    reject(state, printRejectionReason,
+           "PartialRMS requires MacroTile0 // (MatrixInstM*MIWaveGroup[0]) >= 1")
+    return
+  if wg[0] > 1:
+    if (wg[0] & (wg[0] - 1)) != 0:
+      reject(state, printRejectionReason,
+             "PartialRMS cross-wave reduction requires MIWaveGroup[0] power of two")
+      return
+    mma_n = (state["MacroTile1"] // mfma_n) // wg[1]
+    ldsBytes = wg[0] * wg[1] * state["WavefrontSize"] * mma_n * 4
+    if state["MaxLDS"] > 0 and ldsBytes > state["MaxLDS"]:
+      reject(state, printRejectionReason,
+             "PartialRMS cross-wave LDS scratch (%u) exceeds MaxLDS (%u)"
+             % (ldsBytes, state["MaxLDS"]))
+      return
+
+
+def _validateRstdScale(state, printRejectionReason):
+  """Validate RstdScale fused epilogue constraints.
+
+  RstdScale (Phase 3 / K3) loads a pre-computed per-row rstd scalar from
+  rstdBuf and multiplies every accumulator element of that row in-place.
+  No reduction, no LDS, no butterfly — simplest of the three emitters.
+
+  Structural requirements (mirrors _validatePartialRMS):
+    - UseSubtileImpl, gfx950, bf16, StreamKForceDPOnly: same as PartialRMS.
+    - Mutually exclusive with PartialRMS.
+    - MacroTile1 > 0 (N == MacroTile1 enforced at launch).
+    - OutputAmaxD and MBSK/AdaptiveGemmGSUA rejected (kernarg layout conflict).
+    - No cross-wave LDS needed; no wg_n constraint.
+  """
+  if not state["RstdScale"]:
+    return
+  if state["PartialRMS"]:
+    reject(state, printRejectionReason, "RstdScale and PartialRMS are mutually exclusive")
+    return
+  if not _validateSubtileEpiloguePrereqs(state, printRejectionReason, "RstdScale"):
+    return
+  # Same PAP interaction as PartialRMS — papDtlSaveLdsBank absent in Subtile path.
+  if state.get("PrefetchAcrossPersistent", 0):
+    reject(state, printRejectionReason,
+           "RstdScale is not supported with PrefetchAcrossPersistent")
+    return
+  if state["MacroTile1"] <= 0:
+    reject(state, printRejectionReason, "RstdScale requires a positive MacroTile1")
+    return
+  if state["ProblemType"]["OutputAmaxD"]:
+    reject(state, printRejectionReason,
+           "RstdScale does not support OutputAmaxD (kernarg layout conflict)")
+    return
+  if (state.get("_GlobalAccumulation") == "MultipleBufferSingleKernel" or
+      state.get("AdaptiveGemmGSUA") == 1):
+    reject(state, printRejectionReason,
+           "RstdScale does not support MultipleBufferSingleKernel/AdaptiveGemmGSUA "
+           "(kernarg layout conflict)")
+    return
+
+
 def _validateStreamKForceDPOnly(state, printRejectionReason):
   if state["StreamKForceDPOnly"]:
     if state["StreamK"] != 3:
@@ -1000,6 +1168,12 @@ class Solution(collections.abc.Mapping):
       # Not currently implemented in subtile implementation
       state["Use64bShadowLimit"] = False
       state["Use64bShadowLimitMX"] = False
+      # The subtile scheduler always double-buffers LDS: SubtileGREmit/SubtileLREmit
+      # unconditionally emit buffer swaps that toggle between two LDS halves (XOR
+      # ldsTotalSize). Single-buffering is not implemented, so 1LDSBuffer=1 would
+      # allocate only one buffer (NumLdsBlk=1) while the code still swaps into the
+      # unallocated second half, corrupting results. Force double buffering.
+      state["1LDSBuffer"] = 0
 
       # DepthU must be a multiple of numSubIterK * MIK * LSU, where numSubIterK is the
       # number of K-subtiles per depth-U iteration: 1 for fp8 (AB_B8, subtileShape K=1),
@@ -1076,6 +1250,20 @@ class Solution(collections.abc.Mapping):
           reject(state, printRejectionReason, "UseSubtileImpl=1 PrefetchAcrossPersistent requires PrefetchGlobalRead=2")
         if state["DirectToVgprMXSA"] or state["DirectToVgprMXSB"]:
           reject(state, printRejectionReason, "UseSubtileImpl=1 PrefetchAcrossPersistent not supported with DirectToVgpr MX scale tensors")
+
+    _validatePartialRMS(state, printRejectionReason)
+    if not state["Valid"]:
+      return
+
+    _validateRstdScale(state, printRejectionReason)
+    if not state["Valid"]:
+      return
+
+    # TODO: Support other LdsBlockSizePerPadMXSA/B for gfx1250.
+    if state["ISA"] == (12, 5, 0):
+      if ((state["LdsBlockSizePerPadMXSA"] > 0) or (state["LdsBlockSizePerPadMXSB"] > 0 )):
+        reject(state, printRejectionReason, "LdsBlockSizePerPadMXSA/LdsBlockSizePerPadMXSB support -1 and 0 for gfx1250")
+        return
 
     state["Multicast"] = False
     state["ClusterBarrier"] = False
@@ -5441,7 +5629,26 @@ class Solution(collections.abc.Mapping):
       ldsNumBytes += ldsAmaxDBytes
 
     state["LdsNumBytes"] = ldsNumBytes
-    ldsSize = ldsNumBytes
+
+    # PartialRMS cross-wave reduction guarantee:
+    # _validatePartialRMS runs early (before LdsNumBytes is finalised) so it can
+    # only check against MaxLDS.  Here, now that the reserved main-loop LDS
+    # region is finalised, ensure it is at least as large as the cross-wave
+    # scratch so the emitter's LDS writes are provably within the reserved
+    # region (freed at the epilogue).  The existing MaxLDS reject below then
+    # catches any device overflow.
+    if state.get("PartialRMS") and state["MIWaveGroup"][1] > 1:
+      wg = state["MIWaveGroup"]
+      # Use mma_n (MT1-derived) to match the emitter's numPartials in
+      # SubtilePartialRMSEmit.py, not mma_m (MT0-derived) which over-reserves
+      # for wide-MT0 tiles.
+      mma_n_prms    = (state["MacroTile1"] // state["MatrixInstN"]) // wg[1]
+      rows_per_lane = (state["MatrixInstM"] * state["MatrixInstN"]) // state["WavefrontSize"]
+      num_rows_prms = mma_n_prms * rows_per_lane
+      partialRMSLdsBytes = wg[0] * wg[1] * state["WavefrontSize"] * num_rows_prms * 4
+      state["LdsNumBytes"] = max(state["LdsNumBytes"], partialRMSLdsBytes)
+
+    ldsSize = state["LdsNumBytes"]
     if ldsSize > state["MaxLDS"]:
       reject(state, printRejectionReason, "Kernel Uses %u > %u bytes of LDS" % ( ldsSize, state["MaxLDS"]))
       state["ValidDepthU"] = False

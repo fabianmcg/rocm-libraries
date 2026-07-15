@@ -55,6 +55,7 @@ class UserArgumentsInfo:
     gateSize: int = 0
     activationSize: int = 0
     factorDimSize: int = 0
+    rmsNormSize: int = 0
     # Total argument size
     totalSize: int = 0
 
@@ -352,6 +353,27 @@ class SignatureDefault(Signature):
             userArgumentsInfo.activationSize += userArgumentsInfo.actMaxSize
         userArgumentsInfo.activationSize += 4  # Type size
 
+        if kernel["PartialRMS"]:
+            # PartialRMS (K1) epilogue appends in this order:
+            #   RMSNormGamma: bf16 global buffer pointer (8 bytes) — per-column gamma weight.
+            #   PartialBuf:   fp32 global buffer pointer (8 bytes) — output Σx² per (row, N-tile).
+            # No RMSNormEps: K2 uses eps, not K1.
+            # NTilesN is not a kernarg: the device computes it from SizesFree[1] and the
+            # compile-time MT1 constant to avoid consuming a permanent named-SGPR slot.
+            gammaValueType = getSrcValueType(kernel, True)  # always bf16; PartialRMS validation enforces isBFloat16().
+            signature.addArg("RMSNormGamma", SVK.SIG_GLOBALBUFFER, gammaValueType, "generic")
+            signature.addArg("PartialBuf",   SVK.SIG_GLOBALBUFFER, "f32",          "generic")
+            userArgumentsInfo.rmsNormSize = 8 + 8  # gamma ptr + partialBuf ptr
+            if kernel["PartialRMSResidualAdd"]:
+                signature.addArg("ResidualBuf", SVK.SIG_GLOBALBUFFER, gammaValueType, "generic")
+                userArgumentsInfo.rmsNormSize += 8  # residual ptr
+
+        if kernel["RstdScale"]:
+            # RstdScale (K3) epilogue appends in this order:
+            #   RstdBuf: fp32 global buffer pointer (8 bytes) — pre-computed per-row rstd.
+            signature.addArg("RstdBuf", SVK.SIG_GLOBALBUFFER, "f32", "generic")
+            userArgumentsInfo.rmsNormSize = 8  # 8B rstdBuf ptr
+
         # Calculate total size
         userArgumentsInfo.totalSize = userArgumentsInfo.gemmArgumentSize + \
                                       userArgumentsInfo.scaleASize + \
@@ -363,7 +385,8 @@ class SignatureDefault(Signature):
                                       userArgumentsInfo.factorDimSize + \
                                       userArgumentsInfo.eSize + \
                                       userArgumentsInfo.activationSize + \
-                                      userArgumentsInfo.gateSize
+                                      userArgumentsInfo.gateSize + \
+                                      userArgumentsInfo.rmsNormSize
 
         writer.states.userArgsInfo = userArgumentsInfo
 

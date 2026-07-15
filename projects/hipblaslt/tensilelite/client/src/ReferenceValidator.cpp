@@ -139,11 +139,39 @@ namespace TensileLite
 
             if(auto* gemm = dynamic_cast<ContractionProblemGemm*>(m_problem))
             {
-                // Match DataInitialization MX gate.
-                if(!isMXProblem(*gemm))
-                    return;
-                ScopedTimer timer("cpu_reference_gemm_per_solution");
-                SolveCPU(m_problem, m_referenceInputs.get(), m_elementsToValidate);
+                bool needsRerun = false;
+
+                // When a PartialRMS benchmark group contains solutions with different
+                // MT0 values, the client allocates partialBuf using minMT0 (the
+                // smallest MT0 across all solutions).  Each kernel computes its own
+                // n_d = ceil(N_hidden / MT0_kernel) at runtime and uses that as the
+                // partialBuf column stride.  The CPU reference must use the same MT0
+                // as the kernel being validated; otherwise the tile layout doesn't
+                // match and validation fails for kernels with MT0 > minMT0.
+                if(gemm->usePartialRMS())
+                {
+                    int actualMT0 = static_cast<int>(solution->sizeMapping.macroTile.x);
+                    if(actualMT0 > 0 && actualMT0 != gemm->partialRMSMT0())
+                    {
+                        size_t nHidden = gemm->d().sizes()[0];
+                        size_t mPadded
+                            = gemm->tensors()[ContractionProblemGemm::TENSOR::PARTIALBUF]
+                                  .sizes()[0];
+                        size_t nTilesN = (nHidden + static_cast<size_t>(actualMT0) - 1)
+                                         / static_cast<size_t>(actualMT0);
+                        gemm->setPartialRMSMT0(actualMT0);
+                        gemm->setPartialBuf(mPadded, nTilesN);
+                        needsRerun = true;
+                    }
+                }
+
+                // Always re-run for MX problems; also re-run when the partialBuf
+                // layout changed for a PartialRMS solution.
+                if(isMXProblem(*gemm) || needsRerun)
+                {
+                    ScopedTimer timer("cpu_reference_gemm_per_solution");
+                    SolveCPU(m_problem, m_referenceInputs.get(), m_elementsToValidate);
+                }
             }
         }
 
@@ -511,7 +539,12 @@ namespace TensileLite
                     refPtr = reference.amaxD;
                     resPtr = result.amaxD;
                 }
-
+                break;
+                case ContractionProblemGemm::TENSOR::PARTIALBUF:
+                {
+                    refPtr = reference.partialBuf;
+                    resPtr = result.partialBuf;
+                }
                 break;
                 default:
                     throw std::runtime_error("Unrecognized output tensor.");

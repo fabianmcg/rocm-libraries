@@ -165,4 +165,8 @@ def getRequiredParametersMin() -> set:
         'UsePLRPack',
         'UseSubtileImpl',
         'ClusterDim',
+        'PartialRMS',
+        'PartialRMSQuant',
+        'PartialRMSResidualAdd',
+        'RstdScale',
     })

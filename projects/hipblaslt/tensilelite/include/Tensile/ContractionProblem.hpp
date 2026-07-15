@@ -349,6 +349,10 @@ namespace TensileLite
             MXSA          = 15,
             MXSB          = 16,
             GATE_RESIDUAL = 17,
+            RMSGAMMA      = 18, // bf16 input: RMSNorm gamma (N_hidden elements).
+            PARTIALBUF    = 19, // f32 output: partial Σx² [M_tokens_padded x n_d] row-major, n_d = ceil(N_hidden/MT0).
+            RESIDUAL      = 20, // bf16 input: residual tensor [M_tokens x N_hidden] row-major (optional).
+            RSTDBUF       = 21, // f32 input: reciprocal std-dev buffer [M] for RstdScale epilogue.
             TENSOR_COUNT
         };
 
@@ -761,6 +765,21 @@ namespace TensileLite
             m_outputAmaxD = outputAmaxD;
         }
 
+        void setUsePartialRMS(bool v)           { m_usePartialRMS = v; }
+        void setPartialRMSResidualAdd(bool v)   { m_partialRMSResidualAdd = v; }
+        void setPartialRMSQuant(bool v)         { m_partialRMSQuant = v; }
+        void setPartialRMSMT0(int v)            { m_partialRMSMT0 = v; }
+        void setPartialRMSMT1(int v)            { m_partialRMSMT1 = v; }
+
+        bool usePartialRMS()         const { return m_usePartialRMS; }
+        bool partialRMSResidualAdd() const { return m_partialRMSResidualAdd; }
+        bool partialRMSQuant()       const { return m_partialRMSQuant; }
+        int  partialRMSMT0()         const { return m_partialRMSMT0; }
+        int  partialRMSMT1()         const { return m_partialRMSMT1; }
+
+        void setUseRstdScale(bool v) { m_useRstdScale = v; }
+        bool useRstdScale() const    { return m_useRstdScale; }
+
         void setUseBias(int useBias)
         {
             m_useBias = useBias;
@@ -968,6 +987,37 @@ namespace TensileLite
                 m_tensors[ContractionProblemGemm::TENSOR::AMAXD] = {"amaxD", type, {1}, {1, 1}};
                 m_tensors[ContractionProblemGemm::TENSOR::AMAXD].setAsOutput(isOutput);
             }
+        }
+
+        void setRMSGamma(rocisa::DataType type, size_t nHidden)
+        {
+            if(m_usePartialRMS)
+                m_tensors[ContractionProblemGemm::TENSOR::RMSGAMMA]
+                    = {"rmsGamma", type, {nHidden}, {1}};
+        }
+
+        void setPartialBuf(size_t mPadded, size_t nTilesN)
+        {
+            if(m_usePartialRMS)
+            {
+                m_tensors[ContractionProblemGemm::TENSOR::PARTIALBUF]
+                    = {"partialBuf", rocisa::DataType::Float, {mPadded, nTilesN}, {nTilesN, 1}};
+                m_tensors[ContractionProblemGemm::TENSOR::PARTIALBUF].setAsOutput(true);
+            }
+        }
+
+        void setResidual(rocisa::DataType type, size_t M, size_t nHidden)
+        {
+            if(m_usePartialRMS && m_partialRMSResidualAdd)
+                m_tensors[ContractionProblemGemm::TENSOR::RESIDUAL]
+                    = {"residual", type, {M, nHidden}, {1, M}};
+        }
+
+        void setRstdBuf(size_t mPadded)
+        {
+            if(m_useRstdScale)
+                m_tensors[ContractionProblemGemm::TENSOR::RSTDBUF]
+                    = {"rstdBuf", rocisa::DataType::Float, {mPadded}, {1}};
         }
 
         void setSynchronizer(rocisa::DataType type, size_t length)
@@ -1478,6 +1528,12 @@ namespace TensileLite
         bool             m_useE                    = false;
         rocisa::DataType m_auxType                 = rocisa::DataType::None;
         bool             m_outputAmaxD             = false;
+        bool             m_usePartialRMS           = false;
+        bool             m_partialRMSResidualAdd   = false;
+        bool             m_partialRMSQuant         = false;
+        int              m_partialRMSMT0            = 0;
+        int              m_partialRMSMT1            = 0;
+        bool             m_useRstdScale            = false;
         bool             m_swizzleTensorA          = false;
         bool             m_swizzleTensorB          = false;
         int              m_useBias                 = 0;
@@ -1616,6 +1672,11 @@ namespace TensileLite
         void*       d     = nullptr;
         void*       e     = nullptr;
         void*       amaxD = nullptr;
+
+        void*       partialBuf = nullptr;
+        void const* rmsGamma   = nullptr;
+        void const* residual   = nullptr;
+        void const* rstdBuf    = nullptr;
 
         void const* const* batchA    = nullptr;
         void const* const* batchB    = nullptr;

@@ -181,6 +181,10 @@ namespace TensileLite
         // kernels (e.g. rejecting them for small K).
         bool useSubtileImpl = false;
 
+        bool partialRMS            = false;
+        bool partialRMSResidualAdd = false;
+        bool rstdScale             = false;
+
         int NonTemporalD = 0;
         int WaveSeparateGlobalReadA = 0;
         int WaveSeparateGlobalReadB = 0;
@@ -651,6 +655,11 @@ namespace TensileLite
             // The host (DataInitialization) consults this to decide whether to
             // apply the K-dimension swizzle on the MX scale tensor before upload.
             int mxScaleFormat = 0;
+
+            bool usePartialRMS         = false;
+            bool partialRMSResidualAdd = false;
+            bool partialRMSQuant       = false;
+            bool useRstdScale          = false;
         };
 
         struct LinearModel

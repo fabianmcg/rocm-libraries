@@ -1256,6 +1256,12 @@ namespace TensileLite
                 return rejectFast("amaxD");
             }
 
+            if(problem.usePartialRMS())
+                return rejectFast("partialRMS");
+
+            if(problem.useRstdScale())
+                return rejectFast("rstdScale");
+
             if(problem.useE())
             {
                 return rejectFast("useE");
@@ -2129,6 +2135,16 @@ namespace TensileLite
                         alpha *= scaleB;
                 }
 
+                // RstdScale (K3): multiply the raw accumulator by the per-row rstd scalar
+                // before the alpha/beta store, matching the kernel's AGPR-level multiply.
+                if(problem.useRstdScale() && inputs.rstdBuf != nullptr)
+                {
+                    size_t mCoord  = dCoord[0];
+                    float  rstdVal = GetValue<float>(rocisa::DataType::Float,
+                                                     inputs.rstdBuf, (int)mCoord, aConjugate);
+                    value *= static_cast<Accumulator>(rstdVal);
+                }
+
                 auto resultD = multiply<Accumulator>(alpha, value);
 
                 if(problem.useScaleAlphaVec())
@@ -2216,7 +2232,6 @@ namespace TensileLite
                                          actArgs);
                 }
 
-                omp_set_num_threads(MAX_OMP_THREADS);
 #pragma omp critical
                 {
                     if constexpr(notCmplxAmaxD)
@@ -2255,7 +2270,171 @@ namespace TensileLite
                     resultD = gateVal * resultD + gateVal;
                 }
 
-                dPtr[dIndex] = SaturateCast<typename Inputs::DType>(resultD);
+                if constexpr(notCmplxAmaxD)
+                {
+                    if(problem.usePartialRMS() && inputs.partialBuf != nullptr
+                       && inputs.rmsGamma != nullptr)
+                    {
+                        // PartialRMSAxis=0: free0=N_hidden (mCoord), free1=M_tokens (nCoord).
+                        // gamma is indexed by free0 position (mCoord).
+                        // Kernel execution order:
+                        //   1. rC = A*B  (MFMA accumulation)
+                        //   [2. rC += residual[nCoord, mCoord]  (if PartialRMSResidualAdd)]
+                        //   3. rC *= gamma[mCoord]  (PartialRMS epilogue)
+                        //   4. D = bf16(alpha*rC + beta*C)  (standard store)
+                        //   5. partialBuf[nCoord, t] = Σ rC_eff²  (per free0 tile t=mCoord/MT0)
+                        size_t mCoord = dCoord[0];  // free0 = N_hidden position
+                        size_t nCoord = dCoord[1];  // free1 = M_tokens position
+
+                        float hF = static_cast<float>(value);
+                        if(problem.partialRMSResidualAdd() && inputs.residual != nullptr)
+                        {
+                            // residual is row-major [M_tokens, N_hidden]: offset = nCoord*N + mCoord.
+                            size_t residualIdx = nCoord * static_cast<size_t>(d.sizes()[0]) + mCoord;
+                            hF += static_cast<float>(
+                                GetValue<float>(rocisa::DataType::BFloat16,
+                                                inputs.residual, (int)residualIdx, aConjugate));
+                        }
+                        // D = bf16(alpha * gamma[mCoord] * hF + beta * C).
+                        float gammaVal = static_cast<float>(
+                            GetValue<float>(rocisa::DataType::BFloat16,
+                                            inputs.rmsGamma, (int)mCoord, aConjugate));
+                        float dVal = static_cast<float>(alpha) * hF * gammaVal;
+                        if(beta != zero)
+                            dVal += static_cast<float>(beta)
+                                    * static_cast<float>(cPtr[cIndex]);
+                        dPtr[dIndex] = SaturateCast<typename Inputs::DType>(dVal);
+                    }
+                    else
+                    {
+                        dPtr[dIndex] = SaturateCast<typename Inputs::DType>(resultD);
+                    }
+                }
+                else
+                {
+                    dPtr[dIndex] = SaturateCast<typename Inputs::DType>(resultD);
+                }
+            }
+
+            // Compute partialBuf for PartialRMSAxis=0: per-token (free1) Σx² over each
+            // free0 tile. partialBuf[token, tFree0] = Σ_{m in tile t} (A*B)[m, token]².
+            // pbCoord[0]=token (free1 index), pbCoord[1]=tFree0 (free0 tile index, MT0-wide).
+            // When PartialRMSQuant is enabled, sizes()[0] = 2*mPadded: the first half holds
+            // tileSum entries and the second half holds amax/fp8_max entries. Both halves are
+            // computed directly here so sparse stride sampling covers them independently.
+            if constexpr(notCmplxAmaxD)
+            {
+                if(problem.usePartialRMS() && inputs.partialBuf != nullptr)
+                {
+                    int mt0 = problem.partialRMSMT0() > 0 ? problem.partialRMSMT0() : 16;
+
+                    auto const& pbTensor
+                        = problem.tensors()[ContractionProblemGemm::TENSOR::PARTIALBUF];
+                    size_t pbValidStride = 1;
+                    if(elementsToValidate > 0
+                       && elementsToValidate < pbTensor.totalLogicalElements())
+                        pbValidStride = NextPrime(
+                            pbTensor.totalAllocatedElements() / elementsToValidate);
+
+                    float* pb = static_cast<float*>(inputs.partialBuf);
+
+                    std::fill(pb, pb + pbTensor.totalAllocatedElements(), 0.0f);
+
+                    // mPadded is the first-half row count; second half starts at mPadded.
+                    size_t mPadded = problem.partialRMSQuant()
+                                         ? pbTensor.sizes()[0] / 2
+                                         : pbTensor.sizes()[0];
+
+                    omp_set_num_threads(MAX_OMP_THREADS);
+#pragma omp parallel for schedule(dynamic)
+                    for(size_t pbNum = 0; pbNum < pbTensor.totalLogicalElements();
+                        pbNum += pbValidStride)
+                    {
+                        std::vector<int64_t> pbCoord(pbTensor.dimensions());
+                        CoordNumbered(pbNum,
+                                      pbCoord.begin(),
+                                      pbCoord.end(),
+                                      pbTensor.sizes().begin(),
+                                      pbTensor.sizes().end());
+                        size_t pbIdx = pbTensor.index(pbCoord);
+                        size_t token = static_cast<size_t>(pbCoord[0]);
+
+                        // Determine whether this row is a second-half amax entry.
+                        bool isAmaxRow  = problem.partialRMSQuant() && token >= mPadded;
+                        size_t realToken = isAmaxRow ? token - mPadded : token;
+
+                        // Padded rows (first-half beyond M_tokens, or second-half amax
+                        // for a padded token) carry no data; leave them zero.
+                        if(realToken >= static_cast<size_t>(d.sizes()[1]))
+                            continue;
+
+                        size_t tFree0 = static_cast<size_t>(pbCoord[1]); // free0 tile (MT0-wide)
+                        size_t mLo    = tFree0 * mt0;
+                        size_t mHi    = std::min(mLo + mt0, static_cast<size_t>(d.sizes()[0]));
+
+                        constexpr float kFp8E4M3Max = 448.0f;
+                        float tileSum  = 0.0f;
+                        float tileAmax = 0.0f;
+                        for(size_t m = mLo; m < mHi; ++m)
+                        {
+                            // (A*B)[m, realToken] = Σ_k A[k, m] * B[k, realToken].
+                            // free0 corresponds to freeIndicesA, free1 to freeIndicesB.
+                            std::vector<int64_t> aCoordL(a.dimensions(), 0);
+                            std::vector<int64_t> bCoordL(b.dimensions(), 0);
+                            for(auto const& fi : freeIndicesA)
+                                aCoordL[fi.i] = static_cast<int64_t>(m);
+                            for(auto const& fi : freeIndicesB)
+                                bCoordL[fi.i] = static_cast<int64_t>(realToken);
+
+                            float dot = 0.0f;
+                            for(size_t k = 0; k < boundSize[0]; ++k)
+                            {
+                                aCoordL[boundIndices[0].a] = static_cast<int64_t>(k);
+                                bCoordL[boundIndices[0].b] = static_cast<int64_t>(k);
+                                size_t aI = a.index(aCoordL);
+                                size_t bI = b.index(bCoordL);
+                                dot += GetValue<float>(a.dataType(), inputs.a,
+                                                        static_cast<int>(aI), false)
+                                       * GetValue<float>(b.dataType(), inputs.b,
+                                                         static_cast<int>(bI), false);
+                            }
+
+                            if(problem.partialRMSResidualAdd() && inputs.residual != nullptr)
+                            {
+                                // residual is row-major [M_tokens, N_hidden]:
+                                // offset = realToken * N_hidden + m_free0.
+                                size_t residualIdx
+                                    = realToken * static_cast<size_t>(d.sizes()[0]) + m;
+                                dot += static_cast<float>(
+                                    GetValue<float>(rocisa::DataType::BFloat16,
+                                                    inputs.residual,
+                                                    static_cast<int>(residualIdx), false));
+                            }
+
+                            if(!isAmaxRow)
+                                tileSum += dot * dot;
+
+                            if(isAmaxRow && inputs.rmsGamma != nullptr)
+                            {
+                                // amax uses the post-gamma pre-D-store value.
+                                float gammaM = static_cast<float>(
+                                    GetValue<float>(rocisa::DataType::BFloat16,
+                                                    inputs.rmsGamma,
+                                                    static_cast<int>(m), false));
+                                float absDVal = gammaM * dot;
+                                absDVal       = absDVal < 0.0f ? -absDVal : absDVal;
+                                if(absDVal > tileAmax)
+                                    tileAmax = absDVal;
+                            }
+                        }
+
+                        // Write directly into the correct half; no cross-half side effects.
+                        if(isAmaxRow)
+                            pb[pbIdx] = tileAmax / kFp8E4M3Max;
+                        else
+                            pb[pbIdx] = tileSum;
+                    }
+                }
             }
 
             if(problem.outputAmaxD())

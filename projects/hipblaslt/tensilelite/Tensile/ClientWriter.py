@@ -592,7 +592,7 @@ def pruneModeName(mode):
     if mode == 5: return 'Prune0X0X'
     if mode == 6: return 'Prune00XX'
 
-def writeClientConfigIni(forBenchmark, problemSizes, biasTypeArgs, factorDimArgs, activationArgs, icacheFlushArgs, problemType, sourceDir, codeObjectFiles, resultsFileName, parametersFilePath, deviceId: int, gfxName: str, libraryFile, gateTypeArgs="", probSolMap={}):
+def writeClientConfigIni(forBenchmark, problemSizes, biasTypeArgs, factorDimArgs, activationArgs, icacheFlushArgs, problemType, sourceDir, codeObjectFiles, resultsFileName, parametersFilePath, deviceId: int, gfxName: str, libraryFile, gateTypeArgs="", probSolMap={}, partialRMSMT0=0, partialRMSMT1=0, anyPartialRMSResidualAdd=False, useRstdScale=False, anyPartialRMSQuant=False):
 
     assert os.path.exists(sourceDir), f"sourceDir={sourceDir} does not exist"
     # libraryFile must point at the per-base TensileLibrary{,.yaml,.dat}; the
@@ -633,6 +633,17 @@ def writeClientConfigIni(forBenchmark, problemSizes, biasTypeArgs, factorDimArgs
         param('use-e', problemType.useE)
         param('use-gate-residual', problemType.useGateResidual)
         param('output-amaxD', problemType.outputAmaxD)
+        usePartialRMS = getattr(problemType, 'usePartialRMS', False)
+        param('use-partial-rms', usePartialRMS)
+        residualAdd = anyPartialRMSResidualAdd or getattr(problemType, 'partialRMSResidualAdd', False)
+        param('partial-rms-residual-add', residualAdd)
+        partialRMSQuant = anyPartialRMSQuant or getattr(problemType, 'partialRMSQuant', False)
+        param('partial-rms-quant', partialRMSQuant)
+        if usePartialRMS and partialRMSMT0 > 0:
+            param('partial-rms-mt0', partialRMSMT0)
+        if usePartialRMS and partialRMSMT1 > 0:
+            param('partial-rms-mt1', partialRMSMT1)
+        param('use-rstd-scale', useRstdScale)
         param('use-scaleAB',   problemType.useScaleAB)
         param('use-scaleCD',   problemType.useScaleCD)
         param('use-scaleAlphaVec',   problemType.useScaleAlphaVec)
@@ -809,7 +820,61 @@ def writeClientConfig(
       resultsFileName = os.path.join(stepBaseDir, "../Data", stepName+".csv")
 
     newSolution = next(iter(newLibrary.solutions.values()))
-    writeClientConfigIni(forBenchmark, problemSizes, biasTypeArgs, factorDimArgs, activationArgs, icacheFlushArgs, newSolution.problemType, sourceDir, codeObjectFiles, resultsFileName, filename, deviceId, gfxName, libraryFile, gateTypeArgs, probSolMap)
+
+    minMT0 = 0
+    minMT1 = 0
+    anyResidualAdd = False
+    anyQuantFlag   = False
+    # When solutions is None (library-client mode), derive flags from the problem type.
+    if solutions is None:
+        anyRstdScale = getattr(newSolution.problemType, 'useRstdScale', False)
+        anyResidualAdd = getattr(newSolution.problemType, 'partialRMSResidualAdd', False)
+        anyQuantFlag   = getattr(newSolution.problemType, 'partialRMSQuant', False)
+        # MacroTile0/1 are solution-level; read via originalSolution, not problemType.
+        if getattr(newSolution.problemType, 'usePartialRMS', False):
+            minMT0 = newSolution.originalSolution["MacroTile0"]
+            minMT1 = newSolution.originalSolution["MacroTile1"]
+    else:
+        anyRstdScale = any(bool(sol.get("RstdScale", False)) for sol in solutions)
+        if getattr(newSolution.problemType, 'usePartialRMS', False):
+            mt1Values = set()
+            for sol in solutions:
+                mt0 = sol["MacroTile0"]
+                mt1 = sol["MacroTile1"]
+                minMT0 = mt0 if minMT0 == 0 else min(minMT0, mt0)
+                minMT1 = mt1 if minMT1 == 0 else min(minMT1, mt1)
+                mt1Values.add(mt1)
+                if sol.get("PartialRMSResidualAdd", False):
+                    anyResidualAdd = True
+                if sol.get("PartialRMSQuant", False):
+                    anyQuantFlag = True
+            # PartialRMS kernels compute NTilesN = ceil(N/MT1) on-device using their
+            # compile-time MT1. All solutions in one benchmark pass must share the same
+            # MT1 so every kernel uses the same partialBuf row stride as the client
+            # allocation. Split solutions by MT1 into separate BenchmarkProblemSizeGroups
+            # if this fires.
+            if len(mt1Values) > 1:
+                raise ValueError(
+                    f"PartialRMS benchmark pass mixes solutions with different MT1 values "
+                    f"({sorted(mt1Values)}). Each BenchmarkProblemSizeGroup must contain "
+                    f"solutions with a single MT1. Use separate ForkParameters groups per tile."
+                )
+            # Similarly, PartialRMSResidualAdd must be uniform: the client reference and
+            # buffer allocation differ between residual-add and non-residual paths.
+            residualAddValues = set(bool(sol.get("PartialRMSResidualAdd", False)) for sol in solutions)
+            if len(residualAddValues) > 1:
+                raise ValueError(
+                    f"PartialRMS benchmark pass mixes PartialRMSResidualAdd=False and True. "
+                    f"Use separate ForkParameters groups per residual-add variant."
+                )
+            quantValues = set(bool(sol.get("PartialRMSQuant", False)) for sol in solutions)
+            if len(quantValues) > 1:
+                raise ValueError(
+                    f"PartialRMS benchmark pass mixes PartialRMSQuant=False and True. "
+                    f"Use separate ForkParameters groups per quant variant."
+                )
+
+    writeClientConfigIni(forBenchmark, problemSizes, biasTypeArgs, factorDimArgs, activationArgs, icacheFlushArgs, newSolution.problemType, sourceDir, codeObjectFiles, resultsFileName, filename, deviceId, gfxName, libraryFile, gateTypeArgs, probSolMap, minMT0, minMT1, anyResidualAdd, anyRstdScale, anyQuantFlag)
 
     return filename
 

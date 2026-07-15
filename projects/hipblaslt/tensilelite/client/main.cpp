@@ -412,6 +412,15 @@ namespace TensileLite
                 ("rotating-buffer-size",      po::value<int32_t>()->default_value(0), "Size of rotating buffer in the unit of MB.")
                 ("rotating-buffer-mode",      po::value<int32_t>()->default_value(0), "Rotating mode.")
                 ("output-amaxD",              po::value<bool>()->default_value(false), "Output AmaxD.")
+                ("use-partial-rms",           po::value<bool>()->default_value(false), "Enable PartialRMS fused epilogue.")
+                ("partial-rms-residual-add",  po::value<bool>()->default_value(false), "PartialRMS: add residual before reduction.")
+                ("partial-rms-quant",         po::value<bool>()->default_value(false), "PartialRMS: also compute amax(|D|)/448 into partialBuf second half.")
+                ("use-rstd-scale",            po::value<bool>()->default_value(false)->implicit_value(true), "Enable RstdScale (K3) fused epilogue.")
+                ("partial-rms-mt0",           po::value<size_t>()->default_value(0), "MacroTile0 for PartialRMS (0 = conservative bound).")
+                ("partial-rms-mt1",           po::value<size_t>()->default_value(0), "MacroTile1 for PartialRMS (0 = conservative bound).")
+                ("init-rmsGamma",             po::value<InitMode>()->default_value(InitMode::Random), "Init mode for RMS gamma buffer.")
+                ("init-partialBuf",           po::value<InitMode>()->default_value(InitMode::Zero),   "Init mode for partialBuf output.")
+                ("init-residual",             po::value<InitMode>()->default_value(InitMode::Random), "Init mode for residual buffer.")
                 ("timing-instrumentation",    po::value<bool>()->default_value(false)->implicit_value(true), "Enable detailed timing instrumentation output to stderr.")
                 ("rocprof-counter",           vector_default_empty<std::string>(), "Rocprof counters.")
                 ("metadata-layout",           po::value<int32_t>()->default_value(0), "Sparse Metadata Layout")
@@ -556,6 +565,15 @@ namespace TensileLite
             DUMP_OPT("init-scaleC", InitMode);
             DUMP_OPT("init-scaleD", InitMode);
             DUMP_OPT("init-scaleAlphaVec", InitMode);
+            DUMP_OPT("use-partial-rms", bool);
+            DUMP_OPT("partial-rms-residual-add", bool);
+            DUMP_OPT("partial-rms-quant", bool);
+            DUMP_OPT("use-rstd-scale", bool);
+            DUMP_OPT("partial-rms-mt0", size_t);
+            DUMP_OPT("partial-rms-mt1", size_t);
+            DUMP_OPT("init-rmsGamma", InitMode);
+            DUMP_OPT("init-partialBuf", InitMode);
+            DUMP_OPT("init-residual", InitMode);
             DUMP_OPT("pristine-on-gpu", bool);
             DUMP_OPT("c-equal-d", bool);
             DUMP_OPT("num-elements-to-validate", int);

@@ -187,6 +187,19 @@ namespace TensileLite
             if(args.count("output-amaxD"))
                 m_outputAmaxD = args["output-amaxD"].as<bool>();
 
+            if(args.count("use-partial-rms"))
+                m_usePartialRMS = args["use-partial-rms"].as<bool>();
+            if(args.count("partial-rms-residual-add"))
+                m_partialRMSResidualAdd = args["partial-rms-residual-add"].as<bool>();
+            if(args.count("partial-rms-quant"))
+                m_partialRMSQuant = args["partial-rms-quant"].as<bool>();
+            if(args.count("partial-rms-mt0"))
+                m_partialRMSMT0Override = static_cast<int>(args["partial-rms-mt0"].as<size_t>());
+            if(args.count("partial-rms-mt1"))
+                m_partialRMSMT1Override = static_cast<int>(args["partial-rms-mt1"].as<size_t>());
+            if(args.count("use-rstd-scale"))
+                m_useRstdScale = args["use-rstd-scale"].as<bool>();
+
             if(args.count("bias-type-args"))
                 m_biasTypeArgs = args["bias-type-args"].as<std::vector<rocisa::DataType>>();
             if(args.count("factor-dim-args"))
@@ -396,6 +409,9 @@ namespace TensileLite
                                 rv.back().setUseGateResidual(m_useGateResidual);
                                 rv.back().setUseE(m_useE);
                                 rv.back().setOutputAmaxD(m_outputAmaxD);
+                                rv.back().setUsePartialRMS(m_usePartialRMS);
+                                rv.back().setPartialRMSResidualAdd(m_partialRMSResidualAdd);
+                                rv.back().setUseRstdScale(m_useRstdScale);
                                 rv.back().setKernelLanguage(m_kernelLanguage);
                                 rv.back().setPerformanceMetric(m_performanceMetric);
                                 rv.back().setDeterministicMode(m_deterministicMode);
@@ -457,6 +473,41 @@ namespace TensileLite
                                 {
                                     rv.back().setSynchronizer(
                                         m_constantTypes[ContractionProblemGemm::CONST::ALPHA], 409600);
+                                }
+                                if(m_usePartialRMS)
+                                {
+                                    // PartialRMSAxis=0: free0=N_hidden tiles with MT0,
+                                    // free1=M_tokens padded with MT1.
+                                    // d.sizes()[0]=N_hidden (free0), d.sizes()[1]=M_tokens (free1).
+                                    // partialBuf[token, t_free0]: shape [M_tokens_padded, n_d].
+                                    size_t nHidden  = rv.back().d().sizes()[0];  // free0
+                                    size_t mTokens  = rv.back().d().sizes()[1];  // free1
+
+                                    int mt0      = m_partialRMSMT0Override > 0 ? m_partialRMSMT0Override : 16;
+                                    int mt1      = m_partialRMSMT1Override > 0 ? m_partialRMSMT1Override : 16;
+                                    size_t mPadded  = ((mTokens  + static_cast<size_t>(mt1) - 1) / static_cast<size_t>(mt1)) * static_cast<size_t>(mt1);
+                                    size_t nTilesN  = (nHidden   + static_cast<size_t>(mt0) - 1) / static_cast<size_t>(mt0);
+
+                                    rocisa::DataType bf16Type = rocisa::DataType::BFloat16;
+                                    rv.back().setPartialRMSMT0(mt0);
+                                    rv.back().setPartialRMSMT1(mt1);
+                                    rv.back().setRMSGamma(bf16Type, nHidden);
+                                    rv.back().setPartialRMSQuant(m_partialRMSQuant);
+                                    // Double the row count so both halves fit: first half = Σx²,
+                                    // second half = amax(|D|)/448.
+                                    size_t pbRows = m_partialRMSQuant ? 2 * mPadded : mPadded;
+                                    rv.back().setPartialBuf(pbRows, nTilesN);
+                                    rv.back().setPartialRMSResidualAdd(m_partialRMSResidualAdd);
+                                    if(m_partialRMSResidualAdd)
+                                        // residual is row-major [M_tokens, N_hidden] bf16;
+                                        // setResidual allocates mTokens*nHidden elements.
+                                        rv.back().setResidual(bf16Type, mTokens, nHidden);
+                                }
+                                if(m_useRstdScale)
+                                {
+                                    size_t M       = rv.back().d().sizes()[0];
+                                    size_t mPadded = ((M + 255) / 256) * 256;
+                                    rv.back().setRstdBuf(mPadded);
                                 }
                                 if(j < m_activationEnumArg.size())
                                 {
