@@ -348,7 +348,7 @@ def _buildNtFp8TypedArgs(sol_dict: dict, M: int, N: int, batch: int, K: int,
     num_wg = math.ceil(M / mt0) * math.ceil(N / mt1) * batch
 
     arg0 = _computeInternalArg0(sol_dict, gsu=1)
-    gemm_count = (1 & 0x3FFFFFFF) | (0 << 30)  # stridedBatched, argType=0
+    gemm_count = (1 & 0x3FFFFFFF) | (0 << 30)  # stridedBatched, argType=0.
 
     args: list = [np.uint32(gemm_count), np.uint32(arg0)]
     if version >= 1:
@@ -412,8 +412,8 @@ def _corruptStrideA1(argList: list, M: int) -> list:
     Corrupting lda causes every A[i,j] access to land at the wrong memory row.
     Infers header_n from total arg count: total = header_n + 18.
     """
-    header_n = len(argList) - 18  # 4 sizes + 4 ptrs + 8 strides + 2 scalars
-    ldaIdx = header_n + 4 + 4 + 4  # header + sizes + ptrs + D/C strides
+    header_n = len(argList) - 18  # 4 sizes + 4 ptrs + 8 strides + 2 scalars.
+    ldaIdx = header_n + 4 + 4 + 4  # header + sizes + ptrs + D/C strides.
     argList[ldaIdx] = np.uint32(int(argList[ldaIdx]) + M)
     return argList
 

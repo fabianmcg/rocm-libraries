@@ -48,7 +48,7 @@ NaN semantics (from include/Tensile/DataTypes_Float8_BFloat8.hpp):
 
 Poison-input test design:
   The poison tests corrupt lda (the leading dimension stride of A) rather than
-  stride_a (the batch stride). Corrupting lda by +M//2 causes the kernel to use
+  stride_a (the batch stride). Corrupting lda by +M causes the kernel to use
   the wrong row stride when reading A, making every A[i,j] access land at the
   wrong memory location. This gives a completely wrong matrix layout and guarantees
   that >90% of output elements differ from the reference by more than RTOL_FP32.
