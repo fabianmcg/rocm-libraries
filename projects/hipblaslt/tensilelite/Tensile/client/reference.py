@@ -188,6 +188,31 @@ def gemmXf32(
     return D.astype(np.float32)
 
 
+def _mxBlockPartial(
+    A_f: np.ndarray,
+    B_f: np.ndarray,
+    sa: np.ndarray,
+    sb: np.ndarray,
+    blockK: int,
+) -> np.ndarray:
+    """Accumulate block-scaled partial sums over all K-blocks.
+
+    A_f: (M, K) float32, B_f: (N, K) float32.
+    sa: (M, kBlocks) float32 decoded scales for A.
+    sb: (N, kBlocks) float32 decoded scales for B.
+    Returns (M, N) float32 accumulated result.
+    """
+    M, K = A_f.shape
+    N = B_f.shape[0]
+    kBlocks = K // blockK
+    D = np.zeros((M, N), dtype=np.float32)
+    for kb in range(kBlocks):
+        kStart = kb * blockK
+        partial = A_f[:, kStart:kStart + blockK] @ B_f[:, kStart:kStart + blockK].T
+        D += partial * np.outer(sa[:, kb], sb[:, kb])
+    return D
+
+
 def gemmMx(
     A: np.ndarray,
     B: np.ndarray,
@@ -214,21 +239,9 @@ def gemmMx(
 
     A_f = np.asarray(A, dtype=np.float32)
     B_f = np.asarray(B, dtype=np.float32)
-    M, K = A_f.shape
-    N = B_f.shape[0]
-    kBlocks = K // blockK
-
     sa = decodeE8(np.asarray(scaleA, dtype=np.uint8))  # (M, kBlocks)
     sb = decodeE8(np.asarray(scaleB, dtype=np.uint8))  # (N, kBlocks)
-
-    D = np.zeros((M, N), dtype=np.float32)
-    for kb in range(kBlocks):
-        kStart = kb * blockK
-        kEnd = kStart + blockK
-        partial = A_f[:, kStart:kEnd] @ B_f[:, kStart:kEnd].T  # (M, N)
-        scale = np.outer(sa[:, kb], sb[:, kb])                  # (M, N)
-        D += partial * scale
-
+    D = _mxBlockPartial(A_f, B_f, sa, sb, blockK)
     D *= alpha
     if beta != 0.0 and C is not None:
         D += beta * np.asarray(C, dtype=np.float32)

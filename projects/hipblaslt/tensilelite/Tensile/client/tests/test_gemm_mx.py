@@ -46,7 +46,7 @@ from Tensile.client.mx_types import (
     unpackFloat6E2m3,
     unpackBfloat6E3m2,
 )
-from Tensile.client.reference import gemmMx, assertClose
+from Tensile.client.reference import gemmMx, assertClose, RTOL_FP32
 from Tensile.client.gemm_args import (
     _computeInternalArg0,
     _computeInternalArg1,
@@ -179,10 +179,14 @@ class TestUnpackFloat4:
     Low nibble (bits[3:0]) gives element 0; high nibble (bits[7:4]) gives element 1.
     """
 
-    # 12 triples: (packed_byte, elem_even, elem_odd).
+    # 16 triples: (packed_byte, elem_even, elem_odd).
     _pairs = [
         (0x00, 0.0,  0.0),
         (0x01, 0.5,  0.0),   # low=0x1, high=0x0
+        (0x08, 0.0,  0.0),   # low=0x8=-0.0≡0.0, high=0x0=0.0
+        (0x09, -0.5, 0.0),   # low=0x9=-0.5, high=0x0=0.0
+        (0x0D, -3.0, 0.0),   # low=0xD=-3.0, high=0x0=0.0
+        (0x0E, -4.0, 0.0),   # low=0xE=-4.0, high=0x0=0.0
         (0x10, 0.0,  0.5),   # low=0x0, high=0x1
         (0x22, 1.0,  1.0),
         (0x23, 1.5,  1.0),   # low=0x3, high=0x2
@@ -300,6 +304,45 @@ class TestUnpackFloat6E2m3:
         np.testing.assert_allclose(float(result[0]), 3.25, rtol=1e-6)
         np.testing.assert_allclose(float(result[31]), -7.5, rtol=1e-6)
 
+    # 35 (position, raw6, expected) triples covering byte-boundary indices
+    # 0, 3, 4, 7, 15, 16, 31.  E2M3 bias=1; formula in class docstring.
+    _boundary_cases = [
+        # Index 0: byte 0 bits [0:5].
+        (0, 0x00, 0.0), (0, 0x01, 0.125), (0, 0x08, 1.0),
+        (0, 0x28, -1.0), (0, 0x3F, -7.5),
+        # Index 3: byte 2 bits [2:7] (within byte 2 only).
+        (3, 0x00, 0.0), (3, 0x01, 0.125), (3, 0x08, 1.0),
+        (3, 0x18, 4.0), (3, 0x3F, -7.5),
+        # Index 4: byte 3 bits [0:5] (start of second 3-byte group).
+        (4, 0x00, 0.0), (4, 0x01, 0.125), (4, 0x08, 1.0),
+        (4, 0x28, -1.0), (4, 0x3F, -7.5),
+        # Index 7: byte 5 bits [2:7] (last of second group).
+        (7, 0x00, 0.0), (7, 0x07, 0.875), (7, 0x08, 1.0),
+        (7, 0x18, 4.0), (7, 0x28, -1.0),
+        # Index 15: byte 11 bits [2:7] (last of fourth group).
+        (15, 0x00, 0.0), (15, 0x07, 0.875), (15, 0x08, 1.0),
+        (15, 0x28, -1.0), (15, 0x3F, -7.5),
+        # Index 16: byte 12 bits [0:5] (start of fifth group).
+        (16, 0x00, 0.0), (16, 0x01, 0.125), (16, 0x08, 1.0),
+        (16, 0x28, -1.0), (16, 0x3F, -7.5),
+        # Index 31: byte 23 bits [2:7] (last element of the buffer).
+        (31, 0x00, 0.0), (31, 0x01, 0.125), (31, 0x08, 1.0),
+        (31, 0x18, 4.0), (31, 0x3F, -7.5),
+    ]
+
+    @pytest.mark.parametrize("pos,raw6,expected", _boundary_cases,
+                             ids=[f"idx{p}_0x{r:02X}" for p, r, _ in _boundary_cases])
+    def test_boundary_position(self, pos, raw6, expected):
+        """Element at byte-boundary position decodes to the correct float."""
+        elems = [0] * 32
+        elems[pos] = raw6
+        packed = np.frombuffer(_pack6bitGroup(elems), dtype=np.uint8)
+        result = unpackFloat6E2m3(packed, 32)
+        np.testing.assert_allclose(
+            float(result[pos]), expected, atol=1e-7,
+            err_msg=f"E2M3 pos={pos} raw=0x{raw6:02X}",
+        )
+
 
 class TestUnpackBfloat6E3m2:
     """Unit tests for BFloat6 E3M2 unpacker.
@@ -354,6 +397,45 @@ class TestUnpackBfloat6E3m2:
                 float(result[0]), expected, atol=1e-7,
                 err_msg=f"E3M2 raw 0x{raw6:02X}: expected {expected}",
             )
+
+    # 35 (position, raw6, expected) triples covering byte-boundary indices
+    # 0, 3, 4, 7, 15, 16, 31.  E3M2 bias=3; formula in class docstring.
+    _boundary_cases = [
+        # Index 0: byte 0 bits [0:5].
+        (0, 0x00, 0.0), (0, 0x04, 0.25), (0, 0x0C, 1.0),
+        (0, 0x2C, -1.0), (0, 0x3F, -28.0),
+        # Index 3: byte 2 bits [2:7] (within byte 2 only).
+        (3, 0x00, 0.0), (3, 0x04, 0.25), (3, 0x0C, 1.0),
+        (3, 0x2C, -1.0), (3, 0x3F, -28.0),
+        # Index 4: byte 3 bits [0:5] (start of second 3-byte group).
+        (4, 0x00, 0.0), (4, 0x04, 0.25), (4, 0x0C, 1.0),
+        (4, 0x2C, -1.0), (4, 0x3F, -28.0),
+        # Index 7: byte 5 bits [2:7] (last of second group).
+        (7, 0x00, 0.0), (7, 0x04, 0.25), (7, 0x0C, 1.0),
+        (7, 0x2C, -1.0), (7, 0x3F, -28.0),
+        # Index 15: byte 11 bits [2:7] (last of fourth group).
+        (15, 0x00, 0.0), (15, 0x04, 0.25), (15, 0x0C, 1.0),
+        (15, 0x2C, -1.0), (15, 0x3F, -28.0),
+        # Index 16: byte 12 bits [0:5] (start of fifth group).
+        (16, 0x00, 0.0), (16, 0x04, 0.25), (16, 0x0C, 1.0),
+        (16, 0x2C, -1.0), (16, 0x3F, -28.0),
+        # Index 31: byte 23 bits [2:7] (last element of the buffer).
+        (31, 0x00, 0.0), (31, 0x04, 0.25), (31, 0x0C, 1.0),
+        (31, 0x2C, -1.0), (31, 0x3F, -28.0),
+    ]
+
+    @pytest.mark.parametrize("pos,raw6,expected", _boundary_cases,
+                             ids=[f"idx{p}_0x{r:02X}" for p, r, _ in _boundary_cases])
+    def test_boundary_position(self, pos, raw6, expected):
+        """Element at byte-boundary position decodes to the correct float."""
+        elems = [0] * 32
+        elems[pos] = raw6
+        packed = np.frombuffer(_pack6bitGroup(elems), dtype=np.uint8)
+        result = unpackBfloat6E3m2(packed, 32)
+        np.testing.assert_allclose(
+            float(result[pos]), expected, atol=1e-7,
+            err_msg=f"E3M2 pos={pos} raw=0x{raw6:02X}",
+        )
 
 
 # ===========================================================================
@@ -640,49 +722,20 @@ def _buildMxHeader(sol_dict: dict, M: int, N: int, batch: int) -> list:
     return args
 
 
-def _buildTnMxF8Args(sol_dict: dict, M: int, N: int, batch: int, K: int,
-                     D_arr, C_arr, A_arr, mxsa_arr, B_arr, mxsb_arr,
-                     blockK: int = 32, alpha: float = 1.0, beta: float = 0.0) -> list:
-    """Build typed args for TN stridedBatched MX F8->float32 GEMM.
+def _buildTnMxArgs(sol_dict: dict, M: int, N: int, batch: int, K: int,
+                   D_arr, C_arr, A_arr, mxsa_arr, B_arr, mxsb_arr,
+                   blockK: int = 32, alpha: float = 1.0, beta: float = 0.0) -> list:
+    """Build typed args for a TN stridedBatched MX GEMM (F8 or F4, float32 output).
 
-    TN layout: lda = M (K stride over column-major A), ldb = N.
-    Scale A: shape (K//blockK, M) per batch -> ld_mxsa = K//blockK.
-    Scale B: shape (K//blockK, N) per batch -> ld_mxsb = K//blockK.
+    TN K-fast layout: lda = K (M-stride of K-fast A), ldb = K (N-stride of K-fast B).
+    Scale strides: ld_mxsa = kBlocks, stride_mxsa = M * kBlocks (row-major scale layout).
     """
     args = _buildMxHeader(sol_dict, M, N, batch)
     args.extend([np.uint32(M), np.uint32(N), np.uint32(batch), np.uint32(K)])
     args.extend([D_arr, C_arr, A_arr, mxsa_arr, B_arr, mxsb_arr])
 
     kBlocks = K // blockK
-    lda, ldb, ldd, ldc = M, N, M, M
-    stride_a, stride_b, stride_d, stride_c = M * K, N * K, M * N, M * N
-    ld_mxsa, stride_mxsa = kBlocks, M * kBlocks
-    ld_mxsb, stride_mxsb = kBlocks, N * kBlocks
-    args.extend([
-        np.uint32(ldd), np.uint32(stride_d),
-        np.uint32(ldc), np.uint32(stride_c),
-        np.uint32(lda), np.uint32(stride_a),
-        np.uint32(ld_mxsa), np.uint32(stride_mxsa),
-        np.uint32(ldb), np.uint32(stride_b),
-        np.uint32(ld_mxsb), np.uint32(stride_mxsb),
-    ])
-    args.extend([np.float32(alpha), np.float32(beta)])
-    return args
-
-
-def _buildTnMxF4Args(sol_dict: dict, M: int, N: int, batch: int, K: int,
-                     D_arr, C_arr, A_arr, mxsa_arr, B_arr, mxsb_arr,
-                     blockK: int = 32, alpha: float = 1.0, beta: float = 0.0) -> list:
-    """Build typed args for TN stridedBatched MX F4->float32 GEMM.
-
-    F4 uses lda = M (logical F4 elements per K-row). Scale strides identical to F8.
-    """
-    args = _buildMxHeader(sol_dict, M, N, batch)
-    args.extend([np.uint32(M), np.uint32(N), np.uint32(batch), np.uint32(K)])
-    args.extend([D_arr, C_arr, A_arr, mxsa_arr, B_arr, mxsb_arr])
-
-    kBlocks = K // blockK
-    lda, ldb, ldd, ldc = M, N, M, M
+    lda, ldb, ldd, ldc = K, K, M, M
     stride_a, stride_b, stride_d, stride_c = M * K, N * K, M * N, M * N
     ld_mxsa, stride_mxsa = kBlocks, M * kBlocks
     ld_mxsb, stride_mxsb = kBlocks, N * kBlocks
@@ -701,8 +754,10 @@ def _buildTnMxF4Args(sol_dict: dict, M: int, N: int, batch: int, K: int,
 def _allocMxF8Batched(M: int, N: int, K: int, batch: int, blockK: int, rng):
     """Allocate F8 input buffers and all-1 E8 scale buffers.
 
-    A and B: float32 in [-0.5, 0.5], quantized to float8_e4m3fn, stored as
-    column-major uint8 (TN layout: lda=M). Scales: 0x7F = 1.0 for all.
+    A and B: float32 in [-0.5, 0.5], quantized to float8_e4m3fn.
+    TN K-fast layout: rawA[k + m*K] = fp8(A[m,k]), rawB[k + n*K] = fp8(B[n,k]).
+    Returns A_f32 and B_f32 as (M,K) and (N,K) float32 for the reference.
+    Scales: 0x7F = 1.0 for all.
     """
     try:
         import ml_dtypes
@@ -712,10 +767,10 @@ def _allocMxF8Batched(M: int, N: int, K: int, batch: int, blockK: int, rng):
 
     valsA = rng.uniform(-0.5, 0.5, (M, K)).astype(np.float32).astype(fp8Dtype)
     valsB = rng.uniform(-0.5, 0.5, (N, K)).astype(np.float32).astype(fp8Dtype)
-    A_np = np.asfortranarray(valsA)
-    B_np = np.asfortranarray(valsB)
-    rawA = np.frombuffer(A_np.ravel(order="F").tobytes(), dtype=np.uint8)
-    rawB = np.frombuffer(B_np.ravel(order="F").tobytes(), dtype=np.uint8)
+    # TN K-fast: A stored as K×M col-major → rawA[k + m*K] = valsA[m, k].
+    rawA = np.frombuffer(np.asfortranarray(valsA.T).ravel(order="F").tobytes(), dtype=np.uint8)
+    # TN K-fast: B stored as K×N col-major → rawB[k + n*K] = valsB[n, k].
+    rawB = np.frombuffer(np.asfortranarray(valsB.T).ravel(order="F").tobytes(), dtype=np.uint8)
     A_buf = np.tile(rawA, batch)
     B_buf = np.tile(rawB, batch)
 
@@ -724,17 +779,21 @@ def _allocMxF8Batched(M: int, N: int, K: int, batch: int, blockK: int, rng):
     mxsb_buf = np.full(batch * N * kBlocks, 0x7F, dtype=np.uint8)
     C_buf = np.zeros(M * N * batch, dtype=np.float32)
     D_buf = np.zeros(M * N * batch, dtype=np.float32)
-    return A_buf, B_buf, mxsa_buf, mxsb_buf, C_buf, D_buf, A_np, B_np
+    # Float32 logical values for reference; A_f32[m,k] and B_f32[n,k].
+    A_f32 = valsA.astype(np.float32)
+    B_f32 = valsB.astype(np.float32)
+    return A_buf, B_buf, mxsa_buf, mxsb_buf, C_buf, D_buf, A_f32, B_f32
 
 
 def _allocMxF4Batched(M: int, N: int, K: int, batch: int, blockK: int, rng):
     """Allocate F4 input buffers (2 elements/byte) and all-1 E8 scale buffers.
 
-    A_mem: (K, M//2) bytes per batch (TN F4 layout, lda=M logical elements).
-    B_mem: (K, N//2) bytes per batch. Scales: 0x7F = 1.0.
+    TN K-fast layout: rawA has shape (M, K//2) per batch.
+    rawA[m, k//2] byte, nibble k%2 = A[m, k].  Same for B with N in place of M.
+    Scales: 0x7F = 1.0.
     """
-    rawA_one = rng.integers(0, 256, K * (M // 2), dtype=np.uint8)
-    rawB_one = rng.integers(0, 256, K * (N // 2), dtype=np.uint8)
+    rawA_one = rng.integers(0, 256, M * (K // 2), dtype=np.uint8)
+    rawB_one = rng.integers(0, 256, N * (K // 2), dtype=np.uint8)
     A_buf = np.tile(rawA_one, batch)
     B_buf = np.tile(rawB_one, batch)
 
@@ -745,23 +804,29 @@ def _allocMxF4Batched(M: int, N: int, K: int, batch: int, blockK: int, rng):
     D_buf = np.zeros(M * N * batch, dtype=np.float32)
 
     # Unpack to logical (M, K) and (N, K) for the Python reference.
-    A_logical = unpackFloat4(rawA_one.reshape(K, M // 2)).T.astype(np.float32)
-    B_logical = unpackFloat4(rawB_one.reshape(K, N // 2)).T.astype(np.float32)
+    A_logical = unpackFloat4(rawA_one.reshape(M, K // 2)).astype(np.float32)
+    B_logical = unpackFloat4(rawB_one.reshape(N, K // 2)).astype(np.float32)
     return A_buf, B_buf, mxsa_buf, mxsb_buf, C_buf, D_buf, A_logical, B_logical
 
 
-def _runMxF8Batched(entry: dict, M: int, N: int, batch: int, K: int,
-                    blockK: int, rtol: float, atol: float, label: str):
-    """Execute one MX F8 TN stridedBatched kernel and verify against reference."""
+def _runMxBatched(entry: dict, M: int, N: int, batch: int, K: int,
+                  blockK: int, rtol: float, atol: float, label: str,
+                  allocFn):
+    """Execute one MX TN stridedBatched kernel and verify against reference.
+
+    allocFn must be _allocMxF8Batched or _allocMxF4Batched; both return the
+    same seven-tuple interface with float32 reference arrays at positions 6-7.
+    """
     sol_dict = entry["sol_dict"]
     kernel_name = entry["kernel_name"]
     hsaco = entry["hsaco"]
     num_wg = math.ceil(M / sol_dict["MacroTile0"]) * math.ceil(N / sol_dict["MacroTile1"]) * batch
     num_threads = sol_dict["NumThreads"]
-    rng = np.random.default_rng(seed=M * 1000 + N + K)
+    seed = M * 1000 + N + K + (7 if allocFn is _allocMxF4Batched else 0)
+    rng = np.random.default_rng(seed=seed)
 
-    A_buf, B_buf, mxsa_buf, mxsb_buf, C_buf, D_buf, A_np, B_np = \
-        _allocMxF8Batched(M, N, K, batch, blockK, rng)
+    A_buf, B_buf, mxsa_buf, mxsb_buf, C_buf, D_buf, A_f32, B_f32 = \
+        allocFn(M, N, K, batch, blockK, rng)
 
     result_holder: dict = {}
 
@@ -775,9 +840,9 @@ def _runMxF8Batched(entry: dict, M: int, N: int, batch: int, K: int,
     mxsa_in = amdgpu_exec.InputArray(mxsa_buf)
     mxsb_in = amdgpu_exec.InputArray(mxsb_buf)
 
-    args = _buildTnMxF8Args(sol_dict, M, N, batch, K,
-                             D_io, C_in, A_in, mxsa_in, B_in, mxsb_in,
-                             blockK=blockK)
+    args = _buildTnMxArgs(sol_dict, M, N, batch, K,
+                          D_io, C_in, A_in, mxsa_in, B_in, mxsb_in,
+                          blockK=blockK)
     amdgpu_exec.execute_hsaco(
         hsaco=hsaco, kernel_name=kernel_name, arguments=args,
         grid_dim=(num_wg, 1, 1), block_dim=(num_threads, 1, 1),
@@ -785,55 +850,11 @@ def _runMxF8Batched(entry: dict, M: int, N: int, batch: int, K: int,
     )
     D_gpu = result_holder["D_gpu"]
 
-    # All-1 scales -> plain float32 GEMM is the expected reference.
+    # All-1 scales → gemmMx with all-1.0 = plain float32 GEMM.
     kBlocks = K // blockK
     sa = np.full((M, kBlocks), 0x7F, dtype=np.uint8)
     sb = np.full((N, kBlocks), 0x7F, dtype=np.uint8)
-    D_ref_one = gemmMx(A_np.astype(np.float32), B_np.astype(np.float32),
-                       sa, sb, blockK=blockK)
-    D_ref = np.tile(np.asfortranarray(D_ref_one).ravel(order="F"), batch)
-    assertClose(D_gpu, D_ref, rtol=rtol, atol=atol, label=label)
-
-
-def _runMxF4Batched(entry: dict, M: int, N: int, batch: int, K: int,
-                    blockK: int, rtol: float, atol: float, label: str):
-    """Execute one MX F4 TN stridedBatched kernel and verify against reference."""
-    sol_dict = entry["sol_dict"]
-    kernel_name = entry["kernel_name"]
-    hsaco = entry["hsaco"]
-    num_wg = math.ceil(M / sol_dict["MacroTile0"]) * math.ceil(N / sol_dict["MacroTile1"]) * batch
-    num_threads = sol_dict["NumThreads"]
-    rng = np.random.default_rng(seed=M * 1000 + N + K + 7)
-
-    A_buf, B_buf, mxsa_buf, mxsb_buf, C_buf, D_buf, A_logical, B_logical = \
-        _allocMxF4Batched(M, N, K, batch, blockK, rng)
-
-    result_holder: dict = {}
-
-    def capture(arguments):
-        result_holder["D_gpu"] = np.asarray(arguments[8].array, dtype=np.float32).copy()
-
-    D_io = amdgpu_exec.InOutArray(D_buf)
-    C_in = amdgpu_exec.InputArray(C_buf)
-    A_in = amdgpu_exec.InputArray(A_buf)
-    B_in = amdgpu_exec.InputArray(B_buf)
-    mxsa_in = amdgpu_exec.InputArray(mxsa_buf)
-    mxsb_in = amdgpu_exec.InputArray(mxsb_buf)
-
-    args = _buildTnMxF4Args(sol_dict, M, N, batch, K,
-                             D_io, C_in, A_in, mxsa_in, B_in, mxsb_in,
-                             blockK=blockK)
-    amdgpu_exec.execute_hsaco(
-        hsaco=hsaco, kernel_name=kernel_name, arguments=args,
-        grid_dim=(num_wg, 1, 1), block_dim=(num_threads, 1, 1),
-        num_iterations=1, verify_fn=capture,
-    )
-    D_gpu = result_holder["D_gpu"]
-
-    kBlocks = K // blockK
-    sa = np.full((M, kBlocks), 0x7F, dtype=np.uint8)
-    sb = np.full((N, kBlocks), 0x7F, dtype=np.uint8)
-    D_ref_one = gemmMx(A_logical, B_logical, sa, sb, blockK=blockK)
+    D_ref_one = gemmMx(A_f32, B_f32, sa, sb, blockK=blockK)
     D_ref = np.tile(np.asfortranarray(D_ref_one).ravel(order="F"), batch)
     assertClose(D_gpu, D_ref, rtol=rtol, atol=atol, label=label)
 
@@ -873,8 +894,9 @@ def test_mxfp8_f8s_tn_correctness(mxF8Kernels, size):
     M, N, batch, K = size
     for entry in entries:
         sid = entry["sid"]
-        _runMxF8Batched(entry, M, N, batch, K, _mxBlockK, rtolMx, atolMx,
-                        label=f"mx-f8 M{M}N{N}B{batch}K{K} {sid}")
+        _runMxBatched(entry, M, N, batch, K, _mxBlockK, rtolMx, atolMx,
+                      label=f"mx-f8 M{M}N{N}B{batch}K{K} {sid}",
+                      allocFn=_allocMxF8Batched)
 
 
 @requires_gfx950
@@ -890,5 +912,126 @@ def test_mxfp4_f4s_tn_correctness(mxF4Kernels, size):
     M, N, batch, K = size
     for entry in entries:
         sid = entry["sid"]
-        _runMxF4Batched(entry, M, N, batch, K, _mxBlockK, rtolMx, atolMx,
-                        label=f"mx-f4 M{M}N{N}B{batch}K{K} {sid}")
+        _runMxBatched(entry, M, N, batch, K, _mxBlockK, rtolMx, atolMx,
+                      label=f"mx-f4 M{M}N{N}B{batch}K{K} {sid}",
+                      allocFn=_allocMxF4Batched)
+
+
+@requires_gfx950
+def test_mxfp8_nan_scale_row(mxF8Kernels):
+    """E8 scale byte 0xFF (NaN) in row 0 produces NaN in output row 0 on gfx950."""
+    if not haveDeps:
+        pytest.skip("amdgpu_exec not installed")
+    entries = [e for e in mxF8Kernels if _filterMxSolution(e)]
+    if not entries:
+        pytest.skip("no MX F8 solution compiled on this GPU")
+    M, N, batch, K = 256, 256, 4, 256
+    entry = entries[0]
+    sol_dict = entry["sol_dict"]
+    kernel_name = entry["kernel_name"]
+    hsaco = entry["hsaco"]
+    rng = np.random.default_rng(seed=99)
+    A_buf, B_buf, mxsa_buf, mxsb_buf, C_buf, D_buf, _, _ = \
+        _allocMxF8Batched(M, N, K, batch, _mxBlockK, rng)
+    # Set all K-blocks of row 0 in batch 0 to NaN scale (0xFF).
+    kBlocks = K // _mxBlockK
+    mxsa_buf[0:kBlocks] = 0xFF
+    result_holder: dict = {}
+
+    def capture(arguments):
+        result_holder["D_gpu"] = np.asarray(arguments[8].array, dtype=np.float32).copy()
+
+    num_wg = math.ceil(M / sol_dict["MacroTile0"]) * math.ceil(N / sol_dict["MacroTile1"]) * batch
+    D_io = amdgpu_exec.InOutArray(D_buf)
+    C_in = amdgpu_exec.InputArray(C_buf)
+    A_in = amdgpu_exec.InputArray(A_buf)
+    B_in = amdgpu_exec.InputArray(B_buf)
+    mxsa_in = amdgpu_exec.InputArray(mxsa_buf)
+    mxsb_in = amdgpu_exec.InputArray(mxsb_buf)
+    args = _buildTnMxArgs(sol_dict, M, N, batch, K,
+                          D_io, C_in, A_in, mxsa_in, B_in, mxsb_in,
+                          blockK=_mxBlockK)
+    amdgpu_exec.execute_hsaco(
+        hsaco=hsaco, kernel_name=kernel_name, arguments=args,
+        grid_dim=(num_wg, 1, 1), block_dim=(sol_dict["NumThreads"], 1, 1),
+        num_iterations=1, verify_fn=capture,
+    )
+    D_gpu = result_holder["D_gpu"]
+    # D is col-major (M,N,batch); row 0 of batch 0: indices 0, M, 2M, ... (N-1)*M.
+    row0 = D_gpu[0:M * N:M]
+    assert np.all(np.isnan(row0)), (
+        f"expected NaN in row 0 but got {int(np.sum(~np.isnan(row0)))} non-NaN elements"
+    )
+
+
+def _runMxPoisonStride(entry: dict, M: int, N: int, batch: int, K: int,
+                       blockK: int, allocFn) -> None:
+    """Run the MX kernel with a corrupted lda; assert ≥50% of output diverges from reference.
+
+    The corrupted lda causes the kernel to read A from the wrong memory positions,
+    so the output should differ widely from the correct reference.
+    """
+    sol_dict = entry["sol_dict"]
+    kernel_name = entry["kernel_name"]
+    hsaco = entry["hsaco"]
+    num_wg = math.ceil(M / sol_dict["MacroTile0"]) * math.ceil(N / sol_dict["MacroTile1"]) * batch
+    rng = np.random.default_rng(seed=77)
+    A_buf, B_buf, mxsa_buf, mxsb_buf, C_buf, D_buf, A_f32, B_f32 = \
+        allocFn(M, N, K, batch, blockK, rng)
+    result_holder: dict = {}
+
+    def capture(arguments):
+        result_holder["D_gpu"] = np.asarray(arguments[8].array, dtype=np.float32).copy()
+
+    D_io = amdgpu_exec.InOutArray(D_buf)
+    C_in = amdgpu_exec.InputArray(C_buf)
+    A_in = amdgpu_exec.InputArray(A_buf)
+    B_in = amdgpu_exec.InputArray(B_buf)
+    mxsa_in = amdgpu_exec.InputArray(mxsa_buf)
+    mxsb_in = amdgpu_exec.InputArray(mxsb_buf)
+
+    args = _buildTnMxArgs(sol_dict, M, N, batch, K,
+                          D_io, C_in, A_in, mxsa_in, B_in, mxsb_in,
+                          blockK=blockK)
+    # args[18] is lda; corrupt it so the kernel reads A with a wrong stride.
+    args[18] = np.uint32(K + 1)
+    amdgpu_exec.execute_hsaco(
+        hsaco=hsaco, kernel_name=kernel_name, arguments=args,
+        grid_dim=(num_wg, 1, 1), block_dim=(sol_dict["NumThreads"], 1, 1),
+        num_iterations=1, verify_fn=capture,
+    )
+    D_gpu = result_holder["D_gpu"]
+    kBlocks = K // blockK
+    sa = np.full((M, kBlocks), 0x7F, dtype=np.uint8)
+    sb = np.full((N, kBlocks), 0x7F, dtype=np.uint8)
+    D_ref_one = gemmMx(A_f32, B_f32, sa, sb, blockK=blockK)
+    D_ref = np.tile(np.asfortranarray(D_ref_one).ravel(order="F"), batch)
+    # Use fp32 machine-epsilon headroom; any non-trivial stride corruption should produce
+    # errors orders of magnitude larger than this per-element threshold.
+    threshold = 10 * RTOL_FP32 * (np.abs(D_ref.astype(np.float64)) + 1.0)
+    n_diverge = int(np.sum(np.abs(D_gpu.astype(np.float64) - D_ref.astype(np.float64)) > threshold))
+    assert n_diverge >= len(D_gpu) // 2, (
+        f"poison-stride test: expected ≥50% divergence but only {n_diverge}/{len(D_gpu)} differ"
+    )
+
+
+@requires_gfx950
+def test_mxfp8_poison_stride_a(mxF8Kernels):
+    """Corrupted lda causes ≥50% of F8 output to diverge from reference on gfx950."""
+    if not haveDeps:
+        pytest.skip("amdgpu_exec not installed")
+    entries = [e for e in mxF8Kernels if _filterMxSolution(e)]
+    if not entries:
+        pytest.skip("no MX F8 solution compiled on this GPU")
+    _runMxPoisonStride(entries[0], 256, 256, 4, 256, _mxBlockK, _allocMxF8Batched)
+
+
+@requires_gfx950
+def test_mxfp4_poison_stride_a(mxF4Kernels):
+    """Corrupted lda causes ≥50% of F4 output to diverge from reference on gfx950."""
+    if not haveDeps:
+        pytest.skip("amdgpu_exec not installed")
+    entries = [e for e in mxF4Kernels if _filterMxSolution(e)]
+    if not entries:
+        pytest.skip("no MX F4 solution compiled on this GPU")
+    _runMxPoisonStride(entries[0], 256, 256, 4, 256, _mxBlockK, _allocMxF4Batched)
