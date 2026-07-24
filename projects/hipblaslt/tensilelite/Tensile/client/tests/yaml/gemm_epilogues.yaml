@@ -1,0 +1,313 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+################################################################################
+# gemm_epilogues: NT batched GEMM with standard epilogue variants for M5 tests.
+#
+# All groups target gfx950 with standard MI [16,16,16,1,1,2,2,2,2] bf16 or
+# [16,16,4,1,1,2,2,2,2] fp32 tiles (MT 128x128), DepthU=16, GlobalSplitU=1.
+#
+# Index:
+#   0 — bf16 NT batched + row bias  (UseBias=1, BiasDataTypeList=['s'])
+#   1 — fp32 NT batched + row bias  (UseBias=1, BiasDataTypeList=['s'])
+#   2 — bf16 NT batched + Relu      (ActivationType=relu, Activation=True)
+#   3 — fp32 NT batched + Relu      (ActivationType=relu, Activation=True)
+#   4 — bf16 NT batched + ScaleAB scalar
+#   5 — fp32 NT batched + ScaleAB scalar
+#   6 — bf16 NT batched + ScaleCD
+#   7 — fp32 NT batched + ScaleCD
+################################################################################
+GlobalParameters:
+  SyncsPerBenchmark: 0
+  MinimumRequiredVersion: 5.0.0
+  NumElementsToValidate: 128
+  DataInitTypeBeta: 0
+  DataInitTypeAlpha: 1
+  Device: 0
+
+BenchmarkProblems:
+  ##############################################################################
+  # Group 0: bf16 HPA NT batched + row bias (UseBias=1)
+  # BiasDataTypeList: ['s'] — float32 bias vector of length N.
+  ##############################################################################
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: b
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: False
+      TransposeB: True
+      UseBeta: True
+      Batched: True
+      UseBias: 1
+      BiasDataTypeList: ['s']
+      UseScaleAB: ""
+      UseScaleCD: False
+      UseScaleAlphaVec: 0
+    - # BenchmarkProblemSizeGroup
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 16, 1, 1, 2, 2, 2, 2]
+        - DepthU: [16]
+        - GlobalSplitU: [1]
+        - SourceSwap: [True]
+        - PrefetchGlobalRead: [1]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [256, 256, 4, 256]
+          - Exact: [512, 512, 4, 512]
+        - BiasTypeArgs: ['s']
+
+  ##############################################################################
+  # Group 1: fp32 (SSS) NT batched + row bias (UseBias=1)
+  ##############################################################################
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: s
+      DestDataType: s
+      ComputeDataType: s
+      TransposeA: False
+      TransposeB: True
+      UseBeta: True
+      Batched: True
+      UseBias: 1
+      BiasDataTypeList: ['s']
+      UseScaleAB: ""
+      UseScaleCD: False
+      UseScaleAlphaVec: 0
+    - # BenchmarkProblemSizeGroup
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 4, 1, 1, 2, 2, 2, 2]
+        - DepthU: [16]
+        - GlobalSplitU: [1]
+        - SourceSwap: [True]
+        - PrefetchGlobalRead: [1]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [256, 256, 4, 256]
+          - Exact: [512, 512, 4, 512]
+        - BiasTypeArgs: ['s']
+
+  ##############################################################################
+  # Group 2: bf16 HPA NT batched + Relu activation (ActivationFused, 0 extra args)
+  ##############################################################################
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: b
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: False
+      TransposeB: True
+      UseBeta: True
+      Batched: True
+      Activation: True
+      ActivationType: relu
+      UseBias: 0
+      UseScaleAB: ""
+      UseScaleCD: False
+      UseScaleAlphaVec: 0
+    - # BenchmarkProblemSizeGroup
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 16, 1, 1, 2, 2, 2, 2]
+        - DepthU: [16]
+        - GlobalSplitU: [1]
+        - SourceSwap: [True]
+        - PrefetchGlobalRead: [1]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [256, 256, 4, 256]
+          - Exact: [512, 512, 4, 512]
+        - ActivationArgs: []
+
+  ##############################################################################
+  # Group 3: fp32 NT batched + Relu activation
+  ##############################################################################
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: s
+      DestDataType: s
+      ComputeDataType: s
+      TransposeA: False
+      TransposeB: True
+      UseBeta: True
+      Batched: True
+      Activation: True
+      ActivationType: relu
+      UseBias: 0
+      UseScaleAB: ""
+      UseScaleCD: False
+      UseScaleAlphaVec: 0
+    - # BenchmarkProblemSizeGroup
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 4, 1, 1, 2, 2, 2, 2]
+        - DepthU: [16]
+        - GlobalSplitU: [1]
+        - SourceSwap: [True]
+        - PrefetchGlobalRead: [1]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [256, 256, 4, 256]
+          - Exact: [512, 512, 4, 512]
+        - ActivationArgs: []
+
+  ##############################################################################
+  # Group 4: bf16 HPA NT batched + ScaleAB scalar
+  ##############################################################################
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: b
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: False
+      TransposeB: True
+      UseBeta: True
+      Batched: True
+      UseBias: 0
+      UseScaleAB: "Scalar"
+      UseScaleCD: False
+      UseScaleAlphaVec: 0
+    - # BenchmarkProblemSizeGroup
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 16, 1, 1, 2, 2, 2, 2]
+        - DepthU: [16]
+        - GlobalSplitU: [1]
+        - SourceSwap: [True]
+        - PrefetchGlobalRead: [1]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [256, 256, 4, 256]
+          - Exact: [512, 512, 4, 512]
+
+  ##############################################################################
+  # Group 5: fp32 NT batched + ScaleAB scalar
+  ##############################################################################
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: s
+      DestDataType: s
+      ComputeDataType: s
+      TransposeA: False
+      TransposeB: True
+      UseBeta: True
+      Batched: True
+      UseBias: 0
+      UseScaleAB: "Scalar"
+      UseScaleCD: False
+      UseScaleAlphaVec: 0
+    - # BenchmarkProblemSizeGroup
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 4, 1, 1, 2, 2, 2, 2]
+        - DepthU: [16]
+        - GlobalSplitU: [1]
+        - SourceSwap: [True]
+        - PrefetchGlobalRead: [1]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [256, 256, 4, 256]
+          - Exact: [512, 512, 4, 512]
+
+  ##############################################################################
+  # Group 6: bf16 HPA NT batched + ScaleCD
+  ##############################################################################
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: b
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: False
+      TransposeB: True
+      UseBeta: True
+      Batched: True
+      UseBias: 0
+      UseScaleAB: ""
+      UseScaleCD: True
+      UseScaleAlphaVec: 0
+    - # BenchmarkProblemSizeGroup
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 16, 1, 1, 2, 2, 2, 2]
+        - DepthU: [16]
+        - GlobalSplitU: [1]
+        - SourceSwap: [True]
+        - PrefetchGlobalRead: [1]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [256, 256, 4, 256]
+          - Exact: [512, 512, 4, 512]
+
+  ##############################################################################
+  # Group 7: fp32 NT batched + ScaleCD
+  ##############################################################################
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: s
+      DestDataType: s
+      ComputeDataType: s
+      TransposeA: False
+      TransposeB: True
+      UseBeta: True
+      Batched: True
+      UseBias: 0
+      UseScaleAB: ""
+      UseScaleCD: True
+      UseScaleAlphaVec: 0
+    - # BenchmarkProblemSizeGroup
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 4, 1, 1, 2, 2, 2, 2]
+        - DepthU: [16]
+        - GlobalSplitU: [1]
+        - SourceSwap: [True]
+        - PrefetchGlobalRead: [1]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [256, 256, 4, 256]
+          - Exact: [512, 512, 4, 512]

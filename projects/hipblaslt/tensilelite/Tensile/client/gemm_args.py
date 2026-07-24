@@ -16,6 +16,8 @@ Supported configuration subset (M1-M5; extended per milestone):
   - KernArgsVersion <= 2, useSFC = False
   - expertSchedulingMode = 0, debugKernel = False
   - MX block-scaled A and/or B (MXBlockA/B != 0), stridedBatched only (M4)
+  - Epilogue slots: bias, ScaleAB, ScaleCD, ScaleAlphaVec, E tensor,
+    activation args, AmaxD (M5)
 
 Unsupported combinations raise NotImplementedError, including:
   - GSU > 1 && streamK == 0
@@ -475,6 +477,150 @@ def _buildStreamK3Args(solutionParams: dict, problemParams: dict) -> bytes:
     return buf
 
 
+def _readPTFlag(solutionParams: dict, key: str, default=None):
+    """Read an epilogue flag from solutionParams, trying top-level then ProblemType.
+
+    Handles both flat dicts (top-level key) and compiled Solution dicts
+    (where epilogue flags live in a nested ProblemType sub-dict).
+    """
+    if key in solutionParams:
+        return solutionParams[key]
+    pt = solutionParams.get("ProblemType") or {}
+    return pt.get(key, default)
+
+
+def _buildEpilogueArgs(solutionParams: dict, problemParams: dict, tensors: dict) -> bytes:
+    """Build epilogue argument slots after alpha/beta.
+
+    Ports the epilogue section of ContractionSolution.cpp:singleCallArgs
+    (lines 997-1113) covering ScaleAB, ScaleCD, ScaleAlphaVec, Bias,
+    factorDim, E tensor, activation args, and AmaxD.
+    """
+    useScaleAB = _readPTFlag(solutionParams, "UseScaleAB", "")
+    useScaleCD = bool(_readPTFlag(solutionParams, "UseScaleCD", False))
+    useScaleAlphaVec = int(_readPTFlag(solutionParams, "UseScaleAlphaVec", 0))
+    useBias = int(_readPTFlag(solutionParams, "UseBias", 0))
+    useE = bool(_readPTFlag(solutionParams, "UseE", False))
+    outputAmaxD = bool(_readPTFlag(solutionParams, "OutputAmaxD", False))
+    useGradient = bool(_readPTFlag(solutionParams, "Gradient", False))
+    activationType = _readPTFlag(solutionParams, "ActivationType", "none")
+    activationFused = bool(solutionParams.get("ActivationFused",
+                           (_readPTFlag(solutionParams, "ActivationFused", True))))
+    stridedBatched = solutionParams.get("StridedBatched", True)
+    actStr = str(activationType).lower() if activationType else "none"
+    runActivation = (actStr not in ("none", "0")) and activationFused
+
+    buf = _buildScaleAbSlots(useScaleAB, tensors)
+    buf += _buildScaleCdSlots(useScaleCD, tensors)
+    buf += _buildScaleAlphaVecSlot(useScaleAlphaVec, tensors)
+    buf += _buildBiasSlots(useBias, useGradient, stridedBatched, problemParams, tensors)
+    buf += _buildFactorDimSlot(useScaleAlphaVec, useBias, problemParams)
+    buf += _buildESlots(useE, problemParams, tensors)
+    buf += _buildActivationSlots(runActivation, actStr, solutionParams, problemParams)
+    buf += _buildAmaxDSlots(outputAmaxD, tensors)
+    return buf
+
+
+def _buildScaleAbSlots(useScaleAB: str, tensors: dict) -> bytes:
+    """Append scaleA + scaleB pointers when UseScaleAB is non-empty."""
+    if not useScaleAB:
+        return b""
+    return _packPtr(tensors.get("scaleA", 0)) + _packPtr(tensors.get("scaleB", 0))
+
+
+def _buildScaleCdSlots(useScaleCD: bool, tensors: dict) -> bytes:
+    """Append scaleC + scaleD pointers when UseScaleCD is True."""
+    if not useScaleCD:
+        return b""
+    return _packPtr(tensors.get("scaleC", 0)) + _packPtr(tensors.get("scaleD", 0))
+
+
+def _buildScaleAlphaVecSlot(useScaleAlphaVec: int, tensors: dict) -> bytes:
+    """Append scaleAlphaVec pointer when UseScaleAlphaVec is non-zero."""
+    if not useScaleAlphaVec:
+        return b""
+    return _packPtr(tensors.get("scaleAlphaVec", 0))
+
+
+def _buildBiasSlots(
+    useBias: int,
+    useGradient: bool,
+    stridedBatched: bool,
+    problemParams: dict,
+    tensors: dict,
+) -> bytes:
+    """Append bias pointer + bias_type + strideBias when UseBias is non-zero."""
+    if not useBias:
+        return b""
+    if stridedBatched:
+        buf = _packPtr(tensors.get("bias", 0))
+    else:
+        buf = _packPtr(tensors.get("batchBias", 0))
+    # bias_type and strideBias: appended when not gradient, or gradient with A/B biasSrc.
+    # M5 only supports useGradient=False (the common case).
+    if not useGradient:
+        biasType = int(problemParams.get("biasType", 0))
+        # strideBias=0 signals non-batched bias; the kernel uses SizeI as the SRD bound.
+        strideBias = int(problemParams.get("strideBias", 0))
+        buf += struct.pack("<I", biasType)
+        buf += struct.pack("<I", strideBias)
+    return buf
+
+
+def _buildFactorDimSlot(useScaleAlphaVec: int, useBias: int, problemParams: dict) -> bytes:
+    """Append factorDim when UseScaleAlphaVec==3 or UseBias==3."""
+    if useScaleAlphaVec != 3 and useBias != 3:
+        return b""
+    factorDim = int(problemParams.get("factorDim", 0))
+    return struct.pack("<I", factorDim)
+
+
+def _buildESlots(useE: bool, problemParams: dict, tensors: dict) -> bytes:
+    """Append E tensor pointer and strides when UseE is True."""
+    if not useE:
+        return b""
+    buf = _packPtr(tensors.get("e", 0))
+    sizes = problemParams["sizes"]
+    batched = len(sizes) == 4
+    buf += struct.pack("<I", int(problemParams.get("lde", 0)))
+    if batched:
+        buf += struct.pack("<I", int(problemParams.get("stride_e", 0)))
+    return buf
+
+
+def _buildActivationSlots(
+    runActivation: bool,
+    actStr: str,
+    solutionParams: dict,
+    problemParams: dict,
+) -> bytes:
+    """Append activation scalar args and optional activationType enum."""
+    if not runActivation:
+        return b""
+    from .reference import _ACT_ARG_COUNT
+    argCount = int(solutionParams.get("ActivationArgLength",
+                   _ACT_ARG_COUNT.get(actStr, 0)))
+    actArgs = problemParams.get("activationArgs", [])
+    buf = b""
+    for i in range(argCount):
+        val = float(actArgs[i]) if i < len(actArgs) else 0.0
+        buf += struct.pack("<f", val)
+    if actStr in ("all", "hipblaslt_all"):
+        actEnum = int(problemParams.get("activationEnum", 0))
+        buf += struct.pack("<I", actEnum)
+    return buf
+
+
+def _buildAmaxDSlots(outputAmaxD: bool, tensors: dict) -> bytes:
+    """Append AddrAmaxOut + AmaxWS + AmaxSync pointers when OutputAmaxD is True."""
+    if not outputAmaxD:
+        return b""
+    buf = _packPtr(tensors.get("amaxD", 0))
+    buf += _packPtr(tensors.get("amaxWS", 0))
+    buf += _packPtr(tensors.get("amaxSync", 0))
+    return buf
+
+
 def buildKernelArgs(
     solutionParams: dict,
     problemParams: dict,
@@ -484,7 +630,9 @@ def buildKernelArgs(
     """Build the raw argument buffer for a TensileLite GEMM kernel.
 
     Ports ContractionSolution.cpp:singleCallArgs (lines 548-1135) and
-    kernelArgs (lines 1557-1714) to Python.
+    kernelArgs (lines 1557-1714) to Python, including epilogue arg slots
+    from lines 997-1113 (ScaleAB, ScaleCD, ScaleAlphaVec, Bias, E, Activation,
+    AmaxD).
 
     solutionParams: solution dict from enumerateAllSolutions (includes
                     InternalArgsSupport fields injected by task 0.8).
@@ -495,6 +643,8 @@ def buildKernelArgs(
                     StreamK, StreamKAtomic, GlobalSplitU,
                     GlobalSplitUCoalesced, GlobalSplitUWorkGroupMappingRoundRobin,
                     StridedBatched, UseBeta.
+                    Epilogue flags are read from the nested ProblemType sub-dict
+                    or from the top-level dict directly.
 
     problemParams:  problem dimensions with keys: sizes ([M, N, batch, K] or [M, N, K]),
                     ldd, ldc, lda, ldb, stride_d, stride_c, stride_a, stride_b,
@@ -502,12 +652,17 @@ def buildKernelArgs(
                     MX scale tensors (when MXBlockA/B non-zero in solutionParams):
                       ld_mxsa, stride_mxsa  — leading dim and batch stride for scale A
                       ld_mxsb, stride_mxsb  — leading dim and batch stride for scale B
+                    Epilogue params (optional, default to zero/empty):
+                      biasType, strideBias, factorDim,
+                      lde, stride_e, activationArgs, activationEnum.
 
     tensors:        device pointers (int) keyed by 'D', 'C', 'A', 'B'
                     (for stridedBatched=True), or 'batchD', 'batchC', 'batchA',
                     'batchB' (for stridedBatched=False), and optionally
                     'workspace', 'flags' (for streamK > 0),
-                    'mxsa', 'mxsb' (for MX-scaled kernels).
+                    'mxsa', 'mxsb' (for MX-scaled kernels),
+                    'bias', 'scaleA', 'scaleB', 'scaleC', 'scaleD',
+                    'scaleAlphaVec', 'e', 'amaxD', 'amaxWS', 'amaxSync'.
 
     cu_count:       device CU count (multiprocessor_count) needed when
                     WorkGroupMappingXCCGroup == -1. Pass 0 when not using
@@ -527,4 +682,5 @@ def buildKernelArgs(
     if solutionParams.get("StreamK", 0) == 3:
         buf += _buildStreamK3Args(solutionParams, problemParams)
 
+    buf += _buildEpilogueArgs(solutionParams, problemParams, tensors)
     return buf
