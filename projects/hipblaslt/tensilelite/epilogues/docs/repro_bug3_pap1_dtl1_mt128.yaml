@@ -1,0 +1,72 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+#
+# Reproducer for Bug 3: GPU hard fault (SIGABRT in amdgpu_exec.synchronize)
+# triggered by PrefetchAcrossPersistent=1 + DirectToLds=1 + MT1=128.
+#
+# Crashing config (from test_bug2_failing_configs.py run):
+#   MT64x128_nores_DTL1_DU64_PGR2_SU0_PKA0_1
+#   i.e. MT0=64 MT1=128, DirectToLds=1, DepthU=64, PGR=2, SU=0, PKA=False,
+#        PrefetchAcrossPersistent=1
+#
+# The crash occurs in the GPU kernel itself (not in validation): the process
+# receives SIGABRT from amdgpu_exec.synchronize after kernel dispatch.
+
+GlobalParameters:
+  MinimumRequiredVersion: 5.0.0
+  NumElementsToValidate: 128
+
+BenchmarkProblems:
+  -
+    - OperationType: GEMM
+      DataType: b
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: True
+      TransposeB: False
+      UseBeta: True
+      Batched: True
+      StridedBatched: True
+      GroupedGemm: False
+      UseBias: 0
+      UseScaleAB: ""
+      UseScaleCD: False
+      UseScaleAlphaVec: 0
+      Sparse: 0
+      UsePartialRMS: True
+      PartialRMSResidualAdd: False
+
+    - BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+            - [16, 16, 32, 1, 1, 4, 8, 1, 1]   # MT0=64 MT1=128
+        - PartialRMSResidualAdd: [False]
+        - StreamK: [3]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0]
+        - GlobalSplitU: [1]
+        - ScheduleIterAlg: [3]
+        - PrefetchGlobalRead: [2]
+        - PrefetchAcrossPersistent: [1]
+        - DirectToLds: [1]
+        - 1LDSBuffer: [0]
+        - UseSubtileImpl: [True]
+        - PartialRMS: [True]
+        - StaggerU: [0]
+        - DepthU: [64]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - PreloadKernArgs: [False]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+            - Exact: [8192, 8192, 1, 8192]
+
+LibraryLogic:
+  ScheduleName: "repro_bug3_pap1_dtl1_mt128"
+  DeviceNames: ["Device 75a0", "Device 75b0", "Device 75a2", "Device 75b2"]
+  ArchitectureName: "gfx950"

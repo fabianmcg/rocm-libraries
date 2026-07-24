@@ -1,0 +1,156 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+#
+# Reproducer for Bug 4: wrong D-tensor output in DirectToLds=1 + MT1=128 + PAP=0
+# kernels triggered by a specific random seed during a Tensile client sweep run.
+#
+# Discovery: 40 failures in Group A of repro_bug2_24configs.yaml during run 1
+# of a 5-run PAP-validation sweep (seed=1784565775). The failure message was
+# of the form "elem=3670163: -432!=-306", indicating a D-tensor correctness
+# mismatch, not a crash.
+#
+# All 40 failures share: DTLA=1, MT1=128, PAP=0, LDSB=0, StreamKAtomic=0.
+# Varying axes: MT0 in {64,128,256}, DepthU in {64,128}, PGR in {1,2},
+#               StaggerU in {0,8}, PreloadKernArgs in {False,True}.
+# Note: MT0=256 + DU=128 did NOT appear in the failure set.
+#
+# The bug may be order-dependent (like Bug 2): the sweep exposes it after prior
+# kernel runs place the GPU in a particular memory state.  In isolation (pytest)
+# the kernels currently pass with numpy-generated data; the pytest in
+# test_bug4_dtl1_mt128.py still serves as a regression gate for when the fix
+# lands, and as a harness to exercise these configs with multiple seeds.
+#
+# This file contains only the failing configurations (PAP=0 only; no PAP=1
+# because those trigger a GPU hard fault, tracked separately as Bug 3).
+
+GlobalParameters:
+  MinimumRequiredVersion: 5.0.0
+  NumElementsToValidate: 128
+
+BenchmarkProblems:
+  -
+    - # PartialRMS bf16 GEMM, no residual add — matches the Group A problem type
+      # from repro_bug2_24configs.yaml.
+      OperationType: GEMM
+      DataType: b
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: True
+      TransposeB: False
+      UseBeta: True
+      Batched: True
+      StridedBatched: True
+      GroupedGemm: False
+      UseBias: 0
+      UseScaleAB: ""
+      UseScaleCD: False
+      UseScaleAlphaVec: 0
+      Sparse: 0
+      UsePartialRMS: True
+      PartialRMSResidualAdd: False
+
+    # ------------------------------------------------------------------
+    # Group A (index 0): MT0=64, MT1=128, DepthU in {64, 128}, DTLA=1, PAP=0.
+    # MT0=64 maps to MatrixInstruction wg0=1: [16,16,32,1,1,4,8,1,1].
+    # ------------------------------------------------------------------
+    - BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+            - [16, 16, 32, 1, 1, 4, 8, 1, 1]   # MT0=64  MT1=128  wg0=1 wg1=1
+        - PartialRMSResidualAdd: [False]
+        - StreamK: [3]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0]
+        - GlobalSplitU: [1]
+        - ScheduleIterAlg: [3]
+        - PrefetchGlobalRead: [1, 2]
+        - PrefetchAcrossPersistent: [0]
+        - DirectToLds: [1]
+        - 1LDSBuffer: [0]
+        - UseSubtileImpl: [True]
+        - PartialRMS: [True]
+        - StaggerU: [0, 8]
+        - DepthU: [64, 128]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - PreloadKernArgs: [False, True]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+            - Exact: [8192, 8192, 1, 8192]
+
+    # ------------------------------------------------------------------
+    # Group B (index 1): MT0=128, MT1=128, DepthU in {64, 128}, DTLA=1, PAP=0.
+    # MT0=128 maps to MatrixInstruction wg0=2: [16,16,32,1,1,4,8,2,1].
+    # ------------------------------------------------------------------
+    - BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+            - [16, 16, 32, 1, 1, 4, 8, 2, 1]   # MT0=128 MT1=128  wg0=2 wg1=1
+        - PartialRMSResidualAdd: [False]
+        - StreamK: [3]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0]
+        - GlobalSplitU: [1]
+        - ScheduleIterAlg: [3]
+        - PrefetchGlobalRead: [1, 2]
+        - PrefetchAcrossPersistent: [0]
+        - DirectToLds: [1]
+        - 1LDSBuffer: [0]
+        - UseSubtileImpl: [True]
+        - PartialRMS: [True]
+        - StaggerU: [0, 8]
+        - DepthU: [64, 128]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - PreloadKernArgs: [False, True]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+            - Exact: [8192, 8192, 1, 8192]
+
+    # ------------------------------------------------------------------
+    # Group C (index 2): MT0=256, MT1=128, DepthU=64 only, DTLA=1, PAP=0.
+    # MT0=256 maps to MatrixInstruction wg0=4: [16,16,32,1,1,4,8,4,1].
+    # DU=128 was NOT in the failure set for MT0=256, so it is excluded.
+    # ------------------------------------------------------------------
+    - BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+            - [16, 16, 32, 1, 1, 4, 8, 4, 1]   # MT0=256 MT1=128  wg0=4 wg1=1
+        - PartialRMSResidualAdd: [False]
+        - StreamK: [3]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0]
+        - GlobalSplitU: [1]
+        - ScheduleIterAlg: [3]
+        - PrefetchGlobalRead: [1, 2]
+        - PrefetchAcrossPersistent: [0]
+        - DirectToLds: [1]
+        - 1LDSBuffer: [0]
+        - UseSubtileImpl: [True]
+        - PartialRMS: [True]
+        - StaggerU: [0, 8]
+        - DepthU: [64]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - PreloadKernArgs: [False, True]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+            - Exact: [8192, 8192, 1, 8192]
+
+LibraryLogic:
+  ScheduleName: "repro_bug4_dtl1_mt128_datarace"
+  DeviceNames: ["Device 75a0", "Device 75b0", "Device 75a2", "Device 75b2", "Device 75a3", "Device 75b3", "Device 75a8", "Device 75b8"]
+  ArchitectureName: "gfx950"

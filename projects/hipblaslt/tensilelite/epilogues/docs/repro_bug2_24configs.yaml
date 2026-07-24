@@ -1,0 +1,185 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+#
+# Reproducer for Bug 2: exactly the 24 failing PartialRMS configs
+# (LDSB0 + DirectToLds=0 + MT1=256), preceded by Groups A–C from the full
+# tune_prms_8192.yaml sweep in the same order.
+#
+# The failures are order-dependent: Groups A, B, C must run first to place the
+# GPU in the state that causes Group D (the 24 configs) to produce wrong
+# partialBuf output. Without this warm-up the 24 configs pass.
+#
+# Groups A–C are identical to tune_prms_8192.yaml. Group D is restricted to
+# the 24 configs confirmed to fail: LDSB0, DTLA0, PAP=0, SKA=0, and the
+# three tile/DepthU combinations (MT64×256×64, MT64×256×128, MT256×256×64).
+
+GlobalParameters:
+  MinimumRequiredVersion: 5.0.0
+  NumElementsToValidate: 128
+
+BenchmarkProblems:
+  -
+    - # PartialRMS bf16 GEMM, no residual add
+      OperationType: GEMM
+      DataType: b
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: True
+      TransposeB: False
+      UseBeta: True
+      Batched: True
+      StridedBatched: True
+      GroupedGemm: False
+      UseBias: 0
+      UseScaleAB: ""
+      UseScaleCD: False
+      UseScaleAlphaVec: 0
+      Sparse: 0
+      UsePartialRMS: True
+      PartialRMSResidualAdd: False
+
+    # ------------------------------------------------------------------
+    # Group A: MT1=128, DirectToLds=1, 1LDSBuffer=0  (warm-up, all pass)
+    # PAP=1 excluded — triggers a hard GPU fault (Bug 3).
+    # ------------------------------------------------------------------
+    - BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+            - [16, 16, 32, 1, 1, 4, 8, 1, 1]   # MT0=64  MT1=128
+            - [16, 16, 32, 1, 1, 4, 8, 2, 1]   # MT0=128 MT1=128
+            - [16, 16, 32, 1, 1, 4, 8, 4, 1]   # MT0=256 MT1=128
+        - PartialRMSResidualAdd: [False]
+        - StreamK: [3]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0, 1]
+        - GlobalSplitU: [1]
+        - ScheduleIterAlg: [3]
+        - PrefetchGlobalRead: [1, 2]
+        - PrefetchAcrossPersistent: [0]
+        - DirectToLds: [1]
+        - 1LDSBuffer: [0]
+        - UseSubtileImpl: [True]
+        - PartialRMS: [True]
+        - StaggerU: [0, 8]
+        - DepthU: [32, 64, 128]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - PreloadKernArgs: [False, True]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+            - Exact: [8192, 8192, 1, 8192]
+
+    # ------------------------------------------------------------------
+    # Group B: MT1=128, DirectToLds=0, 1LDSBuffer free  (warm-up, all pass)
+    # PAP requires DirectToLds=1 so PAP=0 only.
+    # ------------------------------------------------------------------
+    - BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+            - [16, 16, 32, 1, 1, 4, 8, 1, 1]   # MT0=64  MT1=128
+            - [16, 16, 32, 1, 1, 4, 8, 2, 1]   # MT0=128 MT1=128
+            - [16, 16, 32, 1, 1, 4, 8, 4, 1]   # MT0=256 MT1=128
+        - PartialRMSResidualAdd: [False]
+        - StreamK: [3]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0, 1]
+        - GlobalSplitU: [1]
+        - ScheduleIterAlg: [3]
+        - PrefetchGlobalRead: [1, 2]
+        - PrefetchAcrossPersistent: [0]
+        - DirectToLds: [0]
+        - 1LDSBuffer: [0, 1]
+        - UseSubtileImpl: [True]
+        - PartialRMS: [True]
+        - StaggerU: [0, 8]
+        - DepthU: [32, 64, 128]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - PreloadKernArgs: [False, True]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+            - Exact: [8192, 8192, 1, 8192]
+
+    # ------------------------------------------------------------------
+    # Group C: MT1=256, DirectToLds=1, 1LDSBuffer=0  (warm-up, all pass)
+    # PAP=1 excluded — triggers a hard GPU fault (Bug 3).
+    # ------------------------------------------------------------------
+    - BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+            - [16, 16, 32, 1, 1, 4, 8, 1, 2]   # MT0=64  MT1=256
+            - [16, 16, 32, 1, 1, 4, 8, 4, 2]   # MT0=256 MT1=256
+        - PartialRMSResidualAdd: [False]
+        - StreamK: [3]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0, 1]
+        - GlobalSplitU: [1]
+        - ScheduleIterAlg: [3]
+        - PrefetchGlobalRead: [1, 2]
+        - PrefetchAcrossPersistent: [0]
+        - DirectToLds: [1]
+        - 1LDSBuffer: [0]
+        - UseSubtileImpl: [True]
+        - PartialRMS: [True]
+        - StaggerU: [0, 8]
+        - DepthU: [32, 64, 128]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - PreloadKernArgs: [False, True]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+            - Exact: [8192, 8192, 1, 8192]
+
+    # ------------------------------------------------------------------
+    # Group D: MT1=256, DirectToLds=0 — identical to tune_prms_8192.yaml.
+    # The 24 failing configs are the subset with LDSB=0, PAP=0, SKA=0,
+    # DU=64 or 128 (DU=32 is legal but did not appear in the confirmed
+    # failure set). All other generated configs in this group pass.
+    # ------------------------------------------------------------------
+    - BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+            - [16, 16, 32, 1, 1, 4, 8, 1, 2]   # MT0=64  MT1=256
+            - [16, 16, 32, 1, 1, 4, 8, 4, 2]   # MT0=256 MT1=256
+        - PartialRMSResidualAdd: [False]
+        - StreamK: [3]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0, 1]
+        - GlobalSplitU: [1]
+        - ScheduleIterAlg: [3]
+        - PrefetchGlobalRead: [1, 2]
+        - PrefetchAcrossPersistent: [0]
+        - DirectToLds: [0]
+        - 1LDSBuffer: [0, 1]
+        - UseSubtileImpl: [True]
+        - PartialRMS: [True]
+        - StaggerU: [0, 8]
+        - DepthU: [32, 64, 128]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - PreloadKernArgs: [False, True]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+            - Exact: [8192, 8192, 1, 8192]
+
+LibraryLogic:
+  ScheduleName: "repro_bug2_24configs"
+  DeviceNames: ["Device 75a0", "Device 75b0", "Device 75a2", "Device 75b2", "Device 75a3", "Device 75b3", "Device 75a8", "Device 75b8"]
+  ArchitectureName: "gfx950"
