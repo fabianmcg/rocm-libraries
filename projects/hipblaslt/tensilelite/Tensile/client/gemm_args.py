@@ -32,10 +32,10 @@ import math
 import struct
 
 # Integer codes from rocisa::DataType enum (enum.hpp).
-_DTYPE_HALF: int = 4     # rocisa::DataType::Half
-_DTYPE_INT32: int = 6    # rocisa::DataType::Int32
-_DTYPE_INT8: int = 8     # rocisa::DataType::Int8
-_DTYPE_XF32: int = 10    # rocisa::DataType::XFloat32
+_dtypeHalf: int = 4     # rocisa::DataType::Half
+_dtypeInt32: int = 6    # rocisa::DataType::Int32
+_dtypeInt8: int = 8     # rocisa::DataType::Int8
+_dtypeXf32: int = 10    # rocisa::DataType::XFloat32
 
 
 def _validateConfig(solutionParams: dict, problemParams: dict) -> None:
@@ -375,7 +375,7 @@ def _alphaTypeIsHalf(solutionParams: dict) -> bool:
     """
     if _readHPA(solutionParams):
         return False
-    return _readComputeTypeCode(solutionParams) == _DTYPE_HALF
+    return _readComputeTypeCode(solutionParams) == _dtypeHalf
 
 
 def _alphaTypeIsInt32(solutionParams: dict) -> bool:
@@ -386,7 +386,7 @@ def _alphaTypeIsInt32(solutionParams: dict) -> bool:
     """
     if _readHPA(solutionParams):
         return False
-    return _readComputeTypeCode(solutionParams) == _DTYPE_INT32
+    return _readComputeTypeCode(solutionParams) == _dtypeInt32
 
 
 def _packScalar(value: float, isHalf: bool, isInt32: bool = False) -> bytes:

@@ -27,17 +27,17 @@ import pytest
 
 try:
     import amdgpu_exec
-    HAVE_DEPS = True
+    haveDeps = True
 except ImportError:
     amdgpu_exec = None
-    HAVE_DEPS = False
+    haveDeps = False
 
 try:
     import ml_dtypes
-    HAVE_ML_DTYPES = True
+    haveMlDtypes = True
 except ImportError:
     ml_dtypes = None
-    HAVE_ML_DTYPES = False
+    haveMlDtypes = False
 
 from .conftest import requires_gfx950
 
@@ -45,12 +45,12 @@ from .conftest import requires_gfx950
 # Module-level paths
 # ---------------------------------------------------------------------------
 
-_TESTS_DIR = os.path.dirname(__file__)
-_YAML_PATH = os.path.join(_TESTS_DIR, "yaml", "gemm_int_xf32.yaml")
-_TENSILE_ROOT = os.path.abspath(os.path.join(_TESTS_DIR, "..", "..", "..", ".."))
+_testsDir = os.path.dirname(__file__)
+_yamlPath = os.path.join(_testsDir, "yaml", "gemm_int_xf32.yaml")
+_tensileRoot = os.path.abspath(os.path.join(_testsDir, "..", "..", "..", ".."))
 
-if _TENSILE_ROOT not in sys.path:
-    sys.path.insert(0, _TENSILE_ROOT)
+if _tensileRoot not in sys.path:
+    sys.path.insert(0, _tensileRoot)
 
 # ---------------------------------------------------------------------------
 # Imports from the library under test.
@@ -60,9 +60,9 @@ from Tensile.client.gemm_args import (
     buildKernelArgs,
     _computeInternalArg0,
     _computeInternalArg1,
-    _DTYPE_INT8,
-    _DTYPE_INT32,
-    _DTYPE_XF32,
+    _dtypeInt8,
+    _dtypeInt32,
+    _dtypeXf32,
 )
 from Tensile.client.reference import (
     gemm, gemmInt8, gemmXf32, toXf32,
@@ -75,20 +75,20 @@ from epilogues.epilogue_harness.yaml_solution_builder import _injectInternalArgs
 # Problem sizes and strides.
 # ---------------------------------------------------------------------------
 
-_INT8_PROBLEM_SIZES = [
+_int8ProblemSizes = [
     (256, 256, 4, 256),
     (512, 512, 4, 512),
 ]
 
-_XF32_PROBLEM_SIZES = [
+_xf32ProblemSizes = [
     (256, 256, 4, 256),
     (1024, 1024, 4, 1024),
 ]
 
 # Tolerance for XFloat32 output (float32 with reduced mantissa precision).
 # The rounding error from the 13-bit mantissa truncation can be significant.
-RTOL_XF32: float = 1e-2
-ATOL_XF32: float = 1e-2
+rtolXf32: float = 1e-2
+atolXf32: float = 1e-2
 
 
 def _ntStrides(M: int, N: int, K: int):
@@ -214,20 +214,19 @@ class TestGemmInt8Boundary:
         assert self._scalar_saturate(127.0) == 127
 
     def test_bf16_accumulator_256p5_gives_256(self):
-        """256.5 when cast to bf16 first becomes 256.0, so nearbyint gives 256.
+        """256.5 cast to bf16 becomes 256.0; nearbyint gives 256 before clipping to 127.
 
         For the bf16-accumulator SaturateCast branch (Reference.cpp:424-431):
         bfloat16 step near 256 is 2.0, so bf16(256.5)=256.0, nearbyint→256.
         This confirms the Python reference reproduces the bf16 precision loss.
         """
-        if not HAVE_ML_DTYPES:
+        if not haveMlDtypes:
             pytest.skip("ml_dtypes not installed")
-        val = np.float32(256.5)
-        # Simulate bf16 accumulator: cast to bf16 first, then nearbyint, then clip.
-        bf16_val = float(ml_dtypes.bfloat16(val))
-        result = int(np.round(np.float64(bf16_val)))
-        result = np.clip(result, -128, 127)
-        assert result == 127, f"expected 127 (after clip), got {result}"
+        bf16Val = ml_dtypes.bfloat16(256.5)
+        assert float(bf16Val) == 256.0, f"expected bf16(256.5)==256.0, got {float(bf16Val)}"
+        preClip = int(np.round(np.float64(float(bf16Val))))
+        assert preClip == 256, f"expected pre-clip value 256, got {preClip}"
+        assert np.clip(preClip, -128, 127) == 127
 
 
 # ===========================================================================
@@ -292,14 +291,14 @@ class TestGemmXf32Reference:
         np.testing.assert_allclose(D, ref, atol=ATOL_FP32)
 
     def test_result_close_to_fp32_for_small_inputs(self):
-        """For small (16×16×16) matrices, XF32 result is within RTOL_XF32 of fp32."""
+        """For small (16×16×16) matrices, XF32 result is within rtolXf32 of fp32."""
         rng = np.random.default_rng(123)
         M, K, N = 16, 16, 16
         A = rng.random((M, K)).astype(np.float32)
         B = rng.random((K, N)).astype(np.float32)
         D_xf = gemmXf32(A, B)
         D_ref = gemm(A, B).astype(np.float32)
-        np.testing.assert_allclose(D_xf, D_ref, rtol=RTOL_XF32, atol=ATOL_XF32)
+        np.testing.assert_allclose(D_xf, D_ref, rtol=rtolXf32, atol=atolXf32)
 
     def test_xf32_differs_from_fp32(self):
         """XF32 result differs from fp32 when inputs have sub-XF32-precision mantissa."""
@@ -329,13 +328,13 @@ class TestDtypeEnumValues:
     """Verify the DataTypeEnum integer codes used in gemm_args."""
 
     def test_dtype_int8_is_8(self):
-        assert _DTYPE_INT8 == 8
+        assert _dtypeInt8 == 8
 
     def test_dtype_int32_is_6(self):
-        assert _DTYPE_INT32 == 6
+        assert _dtypeInt32 == 6
 
     def test_dtype_xf32_is_10(self):
-        assert _DTYPE_XF32 == 10
+        assert _dtypeXf32 == 10
 
 
 class TestBuildKernelArgsInt8Layout:
@@ -482,13 +481,13 @@ def _generateAsm(solution, assembler, debugConfig):
 
 def _compileSolutions(problem_idx: int):
     """Compile all solutions for one YAML problem group; return list of dicts."""
-    if not HAVE_DEPS:
+    if not haveDeps:
         return []
     try:
         from epilogues.epilogue_harness.yaml_solution_builder import solutionsFromYaml
         chip = amdgpu_exec.get_chip()
         assembler, isaInfoMap, debugConfig = _setupTensile(chip)
-        sols = solutionsFromYaml(_YAML_PATH, assembler, isaInfoMap, debugConfig,
+        sols = solutionsFromYaml(_yamlPath, assembler, isaInfoMap, debugConfig,
                                  problemIdx=problem_idx)
     except Exception as exc:
         import warnings
@@ -534,7 +533,7 @@ def _filterSolution(entry: dict) -> bool:
 
 def _deviceCuCount() -> int:
     """Return the device CU count (multiprocessor_count) for device 0."""
-    if not HAVE_DEPS:
+    if not haveDeps:
         return 0
     props = amdgpu_exec._runtime_module.hip_get_device_props(0)
     return int(props.get("multiprocessor_count", 0))
@@ -609,24 +608,22 @@ def _ntBatchRef(A_np, B_np, batch, M, N, ref_fn, alpha, beta):
     return np.tile(np.asfortranarray(D_one).ravel(order='F'), batch)
 
 
+def _verifyNtResult(dBuf: np.ndarray, refD: np.ndarray, dtype, rtol: float, atol: float, label: str) -> None:
+    """Cast the captured GPU result to float64 and assert closeness to reference."""
+    assertClose(dBuf.astype(np.float64), refD.astype(np.float64), rtol=rtol, atol=atol, label=label)
+
+
 def _runNtStridedBatched(entry: dict, M: int, N: int, batch: int, K: int,
                          np_dtype, ref_fn, rtol: float, atol: float, label: str,
                          dest_dtype=None):
-    """Execute one NT stridedBatched kernel and verify output against reference.
-
-    dest_dtype overrides the output numpy dtype (for int8→int32 where input
-    dtype is int8 but output dtype is int32).
-    """
+    """Execute one NT stridedBatched kernel and verify output against reference."""
+    if dest_dtype is None:
+        dest_dtype = np_dtype
     sol_dict = entry["sol_dict"]
     kernel_name = entry["kernel_name"]
     hsaco = entry["hsaco"]
     num_wg = math.ceil(M / sol_dict["MacroTile0"]) * math.ceil(N / sol_dict["MacroTile1"]) * batch
     num_threads = sol_dict["NumThreads"]
-    alpha, beta = 1.0, 0.0
-
-    if dest_dtype is None:
-        dest_dtype = np_dtype
-
     rng = np.random.default_rng(seed=M * 1000 + N + K)
 
     if np_dtype == np.int8:
@@ -643,24 +640,20 @@ def _runNtStridedBatched(entry: dict, M: int, N: int, batch: int, K: int,
     result_holder = {}
 
     def capture(arguments):
-        # D is the first output after header and sizes (index 8 in typed-arg list).
         result_holder["D_gpu"] = np.asarray(arguments[8].array, dtype=dest_dtype).copy()
 
     D_io = amdgpu_exec.InOutArray(D_buf)
     C_in = amdgpu_exec.InputArray(C_buf)
     A_in = amdgpu_exec.InputArray(A_buf)
     B_in = amdgpu_exec.InputArray(B_buf)
-    args = _buildNtTypedArgs(sol_dict, M, N, batch, K, D_io, C_in, A_in, B_in, alpha, beta)
+    args = _buildNtTypedArgs(sol_dict, M, N, batch, K, D_io, C_in, A_in, B_in, 1.0, 0.0)
     amdgpu_exec.execute_hsaco(
         hsaco=hsaco, kernel_name=kernel_name, arguments=args,
         grid_dim=(num_wg, 1, 1), block_dim=(num_threads, 1, 1),
         num_iterations=1, verify_fn=capture,
     )
-
-    D_gpu = result_holder["D_gpu"]
-    D_ref = _ntBatchRef(A_np, B_np, batch, M, N, ref_fn, alpha, beta)
-    assertClose(D_gpu.astype(np.float64), D_ref.astype(np.float64),
-                rtol=rtol, atol=atol, label=label)
+    D_ref = _ntBatchRef(A_np, B_np, batch, M, N, ref_fn, 1.0, 0.0)
+    _verifyNtResult(result_holder["D_gpu"], D_ref, dest_dtype, rtol, atol, label)
 
 
 # ---------------------------------------------------------------------------
@@ -690,17 +683,18 @@ def xf32Kernels():
 # ---------------------------------------------------------------------------
 
 def _corruptStrideA1(argList: list, M: int) -> list:
-    """Corrupt lda (leading dimension of A) by +M in the typed arg list.
+    """Corrupt strideA[1] (stride_a, the batch stride of A) by +M in the typed arg list.
 
-    lda is after header_n + 4 sizes + 4 ptrs + D-strides(2) + C-strides(2).
-    Adding M to lda causes the kernel to read every other column at the wrong
-    row stride, producing wildly different outputs detectable at any tolerance.
+    strideA[1] is the stride between batches of A, located immediately after lda.
+    Corrupting the batch stride causes the kernel to read A data from the wrong
+    batch offset, producing wildly different outputs detectable at any tolerance.
     Infers header_n from total arg count: total = header_n + 18.
     """
     header_n = len(argList) - 18  # header + 4 sizes + 4 ptrs + 8 strides + 2 scalars
-    lda_idx = header_n + 4 + 4 + 4  # after header/sizes/ptrs/D-strides/C-strides
-    original = argList[lda_idx]
-    argList[lda_idx] = np.uint32(int(original) + M)
+    ldaIdx = header_n + 4 + 4 + 4  # after header/sizes/ptrs/D-strides/C-strides
+    strideA1Idx = ldaIdx + 1       # stride_a is immediately after lda
+    original = argList[strideA1Idx]
+    argList[strideA1Idx] = np.uint32(int(original) + M)
     return argList
 
 
@@ -720,7 +714,7 @@ def _assertPoisonDetected(gpuOut: np.ndarray, refOut: np.ndarray,
 @requires_gfx950
 def test_buildKernelArgs_poison_int8i32(int8I32Kernels):
     """Corrupt strideA[1] for int8→int32 and assert >= 50% of outputs differ."""
-    if not HAVE_DEPS:
+    if not haveDeps:
         pytest.skip("amdgpu_exec not installed")
     entries = [e for e in int8I32Kernels if _filterSolution(e)]
     if not entries:
@@ -763,7 +757,7 @@ def test_buildKernelArgs_poison_int8i32(int8I32Kernels):
 @requires_gfx950
 def test_buildKernelArgs_poison_xf32(xf32Kernels):
     """Corrupt strideA[1] for XFloat32 and assert >= 50% of outputs differ."""
-    if not HAVE_DEPS:
+    if not haveDeps:
         pytest.skip("amdgpu_exec not installed")
     entries = [e for e in xf32Kernels if _filterSolution(e)]
     if not entries:
@@ -812,11 +806,11 @@ def test_buildKernelArgs_poison_xf32(xf32Kernels):
 # ---------------------------------------------------------------------------
 
 @requires_gfx950
-@pytest.mark.parametrize("size", _INT8_PROBLEM_SIZES,
-                         ids=[f"M{m}N{n}B{b}K{k}" for m, n, b, k in _INT8_PROBLEM_SIZES])
+@pytest.mark.parametrize("size", _int8ProblemSizes,
+                         ids=[f"M{m}N{n}B{b}K{k}" for m, n, b, k in _int8ProblemSizes])
 def test_int8_to_int32_strided_batched(int8I32Kernels, size):
     """int8→int32 NT stridedBatched=True correctness."""
-    if not HAVE_DEPS:
+    if not haveDeps:
         pytest.skip("amdgpu_exec not installed")
     entries = [e for e in int8I32Kernels if _filterSolution(e)]
     if not entries:
@@ -839,11 +833,11 @@ def test_int8_to_int32_strided_batched(int8I32Kernels, size):
 # ---------------------------------------------------------------------------
 
 @requires_gfx950
-@pytest.mark.parametrize("size", _INT8_PROBLEM_SIZES,
-                         ids=[f"M{m}N{n}B{b}K{k}" for m, n, b, k in _INT8_PROBLEM_SIZES])
+@pytest.mark.parametrize("size", _int8ProblemSizes,
+                         ids=[f"M{m}N{n}B{b}K{k}" for m, n, b, k in _int8ProblemSizes])
 def test_int8_to_int8_strided_batched(int8I8Kernels, size):
     """int8→int8 (with SaturateCast) NT stridedBatched=True correctness."""
-    if not HAVE_DEPS:
+    if not haveDeps:
         pytest.skip("amdgpu_exec not installed")
     entries = [e for e in int8I8Kernels if _filterSolution(e)]
     if not entries:
@@ -867,11 +861,11 @@ def test_int8_to_int8_strided_batched(int8I8Kernels, size):
 # ---------------------------------------------------------------------------
 
 @requires_gfx950
-@pytest.mark.parametrize("size", _XF32_PROBLEM_SIZES,
-                         ids=[f"M{m}N{n}B{b}K{k}" for m, n, b, k in _XF32_PROBLEM_SIZES])
+@pytest.mark.parametrize("size", _xf32ProblemSizes,
+                         ids=[f"M{m}N{n}B{b}K{k}" for m, n, b, k in _xf32ProblemSizes])
 def test_xf32_to_fp32_strided_batched(xf32Kernels, size):
     """XFloat32→float32 NT stridedBatched=True correctness."""
-    if not HAVE_DEPS:
+    if not haveDeps:
         pytest.skip("amdgpu_exec not installed")
     entries = [e for e in xf32Kernels if _filterSolution(e)]
     if not entries:
@@ -883,6 +877,6 @@ def test_xf32_to_fp32_strided_batched(xf32Kernels, size):
         _runNtStridedBatched(
             entry, M, N, batch, K,
             np_dtype=np.float32, ref_fn=gemmXf32,
-            rtol=RTOL_XF32, atol=ATOL_XF32,
+            rtol=rtolXf32, atol=atolXf32,
             label=f"xf32→fp32 M{M}N{N}B{batch}K{K} {sid}",
         )
