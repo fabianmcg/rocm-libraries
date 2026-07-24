@@ -123,7 +123,7 @@ typedef enum {
   HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS = 2, /**<Decomposed flow (GEMM1 producer): emits the tile-local ``h1 * gamma`` value plus per-row RMSNorm statistics into an RMSNorm handoff descriptor. Requires gamma, eps, and stats attributes.*/
   HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM_SCALE_APPLY   = 3, /**<Decomposed flow (GEMM2 consumer): applies the deferred per-row RMSNorm scale carried in the handoff descriptor. Requires the stats attribute.*/
   HIPBLASLT_FUSEABLE_EPILOGUE_AMAX                  = 4, /**<Capture the result AMax (maximum absolute value) as a side output.*/
-  HIPBLASLT_FUSEABLE_EPILOGUE_REQUANT               = 5, /**<Requantize the result to a narrow output type (chosen by D's data type, e.g. FP8). Configured by the requant scale, amax, compute-mode, and granularity attributes.*/
+  HIPBLASLT_FUSEABLE_EPILOGUE_REQUANT               = 5, /**<Requantize the result to a narrow output type (chosen by D's data type, e.g. FP8). In a decomposed producer chain after partial RMSNorm stats, this writes the dynamic-quantized producer output while the RMSNorm handoff carries the composed consumer scale. Configured by the requant scale, amax, compute-mode, and granularity attributes.*/
   HIPBLASLT_FUSEABLE_EPILOGUE_SWIGLU                = 6, /**<Reserved epilogue family: SwiGLU gated linear unit.*/
 } hipblasLtFuseableEpilogue_t;
 
@@ -162,8 +162,8 @@ typedef enum {
   HIPBLASLT_FUSED_EPILOGUE_RMSNORM_EPS   = 1, /**<Epsilon added inside the RMSNorm reciprocal square root. Used by the RMSNorm and partial-RMSNorm-stats stages. Data type: ``float``.*/
   HIPBLASLT_FUSED_EPILOGUE_RESIDUAL_POINTER = 2, /**<Non-null device pointer to the residual input tensor. The tensor has the same logical shape, layout, and data type as D. Data type: ``void*``.*/
   HIPBLASLT_FUSED_EPILOGUE_RESIDUAL_OUTPUT_POINTER = 3, /**<Optional device pointer that receives the updated residual stream after the residual add. If NULL or unset, the residual input tensor is updated in place. Data type: ``void*``.*/
-  HIPBLASLT_FUSED_EPILOGUE_RMSNORM_STATS = 4, /**<Opaque RMSNorm handoff descriptor linking the decomposed producer (partial RMSNorm stats) and consumer (RMSNorm scale-apply) matmul calls. The same object must be set on both handles. Data type: ``hipblasLtFusedEpilogueRMSNormDescriptor_t``.*/
-  HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_POINTER = 5, /**<Device pointer to the requant dequant scale. In static mode it is read-only input; in dynamic mode it receives the derived scale. Its element count follows the scale granularity. Data type: ``void*`` (f32 elements).*/
+  HIPBLASLT_FUSED_EPILOGUE_RMSNORM_STATS = 4, /**<Opaque RMSNorm handoff descriptor linking the decomposed producer (partial RMSNorm stats) and consumer (RMSNorm scale-apply) matmul calls. The same object must be set on both handles. The carried consumer scale is rstd for the ordinary decomposed flow, or the composed RMSNorm-output dequant scale for the dynamic-quantized decomposed producer. Data type: ``hipblasLtFusedEpilogueRMSNormDescriptor_t``.*/
+  HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_POINTER = 5, /**<Device pointer to the requant dequant scale. In static mode it is read-only input; in dynamic mode it receives the derived scale. For the dynamic-quantized decomposed producer, this receives the logical RMSNorm-output dequant scale consumed by GEMM2. Its element count follows the scale granularity. Data type: ``void*`` (f32 elements).*/
   HIPBLASLT_FUSED_EPILOGUE_REQUANT_AMAX_POINTER = 6, /**<Optional device pointer that receives the result amax side output, with the same granularity as the scale. If unset in dynamic mode, amax is computed internally only to derive the scale. Data type: ``void*`` (f32 elements).*/
   HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_COMPUTE_MODE = 7, /**<How the output scale is obtained (static vs dynamic-from-amax). Defaults to static. Data type: ``hipblasLtRequantScaleComputeMode_t``.*/
   HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_GRANULARITY = 8, /**<Shape shared by the scale and amax outputs (per-tensor or per-row). Defaults to per-tensor. Data type: ``hipblasLtRequantScaleGranularity_t``.*/
@@ -179,7 +179,7 @@ typedef struct hipblasLtFusedEpilogueDescriptor* hipblasLtFusedEpilogueDescripto
  *
  *  \details
  *  Used only by the decomposed flow: the producer stage
- *  (``HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS``) writes the finalized per-row scale,
+ *  (``HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS``) writes the finalized consumer scale,
  *  and the consumer stage (``HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM_SCALE_APPLY``) reads it in the
  *  GEMM2 epilogue. The caller creates one descriptor, sets the same handle on both fused-epilogue
  *  chains through ``HIPBLASLT_FUSED_EPILOGUE_RMSNORM_STATS``, and destroys it after both calls.

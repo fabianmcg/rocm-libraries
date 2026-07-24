@@ -463,11 +463,30 @@ TEST_F(FusedEpilogueTest, decomposedProducerOrderAccepted)
               HIPBLAS_STATUS_SUCCESS);
 }
 
+TEST_F(FusedEpilogueTest, decomposedProducerRequantOrderAccepted)
+{
+    // Dynamic-quantized producer chain: residual add -> partial RMSNorm stats -> requant.
+    EXPECT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RESIDUAL_ADD),
+              HIPBLAS_STATUS_SUCCESS);
+    EXPECT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS),
+              HIPBLAS_STATUS_SUCCESS);
+    EXPECT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_REQUANT),
+              HIPBLAS_STATUS_SUCCESS);
+}
+
 TEST_F(FusedEpilogueTest, decomposedConsumerAccepted)
 {
     // Consumer chain: RMSNorm scale-apply only.
     EXPECT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM_SCALE_APPLY),
               HIPBLAS_STATUS_SUCCESS);
+}
+
+TEST_F(FusedEpilogueTest, decomposedConsumerRequantRejected)
+{
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM_SCALE_APPLY),
+              HIPBLAS_STATUS_SUCCESS);
+    EXPECT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_REQUANT),
+              HIPBLAS_STATUS_INVALID_VALUE);
 }
 
 TEST_F(FusedEpilogueTest, partialStatsBeforeResidualRejected)
@@ -692,6 +711,60 @@ TEST_F(FusedEpilogueTest, attachCompleteProducerAccepted)
     completeResidual();
     completeRmsnorm();
     completeStats();
+    EXPECT_EQ(attach(), HIPBLAS_STATUS_SUCCESS);
+}
+
+TEST_F(FusedEpilogueTest, attachPartialStatsRequantStaticPolicyRejected)
+{
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RESIDUAL_ADD),
+              HIPBLAS_STATUS_SUCCESS);
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS),
+              HIPBLAS_STATUS_SUCCESS);
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_REQUANT),
+              HIPBLAS_STATUS_SUCCESS);
+    completeResidual();
+    completeRmsnorm();
+    completeStats();
+
+    int   dummy_scale_storage = 0;
+    void* scale               = &dummy_scale_storage;
+    ASSERT_EQ(hipblasLtFusedEpilogueSetAttribute(
+                  fused, HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_POINTER, &scale, sizeof(scale)),
+              HIPBLAS_STATUS_SUCCESS);
+
+    // The CODA producer requant path requires dynamic per-row scale.
+    EXPECT_EQ(attach(), HIPBLAS_STATUS_INVALID_VALUE);
+}
+
+TEST_F(FusedEpilogueTest, attachCompleteDynamicQuantizedProducerAccepted)
+{
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RESIDUAL_ADD),
+              HIPBLAS_STATUS_SUCCESS);
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS),
+              HIPBLAS_STATUS_SUCCESS);
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(fused, HIPBLASLT_FUSEABLE_EPILOGUE_REQUANT),
+              HIPBLAS_STATUS_SUCCESS);
+    completeResidual();
+    completeRmsnorm();
+    completeStats();
+
+    int   dummy_scale_storage = 0;
+    void* scale               = &dummy_scale_storage;
+    ASSERT_EQ(hipblasLtFusedEpilogueSetAttribute(
+                  fused, HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_POINTER, &scale, sizeof(scale)),
+              HIPBLAS_STATUS_SUCCESS);
+
+    hipblasLtRequantScaleComputeMode_t mode = HIPBLASLT_REQUANT_SCALE_DYNAMIC_FROM_AMAX;
+    ASSERT_EQ(hipblasLtFusedEpilogueSetAttribute(
+                  fused, HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_COMPUTE_MODE, &mode, sizeof(mode)),
+              HIPBLAS_STATUS_SUCCESS);
+    hipblasLtRequantScaleGranularity_t granularity = HIPBLASLT_REQUANT_SCALE_PER_ROW;
+    ASSERT_EQ(hipblasLtFusedEpilogueSetAttribute(fused,
+                                                 HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_GRANULARITY,
+                                                 &granularity,
+                                                 sizeof(granularity)),
+              HIPBLAS_STATUS_SUCCESS);
+
     EXPECT_EQ(attach(), HIPBLAS_STATUS_SUCCESS);
 }
 

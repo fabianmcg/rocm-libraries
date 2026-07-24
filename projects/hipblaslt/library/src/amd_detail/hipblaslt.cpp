@@ -455,13 +455,14 @@ namespace
 
     // Classify a stage into a chain family so full and decomposed stages cannot be mixed in a
     // single chain (section 4.3): 0 = shared/neutral, 1 = full RMSNorm family, 2 = decomposed.
+    // Requant is neutral: full RMSNorm uses it as an output epilogue, while the decomposed
+    // producer can use it for the CODA dynamic-quantized handoff.
     int rmsnorm_chain_family(hipblasLtFuseableEpilogue_t e)
     {
         switch(e)
         {
         case HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM:
         case HIPBLASLT_FUSEABLE_EPILOGUE_AMAX:
-        case HIPBLASLT_FUSEABLE_EPILOGUE_REQUANT:
             return 1;
         case HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS:
         case HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM_SCALE_APPLY:
@@ -534,6 +535,10 @@ try
     // Reject mixing full and decomposed RMSNorm stages in one chain: a single chain
     // uses either HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM or the decomposed producer/consumer
     // stages, never both.
+    if(epilogue == HIPBLASLT_FUSEABLE_EPILOGUE_REQUANT
+       && fused_epilogue_has_stage(desc, HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM_SCALE_APPLY))
+        return HIPBLAS_STATUS_INVALID_VALUE; // requant is producer/full-flow only
+
     const int family = rmsnorm_chain_family(epilogue);
     if(family != 0)
     {
@@ -724,6 +729,13 @@ try
             if(fused->requant_scale == nullptr
                || !requant_compute_mode_valid(fused->requant_compute_mode)
                || !requant_granularity_valid(fused->requant_granularity))
+            {
+                rocblaslt::Debug::Instance().markerStop();
+                return HIPBLAS_STATUS_INVALID_VALUE;
+            }
+            if(fused_epilogue_has_stage(fused, HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS)
+               && (fused->requant_compute_mode != HIPBLASLT_REQUANT_SCALE_DYNAMIC_FROM_AMAX
+                   || fused->requant_granularity != HIPBLASLT_REQUANT_SCALE_PER_ROW))
             {
                 rocblaslt::Debug::Instance().markerStop();
                 return HIPBLAS_STATUS_INVALID_VALUE;
