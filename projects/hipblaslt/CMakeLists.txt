@@ -337,7 +337,7 @@ if(_hipblaslt_mxdatagen_enabled)
     add_subdirectory(clients/common)
 endif()
 
-add_subdirectory(tensilelite)
+add_subdirectory(tensilelite "${CMAKE_CURRENT_BINARY_DIR}/tensilelite")
 
 if(HIPBLASLT_ENABLE_HOST)
     if(HIPBLASLT_BUILD_SHARED_LIBS)

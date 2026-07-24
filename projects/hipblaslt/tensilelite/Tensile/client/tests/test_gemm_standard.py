@@ -609,6 +609,19 @@ def _filterSolution(entry: dict, strided_batched: bool) -> bool:
     return True
 
 
+def _deviceCuCount() -> int:
+    """Return the device CU count (multiprocessor_count) for device 0.
+
+    The result is cached after the first call. Used to resolve the
+    WorkGroupMappingXCCGroup=-1 sentinel, which the C++ code replaces with
+    pAMDGPU->computeUnitCount at runtime.
+    """
+    if not HAVE_DEPS:
+        return 0
+    props = amdgpu_exec._runtime_module.hip_get_device_props(0)
+    return int(props.get("multiprocessor_count", 0))
+
+
 def _buildNtTypedArgs(sol_dict: dict, M: int, N: int, batch: int, K: int,
                       D_arr, C_arr, A_arr, B_arr,
                       alpha: float = 1.0, beta: float = 0.0):
@@ -628,7 +641,7 @@ def _buildNtTypedArgs(sol_dict: dict, M: int, N: int, batch: int, K: int,
 
     args = [np.uint32(gemm_count), np.uint32(arg0)]
     if version >= 1:
-        arg1 = _computeInternalArg1(sol_dict)
+        arg1 = _computeInternalArg1(sol_dict, cu_count=_deviceCuCount())
         args.append(np.int32(arg1))
         args.append(np.uint32(num_wg))
 
@@ -652,32 +665,40 @@ def _buildNtTypedArgs(sol_dict: dict, M: int, N: int, batch: int, K: int,
 
 
 def _allocStrideArrays(M: int, N: int, K: int, batch: int, np_dtype, rng):
-    """Allocate flat Fortran-order numpy buffers for a batched strided GEMM.
+    """Allocate flat buffers for a batched strided GEMM.
 
-    Returns (A_buf_np, B_buf_np, C_buf_np, D_buf_np).
-    A is (M*batch, K) Fortran; B is (N*batch, K) Fortran; C/D are flat M*N*batch.
+    The GPU kernel uses lda=M and stride_a=M*K for A, ldb=N and stride_b=N*K
+    for B, ldd=M and stride_d=M*N for D/C.  Each batch element is a separate
+    Fortran (column-major) matrix stored consecutively: element (m, k, b) of A
+    lives at offset b*M*K + k*M + m.  np.tile of the Fortran-flat per-batch
+    matrix produces this layout.
+
+    All batch elements share the same A and B data (same random matrix tiled).
+
+    Returns (A_buf_np, B_buf_np, C_buf_np, D_buf_np) as 1-D numpy arrays.
     """
     A_np = np.asfortranarray(rng.random((M, K)).astype(np_dtype))
     B_np = np.asfortranarray(rng.random((N, K)).astype(np_dtype))
-    A_bat = np.stack([A_np] * batch, axis=0)
-    B_bat = np.stack([B_np] * batch, axis=0)
-    C_bat = np.zeros((batch, M, N), dtype=np_dtype)
-    A_buf_np = np.asfortranarray(A_bat.reshape(batch * M, K))
-    B_buf_np = np.asfortranarray(B_bat.reshape(batch * N, K))
-    C_buf_np = np.asfortranarray(C_bat.reshape(batch, M * N).T.reshape(M * N * batch))
+    A_buf_np = np.tile(A_np.ravel(order='F'), batch)   # M*K*batch elements
+    B_buf_np = np.tile(B_np.ravel(order='F'), batch)   # N*K*batch elements
+    C_buf_np = np.zeros(M * N * batch, dtype=np_dtype)
     D_buf_np = np.zeros(M * N * batch, dtype=np_dtype)
     return A_buf_np, B_buf_np, C_buf_np, D_buf_np
 
 
-def _stridedBatchRef(A_buf_np, B_buf_np, batch: int, M: int, N: int,
+def _stridedBatchRef(A_buf_np, B_buf_np, batch: int, M: int, N: int, K: int,
                      ref_fn, alpha: float, beta: float):
-    """Compute the batched NT GEMM reference, returning a flat Fortran-order array."""
-    per_batch = []
-    for b in range(batch):
-        A_b = A_buf_np[b * M:(b + 1) * M, :]
-        B_b = B_buf_np[b * N:(b + 1) * N, :]
-        per_batch.append(ref_fn(A_b, B_b.T, alpha, beta, None))
-    return np.concatenate([np.asfortranarray(d).ravel(order="F") for d in per_batch])
+    """Compute the batched NT GEMM reference, returning a flat 1-D array.
+
+    Reads back A and B from the same flat buffers the GPU receives, so the
+    comparison is always against exactly the same data the kernel sees.
+    All batch elements share the same A/B data, so the reference is computed
+    once and tiled.
+    """
+    A_slice = A_buf_np[:M * K].reshape(M, K, order='F')
+    B_slice = B_buf_np[:N * K].reshape(N, K, order='F')
+    D_one = ref_fn(A_slice, B_slice.T, alpha, beta, None)
+    return np.tile(np.asfortranarray(D_one).ravel(order='F'), batch)
 
 
 def _runStridedBatched(entry: dict, M: int, N: int, batch: int, K: int,
@@ -715,7 +736,7 @@ def _runStridedBatched(entry: dict, M: int, N: int, batch: int, K: int,
     )
 
     D_gpu = result_holder["D_gpu"]
-    D_ref_flat = _stridedBatchRef(A_buf_np, B_buf_np, batch, M, N, ref_fn, alpha, beta)
+    D_ref_flat = _stridedBatchRef(A_buf_np, B_buf_np, batch, M, N, K, ref_fn, alpha, beta)
     assertClose(D_gpu, D_ref_flat, rtol=rtol, atol=atol, label=label)
 
 
@@ -772,9 +793,9 @@ def test_buildKernelArgs_poison(fp32Kernels, size):
     B_np = np.asfortranarray(rng.random((N, K)).astype(np.float32))
     C_np = np.asfortranarray(np.zeros((M, N), dtype=np.float32))
 
-    # Replicate to batch.
-    A_buf = np.asfortranarray(np.stack([A_np] * batch).reshape(batch * M, K))
-    B_buf = np.asfortranarray(np.stack([B_np] * batch).reshape(batch * N, K))
+    # Replicate to batch using the correct strided layout (consecutive Fortran M×K matrices).
+    A_buf = np.tile(A_np.ravel(order='F'), batch)
+    B_buf = np.tile(B_np.ravel(order='F'), batch)
     C_buf = np.zeros(M * N * batch, dtype=np.float32)
     D_poison = np.zeros(M * N * batch, dtype=np.float32)
 
@@ -954,7 +975,7 @@ def _buildPtrBatchArgList(sol_dict: dict, M: int, N: int, batch: int, K: int,
     gemm_count = (1 & 0x3FFFFFFF) | (3 << 30)
     args: list = [np.uint32(gemm_count), np.uint32(arg0)]
     if version >= 1:
-        args.append(np.int32(_computeInternalArg1(sol_dict)))
+        args.append(np.int32(_computeInternalArg1(sol_dict, cu_count=_deviceCuCount())))
         args.append(np.uint32(num_wg_val))
     args.extend([np.uint32(M), np.uint32(N), np.uint32(batch), np.uint32(K)])
     args.extend([

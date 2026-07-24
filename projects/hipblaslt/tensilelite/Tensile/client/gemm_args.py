@@ -184,15 +184,17 @@ def _computeInternalArg0(
     return arg0 & 0xFFFFFFFF
 
 
-def _computeInternalArg1(solutionParams: dict) -> int:
+def _computeInternalArg1(solutionParams: dict, cu_count: int = 0) -> int:
     """Compute internalArg1 for version >= 1.
 
     Returns a value that fits in int32 (signed). Mirrors the C++ kernelArgs
     internalArg1 assembly for version 1 and version 2 (useSFC=False).
 
-    Caller must supply explicit WorkGroupMappingXCC and WorkGroupMappingXCCGroup
-    values from the solution YAML; the C++ sizeMapping defaults differ from 0, so
-    kernels without these keys in YAML may produce wrong internalArg1.
+    When WorkGroupMappingXCCGroup == -1 and WorkGroupMappingXCC >= 1, the C++
+    code substitutes pAMDGPU->computeUnitCount (the device CU count).  Pass
+    that value as cu_count so the Python path matches.  Callers that cannot
+    provide cu_count should filter such solutions out before calling this
+    function.
     """
     version = solutionParams.get("KernArgsVersion", 0)
     supportWgm = solutionParams.get("SupportCustomWGM", False)
@@ -208,14 +210,15 @@ def _computeInternalArg1(solutionParams: dict) -> int:
     wgmxcc = int(solutionParams.get("WorkGroupMappingXCC", 0))
     wgmxccg = int(solutionParams.get("WorkGroupMappingXCCGroup", 0))
 
-    # When wgmxccg == -1 and wgmxcc >= 1 the C++ code reads pAMDGPU->computeUnitCount
-    # from the hardware object. Python cannot replicate that without a GPU binding.
-    # Callers must ensure solutions with this combination are filtered out.
+    # When wgmxccg == -1 and wgmxcc >= 1 the C++ code reads pAMDGPU->computeUnitCount.
+    # Use the caller-supplied cu_count to replicate that; raise if unavailable.
     if wgmxcc >= 1 and wgmxccg == -1:
-        raise NotImplementedError(
-            "wgmxccg=-1 with wgmxcc>=1 requires hardware CU count (not available in Python); "
-            "filter solutions with WorkGroupMappingXCC>=1 and WorkGroupMappingXCCGroup=-1"
-        )
+        if cu_count <= 0:
+            raise NotImplementedError(
+                "wgmxccg=-1 with wgmxcc>=1 requires hardware CU count; "
+                "pass cu_count=<device multiprocessor_count> to _computeInternalArg1"
+            )
+        wgmxccg = cu_count
 
     # When workGroupMappingXCC == -1 the C++ code uses wgmxccchunk. We reject
     # this case the same way.
@@ -229,7 +232,8 @@ def _computeInternalArg1(solutionParams: dict) -> int:
     return int((wgmxccg << 22) | (wgmxcc << 16) | (mask16 & wgm))
 
 
-def _buildKernelArgsHeader(solutionParams: dict, problemParams: dict) -> bytes:
+def _buildKernelArgsHeader(solutionParams: dict, problemParams: dict,
+                           cu_count: int = 0) -> bytes:
     """Build the kernelArgs header (gemm_count + internalArg0 + [internalArg1 + numWG]).
 
     For useUniversalArgs=True (the only supported M1 path), kernelArgs is called with
@@ -250,7 +254,7 @@ def _buildKernelArgsHeader(solutionParams: dict, problemParams: dict) -> bytes:
     buf = struct.pack("<I", gemm_count)
     buf += struct.pack("<I", arg0)
     if version >= 1:
-        arg1 = _computeInternalArg1(solutionParams)
+        arg1 = _computeInternalArg1(solutionParams, cu_count=cu_count)
         buf += struct.pack("<i", arg1)   # int32
         buf += struct.pack("<I", num_wg)
     return buf
@@ -390,6 +394,7 @@ def buildKernelArgs(
     solutionParams: dict,
     problemParams: dict,
     tensors: dict,
+    cu_count: int = 0,
 ) -> bytes:
     """Build the raw argument buffer for a TensileLite GEMM kernel.
 
@@ -415,12 +420,16 @@ def buildKernelArgs(
                     'batchB' (for stridedBatched=False), and optionally
                     'workspace', 'flags' (for streamK > 0).
 
+    cu_count:       device CU count (multiprocessor_count) needed when
+                    WorkGroupMappingXCCGroup == -1. Pass 0 when not using
+                    XCC-aware WGM; defaults to 0.
+
     Returns raw bytes suitable for use as the kernel argument buffer.
     """
     _validateConfig(solutionParams, problemParams)
 
     # kernelArgs header comes first when useUniversalArgs=True (always for M1).
-    buf = _buildKernelArgsHeader(solutionParams, problemParams)
+    buf = _buildKernelArgsHeader(solutionParams, problemParams, cu_count=cu_count)
     buf += _buildProblemSizes(problemParams)
     buf += _buildPointers(solutionParams, tensors)
     buf += _buildStrides(solutionParams, problemParams)
