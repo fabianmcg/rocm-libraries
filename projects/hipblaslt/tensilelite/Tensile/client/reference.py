@@ -136,6 +136,35 @@ def toXf32(arr: np.ndarray) -> np.ndarray:
     return (arr_c.view(np.uint32) & np.uint32(0xFFFFE000)).view(np.float32)
 
 
+def gemmFp8(
+    A,
+    B,
+    dtypeA,
+    dtypeB,
+    dtypeOut,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+    C=None,
+) -> np.ndarray:
+    """Reference GEMM for fp8 inputs with float32 accumulation (HPA mode).
+
+    Upcast A and B to float32 via ml_dtypes, compute in float32, downcast
+    to dtypeOut. This matches the GPU kernel's fp8 HPA behaviour.
+
+    A: (M, K) fp8 array (dtypeA is an ml_dtypes fp8 dtype).
+    B: (K, N) fp8 array (dtypeB is an ml_dtypes fp8 dtype).
+    C: (M, N) array with dtype dtypeOut, or None.
+    dtypeOut: output numpy dtype (e.g. np.float32).
+    Returns D as dtypeOut.
+    """
+    A_f = np.asarray(A, dtype=dtypeA).astype(np.float32)
+    B_f = np.asarray(B, dtype=dtypeB).astype(np.float32)
+    D = alpha * (A_f @ B_f)
+    if beta != 0.0 and C is not None:
+        D += beta * np.asarray(C, dtype=np.float32)
+    return D.astype(dtypeOut)
+
+
 def gemmXf32(
     A: np.ndarray,
     B: np.ndarray,
