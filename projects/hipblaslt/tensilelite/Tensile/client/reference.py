@@ -96,6 +96,69 @@ def gemmBf16(
     return D.astype(ml_dtypes.bfloat16)
 
 
+def gemmInt8(
+    A: np.ndarray,
+    B: np.ndarray,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+    C: np.ndarray | None = None,
+    outputInt8: bool = False,
+) -> np.ndarray:
+    """Reference GEMM for int8 inputs with int32 accumulation (HPA mode).
+
+    Widen A and B to int32, compute in int32. When outputInt8=True, apply
+    round-half-to-even (matching std::nearbyint) then saturate to [-128, 127].
+    The float64 intermediate ensures correct banker's rounding regardless of
+    the accumulation magnitude.
+
+    A: (M, K) int8, B: (K, N) int8, C: (M, N) int32 or int8 or None.
+    Returns D as int32 or int8 depending on outputInt8.
+    """
+    A32 = A.astype(np.int32)
+    B32 = B.astype(np.int32)
+    D = alpha * (A32 @ B32)
+    if beta != 0.0 and C is not None:
+        D += beta * C.astype(np.int32)
+    if not outputInt8:
+        return D.astype(np.int32)
+    # float64 intermediate for round-half-to-even matching std::nearbyint.
+    D64 = D.astype(np.float64)
+    return np.clip(np.round(D64), -128, 127).astype(np.int8)
+
+
+def toXf32(arr: np.ndarray) -> np.ndarray:
+    """Convert float32 array to XFloat32 by zeroing the lower 13 mantissa bits.
+
+    Matches DataTypes_XFloat32.hpp float_to_XFloat32: u.p &= 0xFFFFE000.
+    The input must be float32; the output is float32 with truncated mantissa.
+    """
+    arr_c = np.ascontiguousarray(arr, dtype=np.float32)
+    return (arr_c.view(np.uint32) & np.uint32(0xFFFFE000)).view(np.float32)
+
+
+def gemmXf32(
+    A: np.ndarray,
+    B: np.ndarray,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+    C: np.ndarray | None = None,
+) -> np.ndarray:
+    """Reference GEMM for XFloat32 inputs with float32 accumulation.
+
+    Apply toXf32 to A and B (truncate mantissa), then compute in float32.
+    This matches the GPU kernel's XF32 math-op behaviour.
+
+    A: (M, K) float32, B: (K, N) float32, C: (M, N) float32 or None.
+    Returns D as float32.
+    """
+    A_xf = toXf32(np.asarray(A, dtype=np.float32))
+    B_xf = toXf32(np.asarray(B, dtype=np.float32))
+    D = alpha * (A_xf.astype(np.float32) @ B_xf.astype(np.float32))
+    if beta != 0.0 and C is not None:
+        D += beta * np.asarray(C, dtype=np.float32)
+    return D.astype(np.float32)
+
+
 def assertClose(
     gpu: np.ndarray,
     ref: np.ndarray,
