@@ -32,10 +32,14 @@ import math
 import struct
 
 # Integer codes from rocisa::DataType enum (enum.hpp).
-_dtypeHalf: int = 4     # rocisa::DataType::Half
-_dtypeInt32: int = 6    # rocisa::DataType::Int32
-_dtypeInt8: int = 8     # rocisa::DataType::Int8
-_dtypeXf32: int = 10    # rocisa::DataType::XFloat32
+_dtypeHalf: int = 4          # rocisa::DataType::Half
+_dtypeInt32: int = 6         # rocisa::DataType::Int32
+_dtypeInt8: int = 8          # rocisa::DataType::Int8
+_dtypeXf32: int = 10         # rocisa::DataType::XFloat32
+_dtypeFp8e4m3fnuz: int = 11  # rocisa::DataType::Float8_fnuz  (E4M3 fnuz)
+_dtypeBf8e5m2fnuz: int = 12  # rocisa::DataType::BFloat8_fnuz (E5M2 fnuz)
+_dtypeFp8e4m3fn: int = 15    # rocisa::DataType::Float8       (E4M3 OCP)
+_dtypeBf8e5m2: int = 16      # rocisa::DataType::BFloat8      (E5M2 OCP)
 
 
 def _validateConfig(solutionParams: dict, problemParams: dict) -> None:

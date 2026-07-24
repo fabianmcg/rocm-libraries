@@ -1,0 +1,71 @@
+M3 Float8 Cross-Validation Notes
+==================================
+
+OCP vs fnuz kernel flavor identification
+-----------------------------------------
+The fp8 kernel flavor (OCP or fnuz) is baked into the kernel binary at compile
+time via the DataType field in the ProblemType YAML. The DataType integer codes
+(from rocisa::DataType enum, enum.hpp) that identify each variant are:
+
+  DataType int | rocisa name      | OCP/fnuz | YAML char | ml_dtypes equivalent
+  -------------|------------------|----------|-----------|-----------------------
+  11           | Float8_fnuz      | fnuz     | F8N       | float8_e4m3fnuz
+  12           | BFloat8_fnuz     | fnuz     | B8N       | float8_e5m2fnuz
+  15           | Float8           | OCP      | F8        | float8_e4m3fn
+  16           | BFloat8          | OCP      | B8        | float8_e5m2
+
+The DataType is stored in the compiled solution dict under
+ProblemType['DataType'].value (an int). To identify OCP vs fnuz for a
+compiled solution entry, read entry['sol_dict']['ProblemType']['DataType'].
+
+YAML groups in gemm_fp8.yaml:
+  Group 0: F8  (OCP E4M3)  — gfx950 only (skips gfx942 fnuz-only chips)
+  Group 1: B8  (OCP E5M2)  — gfx950 only
+  Group 2: F8N (fnuz E4M3) — gfx942 only (returns empty on gfx950, see below)
+  Group 3: B8N (fnuz E5M2) — gfx942 only (returns empty on gfx950, see below)
+
+Architecture support:
+  gfx942: supports fnuz FP8 MFMA natively; OCP FP8 MFMA not available.
+  gfx950: supports OCP FP8 MFMA natively. The fnuz MFMA ISA exists for backward
+          compatibility, but the hardware interprets fnuz byte patterns using OCP
+          semantics (0x80 is treated as -0.0, not NaN). As a result, kernels
+          compiled with DataType=F8N (fnuz) running on gfx950 produce incorrect
+          results when compared to ml_dtypes.float8_e4m3fnuz reference values.
+
+fnuz GPU tests on gfx950:
+  The session fixtures fp8FnuzE4m3Kernels and fp8FnuzE5m2Kernels return empty
+  lists when the detected chip is gfx950. This causes all fnuz GPU tests
+  (correctness, NaN propagation, and poison-input) to skip gracefully with:
+    "no E4M3 fnuz solution compiled on this GPU"
+    "no E5M2 fnuz solution compiled on this GPU"
+  This is intentional: fnuz fp8 GPU tests are only meaningful on gfx942.
+
+NaN semantics (from include/Tensile/DataTypes_Float8_BFloat8.hpp):
+  Float8 (OCP E4M3): isnan when (bits & 0x7F) == 0x7F  → patterns 0x7F, 0xFF
+  BFloat8 (OCP E5M2): isnan when (bits & 0x7F) > 0x7C  → patterns 0x7D..0x7F, 0xFD..0xFF
+  Float8_fnuz: isnan when bits == 0x80  (single NaN encoding, no negative zero)
+  BFloat8_fnuz: isnan when bits == 0x80 (single NaN encoding, no negative zero)
+
+Poison-input test design:
+  The poison tests corrupt lda (the leading dimension stride of A) rather than
+  stride_a (the batch stride). Corrupting lda by +M//2 causes the kernel to use
+  the wrong row stride when reading A, making every A[i,j] access land at the
+  wrong memory location. This gives a completely wrong matrix layout and guarantees
+  that >90% of output elements differ from the reference by more than RTOL_FP32.
+  Using RTOL_FP32 (1e-5) rather than rtolFp8 (1e-1) for poison detection ensures
+  any fp32-level difference is caught, regardless of fp8 quantization tolerance.
+
+C++ client cross-validation status:
+  Cross-validation against the C++ tensilelite-client is deferred for the same
+  reason as M1: the C++ client requires pre-built solution library artifacts
+  from the full Tensile benchmark pipeline (BenchmarkProblems → LibraryLogic →
+  ClientWriter), which were not produced during M3 implementation.
+
+  The Python reference (gemmFp8) upscasts fp8 inputs to float32 via ml_dtypes
+  and computes in float32, matching the HPA (HighPrecisionAccumulate=True) GPU
+  kernel behaviour. This is the same approach used for bf16 (gemmBf16).
+
+GPU test results:
+  Pure-Python tests (NaN bit-pattern, dtype enum, gemmFp8 reference): all pass.
+  GPU tests on gfx950: OCP groups (F8, B8) compile, run, and verify correctly.
+  fnuz groups (F8N, B8N) on gfx950: fixtures return empty list; all tests skip.

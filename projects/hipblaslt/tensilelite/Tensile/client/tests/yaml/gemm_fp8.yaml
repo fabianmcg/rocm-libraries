@@ -1,0 +1,181 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+################################################################################
+# gemm_fp8: Float8 OCP and fnuz GEMM (NT, batched) for M3 client tests.
+#
+# Four BenchmarkProblems groups:
+#   0: F8→S  (E4M3 OCP)  NT batched, HPA, gfx950 only
+#   1: B8→S  (E5M2 OCP)  NT batched, HPA, gfx950 only
+#   2: F8N→S (E4M3 fnuz) NT batched, HPA, gfx942/gfx950
+#   3: B8N→S (E5M2 fnuz) NT batched, HPA, gfx942/gfx950
+#
+# OCP groups use MatrixInstruction [16,16,32,1,1,2,2,2,2] → MacroTile 32×32.
+# fnuz groups use MatrixInstruction [16,16,32,1,1,1,1,1,1] → MacroTile 16×16.
+# All groups:
+#   - No UseScaleAB/UseScaleCD/UseBias/Activation (plain GEMM, no extra slots).
+#   - default StaggerU (32) so the M3 kernel filter passes.
+#   - WorkGroupMapping=4 (explicit non-zero, no auto-WGM).
+#   - GlobalSplitU=1 to stay within M1-M5 supported configuration.
+#   - SourceSwap=True, ScheduleIterAlg=3.
+################################################################################
+GlobalParameters:
+  SyncsPerBenchmark: 0
+  MinimumRequiredVersion: 5.0.0
+  NumElementsToValidate: 128
+  DataInitTypeBeta: 0
+  DataInitTypeAlpha: 1
+  Device: 0
+
+BenchmarkProblems:
+  ##############################################################################
+  # Group 0: F8→S (E4M3 OCP) NT batched, HPA — gfx950 only
+  # DataType F8 (OCP E4M3, int=15), DestDataType s (float32).
+  # TransposeA=False, TransposeB=True → NT GEMM.
+  # MI [16,16,32,1,1,2,2,2,2] → v_mfma_f32_16x16x32_fp8_fp8, MT=32×32.
+  ##############################################################################
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: F8
+      DestDataType: s
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: False
+      TransposeB: True
+      UseBeta: True
+      Batched: True
+      UseBias: 0
+    - # BenchmarkProblemSizeGroup
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 32, 1, 1, 2, 2, 2, 2]
+        - DepthU: [128]
+        - GlobalSplitU: [1]
+        - WorkGroupMapping: [4]
+        - SourceSwap: [True]
+        - PrefetchGlobalRead: [1]
+        - PrefetchLocalRead: [1]
+        - ScheduleIterAlg: [3]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [256,  256,  4, 256]
+          - Exact: [512,  512,  4, 512]
+          - Exact: [1024, 1024, 4, 1024]
+
+  ##############################################################################
+  # Group 1: B8→S (E5M2 OCP) NT batched, HPA — gfx950 only
+  # DataType B8 (OCP E5M2, int=16), DestDataType s (float32).
+  # MI [16,16,32,1,1,2,2,2,2] → v_mfma_f32_16x16x32_bf8_bf8, MT=32×32.
+  ##############################################################################
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: B8
+      DestDataType: s
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: False
+      TransposeB: True
+      UseBeta: True
+      Batched: True
+      UseBias: 0
+    - # BenchmarkProblemSizeGroup
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 32, 1, 1, 2, 2, 2, 2]
+        - DepthU: [128]
+        - GlobalSplitU: [1]
+        - WorkGroupMapping: [4]
+        - SourceSwap: [True]
+        - PrefetchGlobalRead: [1]
+        - PrefetchLocalRead: [1]
+        - ScheduleIterAlg: [3]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [256,  256,  4, 256]
+          - Exact: [512,  512,  4, 512]
+          - Exact: [1024, 1024, 4, 1024]
+
+  ##############################################################################
+  # Group 2: F8N→S (E4M3 fnuz) NT batched, HPA — gfx942/gfx950
+  # DataType F8N (fnuz E4M3, int=11), DestDataType s (float32).
+  # MI [16,16,32,1,1,1,1,1,1] → v_mfma_f32_16x16x32_fp8_fp8 (fnuz), MT=16×16.
+  ##############################################################################
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: F8N
+      DestDataType: s
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: False
+      TransposeB: True
+      UseBeta: True
+      Batched: True
+      UseBias: 0
+    - # BenchmarkProblemSizeGroup
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 32, 1, 1, 1, 1, 1, 1]
+        - DepthU: [32]
+        - GlobalSplitU: [1]
+        - WorkGroupMapping: [4]
+        - SourceSwap: [True]
+        - PrefetchGlobalRead: [1]
+        - PrefetchLocalRead: [1]
+        - ScheduleIterAlg: [3]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [256,  256,  4, 256]
+          - Exact: [512,  512,  4, 512]
+          - Exact: [1024, 1024, 4, 1024]
+
+  ##############################################################################
+  # Group 3: B8N→S (E5M2 fnuz) NT batched, HPA — gfx942/gfx950
+  # DataType B8N (fnuz E5M2, int=12), DestDataType s (float32).
+  # MI [16,16,32,1,1,1,1,1,1] → v_mfma_f32_16x16x32_bf8_bf8 (fnuz), MT=16×16.
+  ##############################################################################
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: B8N
+      DestDataType: s
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: False
+      TransposeB: True
+      UseBeta: True
+      Batched: True
+      UseBias: 0
+    - # BenchmarkProblemSizeGroup
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 32, 1, 1, 1, 1, 1, 1]
+        - DepthU: [32]
+        - GlobalSplitU: [1]
+        - WorkGroupMapping: [4]
+        - SourceSwap: [True]
+        - PrefetchGlobalRead: [1]
+        - PrefetchLocalRead: [1]
+        - ScheduleIterAlg: [3]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [256,  256,  4, 256]
+          - Exact: [512,  512,  4, 512]
+          - Exact: [1024, 1024, 4, 1024]
