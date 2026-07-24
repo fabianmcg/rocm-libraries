@@ -56,8 +56,6 @@ from Tensile.client.gemm_args import (
     buildKernelArgs,
     _computeInternalArg0,
     _computeInternalArg1,
-    _computeNumWorkGroups,
-    _validateConfig,
 )
 from Tensile.client.reference import (
     gemm, gemmFp16, gemmBf16,
@@ -793,6 +791,29 @@ def _assertPoisonDetected(gpuOut, refOut, rtol, label):
     )
 
 
+def _allocPoisonRun(solDict, M, N, batch, K):
+    """Allocate buffers, build a poisoned argument list, and return (args, dRef).
+
+    Fills A and B with random data, then corrupts strideA[1] by +M so the
+    kernel reads from the wrong row offset — proving the args drive computation.
+    """
+    rng = np.random.default_rng(seed=999)
+    A_np = np.asfortranarray(rng.random((M, K)).astype(np.float32))
+    B_np = np.asfortranarray(rng.random((N, K)).astype(np.float32))
+    A_buf = np.tile(A_np.ravel(order='F'), batch)
+    B_buf = np.tile(B_np.ravel(order='F'), batch)
+    C_buf = np.zeros(M * N * batch, dtype=np.float32)
+    D_poison = np.zeros(M * N * batch, dtype=np.float32)
+    dRef = (A_np.astype(np.float64) @ B_np.T.astype(np.float64)).astype(np.float32)
+    D_io = amdgpu_exec.InOutArray(D_poison)
+    C_in = amdgpu_exec.InputArray(C_buf)
+    A_in = amdgpu_exec.InputArray(A_buf)
+    B_in = amdgpu_exec.InputArray(B_buf)
+    args = _buildNtTypedArgs(solDict, M, N, batch, K, D_io, C_in, A_in, B_in, 1.0, 0.0)
+    args = _corruptStrideA1(args, M)
+    return args, dRef
+
+
 @requires_gfx950
 @pytest.mark.parametrize("size", [(256, 256, 4, 256)], ids=["M256N256B4K256"])
 def test_buildKernelArgs_poison(fp32Kernels, size):
@@ -813,31 +834,12 @@ def test_buildKernelArgs_poison(fp32Kernels, size):
     num_wg = math.ceil(M / sol_dict["MacroTile0"]) * math.ceil(N / sol_dict["MacroTile1"]) * batch
     num_threads = sol_dict["NumThreads"]
 
-    rng = np.random.default_rng(seed=999)
-    A_np = np.asfortranarray(rng.random((M, K)).astype(np.float32))
-    B_np = np.asfortranarray(rng.random((N, K)).astype(np.float32))
-
-    # Replicate to batch using the correct strided layout (consecutive Fortran M×K matrices).
-    A_buf = np.tile(A_np.ravel(order='F'), batch)
-    B_buf = np.tile(B_np.ravel(order='F'), batch)
-    C_buf = np.zeros(M * N * batch, dtype=np.float32)
-    D_poison = np.zeros(M * N * batch, dtype=np.float32)
-
-    alpha, beta = 1.0, 0.0
-    D_ref = (A_np.astype(np.float64) @ B_np.T.astype(np.float64)).astype(np.float32)
+    args, dRef = _allocPoisonRun(sol_dict, M, N, batch, K)
 
     result_holder = {}
 
     def capture(arguments):
         result_holder["D_gpu"] = np.asarray(arguments[8].array, dtype=np.float32).copy()
-
-    # Build CORRECT args, then corrupt strideA[1] (lda).
-    D_io = amdgpu_exec.InOutArray(D_poison)
-    C_in = amdgpu_exec.InputArray(C_buf)
-    A_in = amdgpu_exec.InputArray(A_buf)
-    B_in = amdgpu_exec.InputArray(B_buf)
-    args = _buildNtTypedArgs(sol_dict, M, N, batch, K, D_io, C_in, A_in, B_in, alpha, beta)
-    args = _corruptStrideA1(args, M)
 
     amdgpu_exec.execute_hsaco(
         hsaco=hsaco, kernel_name=kernel_name, arguments=args,
@@ -845,11 +847,8 @@ def test_buildKernelArgs_poison(fp32Kernels, size):
         num_iterations=1, verify_fn=capture,
     )
 
-    D_gpu = result_holder["D_gpu"]
-    # Reference uses the first batch element's slice.
-    D_ref_first = D_ref.ravel(order="F")
-    D_gpu_first = D_gpu[: M * N]
-    _assertPoisonDetected(D_gpu_first, D_ref_first, RTOL_FP32, "poison test")
+    gpuOut = result_holder["D_gpu"][: M * N]
+    _assertPoisonDetected(gpuOut, dRef.ravel(order="F"), RTOL_FP32, "poison")
 
 
 # ---------------------------------------------------------------------------
