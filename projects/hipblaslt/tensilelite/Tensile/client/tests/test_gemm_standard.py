@@ -35,7 +35,7 @@ except ImportError:
     ml_dtypes = None
     HAVE_DEPS = False
 
-from .conftest import HAVE_DEPS as CONFTEST_HAVE_DEPS, requires_gfx950
+from .conftest import requires_gfx950
 
 # ---------------------------------------------------------------------------
 # Module-level paths
@@ -71,12 +71,6 @@ from epilogues.epilogue_harness.yaml_solution_builder import _injectInternalArgs
 # ---------------------------------------------------------------------------
 # Problem group indices in gemm_standard.yaml.
 # ---------------------------------------------------------------------------
-
-_PROBLEM_IDX = {
-    np.float32: 0,
-    "fp16": 1,
-    "bf16": 2,
-}
 
 # Problem sizes: (M, N, batch, K)
 _PROBLEM_SIZES = [
@@ -766,6 +760,39 @@ def bf16Kernels():
 # Task 1.2b — Poison-input test (GPU required).
 # ---------------------------------------------------------------------------
 
+
+def _corruptStrideA1(argList, M):
+    """Corrupt strideA[1] (lda) in the typed argument list and return it.
+
+    Layout: header(2 or 4) + sizes(4) + ptrs(4) = 10 or 12 args before strides.
+    strideA[0] = lda = M; the first element of the A-stride pair, located after
+    header, sizes, ptrs, 2 D-stride args (ldd, stride_d), 2 C-stride args (ldc, stride_c).
+    Offset: header_n + 4 (sizes) + 4 (ptrs) + 2 (D: ldd, stride_d) + 2 (C: ldc, stride_c)
+          = header_n + 12.
+    Uses strideA[1] rather than strideA[0] so the batch-stride position is not affected.
+    Infers header_n from list length: total = header_n + 18 (sizes+ptrs+strides+scalars).
+    """
+    header_n = len(argList) - 18  # header + 4 sizes + 4 ptrs + 8 strides + 2 scalars = 18
+    stride_a1_idx = header_n + 4 + 4 + 4  # header + sizes + ptrs + D-strides + C-strides
+    original = argList[stride_a1_idx]
+    argList[stride_a1_idx] = np.uint32(int(original) + M)
+    return argList
+
+
+def _assertPoisonDetected(gpuOut, refOut, rtol, label):
+    """Assert that >= 50% of elements in gpuOut differ from refOut by more than 10 * rtol.
+
+    Raises AssertionError with label if poison was not detected, proving that argument
+    corruption caused computation errors.
+    """
+    bad = np.abs(gpuOut - refOut) > 10 * rtol * (np.abs(refOut) + 1)
+    bad_frac = bad.sum() / bad.size
+    assert bad_frac >= 0.5, (
+        f"{label}: only {bad_frac:.1%} elements corrupted — "
+        "argument vector may not be driving computation"
+    )
+
+
 @requires_gfx950
 @pytest.mark.parametrize("size", [(256, 256, 4, 256)], ids=["M256N256B4K256"])
 def test_buildKernelArgs_poison(fp32Kernels, size):
@@ -783,15 +810,12 @@ def test_buildKernelArgs_poison(fp32Kernels, size):
     sol_dict = entry["sol_dict"]
     kernel_name = entry["kernel_name"]
     hsaco = entry["hsaco"]
-    mt0 = sol_dict["MacroTile0"]
-    mt1 = sol_dict["MacroTile1"]
-    num_wg = math.ceil(M / mt0) * math.ceil(N / mt1) * batch
+    num_wg = math.ceil(M / sol_dict["MacroTile0"]) * math.ceil(N / sol_dict["MacroTile1"]) * batch
     num_threads = sol_dict["NumThreads"]
 
     rng = np.random.default_rng(seed=999)
     A_np = np.asfortranarray(rng.random((M, K)).astype(np.float32))
     B_np = np.asfortranarray(rng.random((N, K)).astype(np.float32))
-    C_np = np.asfortranarray(np.zeros((M, N), dtype=np.float32))
 
     # Replicate to batch using the correct strided layout (consecutive Fortran M×K matrices).
     A_buf = np.tile(A_np.ravel(order='F'), batch)
@@ -800,7 +824,6 @@ def test_buildKernelArgs_poison(fp32Kernels, size):
     D_poison = np.zeros(M * N * batch, dtype=np.float32)
 
     alpha, beta = 1.0, 0.0
-    # Reference (correct).
     D_ref = (A_np.astype(np.float64) @ B_np.T.astype(np.float64)).astype(np.float32)
 
     result_holder = {}
@@ -813,47 +836,20 @@ def test_buildKernelArgs_poison(fp32Kernels, size):
     C_in = amdgpu_exec.InputArray(C_buf)
     A_in = amdgpu_exec.InputArray(A_buf)
     B_in = amdgpu_exec.InputArray(B_buf)
-
-    args = _buildNtTypedArgs(sol_dict, M, N, batch, K,
-                             D_io, C_in, A_in, B_in, alpha, beta)
-
-    # Layout: header(2 or 4) + sizes(4) + ptrs(4) = 10 or 12 args before strides.
-    # strideA[0] = lda = M; the first element of the A-stride pair, located after
-    # header, sizes, ptrs, 2 D-stride args (ldd, stride_d), 2 C-stride args (ldc, stride_c).
-    # Offset: header_n + 4 (sizes) + 4 (ptrs) + 2 (D: ldd, stride_d) + 2 (C: ldc, stride_c)
-    #       = header_n + 12.
-    version = sol_dict.get("KernArgsVersion", 0)
-    header_n = 2 + (2 if version >= 1 else 0)  # gemm_count, arg0, [arg1, numWG]
-    stride_a1_idx = header_n + 4 + 4 + 4   # header + sizes + ptrs + D-strides + C-strides
-
-    # Original strideA[1] = M.
-    # Corrupt by adding M so the kernel reads A from wrong positions.
-    original_lda = args[stride_a1_idx]
-    corrupted_lda = np.uint32(int(original_lda) + M)
-    args[stride_a1_idx] = corrupted_lda
+    args = _buildNtTypedArgs(sol_dict, M, N, batch, K, D_io, C_in, A_in, B_in, alpha, beta)
+    args = _corruptStrideA1(args, M)
 
     amdgpu_exec.execute_hsaco(
-        hsaco=hsaco,
-        kernel_name=kernel_name,
-        arguments=args,
-        grid_dim=(num_wg, 1, 1),
-        block_dim=(num_threads, 1, 1),
-        num_iterations=1,
-        verify_fn=capture,
+        hsaco=hsaco, kernel_name=kernel_name, arguments=args,
+        grid_dim=(num_wg, 1, 1), block_dim=(num_threads, 1, 1),
+        num_iterations=1, verify_fn=capture,
     )
 
     D_gpu = result_holder["D_gpu"]
-
     # Reference uses the first batch element's slice.
     D_ref_first = D_ref.ravel(order="F")
     D_gpu_first = D_gpu[: M * N]
-
-    bad = np.abs(D_gpu_first - D_ref_first) > 10 * RTOL_FP32 * (np.abs(D_ref_first) + 1)
-    bad_frac = bad.sum() / bad.size
-    assert bad_frac >= 0.5, (
-        f"poison test: only {bad_frac:.1%} elements corrupted — "
-        "argument vector may not be driving computation"
-    )
+    _assertPoisonDetected(D_gpu_first, D_ref_first, RTOL_FP32, "poison test")
 
 
 # ---------------------------------------------------------------------------
@@ -994,6 +990,24 @@ def _buildPtrBatchArgList(sol_dict: dict, M: int, N: int, batch: int, K: int,
     return args
 
 
+def _verifyPtrBatchResult(dBufs, refOutputs, nBufs, dtype, rtol, atol):
+    """Copy the first nBufs GpuBuffers to host and compare against refOutputs.
+
+    Any mismatch raises AssertionError with a descriptive message.
+    """
+    for i in range(nBufs):
+        D_result = np.zeros(refOutputs[i].shape, dtype=dtype, order="F")
+        dBufs[i].copy_to_host(D_result)
+        if dtype == np.float32:
+            gpu_flat = D_result.ravel(order="F")
+            ref_flat = refOutputs[i].ravel(order="F")
+        else:
+            gpu_flat = np.asarray(D_result, dtype=np.float32).ravel(order="F")
+            ref_flat = np.asarray(refOutputs[i], dtype=np.float32).ravel(order="F")
+        assertClose(gpu_flat, ref_flat, rtol=rtol, atol=atol,
+                    label=f"ptr-batch element {i}")
+
+
 def _runPtrBatch(entry: dict, M: int, N: int, batch: int, K: int,
                  np_dtype, ref_fn, rtol: float, atol: float, label: str):
     """Execute a pointer-array-batch GEMM kernel and verify output.
@@ -1028,19 +1042,8 @@ def _runPtrBatch(entry: dict, M: int, N: int, batch: int, K: int,
     stop.record()
     stop.synchronize()
 
-    D_result = np.zeros((M, N), dtype=np_dtype, order="F")
-    D_bufs[0].copy_to_host(D_result)
     D_ref_b0 = ref_fn(A_nps[0], B_nps[0].T, 1.0, 0.0, None)
-
-    if np_dtype == np.float32:
-        assertClose(D_result.ravel(order="F"), D_ref_b0.ravel(order="F"),
-                    rtol=rtol, atol=atol, label=label)
-    else:
-        assertClose(
-            np.asarray(D_result, dtype=np.float32).ravel(order="F"),
-            np.asarray(D_ref_b0, dtype=np.float32).ravel(order="F"),
-            rtol=rtol, atol=atol, label=label,
-        )
+    _verifyPtrBatchResult(D_bufs, [D_ref_b0], 1, np_dtype, rtol, atol)
 
     for buf in A_bufs + B_bufs + C_bufs + D_bufs + [pD_buf, pC_buf, pA_buf, pB_buf]:
         buf.free()
