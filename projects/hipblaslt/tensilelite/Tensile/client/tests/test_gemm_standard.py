@@ -593,6 +593,8 @@ def _filterSolution(entry: dict, strided_batched: bool) -> bool:
     """Return True if the solution should be used for this strided_batched setting.
 
     Also implements the M1 kernel filter (skip auto-WGM and auto-StaggerU).
+    Kernels compiled with StridedBatched=True support both batch modes at
+    runtime via the arg_type field in gemm_count, so no filtering on that flag.
     """
     sol_dict = entry["sol_dict"]
     raw_dict = entry["raw_dict"]
@@ -602,9 +604,6 @@ def _filterSolution(entry: dict, strided_batched: bool) -> bool:
 
     isp = raw_dict.get("InternalSupportParams", {}) or {}
     if sol_dict.get("StaggerU", 0) == 0 and isp.get("SupportCustomStaggerU", False):
-        return False
-
-    if bool(sol_dict.get("StridedBatched", True)) != strided_batched:
         return False
 
     return True
@@ -652,6 +651,35 @@ def _buildNtTypedArgs(sol_dict: dict, M: int, N: int, batch: int, K: int,
     return args
 
 
+def _allocStrideArrays(M: int, N: int, K: int, batch: int, np_dtype, rng):
+    """Allocate flat Fortran-order numpy buffers for a batched strided GEMM.
+
+    Returns (A_buf_np, B_buf_np, C_buf_np, D_buf_np).
+    A is (M*batch, K) Fortran; B is (N*batch, K) Fortran; C/D are flat M*N*batch.
+    """
+    A_np = np.asfortranarray(rng.random((M, K)).astype(np_dtype))
+    B_np = np.asfortranarray(rng.random((N, K)).astype(np_dtype))
+    A_bat = np.stack([A_np] * batch, axis=0)
+    B_bat = np.stack([B_np] * batch, axis=0)
+    C_bat = np.zeros((batch, M, N), dtype=np_dtype)
+    A_buf_np = np.asfortranarray(A_bat.reshape(batch * M, K))
+    B_buf_np = np.asfortranarray(B_bat.reshape(batch * N, K))
+    C_buf_np = np.asfortranarray(C_bat.reshape(batch, M * N).T.reshape(M * N * batch))
+    D_buf_np = np.zeros(M * N * batch, dtype=np_dtype)
+    return A_buf_np, B_buf_np, C_buf_np, D_buf_np
+
+
+def _stridedBatchRef(A_buf_np, B_buf_np, batch: int, M: int, N: int,
+                     ref_fn, alpha: float, beta: float):
+    """Compute the batched NT GEMM reference, returning a flat Fortran-order array."""
+    per_batch = []
+    for b in range(batch):
+        A_b = A_buf_np[b * M:(b + 1) * M, :]
+        B_b = B_buf_np[b * N:(b + 1) * N, :]
+        per_batch.append(ref_fn(A_b, B_b.T, alpha, beta, None))
+    return np.concatenate([np.asfortranarray(d).ravel(order="F") for d in per_batch])
+
+
 def _runStridedBatched(entry: dict, M: int, N: int, batch: int, K: int,
                        np_dtype, ref_fn, rtol: float, atol: float, label: str):
     """Execute one stridedBatched GEMM kernel and verify output against reference.
@@ -662,77 +690,32 @@ def _runStridedBatched(entry: dict, M: int, N: int, batch: int, K: int,
     sol_dict = entry["sol_dict"]
     kernel_name = entry["kernel_name"]
     hsaco = entry["hsaco"]
-    mt0 = sol_dict["MacroTile0"]
-    mt1 = sol_dict["MacroTile1"]
-    num_wg = math.ceil(M / mt0) * math.ceil(N / mt1) * batch
+    num_wg = math.ceil(M / sol_dict["MacroTile0"]) * math.ceil(N / sol_dict["MacroTile1"]) * batch
     num_threads = sol_dict["NumThreads"]
+    alpha, beta = 1.0, 0.0
 
     rng = np.random.default_rng(seed=M * 1000 + N + K)
-
-    # For NT GEMM: A is (M, K) Fortran, B is (N, K) Fortran.
-    A_np = np.asfortranarray(rng.random((M, K)).astype(np_dtype))
-    B_np = np.asfortranarray(rng.random((N, K)).astype(np_dtype))
-    C_np = np.asfortranarray(np.zeros((M, N), dtype=np_dtype))
-    D_np = np.asfortranarray(np.zeros((M, N), dtype=np_dtype))
-
-    # Batched: replicate A, B, C, D along batch dimension.
-    A_bat = np.stack([A_np] * batch, axis=0)  # (batch, M, K), Fortran order later
-    B_bat = np.stack([B_np] * batch, axis=0)  # (batch, N, K)
-    C_bat = np.zeros((batch, M, N), dtype=np_dtype)
-    D_bat = np.zeros((batch, M, N), dtype=np_dtype)
-
-    # For batched Fortran layout: element [b,i,j] → linear index i + j*M + b*M*N.
-    # numpy uses C order by default; convert batched arrays to Fortran order.
-    A_buf_np = np.asfortranarray(A_bat.reshape(batch * M, K))
-    B_buf_np = np.asfortranarray(B_bat.reshape(batch * N, K))
-    C_buf_np = np.asfortranarray(C_bat.reshape(batch, M * N).T.reshape(M * N * batch))
-    D_buf_np = np.zeros(M * N * batch, dtype=np_dtype)
-
-    alpha, beta = 1.0, 0.0
-    D_out = np.zeros(M * N * batch, dtype=np_dtype)
+    A_buf_np, B_buf_np, C_buf_np, D_buf_np = _allocStrideArrays(M, N, K, batch, np_dtype, rng)
 
     result_holder = {}
 
     def capture(arguments):
-        # D is the first output array in the args; index = 8 (after header/sizes).
-        d_raw = np.asarray(arguments[8].array, dtype=np_dtype).copy()
-        result_holder["D_gpu"] = d_raw
+        # D is the first output array in the args; index 8 is after header + sizes.
+        result_holder["D_gpu"] = np.asarray(arguments[8].array, dtype=np_dtype).copy()
 
-    # Build args using InputArray/InOutArray wrappers.
     D_inout = amdgpu_exec.InOutArray(D_buf_np)
     C_in = amdgpu_exec.InputArray(C_buf_np)
     A_in = amdgpu_exec.InputArray(A_buf_np)
     B_in = amdgpu_exec.InputArray(B_buf_np)
-
-    args = _buildNtTypedArgs(sol_dict, M, N, batch, K,
-                             D_inout, C_in, A_in, B_in, alpha, beta)
-
+    args = _buildNtTypedArgs(sol_dict, M, N, batch, K, D_inout, C_in, A_in, B_in, alpha, beta)
     amdgpu_exec.execute_hsaco(
-        hsaco=hsaco,
-        kernel_name=kernel_name,
-        arguments=args,
-        grid_dim=(num_wg, 1, 1),
-        block_dim=(num_threads, 1, 1),
-        num_iterations=1,
-        verify_fn=capture,
+        hsaco=hsaco, kernel_name=kernel_name, arguments=args,
+        grid_dim=(num_wg, 1, 1), block_dim=(num_threads, 1, 1),
+        num_iterations=1, verify_fn=capture,
     )
 
     D_gpu = result_holder["D_gpu"]
-
-    # Reference: NT GEMM → D = alpha * A @ B.T + beta * C.
-    D_ref_per_batch = []
-    for b in range(batch):
-        # Extract per-batch slices from the Fortran-linearized buffer.
-        A_b = A_buf_np[b * M:(b + 1) * M, :]  # (M, K) Fortran
-        B_b = B_buf_np[b * N:(b + 1) * N, :]  # (N, K) Fortran
-        D_b_ref = ref_fn(A_b, B_b.T, alpha, beta, None)
-        D_ref_per_batch.append(D_b_ref)
-
-    # Stack reference into the same flat Fortran layout.
-    D_ref_flat = np.concatenate([
-        np.asfortranarray(d).ravel(order="F") for d in D_ref_per_batch
-    ])
-
+    D_ref_flat = _stridedBatchRef(A_buf_np, B_buf_np, batch, M, N, ref_fn, alpha, beta)
     assertClose(D_gpu, D_ref_flat, rtol=rtol, atol=atol, label=label)
 
 
@@ -813,13 +796,14 @@ def test_buildKernelArgs_poison(fp32Kernels, size):
     args = _buildNtTypedArgs(sol_dict, M, N, batch, K,
                              D_io, C_in, A_in, B_in, alpha, beta)
 
-    # The stride layout in args: header(2 or 4) + sizes(4) + ptrs(4) = 10 or 12 args.
-    # strideA[1] = lda = M; located at the 3rd stride pair (after D, C strides).
-    # Offset in args list: header_n + 4 (sizes) + 4 (ptrs) + 4 (D strides) + 4 (C strides)
-    #                    = header_n + 12
+    # Layout: header(2 or 4) + sizes(4) + ptrs(4) = 10 or 12 args before strides.
+    # strideA[0] = lda = M; the first element of the A-stride pair, located after
+    # header, sizes, ptrs, 2 D-stride args (ldd, stride_d), 2 C-stride args (ldc, stride_c).
+    # Offset: header_n + 4 (sizes) + 4 (ptrs) + 2 (D: ldd, stride_d) + 2 (C: ldc, stride_c)
+    #       = header_n + 12.
     version = sol_dict.get("KernArgsVersion", 0)
     header_n = 2 + (2 if version >= 1 else 0)  # gemm_count, arg0, [arg1, numWG]
-    stride_a1_idx = header_n + 4 + 4 + 4   # after header, sizes, ptrs, D-strides, C-strides
+    stride_a1_idx = header_n + 4 + 4 + 4   # header + sizes + ptrs + D-strides + C-strides
 
     # Original strideA[1] = M.
     # Corrupt by adding M so the kernel reads A from wrong positions.
@@ -939,101 +923,92 @@ def test_bf16_strided_batched(bf16Kernels, size):
 # stridedBatched=False (pointer-array batch) correctness tests.
 # ---------------------------------------------------------------------------
 
-def _runPtrBatch(entry: dict, M: int, N: int, batch: int, K: int,
-                 np_dtype, ref_fn, rtol: float, atol: float, label: str):
-    """Execute a pointer-array-batch GEMM kernel and verify output.
+def _allocPtrBufs(M: int, N: int, K: int, batch: int, np_dtype, rng):
+    """Allocate per-element numpy arrays and GPU buffers for pointer-array batch GEMM.
 
-    Each batch element has its own device buffer; a device buffer of pointers
-    is built manually and passed as a void* to the kernel.
+    Returns (A_nps, B_nps, C_nps, A_bufs, B_bufs, C_bufs, D_bufs).
     """
-    from amdgpu_exec import GpuModule, GpuBuffer, GpuEvent, GpuStream
-
-    sol_dict = entry["sol_dict"]
-    kernel_name = entry["kernel_name"]
-    hsaco = entry["hsaco"]
-    mt0 = sol_dict["MacroTile0"]
-    mt1 = sol_dict["MacroTile1"]
-    num_wg = math.ceil(M / mt0) * math.ceil(N / mt1) * batch
-    num_threads = sol_dict["NumThreads"]
-
-    item = np.dtype(np_dtype).itemsize
-    rng = np.random.default_rng(seed=M * 2000 + N + K)
-
+    from amdgpu_exec import GpuBuffer
     A_nps, B_nps, C_nps = [], [], []
     A_bufs, B_bufs, C_bufs, D_bufs = [], [], [], []
-
-    for b in range(batch):
+    for _ in range(batch):
         A_b = np.asfortranarray(rng.random((M, K)).astype(np_dtype))
         B_b = np.asfortranarray(rng.random((N, K)).astype(np_dtype))
         C_b = np.asfortranarray(np.zeros((M, N), dtype=np_dtype))
         D_b = np.asfortranarray(np.zeros((M, N), dtype=np_dtype))
-
         A_nps.append(A_b); B_nps.append(B_b); C_nps.append(C_b)
-
         a_buf = GpuBuffer(A_b.nbytes); a_buf.copy_from_host(A_b); A_bufs.append(a_buf)
         b_buf = GpuBuffer(B_b.nbytes); b_buf.copy_from_host(B_b); B_bufs.append(b_buf)
         c_buf = GpuBuffer(C_b.nbytes); c_buf.copy_from_host(C_b); C_bufs.append(c_buf)
         d_buf = GpuBuffer(D_b.nbytes); d_buf.memset(0); D_bufs.append(d_buf)
+    return A_nps, B_nps, C_nps, A_bufs, B_bufs, C_bufs, D_bufs
 
-    # Build pointer arrays on the device.
-    def makeDevPtrBuf(gpu_bufs):
-        ptrs = np.array([buf.ptr_value for buf in gpu_bufs], dtype=np.uint64)
-        dev = GpuBuffer(ptrs.nbytes)
-        dev.copy_from_host(ptrs)
-        return dev
 
-    pD_buf = makeDevPtrBuf(D_bufs)
-    pC_buf = makeDevPtrBuf(C_bufs)
-    pA_buf = makeDevPtrBuf(A_bufs)
-    pB_buf = makeDevPtrBuf(B_bufs)
-
+def _buildPtrBatchArgList(sol_dict: dict, M: int, N: int, batch: int, K: int,
+                          pD_buf, pC_buf, pA_buf, pB_buf) -> list:
+    """Build the typed argument list for a pointer-array batch kernel launch."""
     version = sol_dict.get("KernArgsVersion", 0)
     arg0 = _computeInternalArg0(sol_dict, gsu=1)
-    num_wg_val = math.ceil(M / mt0) * math.ceil(N / mt1) * batch
-
-    # argType=3 for pointer-array batch.
+    num_wg_val = math.ceil(M / sol_dict["MacroTile0"]) * math.ceil(N / sol_dict["MacroTile1"]) * batch
+    # argType=3 selects the pointer-array batch path in the kernel.
     gemm_count = (1 & 0x3FFFFFFF) | (3 << 30)
-
     args: list = [np.uint32(gemm_count), np.uint32(arg0)]
     if version >= 1:
-        arg1 = _computeInternalArg1(sol_dict)
-        args.append(np.int32(arg1))
+        args.append(np.int32(_computeInternalArg1(sol_dict)))
         args.append(np.uint32(num_wg_val))
-
     args.extend([np.uint32(M), np.uint32(N), np.uint32(batch), np.uint32(K)])
-
-    # Device pointer of each pointer-array buffer.
     args.extend([
         ctypes.c_void_p(pD_buf.ptr_value),
         ctypes.c_void_p(pC_buf.ptr_value),
         ctypes.c_void_p(pA_buf.ptr_value),
         ctypes.c_void_p(pB_buf.ptr_value),
     ])
-
-    # For pointer-array batch: leading-dimension strides only (batch stride=0).
+    # Pointer-array batch: leading-dimension strides only; batch stride is zero.
     lda, ldb, ldd, ldc = M, N, M, M
     args.extend([
-        np.uint32(ldd), np.uint32(0),
-        np.uint32(ldc), np.uint32(0),
-        np.uint32(lda), np.uint32(0),
-        np.uint32(ldb), np.uint32(0),
+        np.uint32(ldd), np.uint32(0), np.uint32(ldc), np.uint32(0),
+        np.uint32(lda), np.uint32(0), np.uint32(ldb), np.uint32(0),
     ])
-
     args.extend([np.float32(1.0), np.float32(0.0)])
+    return args
 
-    module = GpuModule(hsaco)
-    fn = module.get_function(kernel_name)
 
+def _runPtrBatch(entry: dict, M: int, N: int, batch: int, K: int,
+                 np_dtype, ref_fn, rtol: float, atol: float, label: str):
+    """Execute a pointer-array-batch GEMM kernel and verify output.
+
+    Each batch element has its own device buffer; a device buffer of pointers
+    is passed to the kernel, which selects the pointer-array path via arg_type=3.
+    """
+    from amdgpu_exec import GpuModule, GpuBuffer, GpuEvent
+
+    sol_dict = entry["sol_dict"]
+    num_wg = math.ceil(M / sol_dict["MacroTile0"]) * math.ceil(N / sol_dict["MacroTile1"]) * batch
+    num_threads = sol_dict["NumThreads"]
+    rng = np.random.default_rng(seed=M * 2000 + N + K)
+    A_nps, B_nps, C_nps, A_bufs, B_bufs, C_bufs, D_bufs = _allocPtrBufs(
+        M, N, K, batch, np_dtype, rng
+    )
+
+    def makeDevPtrBuf(gpu_bufs):
+        ptrs = np.array([buf.ptr_value for buf in gpu_bufs], dtype=np.uint64)
+        dev = GpuBuffer(ptrs.nbytes)
+        dev.copy_from_host(ptrs)
+        return dev
+
+    pD_buf, pC_buf = makeDevPtrBuf(D_bufs), makeDevPtrBuf(C_bufs)
+    pA_buf, pB_buf = makeDevPtrBuf(A_bufs), makeDevPtrBuf(B_bufs)
+    args = _buildPtrBatchArgList(sol_dict, M, N, batch, K, pD_buf, pC_buf, pA_buf, pB_buf)
+
+    module = GpuModule(entry["hsaco"])
+    fn = module.get_function(entry["kernel_name"])
     stop = GpuEvent()
     fn.launch((num_wg, 1, 1), (num_threads, 1, 1), args)
     stop.record()
     stop.synchronize()
 
-    # Read back D from device per batch element.
     D_result = np.zeros((M, N), dtype=np_dtype, order="F")
     D_bufs[0].copy_to_host(D_result)
-
-    # Reference for batch element 0.
     D_ref_b0 = ref_fn(A_nps[0], B_nps[0].T, 1.0, 0.0, None)
 
     if np_dtype == np.float32:
@@ -1046,7 +1021,6 @@ def _runPtrBatch(entry: dict, M: int, N: int, batch: int, K: int,
             rtol=rtol, atol=atol, label=label,
         )
 
-    # Free device buffers explicitly.
     for buf in A_bufs + B_bufs + C_bufs + D_bufs + [pD_buf, pC_buf, pA_buf, pB_buf]:
         buf.free()
     module.unload()

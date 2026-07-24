@@ -189,6 +189,10 @@ def _computeInternalArg1(solutionParams: dict) -> int:
 
     Returns a value that fits in int32 (signed). Mirrors the C++ kernelArgs
     internalArg1 assembly for version 1 and version 2 (useSFC=False).
+
+    Caller must supply explicit WorkGroupMappingXCC and WorkGroupMappingXCCGroup
+    values from the solution YAML; the C++ sizeMapping defaults differ from 0, so
+    kernels without these keys in YAML may produce wrong internalArg1.
     """
     version = solutionParams.get("KernArgsVersion", 0)
     supportWgm = solutionParams.get("SupportCustomWGM", False)
