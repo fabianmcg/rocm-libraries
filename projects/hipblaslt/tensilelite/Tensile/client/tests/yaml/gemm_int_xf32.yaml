@@ -1,0 +1,138 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+################################################################################
+# gemm_int_xf32: Int8 and XFloat32 GEMM (NT, batched) for M2 client tests.
+#
+# Three BenchmarkProblems groups (gfx950 only):
+#   0: int8 in / int32 out (I8II_S) NT batched, HPA
+#   1: int8 in / int8 out  (I8I8S)  NT batched, HPA
+#   2: float32 in / float32 out XFloat32 (SSSX) NT batched
+#
+# MacroTile: 32x32 for int8 groups (MI [32,32,32,1,1,1,1,1,1]).
+#            64x64 for XFloat32   (MI [16,16,32,1,1,2,2,2,2]).
+#
+# All groups use default StaggerU (32) so the M2 kernel filter passes
+# (filter skips kernels with StaggerU==0 and SupportCustomStaggerU==True).
+# WorkGroupMapping=4 is explicit and non-zero so the WGM filter also passes.
+# GlobalSplitU=1 to stay within the M1-M5 supported configuration subset.
+################################################################################
+GlobalParameters:
+  SyncsPerBenchmark: 0
+  MinimumRequiredVersion: 5.0.0
+  NumElementsToValidate: 128
+  DataInitTypeBeta: 0
+  DataInitTypeAlpha: 1
+  Device: 0
+
+BenchmarkProblems:
+  ##############################################################################
+  # Group 0: int8 in / int32 out (I8II_S) NT batched, HPA
+  # DataType I8, DestDataType I (int32), ComputeDataType s (float32), HPA=True.
+  # TransposeA=False, TransposeB=True -> NT GEMM.
+  # MI [32,32,32,1,...] uses v_mfma_i32_32x32x32_i8 (valid on gfx950).
+  ##############################################################################
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: I8
+      DestDataType: I
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: False
+      TransposeB: True
+      UseBeta: True
+      Batched: True
+      UseBias: 0
+    - # BenchmarkProblemSizeGroup
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [32, 32, 32, 1, 1, 1, 1, 1, 1]
+        - DepthU: [32]
+        - GlobalSplitU: [1]
+        - WorkGroupMapping: [4]
+        - SourceSwap: [True]
+        - PrefetchGlobalRead: [1]
+        - PrefetchLocalRead: [1]
+        - ScheduleIterAlg: [3]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [256, 256, 4, 256]
+          - Exact: [512, 512, 4, 512]
+
+  ##############################################################################
+  # Group 1: int8 in / int8 out (I8I8S) NT batched, HPA
+  # DataType I8, DestDataType I8, ComputeDataType s (float32), HPA=True.
+  # Kernel applies SaturateCast (nearbyint + clip to [-128,127]) internally.
+  ##############################################################################
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: I8
+      DestDataType: I8
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: False
+      TransposeB: True
+      UseBeta: True
+      Batched: True
+      UseBias: 0
+    - # BenchmarkProblemSizeGroup
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [32, 32, 32, 1, 1, 1, 1, 1, 1]
+        - DepthU: [32]
+        - GlobalSplitU: [1]
+        - WorkGroupMapping: [4]
+        - SourceSwap: [True]
+        - PrefetchGlobalRead: [1]
+        - PrefetchLocalRead: [1]
+        - ScheduleIterAlg: [3]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [256, 256, 4, 256]
+          - Exact: [512, 512, 4, 512]
+
+  ##############################################################################
+  # Group 2: XFloat32 (F32XdlMathOp=X, SSSX) NT batched
+  # DataType S (float32), DestDataType S, F32XdlMathOp X.
+  # MI [16,16,32,...] uses v_mfma_f32_16x16x32_xf32 (gfx950 only).
+  ##############################################################################
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: S
+      DestDataType: S
+      ComputeDataType: S
+      F32XdlMathOp: X
+      TransposeA: False
+      TransposeB: True
+      UseBeta: True
+      Batched: True
+      UseBias: 0
+    - # BenchmarkProblemSizeGroup
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 32, 1, 1, 2, 2, 2, 2]
+        - DepthU: [32]
+        - GlobalSplitU: [1]
+        - WorkGroupMapping: [4]
+        - SourceSwap: [True]
+        - PrefetchGlobalRead: [1]
+        - PrefetchLocalRead: [1]
+        - ScheduleIterAlg: [3]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [256, 256, 4, 256]
+          - Exact: [1024, 1024, 4, 1024]

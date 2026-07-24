@@ -31,6 +31,12 @@ from __future__ import annotations
 import math
 import struct
 
+# Integer codes from rocisa::DataType enum (enum.hpp).
+_DTYPE_HALF: int = 4     # rocisa::DataType::Half
+_DTYPE_INT32: int = 6    # rocisa::DataType::Int32
+_DTYPE_INT8: int = 8     # rocisa::DataType::Int8
+_DTYPE_XF32: int = 10    # rocisa::DataType::XFloat32
+
 
 def _validateConfig(solutionParams: dict, problemParams: dict) -> None:
     """Raise NotImplementedError for unsupported configurations."""
@@ -331,21 +337,63 @@ def _buildStrides(solutionParams: dict, problemParams: dict) -> bytes:
     return buf
 
 
+def _readComputeTypeCode(solutionParams: dict) -> int:
+    """Read ComputeDataType integer code from a solution dict.
+
+    Handles flat dicts (top-level ComputeDataType key, used in manually
+    constructed test dicts and tuning YAMLs) and compiled Solution dicts
+    (where the value lives in a nested ProblemType Mapping and may be a
+    DataType object with a .value attribute).
+    """
+    val = solutionParams.get("ComputeDataType")
+    if val is not None:
+        return int(val.value) if hasattr(val, "value") else int(val)
+    pt = solutionParams.get("ProblemType") or {}
+    val = pt.get("ComputeDataType") if pt else None
+    if val is None:
+        return 0
+    return int(val.value) if hasattr(val, "value") else int(val)
+
+
+def _readHPA(solutionParams: dict) -> bool:
+    """Read HighPrecisionAccumulate from a solution dict.
+
+    Handles both flat dicts and compiled Solution dicts (nested ProblemType).
+    """
+    if "HighPrecisionAccumulate" in solutionParams:
+        return bool(solutionParams["HighPrecisionAccumulate"])
+    pt = solutionParams.get("ProblemType") or {}
+    return bool(pt.get("HighPrecisionAccumulate", False)) if pt else False
+
+
 def _alphaTypeIsHalf(solutionParams: dict) -> bool:
     """Return True when alpha/beta must be packed as float16 (2-byte + alpha_2 slot).
 
     From ContractionSolution.cpp: the alpha_2/beta_2 slots appear only when
     alphaType == rocisa::DataType::Half. This equals the compute type, which is
     fp32 for HPA GEMM (the typical case) and fp16 only for non-HPA fp16 GEMM.
-    ComputeDataType 4 corresponds to rocisa::DataType::Half.
     """
-    if solutionParams.get("HighPrecisionAccumulate", False):
+    if _readHPA(solutionParams):
         return False
-    return int(solutionParams.get("ComputeDataType", 0)) == 4
+    return _readComputeTypeCode(solutionParams) == _DTYPE_HALF
 
 
-def _packScalar(value: float, isHalf: bool) -> bytes:
-    """Pack a scalar as float32 (4 bytes) or float16 + float16 duplicate (4 bytes total)."""
+def _alphaTypeIsInt32(solutionParams: dict) -> bool:
+    """Return True when alpha/beta must be packed as int32 (non-HPA int8 GEMM).
+
+    For int8 GEMM without HighPrecisionAccumulate, the compute type is Int32
+    and alpha/beta are packed as 4-byte signed integers, not floats.
+    """
+    if _readHPA(solutionParams):
+        return False
+    return _readComputeTypeCode(solutionParams) == _DTYPE_INT32
+
+
+def _packScalar(value: float, isHalf: bool, isInt32: bool = False) -> bytes:
+    """Pack a scalar as float32, float16+duplicate, or int32 (4 bytes in all cases)."""
+    if isInt32:
+        # Non-HPA int8 GEMM: alpha/beta are 4-byte signed integers.
+        return struct.pack("<i", int(round(value)))
     if not isHalf:
         return struct.pack("<f", float(value))
     # float16: 2-byte primary slot + 2-byte alpha_2/beta_2 duplicate slot.
@@ -357,12 +405,13 @@ def _packScalar(value: float, isHalf: bool) -> bytes:
 def _buildAlphaBeta(solutionParams: dict, problemParams: dict) -> bytes:
     """Pack alpha and (when useBeta=True) beta scalar slots."""
     isHalf = _alphaTypeIsHalf(solutionParams)
+    isInt32 = _alphaTypeIsInt32(solutionParams)
     alpha = float(problemParams.get("alpha", 1.0))
-    buf = _packScalar(alpha, isHalf)
+    buf = _packScalar(alpha, isHalf, isInt32)
 
     if solutionParams.get("UseBeta", True):
         beta = float(problemParams.get("beta", 0.0))
-        buf += _packScalar(beta, isHalf)
+        buf += _packScalar(beta, isHalf, isInt32)
     return buf
 
 
