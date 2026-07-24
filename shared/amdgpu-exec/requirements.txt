@@ -1,0 +1,17 @@
+cmake>=3.31.6
+ninja
+nanobind>=2.9
+setuptools>=70.2.0
+scikit-build-core>=0.10
+wheel
+pyright
+black
+pre-commit
+pytest
+
+typing_extensions>=4.12.2
+numpy>=2.1.0
+ml_dtypes>=0.5.0
+
+--extra-index-url https://rocm.nightlies.amd.com/whl-multi-arch/
+rocm[devel]==7.14.*

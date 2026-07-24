@@ -1,0 +1,13 @@
+/.kernels*/
+/.cache/
+*.hsaco*
+/.pytest_cache/
+*.pytest_cache*
+/.vscode/
+/__pycache__/
+*__pycache__*
+/build/
+.claude/
+/.venv/
+/wheelhouse/
+/.test/
