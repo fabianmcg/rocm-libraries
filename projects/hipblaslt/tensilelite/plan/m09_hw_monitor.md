@@ -27,10 +27,17 @@ verify the correct function name for the installed pyamdsmi version:
 ```python
 import pyamdsmi; print([x for x in dir(pyamdsmi) if "metric" in x.lower()])
 ```
-Pin the pyamdsmi version in `tox.ini` deps alongside `amdgpu_exec`. If `amdsmi_get_gpu_metrics`
-does not exist in the installed version, use `amdsmi_get_gpu_activity` or the equivalent
-available function and document the substitution. A `threading.Event` signals the benchmark
-window start/stop. No HIP API calls inside the thread. Matches `HardwareMonitor.cpp:38–60`.
+Pin the pyamdsmi version in `tox.ini` deps alongside `amdgpu_exec`. Resolve the metrics API via
+a **deterministic fallback chain** (do not silently pick whatever happens to be present):
+1. If `amdsmi_get_gpu_metrics` exists, use it.
+2. Otherwise (`AttributeError`), fall back to `amdsmi_get_gpu_activity`.
+3. Otherwise, log a warning and return zeros for all averaged fields — monitoring degrades to a
+   no-op rather than crashing.
+Document which function was selected. A `threading.Event` signals the benchmark window
+start/stop. No HIP API calls inside the thread. This **replicates the monitoring logic of**
+`HardwareMonitor.cpp:38–60` (verify line numbers against the current source). Note: Python
+threading semantics differ from C++ `std::thread`; the Python implementation is functionally
+equivalent but not byte-for-byte identical.
 
 **9.2 — Integrate into `KernelRunner`**
 `KernelRunner.run(..., hw_monitor=False)`: when `True`, wraps the benchmark window in a

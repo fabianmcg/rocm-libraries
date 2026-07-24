@@ -10,6 +10,15 @@
 Support grouped GEMM (correct dispatch path), sparse GEMM (2:4 metadata), and StreamK=4/5
 argument construction.
 
+**Scheduling (split milestone).** Only the grouped-GEMM workspace-size path (tasks 6.1 and 6.3,
+which consume `grouped_gemm_workspace_size`) depends on M10. The remaining tasks have no
+nanobind dependency and may run **after M5, in parallel with M7–M10**:
+- **M6-partial** (no M10 dependency): 6.2 grouped reference, 6.4 sparse 2:4 metadata, 6.5
+  StreamK=4/5 argument branches, and the pure-Python parts of 6.6.
+- **M6-full** (needs M10): 6.1 workspace-size binding and 6.3's use of it, plus the grouped
+  tests in 6.6 that require real workspace sizes.
+See the dependency graph in `review_protocol.md`.
+
 ### Tasks
 
 **6.0 — Dispatch path (pre-determined, no investigation needed)**
@@ -27,9 +36,9 @@ The universal-args top-level kernel argument layout (`ContractionSolution.cpp:20
 5. `argsPtr` (`void const*`): pointer to device workspace holding per-problem arg blobs
    (when `argType==HBM`). Each blob is a flat `singleCallArgs` output for one group,
    written into `inputs.ws[0 .. requiredHostWorkspaceSizePerProblem * N)`. Line 2052.
-6. `Synchronizer` (`void const*`): `inputs.grouped[0].Synchronizer`. Line 2080.
+6. `Synchronizer` (`void const*`): `inputs.grouped[0].Synchronizer`. Line 2091.
 7. `Workspace` (`void const*`): `inputs.ws + requiredHostWorkspaceSizePerProblem * N`.
-   Lines 2081–2083.
+   Lines 2092–2094.
 
 The device workspace must be allocated by the caller with size
 `requiredHostWorkspaceSizePerProblem * N + accumulation_scratch`. Each per-problem blob is
@@ -39,18 +48,33 @@ bytes into the correct workspace offset before kernel launch.
 **6.1 — Grouped GEMM workspace size (deferred to M10)**
 The `grouped_gemm_workspace_size` binding requires `ContractionSolution` and
 `ContractionProblemGemm` C++ types exposed only in M10. It is added to `tensilelite_runtime`
-in M10 task 10.1. During M6 testing, workspace sizes are obtained using the following
-approach:
-1. Add a temporary `printf` at the **end** of `requiredHostSizeGroupedGemmSingle`
-   (`ContractionSolution.cpp:3702–3721`), immediately before the `return` statement, printing
-   the computed size: `fprintf(stderr, "WORKSPACE_SIZE=%zu\n", h_args.size());`.
-2. Rebuild `tensilelite-client-common` (`cmake --build . --target tensilelite-client-common`).
-3. For each test problem (solution_name, M, N, K, group_count), run:
-   `./tensilelite-client --config-file <grouped_yaml> --device 0 2>&1 | grep WORKSPACE_SIZE`
-   and record the printed value.
-4. Remove the `printf` and rebuild before committing.
-5. Acceptance criterion: grep the committed diff to confirm no `WORKSPACE_SIZE` or `fprintf`
-   remains in `ContractionSolution.cpp`.
+in M10 task 10.1. During M6 testing (before M10 lands), workspace sizes are obtained by one of
+the following, in order of preference:
+
+**Preferred — a throwaway standalone probe.** Write a tiny C++ test binary (or a temporary
+gtest under `tests/`) that links `tensilelite-host`, constructs the `ContractionSolution` and
+`ContractionProblemGemm` for each test problem, calls
+`requiredHostSizeGroupedGemmSingle(problem, hardware)`
+(`ContractionSolution.cpp:3761–3780`, returns `h_args.size()` at line 3779), and prints the
+value to stdout. This never touches shipping source. Record the values, then delete the probe.
+
+**Fallback — instrumented client, with safeguards.** Only if the probe is infeasible:
+1. Add a temporary line at the end of `requiredHostSizeGroupedGemmSingle`
+   (`ContractionSolution.cpp:3761–3780`), immediately before `return h_args.size();`, writing
+   to a **dedicated file** (never a shared stderr pipe):
+   `{ FILE* f = fopen("/tmp/ws_probe.txt", "a"); if(f){ fprintf(f, "WORKSPACE_SIZE=%zu\n", h_args.size()); fclose(f); } }`.
+2. Rebuild `tensilelite-client-common`
+   (`cmake --build . --target tensilelite-client-common`).
+3. For each test problem run `./tensilelite-client --config-file <grouped_yaml> --device 0`,
+   then parse `/tmp/ws_probe.txt`, accepting **only** lines matching the regex
+   `^WORKSPACE_SIZE=[0-9]+$`.
+4. Remove the temporary line and rebuild before committing.
+
+**Acceptance criteria for either approach:**
+- Grep the committed diff to confirm no `WORKSPACE_SIZE`, `fprintf`, `/tmp/ws_probe.txt`, or
+  standalone-probe file remains in the tree.
+- Verify the removal took effect: rebuild, run the client once more, and confirm no
+  `WORKSPACE_SIZE=` line is produced (the probe file is not created / stays empty).
 
 Store the recorded values in a hardcoded dict in the test file:
 ```python
@@ -65,14 +89,18 @@ Document the exact C++ client command used to obtain each value in a comment adj
 `gemm_grouped(groups) -> list[np.ndarray]`: loop over groups, call `gemm()` for each.
 
 **6.3 — Grouped GEMM argument builder**
-`build_grouped_gemm_args(groups: list[dict], workspace_sizes: list[int]) -> (top_level_bytes, workspace_layout)`:
+`build_grouped_gemm_args(groups: list[dict], workspace_sizes: list[int], synchronizer_ptr: int) -> (top_level_bytes, workspace_layout)`:
 - Accepts `workspace_sizes[i]` as the pre-determined byte count for group `i`'s arg blob
   (obtained from the hardcoded dict during testing, or from `grouped_gemm_workspace_size`
   post-M10).
+- Accepts `synchronizer_ptr: int` — the device address emitted as the top-level `Synchronizer`
+  slot (task 6.0 item 6). In C++ this is `inputs.grouped[0].Synchronizer`
+  (`ContractionSolution.cpp:2091`); it is part of the workspace allocation the **caller** owns
+  and passes in. `build_grouped_gemm_args` does not allocate it.
 - Builds each per-group blob via `build_kernel_args` for that group's problem parameters.
 - For kernels with `globalAccumulation == 3` (MBSK): raise `NotImplementedError` (appends
-  `dstD`, `Synchronizer`, `GSUSync` trailing slots at `ContractionSolution.cpp:2000–2013`
-  — not yet implemented).
+  `dstD`, `Synchronizer`, `GSUSync` trailing slots — verify the exact location in the current
+  `ContractionSolution.cpp`, previously ~lines 2000–2013 — not yet implemented).
 - Returns the top-level kernel argument bytes and a workspace layout descriptor.
 
 **6.4 — Sparse GEMM metadata in `Tensile/client/sparse.py`**

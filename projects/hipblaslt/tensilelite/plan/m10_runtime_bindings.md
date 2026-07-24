@@ -41,7 +41,11 @@ Additionally expose:
 - `load_library(path: str) -> Library`
 - `get_hardware(device_id=0) -> Hardware`
 - `Library.find_best_solution(hw: Hardware, prob: Problem) -> Solution`
-- `Library.find_top_solutions(hw: Hardware, prob: Problem, n: int) -> list[Solution]`
+- `Library.find_top_solutions(hw: Hardware, prob: Problem, n: int) -> list[Solution]`:
+  internally calls `MasterSolutionLibrary::findTopSolutions`, which returns solutions in
+  library-internal order (**not** Formocast-ranked order), then **sorts the result by
+  `formocast_predict` (descending) before returning it to Python**. This sort is part of the
+  binding contract — not something the test does.
 - `Solution.eval_hardware_predicate(hw: Hardware) -> bool`
 - `Solution.eval_task_predicate(prob: Problem) -> bool`
 - `Solution.kernel_name: str`
@@ -49,8 +53,14 @@ Additionally expose:
 - `Problem(M, N, K, dtype_a, dtype_b, dtype_c, dtype_d, trans_a, trans_b, **kwargs)`
 
 Wraps `MasterSolutionLibrary<ContractionProblemGemm, ContractionSolution>`,
-`ContractionHardware`, and the predicate hierarchy. Use `nb::keep_alive` for the
-Library→Solution lifetime relationship.
+`ContractionHardware`, and the predicate hierarchy. Use `nb::keep_alive` to tie the
+Library→Solution lifetime so a returned `Solution` (which references Library-owned data) cannot
+outlive its `Library`. Apply `nb::keep_alive<0, 1>()` to both `find_best_solution` and
+`find_top_solutions`: in nanobind's index convention, index 0 is the return value (the returned
+`Solution`, or each element of the returned list) and index 1 is the implicit `self` (the
+`Library`). This keeps the `Library` (patient, index 1) alive for at least as long as each
+returned `Solution` (nurse, index 0). Add a comment at each binding site documenting this
+direction.
 
 Do NOT release the GIL during `find_best_solution`. The call path is:
 `MasterSolutionLibrary::findBestSolution` acquires `solutionsGuard`, then calls
@@ -61,8 +71,15 @@ the binding would permit a second Python thread to enter the same path before th
 thread's lazy init completes, producing a data race. Keep the GIL held for the duration of
 `find_best_solution` until the lazy-init path is audited and protected with its own mutex.
 
+**Known limitation (document in a code comment at the binding site):** holding the GIL
+serializes concurrent `find_best_solution` calls from Python threads — a performance limitation.
+To release the GIL safely, the lazy workspace-size init at `SingleSolutionLibrary.hpp:170–173`
+must first be protected with its own mutex; until then, the GIL is the correctness guard. State
+this trade-off explicitly in the comment.
+
 **10.2 — Formocast binding** (unconditional — `origami` is always available):
 `tensilelite_runtime.formocast_predict(solution: Solution, problem: Problem) -> float`
+Returns predicted performance in **GFLOPS** (same unit as `BenchmarkResult.gflops`).
 
 `origami::Formocast` is a stateful class with `setProblem(ProblemInfo)`,
 `setSolution(SizeMapping)`, and `predictedPerformance() const` — it is NOT callable as a
@@ -90,8 +107,11 @@ class LibraryRunner:
   `find_best`, verify a non-null solution is returned and the kernel runs to completion.
 - `TestPredicateEval`: `eval_hardware_predicate` returns True for gfx950, False for a
   mismatched architecture string.
-- `TestTopN`: `find_top_n(5, ...)` returns ≤5 solutions. Note: `MasterSolutionLibrary::findTopSolutions` returns solutions in library-internal order, not Formocast-ranked order. The binding must sort the returned list by `formocast_predict` descending before returning it to Python. The test asserts that GFLOPS predictions are non-increasing across the returned list.
-- `TestFormocast`: `formocast_predict` returns a positive float.
+- `TestTopN`: `find_top_n(5, ...)` returns ≤5 solutions. The binding sorts by `formocast_predict`
+  descending (contract specified in task 10.1), so the test asserts that GFLOPS predictions are
+  non-increasing across the returned list.
+- `TestFormocast`: `formocast_predict` returns a value (in GFLOPS) within a plausible range for
+  gfx950 — assert it is in `[10, 5000]` GFLOPS, not merely a positive float.
 
 ### Acceptance criteria
 - `load_library` + `find_best` + `GpuFunction.launch` runs a kernel to completion on a

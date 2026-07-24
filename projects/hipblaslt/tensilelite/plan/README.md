@@ -29,7 +29,7 @@ No milestone starts until the previous one passes review.
 | [m05_epilogues.md](m05_epilogues.md) | M5 | Fused epilogues (bias, activations, scales, AmaxD, E tensor) |
 | [m06_grouped_sparse.md](m06_grouped_sparse.md) | M6 | Grouped GEMM, sparse GEMM, StreamK=4/5 |
 | [m07_harness.md](m07_harness.md) | M7 | Rotating buffers, I-cache simulation, ELF binding |
-| [m08_bounds.md](m08_bounds.md) | M8 | Bounds checking (guard-page buffers) |
+| [m08_bounds.md](m08_bounds.md) | M8 | Bounds checking (sentinel buffers) |
 | [m09_hw_monitor.md](m09_hw_monitor.md) | M9 | Hardware monitoring (pyamdsmi) |
 | [m10_runtime_bindings.md](m10_runtime_bindings.md) | M10 | nanobind: MasterSolutionLibrary, predicates, Formocast, calculateAuto* |
 | [m11_rocprofiler.md](m11_rocprofiler.md) | M11 | ROCprofiler-SDK bindings |
@@ -52,4 +52,4 @@ Every implementor and reviewer agent must read:
 - Production harness: `Tensile/client/`
 - Nanobind modules: alongside `rocisa/`, following its CMake pattern
 - Epilogue-specific tests: `epilogues/` — imported from `users/fabianmcg/gemm_rms` by M0 task 0.0; `epilogues/tensilelite/` renamed to `epilogues/epilogue_harness/` in M0 task 0.2
-- `amdgpu_exec`: installed as a read-only binary wheel — cannot be modified; all new GPU primitives go into standalone nanobind modules
+- `amdgpu_exec`: buildable from source (repo at `~/amdgpu-exec/`; see `amdgpu_exec_reference.md`); new GPU primitives still go into standalone nanobind modules as a deliberate design choice

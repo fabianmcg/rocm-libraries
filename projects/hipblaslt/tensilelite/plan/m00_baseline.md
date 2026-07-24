@@ -27,6 +27,13 @@ Run all commands below from the **`rocm-libraries` repo root** (the directory th
 `projects/hipblaslt/tensilelite/`):
 
 ```bash
+# Guard against losing uncommitted work before switching branches. `git checkout`
+# is destructive to a dirty tree. Stash everything (including untracked files, hence
+# -u) if the working tree is not clean; skip the stash when it is already clean.
+if [ -n "$(git status --porcelain)" ]; then
+  git stash push -u -m "pre-plan-import stash"
+fi
+
 # Export plan/ and epilogues/ from the epilogue branch.
 # git archive paths are relative to the repo root.
 git checkout users/fabianmcg/gemm_rms
@@ -74,6 +81,8 @@ Define `HAVE_DEPS` and `requires_gfx950` (and later `requires_rocprof`) in
 `Tensile/client/tests/conftest.py`, following the same pattern as
 `epilogues/unittests/epilogue_test_common.py:21–25`:
 ```python
+import functools
+
 try:
     import amdgpu_exec  # noqa: F401
     HAVE_DEPS = True
@@ -81,13 +90,41 @@ except ImportError:
     HAVE_DEPS = False
 
 requires_deps = pytest.mark.skipif(not HAVE_DEPS, reason="amdgpu_exec not installed")
-requires_gfx950 = pytest.mark.skipif(
-    not HAVE_DEPS or get_chip() != "gfx950", reason="requires gfx950 GPU"
-)
+
+# IMPORTANT — do NOT call get_chip() at module import time. get_chip() triggers HIP
+# initialization on first use (see amdgpu_exec_reference.md "HIP initialization timing"),
+# and M11's tensilelite_profiler MUST be imported before any HIP call (see M11 task 11.2).
+# A module-level `get_chip()` inside a skipif marker runs during test COLLECTION, which
+# would initialize HIP before the session-scoped profiler-import fixture runs and break
+# rocprofiler_force_configure. So keep `requires_gfx950` as a plain marker and resolve the
+# chip lazily at test-SETUP time via a hook, after collection and after the profiler import.
+requires_gfx950 = pytest.mark.requires_gfx950
+
+@functools.lru_cache(maxsize=1)
+def _current_chip():
+    from amdgpu_exec import get_chip
+    return get_chip()
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "requires_gfx950: run only on a gfx950 GPU")
+
+def pytest_runtest_setup(item):
+    if item.get_closest_marker("requires_gfx950") is None:
+        return
+    if not HAVE_DEPS:
+        pytest.skip("amdgpu_exec not installed")
+    if _current_chip() != "gfx950":
+        pytest.skip("requires gfx950 GPU")
 ```
-Every test that invokes GPU code must be decorated with `@requires_deps` or `@requires_gfx950`.
-Tests without these decorators must be pure-Python (no GPU, no `amdgpu_exec` import at call
-time).
+Every test that invokes GPU code must be decorated with `@requires_deps` or
+`@requires_gfx950`. The `@requires_gfx950` decorator usage is unchanged for all downstream
+milestones — only its evaluation is deferred to setup time. Tests without these decorators
+must be pure-Python (no GPU, no `amdgpu_exec` import at call time).
+
+**Cross-reference (M11 import ordering):** this lazy-evaluation is a prerequisite for M11
+task 11.2. The session-scoped autouse fixture that imports `tensilelite_profiler` must run
+before any HIP call; because `_current_chip()` is only invoked in `pytest_runtest_setup`
+(after session fixtures), HIP is not initialized during collection.
 
 A shared low-level execution harness (`harness.py`) must expose:
 - `class KernelRunner`: wraps one or more `GpuModule` instances (for module rotation) and
@@ -106,6 +143,16 @@ Shared numpy reference computation. Must implement:
   float32.
 - Tolerance constants: `RTOL_BF16=2e-2`, `ATOL_BF16=2e-2`, `RTOL_FP16=1e-3`,
   `ATOL_FP16=1e-3`, `RTOL_FP32=1e-5`, `ATOL_FP32=1e-5`.
+  **Basis (do not treat as arbitrary):** these are NOT copied verbatim from the C++ client,
+  which does not use numpy-style separate rtol/atol. The C++ client uses a single combined
+  relative/absolute formula `|a - b| < tol * (|a| + |b| + 1)` with per-type constants in
+  `client/include/Reference.hpp:37–48` (Half=0.01, BFloat16=0.1, Float8=0.125, BFloat8=0.25,
+  Float=0.0001, Double=1e-12), plus a separate absolute tolerance in
+  `client/cpu_gemm_driver.cpp:919–925` (FP4=0.5, TF32=1.0, else 0.05). The numpy rtol/atol
+  values above are derived from each dtype's machine epsilon (bf16 ~7.8e-3, fp16 ~9.8e-4,
+  fp32 ~1.2e-7) with headroom for K-length accumulation. If a correctness test is flaky,
+  cross-check against the C++ formula in `Reference.hpp:37–48` before loosening. Verify these
+  line numbers against the current source.
 - `assert_close(gpu, ref, rtol, atol, label)`: wraps `np.testing.assert_allclose` with a
   message showing the worst offender's index, got, expected.
 - Unit tests (no GPU).
@@ -116,6 +163,11 @@ signature, a docstring describing the supported configuration subset, and `NotIm
 for unsupported flag combinations. Milestones 1–6 fill in the branches.
 
 **0.7 — Extend `epilogue_harness/yaml_solution_builder.py` with `enumerate_all_solutions`**
+**Depends on task 0.2:** the `epilogue_harness/` directory (and therefore
+`epilogue_harness/yaml_solution_builder.py`) exists only after task 0.2 renames
+`epilogues/tensilelite/` to `epilogues/epilogue_harness/`. Do not begin task 0.7 until
+task 0.2 is complete.
+
 Generalizes the `while True / except (IndexError, KeyError): break` pattern from
 `bench_gemm_rmsnorm.py:130–139`. Returns `list[(group_idx, solution_idx, solution_dict)]`.
 Tested against both existing YAMLs.
@@ -186,11 +238,33 @@ will catch any such kernels already present.
   Verify by running `tox -e unit -- --collect-only 2>&1 | grep client` and confirming at
   least one test in `Tensile/client/tests/` is listed.
 
+**0.10 — CI integration for the harness test suite**
+The repo's CI is **GitHub Actions**. Reusable per-component workflows live in
+`rocm-libraries/.github/workflows/` (e.g. `component-ci-rocisa.yml`), dispatched by
+`component-ci.yml` based on change detection in `.github/scripts/component_ci.py`. There is
+currently **no** workflow that runs the TensileLite Python test suite (`tox -e unit`).
+
+Add CI coverage for the harness tests:
+- Model a new reusable `workflow_call` workflow on `component-ci-rocisa.yml`: run on the ROCm
+  docker image, check out the repo, set up ROCm, install the `tensilelite` package + `tox`,
+  and run `tox -e unit`.
+- Wire it into `component-ci.yml` next to the `rocisa` job, gated on a new change-detection
+  output for `projects/hipblaslt/tensilelite/**` (extend `.github/scripts/component_ci.py`
+  and the `changes` job outputs).
+- The container-only job exercises the pure-Python tests; GPU-gated tests (`@requires_gfx950`,
+  `requires_rocprof`) skip automatically when no GPU is present. Per `review_protocol.md`, a
+  skipped-GPU run must be flagged as "GPU tests not verified"; a full run on a gfx950 runner
+  is a separately-triggered path.
+- **Prerequisite:** task 0.9 (adding `Tensile/client/tests` to `testpaths`) must be complete,
+  otherwise `tox -e unit` collects zero harness tests and CI passes vacuously.
+
 ### Acceptance criteria
 - `tox -e unit` passes with zero regressions after rename.
 - `import tensilelite` resolves to the installed package in all test environments.
 - `amdgpu_exec` version pinned directly in `tox.ini` `deps` (not in `requirements-dev.txt`).
 - `harness.py`, `reference.py` unit-tested without GPU.
 - `enumerate_all_solutions` tested against both existing YAMLs.
+- CI runs `tox -e unit` (including `Tensile/client/tests`) on push/PR for changes under
+  `projects/hipblaslt/tensilelite/**` (task 0.10).
 
 ---

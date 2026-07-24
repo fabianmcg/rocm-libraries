@@ -10,7 +10,8 @@
 
 **Supported configuration subset** (M1–M5; extended incrementally per milestone):
 - `stridedBatched` ∈ {True, False}
-- `streamK` ∈ {0, 3}, `streamKAtomic=0`
+- `streamK` ∈ {0, 3} **for M1–M5**. M6 (task 6.5) incrementally extends support to `streamK` ∈ {0, 3, 4, 5} by adding the StreamK=4 and StreamK=5 argument branches. In M1–M5, any `streamK` value other than 0 or 3 (i.e. 1, 2, 4, or 5) must raise `NotImplementedError`.
+- `streamKAtomic`: only the default value `0` (non-atomic) is supported. The unsupported case is `streamKAtomic=1`, which must raise `NotImplementedError` (it skips the workspace+flags block at line 653). The `=0` denotes the single supported value, not an added restriction.
 - `groupedGemm=False`
 - `GSU=1`, `globalAccumulation` ∈ {0, 1, 2}
 - `useInitialStrides=False`
@@ -63,7 +64,7 @@ Raise `NotImplementedError(f"unsupported chip for KernArgsVersion lookup: {chip}
 
 ## `getMinKernelSizeToGwEnd`
 
-Extracted from `client/main.cpp:929–1027` into `client/src/ElfUtils.cpp` + `client/include/ElfUtils.hpp` and added to `tensilelite-client-common` as M7 task 7.0.
+Extracted from `client/main.cpp` — the entire `#if defined(__linux__)` block spanning lines 914–1025 (guard at 914, explanatory comment at 915–926, function body `getMinKernelSizeToGwEnd` at 927–1024, closing `#endif` at 1025) — into `client/src/ElfUtils.cpp` + `client/include/ElfUtils.hpp` and added to `tensilelite-client-common` as M7 task 7.0. Verify these line numbers against the current `main.cpp` before extracting.
 
 ---
 
@@ -77,7 +78,7 @@ Created once in M7 (with `get_icache_module_copies`). M10 **extends** the same m
 
 `useUniversalArgs` defaults to `True` everywhere and every characterization YAML sets it explicitly. Only the universal-args path is implemented.
 
-`requiredHostWorkspaceSizePerProblem` is problem-size-dependent (computed by `requiredHostSizeGroupedGemmSingle` at `ContractionSolution.cpp:3702–3721`). The binding requires `ContractionSolution` and `ContractionProblemGemm` exposed in M10. M6 therefore comes after M10 in the dependency graph.
+`requiredHostWorkspaceSizePerProblem` is problem-size-dependent (computed by `requiredHostSizeGroupedGemmSingle` at `ContractionSolution.cpp:3761–3780`, returning `h_args.size()` at line 3779; verify these line numbers against the current source before use). The binding requires `ContractionSolution` and `ContractionProblemGemm` exposed in M10. **Only the grouped-GEMM workspace-size binding (M6 tasks 6.1/6.3) depends on M10.** M6 tasks 6.2 (grouped reference), 6.4 (sparse metadata), and 6.5 (StreamK=4/5 arg branches) have no nanobind dependency and may proceed after M5 in parallel with M7–M10. See the dependency graph in `review_protocol.md`.
 
 During M6 testing, workspace sizes are obtained by running the C++ client and hardcoded in a `_TEST_WORKSPACE_SIZES` dict in the test file.
 
@@ -100,4 +101,4 @@ Do NOT release the GIL during `find_best_solution`. `SingleSolutionLibrary.hpp:1
 - Production harness: `Tensile/client/`
 - Nanobind modules: alongside `rocisa/`, following its CMake and editable-install pattern
 - Epilogue-specific tests: `epilogues/epilogue_harness/` — imported from `users/fabianmcg/gemm_rms` by M0 task 0.0 (the `epilogues/` directory does not exist on `develop`); renamed from `epilogues/tensilelite/` in M0 task 0.2
-- `amdgpu_exec`: installed as a read-only binary wheel (`~/.tensile/lib/python<version>/site-packages/amdgpu_exec/`). **Cannot be modified.** All new GPU primitives (e.g. `BoundedBuffer` for M8) are implemented as standalone nanobind modules alongside `tensilelite_runtime`, not as modifications to `amdgpu_exec`.
+- `amdgpu_exec`: **buildable from source.** The source repository is available at `~/amdgpu-exec/` (a standalone git repo; editable build via `pip install --no-build-isolation -e .` using scikit-build-core + CMake/Ninja — see `~/amdgpu-exec/README.md`). It is also installed into the active environment (`~/.tensile/lib/python<version>/site-packages/amdgpu_exec/`). Because the source is available, `amdgpu_exec` *can* be rebuilt and modified if strictly necessary. Nevertheless, new GPU primitives (e.g. `BoundedBuffer` for M8) are still implemented as standalone nanobind modules alongside `tensilelite_runtime` — a deliberate design choice to keep `amdgpu_exec` a general-purpose, separately-versioned dependency, not a limitation imposed by the wheel.

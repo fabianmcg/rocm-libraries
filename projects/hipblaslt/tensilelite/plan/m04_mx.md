@@ -16,14 +16,31 @@ block-scaled GEMM reference.
 - `decode_e8(scale_bytes: np.ndarray) -> np.ndarray`:
   `2.0 ** (scale_bytes.astype(np.float32) - 127)`, with `scale_bytes == 0xFF → np.nan`.
   Matches `DataTypes_E8.hpp:101–115`.
-- `decode_e5m3(scale_bytes: np.ndarray) -> np.ndarray`: 5-bit exponent + 3-bit mantissa,
-  standard IEEE float interpretation. ~10 lines of numpy bit manipulation.
+- `decode_e5m3(scale_bytes: np.ndarray) -> np.ndarray`: E5M3 is an **unsigned** 8-bit float
+  (**no sign bit**): bits `[e4 e3 e2 e1 e0][m2 m1 m0]` — 5 exponent bits + 3 mantissa bits,
+  exponent **bias 15**. `data == 0x00` → 0.0; `data == 0xFF` → NaN. Subnormals are supported
+  (exponent field 0, nonzero mantissa). This is NOT E5M2 and has no sign bit — every E5M3
+  value is non-negative, correct for a block scale factor. Verified against
+  `tensilelite/include/Tensile/DataTypes_E5M3.hpp` (`struct E5M3` + `cast_from_uf8(data,
+  wm=3, we=5)`, which uses "uf8" = unsigned f8 and forces `sign = 0`). Decode:
+  `exp = data >> 3`, `mant = data & 0x7`; for `exp != 0`, `value = 2**(exp-15) * (1 + mant/8)`;
+  for `exp == 0`, `value = 2**(1-15) * (mant/8)` (subnormal). ~10–15 lines of numpy bit
+  manipulation.
 - Unit tests: for each decoder, test at least 10 hand-computed (byte → float) pairs
   including 0x00, 0x7F, 0x80, 0xFE, 0xFF. Round-trip tests are insufficient on their own.
 
 **4.2 — Float4/6/BFloat6 unpackers**
 - `unpack_float4(packed: np.ndarray) -> np.ndarray`: two E2M1 nibbles per byte → float32.
-  Nibble layout: `[s][e1][e0][m]`. Low nibble = element 0, high nibble = element 1.
+  Each nibble is `[s][e1][e0][m]` (1 sign, 2 exponent, 1 mantissa; bias 1). Assumed packing:
+  low nibble = element 0, high nibble = element 1.
+  **The nibble order (which nibble is element 0) MUST be verified before writing tests — do
+  not assume it.** Cross-check against the AMD MX / OCP MXFP4 specification AND against the
+  C++ unpacking in `client/src/Reference.cpp:75–95` (`loadPackedFloat4To`), which converts a
+  packed `Float4x2` word via the hardware intrinsic
+  `__amd_cvt_fp4x2_to_floatx2_scale(word.data, __AMD_OCP_E2M1, 0)` and stores `v.x` to element
+  `2*word+0` and `v.y` to element `2*word+1`. That intrinsic (not visible bit-math) defines
+  which nibble maps to `v.x` vs `v.y`; validate a byte round-trip through both paths before
+  relying on the Python bit extraction. Verify these line numbers against the current source.
   Unit test: for each of the 16 possible nibble values, verify against the known float
   (hand-computed from E2M1 spec).
 - `unpack_float6_e2m3(packed: np.ndarray, n_elements: int) -> np.ndarray`: 32 6-bit
@@ -38,7 +55,22 @@ block-scaled GEMM reference.
   `scale_a[m, k//block_k] * scale_b[n, k//block_k]`, accumulate in float32. Matches
   `Reference.cpp:1390–1436` and `Reference.cpp:1878–1879`.
 
-**4.4 — Extend `build_kernel_args`** for MX flag branches (`mxBlockA`, `mxBlockB`).
+**4.4 — Extend `build_kernel_args`** for MX flag branches.
+The MX-specific argument slots in `singleCallArgs` are gated by the compile-time flags
+`problemType.mxBlockA` / `problemType.mxBlockB` (these are NOT emitted as runtime arg values;
+they only decide whether the following slots appear). When set, they add, in order:
+- `mxsa` — the MX scale-A device pointer (`inputs.mxsa`), appended right after the `a`
+  pointer (`ContractionSolution.cpp:635–636`, inside the `stridedBatched` branch).
+- `mxsb` — the MX scale-B device pointer (`inputs.mxsb`), appended right after the `b`
+  pointer (`ContractionSolution.cpp:639–640`).
+- `strideMXSA` — one `uint32_t` per MX-scale-A stride dimension
+  (`ContractionSolution.cpp:709–711`).
+- `strideMXSB` — one `uint32_t` per MX-scale-B stride dimension
+  (`ContractionSolution.cpp:719–721`).
+Port exactly these conditional appends, preserving order relative to the surrounding operand
+and stride slots. Verify all line numbers against the current `ContractionSolution.cpp`
+(grep for `mxsa`/`strideMXSA`) before use. Note: MX scale tensors must be E8 (asserted in the
+reference at `Reference.cpp:1232–1235`).
 
 **4.5 — Write `test_gemm_mx.py`**
 - MX-Float8 + E8 scale: sizes (256,256,256), (512,512,512).

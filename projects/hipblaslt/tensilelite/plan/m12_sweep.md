@@ -46,10 +46,11 @@ class SweepRunner:
             rocprof_counters=None) -> list[BenchmarkResult]: ...
 ```
 Orchestrates: enumerate solutions → compile or load → benchmark with rotating buffers and
-module rotation → report. `icache_copies="auto"` calls `get_icache_module_copies` on the
-compiled `.co` file. Falls back to `icache_copies=1` (no rotation) if the `.co` file is not
-available — not 4, since an unjustified constant risks over-rotation causing OOM. Log a
-warning when falling back.
+module rotation → report. `icache_copies="auto"` calls `get_icache_module_copies(co_path)` on
+the compiled `.co` file. Falls back to `icache_copies=1` (no rotation) **if `co_path` is not
+provided or no file exists at `co_path`** — not 4, since an unjustified constant risks
+over-rotation causing OOM. Log a warning when falling back. (This mirrors the `KernelRunner`
+`co_path` fallback from M7 task 7.2.)
 
 **12.3 — Write `test_sweep_runner.py`**
 - Run `SweepRunner` over `gemm_standard.yaml`, verify `results.csv` written with correct
@@ -62,6 +63,12 @@ warning when falling back.
 **12.4 — Cross-validate against C++ client**
 Run C++ client on the same YAML and sizes. Top solution index and GFLOPS must agree within
 **±2% for problems ≥1024², ±5% for smaller**. Document any discrepancies.
+
+**Thermal-variance guard (avoid false CI failures):** GFLOPS measurements vary with GPU
+temperature and clock throttling. If a tolerance assertion fails, **re-run the measurement up
+to 3 times and compare using the best-of-3 GFLOPS**, not a single-run value. Alternatively, for
+CI robustness, widen to ±5% (≥1024²) / ±10% (smaller) and reserve the tighter ±2%/±5% for
+manual validation runs. Never fail CI on a single thermal outlier.
 
 ### Acceptance criteria
 - CSV schema verified against the actual parser in `LibraryLogic.py:413–531` (`addFromCSV`) — cite the line. (`BenchmarkProblems.py` contains the CSV writer that matches this schema, not the parser itself.)

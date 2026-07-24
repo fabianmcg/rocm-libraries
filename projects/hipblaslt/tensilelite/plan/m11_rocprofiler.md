@@ -21,7 +21,11 @@ The module's `PyInit_tensilelite_profiler` function:
 2. Checks the **return code** of `rocprofiler_force_configure`. If it returns
    `ROCPROFILER_STATUS_ERROR_CONFIGURATION_LOCKED`, the configuration window has already
    closed (HSA was initialized by a HIP call before import), and `PyInit` raises
-   `RuntimeError("import tensilelite_profiler before any HIP call")`.
+   `RuntimeError("import tensilelite_profiler before any HIP call")`. If it returns any code
+   **other than** `ROCPROFILER_STATUS_SUCCESS` or
+   `ROCPROFILER_STATUS_ERROR_CONFIGURATION_LOCKED`, `PyInit` raises
+   `RuntimeError(f"rocprofiler_force_configure failed with status {status}")` rather than
+   silently continuing. Only `ROCPROFILER_STATUS_SUCCESS` proceeds.
    Do NOT use `rocprofiler_is_initialized()` as the guard — it reflects rocprofiler's own
    initialization state, not HIP's, and returns 0 in the exact failure case we need to catch. `rocprofiler_configure` is exported from this `.so` with default visibility.
    `tool_init_impl` creates the context and registers the dispatch/record callbacks — this is
@@ -43,9 +47,16 @@ and must not block on Python.
 
 **11.2 — Import-ordering enforcement**
 In `Tensile/client/tests/conftest.py` for the profiler test environment: import
-`tensilelite_profiler` at session scope (via `autouse=True` session fixture) before any
-fixture that touches a GPU. Add a `TENSILELITE_PROFILER_AVAILABLE` flag analogous to
-`HAVE_DEPS`.
+`tensilelite_profiler` at session scope (via an `autouse=True` session fixture) before any
+fixture that touches a GPU **or calls `get_chip()`**. Add a `TENSILELITE_PROFILER_AVAILABLE`
+flag analogous to `HAVE_DEPS`.
+
+**Prerequisite — M0 task 0.4 (lazy `get_chip()`):** this ordering is only achievable because
+the `requires_gfx950` marker does NOT call `get_chip()` at import/collection time. Per the M0
+task 0.4 fix, the chip is resolved lazily in `pytest_runtest_setup` (after session fixtures
+run), so the session-scoped `tensilelite_profiler` import happens before any HIP call. Were
+`get_chip()` evaluated during collection, HIP would initialize first and
+`rocprofiler_force_configure` would fail with `CONFIGURATION_LOCKED`.
 
 **11.3 — Integrate into `KernelRunner`**
 `KernelRunner.run(..., rocprof_counters: list[str] = None)`: when non-empty, wraps each

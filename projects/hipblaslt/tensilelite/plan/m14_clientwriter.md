@@ -7,34 +7,53 @@
 
 ### Goal
 
-Replace `ClientWriter.py:270`'s `subprocess.Popen` call with a direct call to
-`SweepRunner`, making the Python harness the actual execution path in the Tensile pipeline
-— not just a parallel tool.
+Replace `ClientWriter.py`'s `subprocess.Popen` call (at line 273; verify against current
+source) with a direct call to `SweepRunner`, making the Python harness the actual execution
+path in the Tensile pipeline — not just a parallel tool.
 
 ### Tasks
 
 **14.1 — Refactor `ClientWriter.runClient()` and extend `SweepRunner`**
-`ClientWriter.py:270`: replace the `subprocess.Popen(runScriptName, cwd=buildPath)` call
-(the single-GPU path reached after `writeRunScript` at line 267) with a direct call to
-`SweepRunner`. **Modify `SweepRunner.__init__` from M12** by appending three keyword
-parameters — do not create a new class.
+`ClientWriter.py:273`: replace the `subprocess.Popen(runScriptName, cwd=buildPath)` call
+(the single-GPU path reached after the `writeRunScript(...)` call at line 270) with a direct
+call to `SweepRunner`. **Modify `SweepRunner.__init__` from M12** by appending three keyword
+parameters — do not create a new class. (Verify these line numbers against the current
+`ClientWriter.py` before editing.)
 
-The following behaviors from `writeRunScript()` (`ClientWriter.py:334–378`) must be
-replicated:
-- **Clock pinning:** when `globalParameters["PinClocks"]` and `globalParameters["AMDSMIPath"]`
-  are both set, run `sudo <amd-smi-path> set -g 0 --fan 255` and
+**Parameter sourcing (no implicit `globalParameters` reads):** `SweepRunner` reads
+`pin_clocks`, `timing_instrumentation`, and `mx_scale_format` **only from its own keyword
+parameters** — it must NOT read `globalParameters` directly (this keeps `SweepRunner` a pure,
+testable unit). The `runClient` call site passes them explicitly from `globalParameters` when
+constructing `SweepRunner`, e.g.:
+```python
+runner = SweepRunner(
+    yaml_path=configPaths[0],
+    pin_clocks=globalParameters["PinClocks"],
+    timing_instrumentation=globalParameters["TimingInstrumentation"],
+    mx_scale_format=globalParameters["MXScaleFormat"],
+)
+return runner.run(...)
+```
+
+The following behaviors from `writeRunScript()` (`ClientWriter.py:314–382`; verify line
+numbers against the current source) must be replicated:
+- **Clock pinning:** when `pin_clocks` is set and `globalParameters["AMDSMIPath"]` is
+  available, run `sudo <amd-smi-path> set -g 0 --fan 255` and
   `sudo <amd-smi-path> set -g 0 --perf-level HIGH` before benchmarking (matching
-  `ClientWriter.py:337–338`), then sleep 1 second. Reset in a `finally` block via
-  `sudo <amd-smi-path> reset -g 0 --clocks --fans` (matching `ClientWriter.py:377`). If
-  `sudo` returns non-zero, raise `PermissionError` — do not silently continue. Add
+  `ClientWriter.py:340–341`), then sleep 1 second. Reset in a `finally` block via
+  `sudo <amd-smi-path> reset -g 0 --clocks --fans` (matching `ClientWriter.py:380`). If `sudo`
+  returns non-zero, raise `PermissionError` — do not silently continue. **`sudo` may be absent
+  in container environments:** wrap the `subprocess.run(["sudo", ...])` call in
+  `try/except FileNotFoundError` and, on `FileNotFoundError`, raise
+  `PermissionError("sudo not found; clock pinning requires sudo")`. Add
   `pin_clocks: bool = False` to `SweepRunner.__init__`.
 - **Timing instrumentation:** add `timing_instrumentation: bool = False` (matches the
-  `--timing-instrumentation` flag appended at `ClientWriter.py:353`).
+  `--timing-instrumentation` flag appended at `ClientWriter.py:356`).
 - **MX scale format:** add `mx_scale_format: str = None` (matches the `--mx-scale-format`
-  flag appended at `ClientWriter.py:354`).
+  flag appended at `ClientWriter.py:357`).
 
 **Multi-GPU path:** The existing `runClient` calls `runClientParallel` when
-`numGpus > 1 and forBenchmark` (`ClientWriter.py:252–253`). This parallel path is not
+`numGpus > 1 and forBenchmark` (`ClientWriter.py:256`). This parallel path is not
 replaced by `SweepRunner` in M14. When `use_python_client=True` and `numGpus > 1`, fall
 through to `runClientParallel` unchanged. Add a log warning that the Python harness path is
 not used in multi-GPU mode.

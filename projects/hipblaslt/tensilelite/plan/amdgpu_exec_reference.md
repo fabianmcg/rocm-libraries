@@ -5,7 +5,7 @@
 **Build backend:** scikit-build-core 0.12.2 (CMake + Ninja, two nanobind C++ extensions)
 **Requires:** Python ≥ 3.10, numpy ≥ 2.1.0, ml_dtypes ≥ 0.5.0
 **License:** Apache 2.0 with LLVM Exceptions; adapted from the [aster](https://github.com/iree-org/aster) project
-**No staleness check** — distributed as a binary wheel; there is no `_build_info.py` and no source-tree scan.
+**No staleness check** — there is no `_build_info.py` and no source-tree scan (unlike rocisa). Buildable source is available at `~/amdgpu-exec/`; the copy in the active environment may be an installed wheel or an editable build.
 
 ---
 
@@ -265,11 +265,21 @@ out_bufs[(warmup + iters - 1) % N_BUFS].copy_to_host(result)
 
 ---
 
-## Build system (read-only — do not modify)
+## Build system
 
-`amdgpu_exec` is installed as a **read-only binary wheel** (`~/.tensile/lib/python<version>/site-packages/amdgpu_exec/`). There is no buildable source tree available. The wheel was built with scikit-build-core 0.12.2 using MLIR CMake macros from the [aster](https://github.com/iree-org/aster) project; rebuilding requires a full LLVM/MLIR build environment that is not present.
+`amdgpu_exec` is **buildable from source.** The source repository is available at `~/amdgpu-exec/` (a standalone git repo, single commit "Add amdgpu-exec Python package"). It builds with scikit-build-core (CMake + Ninja) and can be installed editable:
 
-**Do not attempt to modify `amdgpu_exec`.** New GPU primitives needed by the harness (e.g. `BoundedBuffer` for M8) must be implemented as standalone nanobind modules (e.g. `tensilelite_bounds`, `tensilelite_runtime`) following the rocisa CMake pattern, not as extensions to `amdgpu_exec`.
+```bash
+cd ~/amdgpu-exec
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+rocm-sdk init
+pip install --no-build-isolation -e .
+```
+
+Requirements to build: clang > 20, LLVM dev libraries (LLVMAMDGPUAsmParser, lldELF, …), CMake 3.21+, Ninja, Python 3.10+, nanobind 2.9+. The HIP runtime (`libamdhip64.so`) is needed only at runtime (loaded via `dlopen`), not at build time. Manylinux wheels are produced via cibuildwheel (`[tool.cibuildwheel]` in `~/amdgpu-exec/pyproject.toml`). The copy in the active environment (`~/.tensile/lib/python<version>/site-packages/amdgpu_exec/`) may be an installed wheel or an editable build.
+
+**`amdgpu_exec` may be modified/rebuilt if strictly necessary**, since source is available. However, new GPU primitives needed by the harness (e.g. `BoundedBuffer` for M8) are still implemented as standalone nanobind modules (e.g. `tensilelite_bounds`, `tensilelite_runtime`) following the rocisa CMake pattern — a deliberate design choice to keep `amdgpu_exec` a general-purpose, separately-versioned dependency, not because the wheel is immutable.
 
 Internally, `amdgpu_exec` uses two nanobind C++ extensions:
 - `_compile_asm` — LLVM MC + LLD for assembly compilation/linking

@@ -40,14 +40,30 @@ combination is already verified against the Python numpy reference in M1–M5; M
 re-verify tensor correctness against the C++ client (the C++ client CSV records only GFLOPS,
 not tensor values).
 
+**Thermal-variance guard (avoid false CI failures):** GFLOPS are thermally variable. If a
+tolerance assertion fails, re-run the measurement up to 3 times and compare using the
+best-of-3 GFLOPS, not a single-run value. For CI robustness, ±5% (≥1024²) / ±10% (smaller) may
+be used, reserving the tighter ±2%/±5% for manual validation runs. Never fail on a single
+thermal outlier.
+
 **13.2 — Generate `Tensile/client/parity_report.md`**
 The test suite writes this file (not hand-authored). Content:
 - Feature coverage table (feature, status, evidence).
 - GFLOPS table (problem, Python harness, C++ client, delta%).
 - Any remaining discrepancies with explanation.
 
+**Staleness policy — do not treat this as a hand-maintained static artifact.** The report is
+generated output and goes stale whenever M1–M12 change. Choose one of:
+- **Preferred:** add a CI step that regenerates it (`pytest --generate-parity-report`) and
+  fails if the report is missing or if any entry exceeds the stated tolerances — so the report
+  is never trusted as a committed static file.
+- **Otherwise:** document explicitly that `parity_report.md` is regenerated as part of M13
+  testing and MUST be recommitted whenever any of M1–M12 changes. A committed report that no
+  longer matches a fresh regenerated run is a review blocker.
+
 **13.3 — Deprecation annotation**
-Add to `client/main.cpp` above the copyright header:
+Add the following to `client/main.cpp` **immediately below the copyright/SPDX header** (never
+above it — the SPDX header must remain the very first content in the file, per `CLAUDE.md`):
 ```cpp
 // Retained as a reference implementation.
 // The Python harness in Tensile/client/ provides equivalent functionality.

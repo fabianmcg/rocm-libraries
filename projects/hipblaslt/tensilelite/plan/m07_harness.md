@@ -13,10 +13,18 @@ Extend `KernelRunner` with rotating buffer and I-cache module rotation. Extract
 ### Tasks
 
 **7.0 — Extract `getMinKernelSizeToGwEnd` (prerequisite)**
-Move `main.cpp:916–1027` into `client/src/ElfUtils.cpp` and declare in
-`client/include/ElfUtils.hpp`. The entire block is inside `#if defined(__linux__)` (see
-`main.cpp:916` and `main.cpp:1027`). Both `ElfUtils.cpp` and the declaration in
-`ElfUtils.hpp` must be wrapped in the same `#if defined(__linux__)` guard — otherwise `<elf.h>` and the ELF types will fail to compile on non-Linux platforms. The nanobind binding for `get_icache_module_copies` must also be conditionally compiled. Add the compilation unit to `tensilelite-client-common` in `client/CMakeLists.txt`. Verify `tensilelite-client` still builds and passes existing tests.
+Move the **entire `#if defined(__linux__)` block spanning `main.cpp:914–1025`** — including the
+guard (`#if defined(__linux__)` at line 914), the explanatory comment (lines 915–926), the
+function body `getMinKernelSizeToGwEnd` (lines 927–1024), and the closing `#endif` (line 1025)
+— into `client/src/ElfUtils.cpp`, and declare `getMinKernelSizeToGwEnd` in
+`client/include/ElfUtils.hpp`. (The function definition itself starts at line 927; do not leave
+the guard and comment on lines 914–926 behind.) Both `ElfUtils.cpp` and the declaration in
+`ElfUtils.hpp` must be wrapped in the same `#if defined(__linux__)` guard — otherwise `<elf.h>`
+and the ELF types will fail to compile on non-Linux platforms. The nanobind binding for
+`get_icache_module_copies` must also be conditionally compiled. Add the compilation unit to
+`tensilelite-client-common` in `client/CMakeLists.txt`. Verify these line numbers against the
+current `main.cpp` before extracting, and confirm `tensilelite-client` still builds and passes
+existing tests.
 
 **7.1 — Create `tensilelite_runtime` nanobind module with ELF binding**
 Create the `tensilelite_runtime` nanobind module (alongside rocisa, following its CMake and
@@ -41,16 +49,34 @@ Ensure the new module's source tree is **outside** rocisa's scanned source roots
 confirming no spurious staleness error fires.
 
 **7.2 — Module rotation in `KernelRunner`**
-`KernelRunner(hsaco_bytes, kernel_name, n_module_copies=1)`: loads `n_module_copies`
-independent `GpuModule` instances. `run()` cycles through them per iteration. Default of 1
-is identical to the pre-rotation behavior — no performance regression for correctness tests.
-`n_module_copies="auto"` calls `get_icache_module_copies` on the compiled `.co` file.
+`KernelRunner(hsaco_bytes, kernel_name, n_module_copies=1, co_path=None)`: loads
+`n_module_copies` independent `GpuModule` instances. `run()` cycles through them per iteration.
+Default of 1 is identical to the pre-rotation behavior — no performance regression for
+correctness tests.
+`n_module_copies="auto"` resolves the copy count via `get_icache_module_copies`, which requires
+a **file path** to the `.co` (it parses the ELF symbol table). `KernelRunner`, however, is
+constructed from `hsaco_bytes` (in-memory bytes), not a path — so `"auto"` needs the optional
+`co_path: str = None` argument:
+- If `n_module_copies == "auto"` and `co_path` is provided, call `get_icache_module_copies(co_path)`.
+- If `n_module_copies == "auto"` and `co_path` is `None`, fall back to `n_module_copies = 1`
+  and log a warning (the ELF probe cannot run without a file path).
 
 **7.3 — Extend `BufferPool`** to integrate with `KernelRunner.run()`: output buffer slot
 is advanced each iteration, matching `main.cpp:1266–1274`.
 
 **7.4 — Benchmark timing helpers**
-- `auto_scale_iters(flops, min_flops_per_sync) -> int`: replicates the algorithm in `BenchmarkTimer::numEnqueuesPerSync()` (`BenchmarkTimer.cpp:295–325`): `CeilDivide(min_flops_per_sync, max(flops, 1))`, clamped to `[m_numEnqueuesPerSync, m_maxEnqueuesPerSync]`. Note: `min_flops_per_sync` has no hardcoded default — read the value from `globalParameters["MinFlopsPerSync"]` or the command-line arg, not a magic constant. Line 54 stores the parsed arg; the algorithm is at lines 295–325.
+- `auto_scale_iters(flops, min_flops_per_sync, num_enqueues_per_sync=1, max_enqueues_per_sync) -> int`:
+  replicates `BenchmarkTimer::numEnqueuesPerSync()` (`BenchmarkTimer.cpp:295–326`). When
+  `min_flops_per_sync > 0`, `enqueuesByFlops = CeilDivide(min_flops_per_sync, max(flops, 1))`
+  (else 0), then the result is
+  `min(max(num_enqueues_per_sync, enqueuesByFlops), max_enqueues_per_sync)`. These three
+  parameters map exactly to the three `BenchmarkTimer` constructor arguments
+  (`BenchmarkTimer.cpp:52–54`): `num_enqueues_per_sync` ← `--num-enqueues-per-sync` (default 1,
+  `main.cpp:293`), `max_enqueues_per_sync` ← `--max-enqueues-per-sync` (default -1,
+  `main.cpp:294`), `min_flops_per_sync` ← `--min-flops-per-sync` (default 0, `main.cpp:297`).
+  None have magic defaults beyond these — read them from `globalParameters` (`MinFlopsPerSync`
+  and the enqueues-per-sync args) or the command line, not hardcoded constants. Verify line
+  numbers against the current source.
 - `BenchmarkResult.gflops(M, N, K)`: assert value is within plausible hardware range
   (100–2000 GFLOPS for gfx950 bf16) in the test suite — catches unit-conversion bugs.
 
