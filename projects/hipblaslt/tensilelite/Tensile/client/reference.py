@@ -248,6 +248,125 @@ def gemmMx(
     return D
 
 
+# ---------------------------------------------------------------------------
+# Epilogue activation arg-count table (mirrors Tensile/Activation.py extraArgs).
+# 'all' and 'hipblaslt_all' use the max over all types (tanh=2).
+# ---------------------------------------------------------------------------
+_ACT_ARG_COUNT: dict[str, int] = {
+    "none": 0,
+    "relu": 0,
+    "gelu": 0,
+    "geluscaling": 1,
+    "sigmoid": 0,
+    "silu": 0,
+    "dgelu": 0,
+    "tanh": 2,
+    "swish": 1,
+    "all": 2,
+    "hipblaslt_all": 2,
+}
+
+
+def applyBias(D: np.ndarray, bias: np.ndarray, biasSource: str) -> np.ndarray:
+    """Add bias to D (float64). Returns a new array without mutating D.
+
+    biasSource:
+      "row"    → bias has shape (N,), broadcast over rows.
+      "col"    → bias has shape (M,), broadcast over columns.
+      "matrix" → bias has shape (M, N), elementwise add.
+    """
+    if biasSource == "row":
+        return D + bias[None, :]
+    if biasSource == "col":
+        return D + bias[:, None]
+    return D + bias
+
+
+def applyActivation(
+    D: np.ndarray,
+    name: str,
+    args: list | None = None,
+) -> np.ndarray:
+    """Apply a named activation elementwise in float64.
+
+    Matches Reference.cpp:746-853 exactly. Returns a new float64 array.
+    args is the list of activation scalar parameters (tanh: [a0, a1], swish: [beta]).
+    """
+    x = D.astype(np.float64)
+    if name == "relu":
+        return np.maximum(x, 0.0)
+    if name == "sigmoid":
+        return 1.0 / (1.0 + np.exp(-x))
+    if name in ("gelu", "geluscaling"):
+        k0 = 0.7978845608028654
+        k1 = 0.044715
+        inner = k0 * x * (1.0 + k1 * x * x)
+        result = 0.5 * x * (1.0 + np.tanh(inner))
+        if name == "geluscaling" and args:
+            result = result * float(args[0])
+        return result
+    if name == "dgelu":
+        k0, k1 = 0.0535161, 0.398942
+        k2, k3 = 0.0356774, 0.797885
+        p3 = x ** 3
+        x1 = k0 * p3 + k1 * x
+        xx = k2 * p3 + k3 * x
+        x2 = 4.0 / (np.exp(-xx) + np.exp(xx)) ** 2
+        return 0.5 * np.tanh(xx) + x1 * x2 + 0.5
+    if name == "silu":
+        return x / (1.0 + np.exp(-x))
+    if name == "swish":
+        beta = float(args[0]) if args else 1.0
+        return x / (1.0 + np.exp(-x * beta))
+    if name == "tanh":
+        a0 = float(args[0]) if args else 1.0
+        a1 = float(args[1]) if args and len(args) > 1 else 1.0
+        return a1 * np.tanh(a0 * x)
+    raise ValueError(f"unknown activation: {name!r}")
+
+
+def applyScaleAb(
+    A: np.ndarray,
+    B: np.ndarray,
+    scaleA,
+    scaleB,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Scale A and B before matmul. scaleA/scaleB may be scalar or vector."""
+    return A * scaleA, B * scaleB
+
+
+def applyScaleCd(
+    C: np.ndarray | None,
+    D: np.ndarray,
+    scaleC,
+    scaleD,
+) -> tuple[np.ndarray | None, np.ndarray]:
+    """Scale C and D elementwise. scaleC/scaleD may be scalar or vector."""
+    scaledC = C * scaleC if C is not None else None
+    return scaledC, D * scaleD
+
+
+def applyScaleAlphaVec(
+    D: np.ndarray,
+    scaleVec: np.ndarray,
+    factorDim: int,
+) -> np.ndarray:
+    """Scale D by a vector. factorDim=0: per-row, factorDim=1: per-column."""
+    if factorDim == 0:
+        return D * scaleVec[:, None]
+    return D * scaleVec[None, :]
+
+
+def computeAmaxD(D: np.ndarray) -> float:
+    """Return the absolute maximum of D as a Python float."""
+    return float(np.max(np.abs(D)))
+
+
+def computeETensor(D: np.ndarray) -> np.ndarray:
+    """Return a copy of D before any output cast (the pre-cast accumulator)."""
+    return D.copy()
+
+
 def assertClose(
     gpu: np.ndarray,
     ref: np.ndarray,
