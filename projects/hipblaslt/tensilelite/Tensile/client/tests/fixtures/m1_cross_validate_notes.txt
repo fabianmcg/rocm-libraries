@@ -1,0 +1,43 @@
+M1 Cross-Validation Notes — Python client vs C++ client
+=========================================================
+
+Status: Deferred (C++ client binary not available in dev environment).
+
+The M1 acceptance criteria require running the C++ client on the same YAML+sizes
+and comparing GFLOPs and tensor values.  This step was not completed during the
+initial implementation because the C++ client binary (hipblaslt-bench or the
+Tensile benchmark runner) was not built and installed in the development
+environment used to write and commit this milestone.
+
+Blocker resolution:
+  The C++ client cross-validation must be performed by the reviewer (or a CI job)
+  before M2 may begin.  Any GFLOPS divergence greater than ±5%, or any tensor-value
+  mismatch, is a blocker per the acceptance criteria.
+
+How to re-run the validation:
+  1. Build the C++ client:
+       invoke build -ca gfx950 -c --clean
+  2. Run hipblaslt-bench (or the Tensile benchmark runner) against the same
+     problem sizes in gemm_standard.yaml:
+       hipblaslt-bench --function gemm --datatype f32_r \
+         --transposeA N --transposeB T \
+         --batch 4 --m 256 --n 256 --k 256 \
+         ...
+  3. Run the Python client on the same sizes via test_gemm_standard.py
+     (printing GFLOPs from BenchmarkResult.gflops()).
+  4. Compare GFLOPS per problem; record results in this file in the format:
+       PROBLEM         PY_GFLOPS   CPP_GFLOPS   DELTA%
+       256x256x4x256   <value>     <value>      <±%>
+       ...
+  5. If any delta > 5%, root-cause (thermal noise, mismatched configuration,
+     argument-construction bug) and document here before marking M1 complete.
+
+Tensor-value comparison:
+  Use `assertClose` from Tensile/client/reference.py with RTOL/ATOL constants
+  from that module.  Any mismatch at the validated tolerance is a blocker.
+
+Note:
+  The poison-input test in test_gemm_standard.py (test_buildKernelArgs_poison)
+  verifies that the argument buffer actually drives the computation by corrupting
+  strideA[1] and confirming that more than 50% of output elements are wrong.
+  This test must pass before any correctness claim is valid.

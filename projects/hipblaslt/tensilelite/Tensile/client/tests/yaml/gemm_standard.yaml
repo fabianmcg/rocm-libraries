@@ -1,0 +1,151 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+################################################################################
+# gemm_standard: standard GEMM (NT, batched) for fp32/fp16/bf16 M1 client tests.
+#
+# Adapted from Tensile/Tests/unit/characterization/_codegen/data/test_data/
+# _designed/gfx942/asmaddr2_fp32.yaml (which is the baseline NT-batched fp32 GEMM
+# characterization YAML).
+#
+# Three BenchmarkProblems groups:
+#   0: fp32  NT StridedBatched in {True, False}
+#   1: fp16 HPA NT StridedBatched in {True, False}
+#   2: bf16 HPA NT StridedBatched in {True, False}
+#
+# MacroTile: 64×64 for all groups (MI [16,16,x,1,1,2,2,2,2]).
+# DepthU=16, GlobalSplitU=1, SourceSwap=True, PrefetchGlobalRead=1.
+# batch_count=4 for strided-batched tests.
+#
+# ProblemSizes: square 256/512/1024/2048/4096 + non-square 256x512 and 512x256.
+# All M,N are multiples of MT=64; K is a multiple of DepthU=16.
+################################################################################
+GlobalParameters:
+  SyncsPerBenchmark: 0
+  MinimumRequiredVersion: 5.0.0
+  NumElementsToValidate: 128
+  DataInitTypeBeta: 0
+  DataInitTypeAlpha: 1
+  Device: 0
+
+BenchmarkProblems:
+  ##############################################################################
+  # Group 0: fp32 (SSS) NT batched
+  # DataType s = float32. HighPrecisionAccumulate not needed (same type).
+  # TransposeA=False, TransposeB=True → NT GEMM.
+  # Strides for NT Fortran (column-major): lda=M, ldb=N, ldd=ldc=M.
+  ##############################################################################
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: s
+      DestDataType: s
+      ComputeDataType: s
+      TransposeA: False
+      TransposeB: True
+      UseBeta: True
+      Batched: True
+      UseBias: 0
+    - # BenchmarkProblemSizeGroup
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 4, 1, 1, 2, 2, 2, 2]
+        - DepthU: [16]
+        - GlobalSplitU: [1]
+        - SourceSwap: [True]
+        - PrefetchGlobalRead: [1]
+        - StridedBatched: [True, False]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [256, 256, 4, 256]
+          - Exact: [512, 512, 4, 512]
+          - Exact: [1024, 1024, 4, 1024]
+          - Exact: [2048, 2048, 4, 2048]
+          - Exact: [4096, 4096, 4, 4096]
+          - Exact: [256, 512, 4, 256]
+          - Exact: [512, 256, 4, 256]
+
+  ##############################################################################
+  # Group 1: fp16 HPA (HHS) NT batched
+  # DataType h = float16, DestDataType h, ComputeDataType s = float32 (HPA).
+  # TransposeA=False, TransposeB=True → NT GEMM.
+  # MI_K=16 for MFMA_F16 (fp16 MFMA instructions).
+  ##############################################################################
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: h
+      DestDataType: h
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: False
+      TransposeB: True
+      UseBeta: True
+      Batched: True
+      UseBias: 0
+    - # BenchmarkProblemSizeGroup
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 16, 1, 1, 2, 2, 2, 2]
+        - DepthU: [16]
+        - GlobalSplitU: [1]
+        - SourceSwap: [True]
+        - PrefetchGlobalRead: [1]
+        - StridedBatched: [True, False]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [256, 256, 4, 256]
+          - Exact: [512, 512, 4, 512]
+          - Exact: [1024, 1024, 4, 1024]
+          - Exact: [2048, 2048, 4, 2048]
+          - Exact: [4096, 4096, 4, 4096]
+          - Exact: [256, 512, 4, 256]
+          - Exact: [512, 256, 4, 256]
+
+  ##############################################################################
+  # Group 2: bf16 HPA (BBS) NT batched
+  # DataType b = bfloat16, DestDataType b, ComputeDataType s = float32 (HPA).
+  # TransposeA=False, TransposeB=True → NT GEMM.
+  # MI_K=16 for MFMA_BF16 (bf16 MFMA instructions).
+  ##############################################################################
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: b
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: False
+      TransposeB: True
+      UseBeta: True
+      Batched: True
+      UseBias: 0
+    - # BenchmarkProblemSizeGroup
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 16, 1, 1, 2, 2, 2, 2]
+        - DepthU: [16]
+        - GlobalSplitU: [1]
+        - SourceSwap: [True]
+        - PrefetchGlobalRead: [1]
+        - StridedBatched: [True, False]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [256, 256, 4, 256]
+          - Exact: [512, 512, 4, 512]
+          - Exact: [1024, 1024, 4, 1024]
+          - Exact: [2048, 2048, 4, 2048]
+          - Exact: [4096, 4096, 4, 4096]
+          - Exact: [256, 512, 4, 256]
+          - Exact: [512, 256, 4, 256]

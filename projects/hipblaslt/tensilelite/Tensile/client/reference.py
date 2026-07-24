@@ -32,7 +32,7 @@ def gemm(
     beta: float = 0.0,
     C: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Compute D = alpha * (A @ B) + beta * C in float32.
+    """Compute D = alpha * (A @ B) + beta * C in float64 precision.
 
     A: (M, K), B: (K, N), C: (M, N) or None (treated as zero).
     Returns D as float64 for maximum precision.
@@ -43,6 +43,57 @@ def gemm(
     if beta != 0.0 and C is not None:
         D += beta * C.astype(np.float64)
     return D
+
+
+def gemmFp16(
+    A: np.ndarray,
+    B: np.ndarray,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+    C: np.ndarray | None = None,
+) -> np.ndarray:
+    """Reference GEMM for fp16 inputs, fp32 accumulation (HPA mode), fp16 output.
+
+    Upcast A and B to float32, compute in float32, downcast to float16.
+    This matches the GPU kernel's HPA accumulation behaviour.
+
+    A: (M, K) fp16, B: (K, N) fp16, C: (M, N) fp16 or None.
+    Returns D as float16.
+    """
+    A_f = A.astype(np.float32)
+    B_f = B.astype(np.float32)
+    D = alpha * (A_f @ B_f)
+    if beta != 0.0 and C is not None:
+        D += beta * C.astype(np.float32)
+    return D.astype(np.float16)
+
+
+def gemmBf16(
+    A,
+    B,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+    C=None,
+):
+    """Reference GEMM for bf16 inputs, fp32 accumulation (HPA mode), bf16 output.
+
+    Uses ml_dtypes.bfloat16 for input/output; intermediate computation in float32.
+    This matches the GPU kernel's HPA accumulation behaviour.
+
+    A: (M, K) bfloat16, B: (K, N) bfloat16, C: (M, N) bfloat16 or None.
+    Returns D as ml_dtypes.bfloat16.
+    """
+    try:
+        import ml_dtypes
+    except ImportError as exc:
+        raise ImportError("ml_dtypes is required for gemmBf16") from exc
+
+    A_f = np.asarray(A, dtype=np.float32)
+    B_f = np.asarray(B, dtype=np.float32)
+    D = alpha * (A_f @ B_f)
+    if beta != 0.0 and C is not None:
+        D += beta * np.asarray(C, dtype=np.float32)
+    return D.astype(ml_dtypes.bfloat16)
 
 
 def assertClose(
