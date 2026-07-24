@@ -2,9 +2,9 @@
 
 This document specifies the hipBLASLt API extensions for fused epilogues, starting with
 RMSNorm, and the composable epilogue-chain mechanism that lets RMSNorm compose with
-optional residual add, AMax capture, and output requantization (e.g. FP8). It also reserves the design points
-required so that Gated Linear Units (SwiGLU/GeGLU/ReGLU) can be added later without
-reworking the API.
+optional residual add, AMax capture, and output requantization (e.g. FP8). It also reserves
+the design points required so that Gated Linear Units (SwiGLU/GeGLU/ReGLU) can be added later
+without reworking the API.
 
 ## 1. Motivation and scope
 
@@ -98,8 +98,10 @@ normalization reduction be split out of the critical dependency between the two 
 ### 3.2 Kernel organization for the two flows
 
 Both flows share the same GEMM producer. They differ in what happens after the cross-tile
-reduction: the full flow applies the scale immediately, while the decomposed flow returns
-the per-row scale for a subsequent GEMM to apply.
+reduction: the full flow applies the scale immediately, while the decomposed flow returns the
+consumer scale for a subsequent GEMM to apply. In the ordinary decomposed variant that consumer
+scale is `rstd`; in the dynamic-quantized variant it is the composed scale needed by the
+subsequent GEMM.
 
 **Kernel 1 (producer, shared by both flows).** The GEMM plus its epilogue:
 
@@ -141,11 +143,60 @@ Kernel 3:  h3 = h2 @ W1;   y = r ⊙ h3           # GEMM2 + CODA scale-apply epi
 
 Kernel 1 and the GEMM in Kernel 3 are both GEMM kernels produced by the single codegen option,
 selecting different epilogue options. The reduction (Kernel 2) is a small custom kernel; it does
-slightly different work in the two flows (apply vs return). In the decomposed flow, only the
-finalized per-row scale crosses the call boundary in an opaque descriptor; tiling-dependent
+slightly different work in the two flows (apply vs return). In the ordinary decomposed flow, only
+the finalized per-row scale crosses the call boundary in an opaque descriptor; tiling-dependent
 metadata such as the partial-buffer column count remains internal to the producer call.
 
-### 3.3 Choosing a flow
+### 3.3 Quantization methods
+
+Both RMSNorm flows can support `GEMM -> residual -> RMSNorm -> fp8 quant`, but the quantization
+is placed differently.
+
+**Full RMSNorm quantization.** Kernel 2 already materializes the logical RMSNorm output, so it
+can requantize that value directly:
+
+```
+y_i,j = r_i * h2_i,j
+q_i,j = round_fp8(y_i,j / s_i(y))
+D      = q(y)
+```
+
+The scale `s_i(y)` is the dequant scale for the logical RMSNorm output. It may be static or
+dynamic, with granularity defined by the requant policy.
+
+**Decomposed dynamic quantization.** The decomposed flow does not materialize `y = r * h2`
+before GEMM2. It can still represent dynamic per-row quantization because the RMSNorm scalar
+commutes into the dynamic scale. Here `r_i` is the per-row RMSNorm reciprocal scale (`rstd`) and
+`fp8_max` is the maximum finite magnitude of the selected FP8 format:
+
+```
+s_i(h2) = amax_j(|h2_i,j|) / fp8_max
+s_i(y)  = amax_j(|r_i * h2_i,j|) / fp8_max
+        = r_i * amax_j(|h2_i,j|) / fp8_max
+        = r_i * s_i(h2)
+
+q_i,j   = quant(y_i,j, s_i(y))
+        = round((r_i * h2_i,j) / (r_i * s_i(h2)))
+        = round(h2_i,j / s_i(h2))
+rho_i   = r_i * s_i(h2)                    # handoff scale, equal to s_i(y)
+```
+
+The producer writes FP8 `q(h2)` and the handoff carries `rho_i`. Numerically `rho_i` is the same
+logical RMSNorm-output dequant scale as `s_i(y)`, but the separate name marks its API role: it is
+the scale GEMM2 consumes to finish the delayed-scale computation.
+
+```
+GEMM2 raw:  u_i = q_i @ W1
+epilogue:  out_i = rho_i * u_i
+```
+
+The initial decomposed quantized target is `DYNAMIC_FROM_AMAX + PER_ROW`. Dynamic block/MX
+scales can use the same idea when each block is contained within one RMSNorm row. Static
+final-output scales do not have this cancellation: for fixed `S`,
+`round_fp8((r_i * h2_i,j) / S)` cannot generally be recovered from
+`round_fp8(h2_i,j / S)` by a later epilogue multiply.
+
+### 3.4 Choosing a flow
 
 The caller selects the flow explicitly through the epilogue stages it adds, based on its own
 use case; the library never substitutes one flow for the other based on a shape heuristic.
@@ -156,12 +207,18 @@ use case; the library never substitutes one flow for the other based on a shape 
   for the decomposed flow when the RMSNorm output directly feeds another matmul. This removes
   the standalone RMSNorm pass and defers the scale into the consuming GEMM's epilogue.
 
-Both flows run the same producer plus a cross-tile reduction, so launch counts are comparable. The
-decomposed flow writes only the per-row scale `[M]` and folds the scale-apply into the consuming
-GEMM's epilogue, avoiding the write and re-read of the full `[M, N]` normalized tensor that the
-full flow materializes. That bandwidth saving grows with `M` and `N`.
+Within the decomposed flow, adding `requant` after `partial RMSNorm stats` selects the
+dynamic-quantized variant described in section 3.3. The producer writes FP8 codes for `h2` and
+carries the composed row scale `rho = rstd * dequant_scale(h2)` to the consuming GEMM.
 
-### 3.4 Reduction backend (internal)
+Both flows run the same producer plus a cross-tile reduction, so launch counts are comparable.
+The ordinary decomposed variant writes only the per-row scale `[M]` and folds the scale-apply
+into the consuming GEMM's epilogue, avoiding the write and re-read of the full `[M, N]`
+normalized tensor that the full flow materializes. The dynamic-quantized decomposed variant
+materializes FP8 `q(h2)` but avoids materializing the BF16/FP16 RMSNorm output `rstd * h2`.
+Those bandwidth savings grow with `M` and `N`.
+
+### 3.5 Reduction backend (internal)
 
 The "combine partials -> rstd" step is the same class of cross-workgroup reduction that
 Stream-K already performs to combine partial output tiles, so its workspace, flag/synchronizer
@@ -169,15 +226,24 @@ handshake, and device-scope fences can be reused. The combine is realized as a c
 and its backend (for example atomic accumulation, an in-kernel tree fixup, or a separate
 reduction kernel) is an internal implementation choice, not a user-selected option.
 
-### 3.5 Numerics
+### 3.6 Numerics
 
 Applying `r` after the projection (decomposed flow) changes rounding relative to applying it
 before. Partial sums of squares, the reciprocal square root, and the row-wise scale `r`/`rstd`
 are kept in FP32 regardless of storage type: the epilogue multiplies by the FP32 `rstd` and only
 then casts the result to the requested output type. CODA paper reports this delayed-scale
 reparameterization on BF16 Llama-style layers against an FP32 reference and does not observe a
-numerical regression. hipBLASLt should still validate both flows against an FP32 reference 
-for the target model shapes and dtypes before enabling them by default.
+numerical regression. hipBLASLt should still validate both flows and the decomposed variants
+against an FP32 reference for the target model shapes and dtypes before enabling them by default.
+
+The decomposed dynamic quantization variant changes the rounding point from
+`round_fp8(r * h2 / s(y))` to the algebraically identical `round_fp8(h2 / s(h2))` for per-row
+dynamic scale. The FP8 codes match the materialized `RMSNorm -> quant` path under the same amax,
+scale, saturation, and rounding rules. The remaining numerical differences are the same CODA
+differences as above: the composed row scale `rho` is applied to GEMM2's accumulated result
+instead of dequantizing the input before the multiply. This should be validated for target models,
+especially when block/MX scales, scale-format quantization, or non-per-row scale domains are
+enabled.
 
 ## 4. Composable-stage model
 
@@ -211,8 +277,9 @@ The decomposed flow of section 3 adds two stages in this taxonomy:
 
 - **Partial RMSNorm stats** is a side-output reduction producer: its main output is the
   tile-local value `h1 ⊙ gamma` written by GEMM1, and its side output is the per-row RMSNorm
-  scale, produced by the internal cross-tile reduction and stored in an opaque handoff
-  descriptor (section 5.2).
+  consumer scale, produced by the internal cross-tile reduction and stored in an opaque handoff
+  descriptor (section 5.2). In the dynamic-quantized decomposed variant this scale includes the
+  activation dequant scale as well as `rstd`.
 - **RMSNorm scale-apply** is a deferred-scale consumer: it multiplies the second GEMM's
   accumulator by the per-row scale carried in the handoff descriptor. It performs no reduction
   of its own.
@@ -250,10 +317,19 @@ calls, linked by an opaque RMSNorm handoff descriptor (section 5.2):
   deferred per-row scale to complete the normalization on GEMM2's output; it adds no further
   stages.
 
-In this design, FP8 activation quantization for the consuming GEMM is input preparation for
-that GEMM, so it lives in GEMM2's prologue / mainloop input path, not in either decomposed
-epilogue chain above. Quantization of a full-RMSNorm output, by contrast, fuses into the
-apply step of the full flow.
+The dynamic-quantized decomposed variant extends the producer chain to
+`bias -> residual add -> partial RMSNorm stats -> requant`. In this chain, `requant` writes
+the FP8 codes for `h2`, while the handoff descriptor carries the composed row scale
+`rho = rstd * dequant_scale(h2)` needed by GEMM2. The consumer chain remains
+`RMSNorm scale-apply`: it reads the same handoff descriptor and applies `rho` to GEMM2's
+accumulator. This is not a normal output requant on GEMM2; it is the first half of
+`GEMM -> residual -> RMSNorm -> fp8 quant` plus a delayed scale that lets GEMM2 finish the
+logical computation.
+
+Static activation quantization for the consuming GEMM, or dynamic quantization with a scale
+domain that does not share one RMSNorm factor, cannot use this exact chain transformation.
+Those cases either use the full-RMSNorm path that materializes the quantized activation, or a
+future kernel that explicitly applies `rstd` before quantizing.
 
 The section 4.2 legality rule applies within each chain independently; the
 producer-before-consumer ordering is a data dependency through the handoff descriptor, not a
@@ -287,7 +363,10 @@ enforced by an internal rank map, not by the numeric value.
 `HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS` and
 `HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM_SCALE_APPLY` are the decomposed-flow stages of section 3.
 They are attached to two different matmul descriptors and are linked by the opaque RMSNorm
-handoff descriptor.
+handoff descriptor. When `HIPBLASLT_FUSEABLE_EPILOGUE_REQUANT` follows
+`HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS`, it enters the CODA dynamic-quantized
+producer mode of section 3.3: the main producer output is the FP8 code for `h2`, and the
+handoff descriptor carries the composed row scale consumed by the second GEMM.
 
 Bias is intentionally absent from this enum. It continues to be configured through the
 existing matmul descriptor attributes (`HIPBLASLT_MATMUL_DESC_BIAS_POINTER` and
@@ -319,19 +398,24 @@ and destroys it, never setting or reading its fields directly.
 ```c
 typedef struct hipblasLtFusedEpilogueRMSNormDescriptor* hipblasLtFusedEpilogueRMSNormDescriptor_t;
 
-hipblasStatus_t hipblasLtFusedEpilogueRMSNormDescriptorCreate(hipblasLtFusedEpilogueRMSNormDescriptor_t* desc);
-hipblasStatus_t hipblasLtFusedEpilogueRMSNormDescriptorDestroy(hipblasLtFusedEpilogueRMSNormDescriptor_t desc);
+hipblasStatus_t hipblasLtFusedEpilogueRMSNormDescriptorCreate(
+    hipblasLtFusedEpilogueRMSNormDescriptor_t* desc);
+hipblasStatus_t hipblasLtFusedEpilogueRMSNormDescriptorDestroy(
+    hipblasLtFusedEpilogueRMSNormDescriptor_t desc);
 ```
 
 The producer matmul call runs Kernel 1 plus the cross-tile reduction, and the reduction folds
 `1/d` and `eps` into the finalized per-row scale before the call returns. The **only** state that
 must cross the API boundary into the consumer call (`RMSNorm scale-apply`) is therefore small:
 
-- the per-row scale (`rstd`) buffer, FP32, tightly packed `[M * batch]` (one value per valid
-  output row, per batch).
+- the consumer row scale buffer, FP32, tightly packed `[M * batch]` for the initial per-row
+  modes (one value per valid output row, per batch). In the unquantized decomposed flow this
+  value is `rstd`; in the dynamic-quantized decomposed variant it is
+  `rho = rstd * dequant_scale(h2)`.
 - a populated/validity token, so a `RMSNorm scale-apply` chain attached to a descriptor that no
   producer has written is rejected at `hipblasLtMatmul` time.
-
+- optional quantization metadata describing whether the producer output is an unquantized `h2`
+  tensor or an FP8 `q(h2)` tensor, and which scale granularity the consumer row scale uses.
 
 `Add` accumulates stages in call order. The chain is attached to a matmul descriptor with a
 single new attribute:
@@ -404,18 +488,19 @@ For the decomposed flow, `gamma` and `eps` are set on the producer handle: `gamm
 tile-locally in Kernel 1, and `eps` (together with `1/d`, which the library derives from the
 problem shape) is consumed by the internal reduction that finalizes the per-row scale. The
 handoff descriptor is set on both the producer and consumer handles and must refer to the same
-object. Only the finalized per-row scale is carried inside the handoff descriptor (which owns
-that one cross-call allocation); the partial sum-of-squares scratch stays in the matmul
+object. The descriptor carries the finalized consumer row scale: `rstd` for the unquantized
+decomposed flow, or the composed CODA scale `rho = rstd * dequant_scale(h2)` when the producer
+also has a dynamic requant stage. The partial sum-of-squares scratch stays in the matmul
 preference workspace and is consumed by the reduction inside the producer call.
 
 #### 5.3.3 Requant attributes
 
-| Attribute                                                | Type                                    | Meaning                                                                                                                                |
-|----------------------------------------------------------|-----------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------|
-| `HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_POINTER`     | `void*` (f32)                           | Device pointer to the dequant scale; read-only input in static mode, written in dynamic mode. Element count follows the granularity |
-| `HIPBLASLT_FUSED_EPILOGUE_REQUANT_AMAX_POINTER`      | `void*` (f32)                           | Optional device pointer receiving the result amax side output, same granularity as the scale (`NULL`/unset = no amax written)          |
-| `HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_COMPUTE_MODE`| `hipblasLtRequantScaleComputeMode_t` | Static caller-provided scale vs dynamic-from-amax (default: static)                                                                    |
-| `HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_GRANULARITY` | `hipblasLtRequantScaleGranularity_t` | Scale/amax shape: per-tensor, per-row, or block (default: per-tensor)                                                                  |
+| Attribute                                             | Type                                    | Meaning                                                                                                                            |
+|-------------------------------------------------------|-----------------------------------------|------------------------------------------------------------------------------------------------------------------------------------|
+| `HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_POINTER`      | `void*` (f32)                           | Device pointer to the dequant scale; read-only input in static mode, written in dynamic mode. Element count follows the granularity |
+| `HIPBLASLT_FUSED_EPILOGUE_REQUANT_AMAX_POINTER`       | `void*` (f32)                           | Optional device pointer receiving the result amax side output, same granularity as the scale (`NULL`/unset = no amax written)      |
+| `HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_COMPUTE_MODE` | `hipblasLtRequantScaleComputeMode_t`    | Static caller-provided scale vs dynamic-from-amax (default: static)                                                                |
+| `HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_GRANULARITY`  | `hipblasLtRequantScaleGranularity_t`    | Scale/amax shape: per-tensor, per-row, or block (default: per-tensor)                                                              |
 
 ##### Requant policy
 
@@ -425,8 +510,8 @@ The motivating model path is:
 RMSNorm output (BF16/FP16) -> requantize to FP8 activation -> next GEMM
 ```
 
-Observed model paths motivate scalar scale support for different compute modes, for example, 
-Mixtral FP8 uses a checkpoint-provided scalar f32 scale (`STATIC` + `PER_TENSOR`), while 
+Observed model paths motivate scalar scale support for different compute modes, for example,
+Mixtral FP8 uses a checkpoint-provided scalar f32 scale (`STATIC` + `PER_TENSOR`), while
 Llama3 FP8 uses a scalar scale derived from the result amax (`DYNAMIC_FROM_AMAX` + `PER_TENSOR`).
 
 The public scale convention is always a **dequant scale**, matching the scale carried with the
@@ -450,6 +535,88 @@ The requant attributes define the policy that is not captured by the stage enum:
 - `AMAX_POINTER` is an optional f32 side output with the same granularity as the scale. It is
   not needed for a static-scale path, but is useful when the caller wants the raw result amax
   for dynamic scaling or delayed-scaling bookkeeping.
+
+##### FP8 variant and architecture compatibility
+
+The `REQUANT` stage does not by itself choose the FP8 number representation. The narrow output
+format is selected by the producer's `D` matrix layout data type, and the consuming GEMM must use
+the same representation for its `A` matrix layout when it reads that output. The scale policy
+(`STATIC` vs `DYNAMIC_FROM_AMAX`, per-tensor vs per-row) is therefore orthogonal to, but not
+independent of, the FP8 encoding.
+
+ROCm's MI300/MI350 workload guidance calls out an architecture-visible format difference:
+MI300 Series (`gfx942`) uses the FNUZ FP8 variants, while MI350 Series (`gfx950`) uses the OCP
+FP8 variants. The initial MI350 fused-requant and CODA paths should therefore target the OCP
+HIP data types:
+
+```text
+HIP_R_8F_E4M3
+HIP_R_8F_E5M2
+```
+
+and should not silently reinterpret FNUZ tensors:
+
+```text
+HIP_R_8F_E4M3_FNUZ
+HIP_R_8F_E5M2_FNUZ
+```
+
+as OCP tensors, or vice versa. The encodings have different value sets and special-value
+semantics, so the scale alone is not sufficient to make a FNUZ checkpoint activation compatible
+with an OCP GEMM. A model or inference engine that stores FNUZ FP8 activations must either use a
+matching MI300/FNUZ kernel path or explicitly convert the checkpoint/runtime tensors and scales
+to the OCP representation expected by MI350. Conversely, vLLM quantized models that already
+target OCP E4M3/E5M2 should use the OCP HIP data types end to end.
+
+The `fp8_max` constant in section 3.3 is the maximum finite magnitude of the selected FP8 format,
+not a global FP8 constant. Requant kernels must derive their quant multiplier, saturation
+threshold, rounding behavior, and optional amax reporting from the actual `hipDataType` selected
+for `D`.
+The CODA handoff must record enough metadata to validate that the producer's FP8 `D` type and
+the consumer's FP8 `A` type match, and that the selected device has a native kernel for that
+variant.
+
+MI350 also introduces OCP MX formats (`MXFP8`, `MXFP6`, `MXFP4`) with a shared exponent/scale
+per 32-element block. These are not just plain FP8 plus a different per-row scale; they carry
+block-scale metadata with layout requirements that must match the GEMM mainloop. A future CODA
+MX mode can reuse the same algebra when each block is contained within one RMSNorm row, replacing
+`rho_i` with a block scale `rho_{i,b} = rstd_i * scale_{i,b}(h2)`. That extension should be gated
+on the quantization format expected by the vLLM model and on MI350 block-scale kernel support,
+rather than enabled by the generic `PER_ROW` FP8 path.
+
+##### CODA dynamic-quantized producer mode
+
+When a producer chain contains both `HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS` and
+`HIPBLASLT_FUSEABLE_EPILOGUE_REQUANT`, the `REQUANT` stage has specialized CODA semantics:
+
+```text
+producer D  = q(h2)                    # FP8 codes, using dynamic scale of h2
+handoff rho = rstd * dequant_scale(h2) # logical RMSNorm-output dequant scale
+```
+
+The initial supported policy for this mode is:
+
+- `SCALE_COMPUTE_MODE = HIPBLASLT_REQUANT_SCALE_DYNAMIC_FROM_AMAX`.
+- `SCALE_GRANULARITY = HIPBLASLT_REQUANT_SCALE_PER_ROW`.
+- `SCALE_POINTER` receives the logical RMSNorm-output dequant scale `rho` (`f32[M * batch]`)
+  and is also recorded in the handoff descriptor for the consumer. If a future implementation
+  lets the handoff descriptor allocate this buffer privately, `SCALE_POINTER` can become an
+  optional side-output attribute for this mode; the initial API keeps it required so the scale
+  lifetime is explicit.
+- `AMAX_POINTER`, when set, receives the logical RMSNorm-output amax
+  `amax(y)_i = rstd_i * amax(h2)_i`, not the pre-RMSNorm `amax(h2)_i`.
+
+The consumer matmul attaches `HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM_SCALE_APPLY` with the same
+handoff descriptor. Its left input `A` points at the producer's FP8 `D` output. The consumer
+kernel computes `q(h2) @ W1` and applies the handoff scale `rho` as a per-row epilogue factor.
+Equivalently, a kernel with native per-row input scaling may consume `rho` before or during the
+mainloop, but it must expose the same numerical contract.
+
+Static scales are intentionally excluded from this CODA mode. With a caller-provided final
+scale `S`, the required FP8 code is `round_fp8((rstd * h2) / S)`, so the producer must either
+apply `rstd` before quantization or use a row-dependent quant multiplier `1 / (S / rstd)`. That
+is not the cancellation in section 3.3 and should be modeled as a full materializing path or a
+separate future mode.
 
 ##### Relationship to the existing matmul-descriptor scale/amax attributes
 
@@ -522,7 +689,9 @@ hipblasLtFusedEpilogueDestroy(fused);
 
 #### 5.4.3 Decomposed RMSNorm handoff
 
-Decomposed flow for `GEMM -> residual -> RMSNorm -> GEMM`, using the opaque handoff descriptor:
+Decomposed flow for `GEMM -> residual -> RMSNorm -> GEMM`, using the opaque handoff descriptor.
+The same sketch covers the dynamic per-row FP8 variant of section 3.3: add `REQUANT` on the
+producer, set the dynamic per-row policy, and use an FP8 producer `D` / consumer `A`.
 
 ```c
 // Handoff object shared by the producer and consumer matmul calls.
@@ -542,13 +711,30 @@ hipblasLtFusedEpilogueSetAttribute(prod, HIPBLASLT_FUSED_EPILOGUE_RMSNORM_EPS,
                                    &eps, sizeof(eps));
 hipblasLtFusedEpilogueSetAttribute(prod, HIPBLASLT_FUSED_EPILOGUE_RMSNORM_STATS,
                                    &stats, sizeof(stats));
+
+// Optional dynamic-quantized decomposed variant:
+//   - matD1 has FP8 type and receives q(h2), not q(rstd * h2)
+//   - stats carries rho_i = rstd_i * dequant_scale_i(h2)
+// Omit this block for the ordinary BF16/FP16 decomposed flow, where matD1 receives h2
+// and stats carries only rstd.
+hipblasLtFusedEpilogueAdd(prod, HIPBLASLT_FUSEABLE_EPILOGUE_REQUANT);
+hipblasLtRequantScaleComputeMode_t mode = HIPBLASLT_REQUANT_SCALE_DYNAMIC_FROM_AMAX;
+hipblasLtRequantScaleGranularity_t gran = HIPBLASLT_REQUANT_SCALE_PER_ROW;
+hipblasLtFusedEpilogueSetAttribute(prod, HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_COMPUTE_MODE,
+                                   &mode, sizeof(mode));
+hipblasLtFusedEpilogueSetAttribute(prod, HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_GRANULARITY,
+                                   &gran, sizeof(gran));
+// f32[M * batch], receives rho_i for the dynamic-quantized variant.
+hipblasLtFusedEpilogueSetAttribute(prod, HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_POINTER,
+                                   &d_coda_row_scale, sizeof(d_coda_row_scale));
 hipblasLtMatmulDescSetAttribute(matmulDesc1, HIPBLASLT_MATMUL_DESC_FUSED_EPILOGUE,
                                 &prod, sizeof(prod));
 // ... hipblasLtMatmul(GEMM1) ...
 // Internally launches GEMM1 producer + auxiliary reduce-and-return kernel.
-// After the queued work completes, `stats` carries the per-row scale.
+// After the queued work completes, `stats` carries rstd (ordinary) or rho (quantized).
 
 // GEMM2 consumer: apply the deferred per-row scale from `stats` in the epilogue.
+// For the dynamic-quantized variant, A points at matD1's FP8 q(h2) output.
 hipblasLtFusedEpilogueDescriptor_t cons;
 hipblasLtFusedEpilogueCreate(&cons);
 hipblasLtFusedEpilogueAdd(cons, HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM_SCALE_APPLY);
@@ -576,6 +762,13 @@ for the sum of squares and the reciprocal square root.
 For the decomposed flow, the internal partial-stats scratch and the per-row scale carried in
 the handoff descriptor are FP32, independent of the GEMM storage types, so the cross-tile
 combine and the deferred scale match the full-flow accumulation precision.
+
+For the dynamic-quantized decomposed variant, the producer's `D` storage type is the requested
+narrow requant type (initially FP8). The source value for quantization is still `h2`, so `gamma`
+has the same storage type as the pre-requant producer output. The handoff scale `rho` remains
+FP32. On MI350 (`gfx950`), the supported native FP8 producer/consumer type should be an OCP FP8
+type (`HIP_R_8F_E4M3` or `HIP_R_8F_E5M2`). FNUZ types remain distinct HIP data types and require
+a matching FNUZ-capable kernel path or explicit conversion before they can feed an OCP MI350 GEMM.
 
 ### 5.6 Strided-batched semantics
 
@@ -605,6 +798,11 @@ When `batch_count > 1` in a strided-batched GEMM:
 | Partial-stats or scale-apply stage present but stats descriptor unset     | `HIPBLAS_STATUS_INVALID_VALUE` | attach                                      |
 | Requant stage present but scale pointer unset                             | `HIPBLAS_STATUS_INVALID_VALUE` | attach                                      |
 | Requant scale compute mode or granularity is outside the enum range       | `HIPBLAS_STATUS_INVALID_VALUE` | `SetAttribute` time / attach                |
+| CODA requant producer uses a non-dynamic or non-per-row scale policy      | `HIPBLAS_STATUS_INVALID_VALUE` | attach                                      |
+| CODA requant producer is missing the RMSNorm handoff descriptor           | `HIPBLAS_STATUS_INVALID_VALUE` | attach                                      |
+| CODA consumer A type/layout does not match the producer's FP8 output      | `HIPBLAS_STATUS_INVALID_VALUE` | `hipblasLtMatmul` / kernel validation       |
+| Requested FP8 variant is not supported natively by the selected GPU       | `HIPBLAS_STATUS_NOT_SUPPORTED` | heuristic / `hipblasLtMatmul`               |
+| Producer and consumer use different FP8 variants (for example OCP vs FNUZ) | `HIPBLAS_STATUS_INVALID_VALUE` | `hipblasLtMatmul` / kernel validation       |
 | Scale-apply consumes a stats descriptor not populated by a producer       | `HIPBLAS_STATUS_INVALID_VALUE` | `hipblasLtMatmul`                           |
 | Attached fused epilogue without a matching kernel implementation          | `HIPBLAS_STATUS_NOT_SUPPORTED` | `hipblasLtMatmul`                           |
 
@@ -621,6 +819,14 @@ should not rely on late updates to satisfy attach-time required-attribute valida
 decomposed flow, the producer-before-consumer dependency on the handoff descriptor can only be
 fully validated at `hipblasLtMatmul` time.
 
+For the dynamic-quantized decomposed variant, attaching a producer chain with
+`PARTIAL_RMSNORM_STATS -> REQUANT` additionally validates that the chain has a handoff
+descriptor, uses `DYNAMIC_FROM_AMAX + PER_ROW`, and writes a narrow producer `D` type supported
+by the matching consumer kernel. The consumer validates that the attached handoff was populated
+by a compatible CODA producer before using its row scale. FP8 validation includes the selected
+HIP data type: the producer `D` type, consumer `A` type, quantization scale interpretation, and
+available kernel must agree on OCP vs FNUZ encoding.
+
 ## 7. Interaction with existing descriptors and preferences
 
 - A new opaque builder object (`hipblasLtFusedEpilogueDescriptor_t`) is introduced; it is
@@ -632,9 +838,11 @@ fully validated at `hipblasLtMatmul` time.
   Neither flow has caller-allocated normalization buffers. In the full flow, `partialBuf` and any
   synchronizer/flag buffer are transient and drawn from the matmul preference workspace for the
   single call; Kernel 2 applies the row scale to `D` in place, so no per-row-scale buffer is
-  materialized. In the decomposed flow, the handoff descriptor owns only the finalized per-row
-  scale used by GEMM2. The producer's `partialBuf` scratch and any synchronizer/flag buffer remain
-  internal, transient workspace sized through the workspace-size query.
+  materialized. In the decomposed flow, the handoff descriptor owns or records only the finalized
+  consumer row scale used by GEMM2 (`rstd` for the unquantized decomposed flow, `rho` for the
+  dynamic-quantized decomposed variant). The producer's `partialBuf` scratch and any
+  synchronizer/flag buffer remain internal, transient workspace sized through the workspace-size
+  query.
 - On the codegen side, the GEMM kernels for both flows come from a single TensileLite option
   (`FusedEpilogues = 1`) that bundles the optional-residual, RMSNorm-producer, and
   RMSNorm-scale-apply epilogue options and selects among them at runtime. The cross-tile
