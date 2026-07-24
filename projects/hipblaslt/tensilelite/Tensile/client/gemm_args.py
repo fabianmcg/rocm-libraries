@@ -35,7 +35,7 @@ def buildKernelArgs(
 ) -> bytes:
     """Build the raw argument buffer for a TensileLite GEMM kernel.
 
-    solution_params: solution dict from enumerate_all_solutions (includes
+    solution_params: solution dict from enumerateAllSolutions (includes
                      InternalArgsSupport fields injected by task 0.8).
     problem_params:  problem dimensions: M, N, K, lda, ldb, ldc, ldd,
                      alpha, beta, batch_count, strides, etc.

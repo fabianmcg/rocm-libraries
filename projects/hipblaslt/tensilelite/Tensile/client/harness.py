@@ -18,26 +18,26 @@ from typing import List
 class BenchmarkResult:
     """Timing data returned by KernelRunner.run()."""
 
-    times_ns: List[int]
-    warmup_n: int
+    timesNs: List[int]
+    warmupN: int
 
     @property
     def meanUs(self) -> float:
-        return statistics.mean(self.times_ns) / 1_000.0
+        return statistics.mean(self.timesNs) / 1_000.0
 
     @property
     def p50Us(self) -> float:
-        return statistics.median(self.times_ns) / 1_000.0
+        return statistics.median(self.timesNs) / 1_000.0
 
     @property
     def p95Us(self) -> float:
-        sorted_ns = sorted(self.times_ns)
+        sorted_ns = sorted(self.timesNs)
         idx = max(0, int(len(sorted_ns) * 0.95) - 1)
         return sorted_ns[idx] / 1_000.0
 
     @property
     def minUs(self) -> float:
-        return min(self.times_ns) / 1_000.0
+        return min(self.timesNs) / 1_000.0
 
     def gflops(self, M: int, N: int, K: int) -> float:
         """Compute GFLOPs from mean timing using 2*M*N*K FLOPs per iteration."""
@@ -48,13 +48,13 @@ class BenchmarkResult:
 class BufferPool:
     """Round-robin pool of GpuBuffer instances.
 
-    Pre-allocates n_slots independent device buffers of size_bytes each.
+    Pre-allocates nSlots independent device buffers of sizeBytes each.
     Cycling them across iterations prevents write-combining effects and
     avoids the kernel reading its own output.
     """
 
-    def __init__(self, n_slots: int, size_bytes: int, gpu_buffer_cls) -> None:
-        self._slots = [gpu_buffer_cls(size_bytes) for _ in range(n_slots)]
+    def __init__(self, nSlots: int, sizeBytes: int, gpuBufferCls) -> None:
+        self._slots = [gpuBufferCls(sizeBytes) for _ in range(nSlots)]
         self._idx = 0
 
     def next(self):
@@ -78,45 +78,45 @@ class KernelRunner:
     HSACO) prevents I-cache reuse from artificially inflating performance.
     """
 
-    def __init__(self, functions: list, output_pool: "BufferPool") -> None:
+    def __init__(self, functions: list, outputPool: "BufferPool") -> None:
         """
-        functions:    list of GpuFunction objects (one per module copy).
-        output_pool:  BufferPool for rotating output buffers.
+        functions:  list of GpuFunction objects (one per module copy).
+        outputPool: BufferPool for rotating output buffers.
         """
         if not functions:
             raise ValueError("functions must be non-empty")
         self._functions = functions
-        self._output_pool = output_pool
+        self._outputPool = outputPool
         self._call_count = 0
 
     def run(
         self,
-        args_fn,
+        argsFn,
         grid: tuple,
         block: tuple,
-        n_warmup: int,
-        n_iters: int,
+        nWarmup: int,
+        nIters: int,
     ) -> BenchmarkResult:
         """Launch the kernel and collect timing.
 
-        args_fn:  callable(output_buf) -> list of kernel args. Called once per
-                  iteration with the next output buffer from the pool.
-        grid:     (gridX, gridY, gridZ) tuple.
-        block:    (blockX, blockY, blockZ) tuple.
-        n_warmup: number of iterations before timing begins.
-        n_iters:  number of timed iterations.
+        argsFn:  callable(output_buf) -> list of kernel args. Called once per
+                 iteration with the next output buffer from the pool.
+        grid:    (gridX, gridY, gridZ) tuple.
+        block:   (blockX, blockY, blockZ) tuple.
+        nWarmup: number of iterations before timing begins.
+        nIters:  number of timed iterations.
         """
         try:
             from amdgpu_exec import GpuEvent
         except ImportError as exc:
             raise RuntimeError("amdgpu_exec is required for KernelRunner.run") from exc
 
-        times_ns = []
-        total = n_warmup + n_iters
+        timesNs = []
+        total = nWarmup + nIters
         for i in range(total):
             fn = self._functions[self._call_count % len(self._functions)]
-            out_buf = self._output_pool.next()
-            args = args_fn(out_buf)
+            out_buf = self._outputPool.next()
+            args = argsFn(out_buf)
 
             start = GpuEvent()
             stop = GpuEvent()
@@ -126,7 +126,7 @@ class KernelRunner:
             stop.synchronize()
 
             self._call_count += 1
-            if i >= n_warmup:
-                times_ns.append(stop.elapsed_ns(start))
+            if i >= nWarmup:
+                timesNs.append(stop.elapsed_ns(start))
 
-        return BenchmarkResult(times_ns=times_ns, warmup_n=n_warmup)
+        return BenchmarkResult(timesNs=timesNs, warmupN=nWarmup)
