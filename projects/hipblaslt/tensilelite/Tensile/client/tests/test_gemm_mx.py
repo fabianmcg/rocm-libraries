@@ -809,53 +809,58 @@ def _allocMxF4Batched(M: int, N: int, K: int, batch: int, blockK: int, rng):
     return A_buf, B_buf, mxsa_buf, mxsb_buf, C_buf, D_buf, A_logical, B_logical
 
 
-def _runMxBatched(entry: dict, M: int, N: int, batch: int, K: int,
-                  blockK: int, rtol: float, atol: float, label: str,
-                  allocFn):
-    """Execute one MX TN stridedBatched kernel and verify against reference.
+def _mxLaunchAndCapture(entry: dict, M: int, N: int, batch: int, K: int,
+                         blockK: int, bufs: tuple, args: list) -> np.ndarray:
+    """Launch an MX kernel and return the captured D output as float32.
 
-    allocFn must be _allocMxF8Batched or _allocMxF4Batched; both return the
-    same seven-tuple interface with float32 reference arrays at positions 6-7.
+    bufs must be (A_buf, B_buf, mxsa_buf, mxsb_buf, C_buf, D_buf).
+    args is the pre-built argument list; the caller may mutate it before passing.
     """
     sol_dict = entry["sol_dict"]
-    kernel_name = entry["kernel_name"]
-    hsaco = entry["hsaco"]
+    A_buf, B_buf, mxsa_buf, mxsb_buf, C_buf, D_buf = bufs
     num_wg = math.ceil(M / sol_dict["MacroTile0"]) * math.ceil(N / sol_dict["MacroTile1"]) * batch
-    num_threads = sol_dict["NumThreads"]
-    seed = M * 1000 + N + K + (7 if allocFn is _allocMxF4Batched else 0)
-    rng = np.random.default_rng(seed=seed)
-
-    A_buf, B_buf, mxsa_buf, mxsb_buf, C_buf, D_buf, A_f32, B_f32 = \
-        allocFn(M, N, K, batch, blockK, rng)
-
     result_holder: dict = {}
 
     def capture(arguments):
         result_holder["D_gpu"] = np.asarray(arguments[8].array, dtype=np.float32).copy()
 
-    D_io = amdgpu_exec.InOutArray(D_buf)
-    C_in = amdgpu_exec.InputArray(C_buf)
-    A_in = amdgpu_exec.InputArray(A_buf)
-    B_in = amdgpu_exec.InputArray(B_buf)
-    mxsa_in = amdgpu_exec.InputArray(mxsa_buf)
-    mxsb_in = amdgpu_exec.InputArray(mxsb_buf)
-
-    args = _buildTnMxArgs(sol_dict, M, N, batch, K,
-                          D_io, C_in, A_in, mxsa_in, B_in, mxsb_in,
-                          blockK=blockK)
     amdgpu_exec.execute_hsaco(
-        hsaco=hsaco, kernel_name=kernel_name, arguments=args,
-        grid_dim=(num_wg, 1, 1), block_dim=(num_threads, 1, 1),
+        hsaco=entry["hsaco"], kernel_name=entry["kernel_name"], arguments=args,
+        grid_dim=(num_wg, 1, 1), block_dim=(sol_dict["NumThreads"], 1, 1),
         num_iterations=1, verify_fn=capture,
     )
-    D_gpu = result_holder["D_gpu"]
+    return result_holder["D_gpu"]
 
-    # All-1 scales → gemmMx with all-1.0 = plain float32 GEMM.
+
+def _mxBuildArgs(sol_dict, M, N, batch, K, blockK, bufs):
+    """Build the typed argument list for an MX TN stridedBatched kernel."""
+    A_buf, B_buf, mxsa_buf, mxsb_buf, C_buf, D_buf = bufs
+    return _buildTnMxArgs(sol_dict, M, N, batch, K,
+                          amdgpu_exec.InOutArray(D_buf),
+                          amdgpu_exec.InputArray(C_buf),
+                          amdgpu_exec.InputArray(A_buf),
+                          amdgpu_exec.InputArray(mxsa_buf),
+                          amdgpu_exec.InputArray(B_buf),
+                          amdgpu_exec.InputArray(mxsb_buf),
+                          blockK=blockK)
+
+
+def _runMxBatched(entry: dict, M: int, N: int, batch: int, K: int,
+                  blockK: int, rtol: float, atol: float, label: str,
+                  allocFn):
+    """Execute one MX TN stridedBatched kernel and verify against reference."""
+    sol_dict = entry["sol_dict"]
+    seed = M * 1000 + N + K + (7 if allocFn is _allocMxF4Batched else 0)
+    rng = np.random.default_rng(seed=seed)
+    A_buf, B_buf, mxsa_buf, mxsb_buf, C_buf, D_buf, A_f32, B_f32 = \
+        allocFn(M, N, K, batch, blockK, rng)
+    bufs = (A_buf, B_buf, mxsa_buf, mxsb_buf, C_buf, D_buf)
+    args = _mxBuildArgs(sol_dict, M, N, batch, K, blockK, bufs)
+    D_gpu = _mxLaunchAndCapture(entry, M, N, batch, K, blockK, bufs, args)
     kBlocks = K // blockK
     sa = np.full((M, kBlocks), 0x7F, dtype=np.uint8)
     sb = np.full((N, kBlocks), 0x7F, dtype=np.uint8)
-    D_ref_one = gemmMx(A_f32, B_f32, sa, sb, blockK=blockK)
-    D_ref = np.tile(np.asfortranarray(D_ref_one).ravel(order="F"), batch)
+    D_ref = np.tile(np.asfortranarray(gemmMx(A_f32, B_f32, sa, sb, blockK=blockK)).ravel(order="F"), batch)
     assertClose(D_gpu, D_ref, rtol=rtol, atol=atol, label=label)
 
 
@@ -927,37 +932,15 @@ def test_mxfp8_nan_scale_row(mxF8Kernels):
         pytest.skip("no MX F8 solution compiled on this GPU")
     M, N, batch, K = 256, 256, 4, 256
     entry = entries[0]
-    sol_dict = entry["sol_dict"]
-    kernel_name = entry["kernel_name"]
-    hsaco = entry["hsaco"]
     rng = np.random.default_rng(seed=99)
     A_buf, B_buf, mxsa_buf, mxsb_buf, C_buf, D_buf, _, _ = \
         _allocMxF8Batched(M, N, K, batch, _mxBlockK, rng)
     # Set all K-blocks of row 0 in batch 0 to NaN scale (0xFF).
-    kBlocks = K // _mxBlockK
-    mxsa_buf[0:kBlocks] = 0xFF
-    result_holder: dict = {}
-
-    def capture(arguments):
-        result_holder["D_gpu"] = np.asarray(arguments[8].array, dtype=np.float32).copy()
-
-    num_wg = math.ceil(M / sol_dict["MacroTile0"]) * math.ceil(N / sol_dict["MacroTile1"]) * batch
-    D_io = amdgpu_exec.InOutArray(D_buf)
-    C_in = amdgpu_exec.InputArray(C_buf)
-    A_in = amdgpu_exec.InputArray(A_buf)
-    B_in = amdgpu_exec.InputArray(B_buf)
-    mxsa_in = amdgpu_exec.InputArray(mxsa_buf)
-    mxsb_in = amdgpu_exec.InputArray(mxsb_buf)
-    args = _buildTnMxArgs(sol_dict, M, N, batch, K,
-                          D_io, C_in, A_in, mxsa_in, B_in, mxsb_in,
-                          blockK=_mxBlockK)
-    amdgpu_exec.execute_hsaco(
-        hsaco=hsaco, kernel_name=kernel_name, arguments=args,
-        grid_dim=(num_wg, 1, 1), block_dim=(sol_dict["NumThreads"], 1, 1),
-        num_iterations=1, verify_fn=capture,
-    )
-    D_gpu = result_holder["D_gpu"]
-    # D is col-major (M,N,batch); row 0 of batch 0: indices 0, M, 2M, ... (N-1)*M.
+    mxsa_buf[0:K // _mxBlockK] = 0xFF
+    bufs = (A_buf, B_buf, mxsa_buf, mxsb_buf, C_buf, D_buf)
+    args = _mxBuildArgs(entry["sol_dict"], M, N, batch, K, _mxBlockK, bufs)
+    D_gpu = _mxLaunchAndCapture(entry, M, N, batch, K, _mxBlockK, bufs, args)
+    # D is col-major (M,N,batch); row 0 of batch 0: indices 0, M, 2M, ..., (N-1)*M.
     row0 = D_gpu[0:M * N:M]
     assert np.all(np.isnan(row0)), (
         f"expected NaN in row 0 but got {int(np.sum(~np.isnan(row0)))} non-NaN elements"
@@ -966,52 +949,24 @@ def test_mxfp8_nan_scale_row(mxF8Kernels):
 
 def _runMxPoisonStride(entry: dict, M: int, N: int, batch: int, K: int,
                        blockK: int, allocFn) -> None:
-    """Run the MX kernel with a corrupted lda; assert ≥50% of output diverges from reference.
-
-    The corrupted lda causes the kernel to read A from the wrong memory positions,
-    so the output should differ widely from the correct reference.
-    """
-    sol_dict = entry["sol_dict"]
-    kernel_name = entry["kernel_name"]
-    hsaco = entry["hsaco"]
-    num_wg = math.ceil(M / sol_dict["MacroTile0"]) * math.ceil(N / sol_dict["MacroTile1"]) * batch
+    """Run the MX kernel with a corrupted lda; assert ≥50% of output diverges from reference."""
     rng = np.random.default_rng(seed=77)
     A_buf, B_buf, mxsa_buf, mxsb_buf, C_buf, D_buf, A_f32, B_f32 = \
         allocFn(M, N, K, batch, blockK, rng)
-    result_holder: dict = {}
-
-    def capture(arguments):
-        result_holder["D_gpu"] = np.asarray(arguments[8].array, dtype=np.float32).copy()
-
-    D_io = amdgpu_exec.InOutArray(D_buf)
-    C_in = amdgpu_exec.InputArray(C_buf)
-    A_in = amdgpu_exec.InputArray(A_buf)
-    B_in = amdgpu_exec.InputArray(B_buf)
-    mxsa_in = amdgpu_exec.InputArray(mxsa_buf)
-    mxsb_in = amdgpu_exec.InputArray(mxsb_buf)
-
-    args = _buildTnMxArgs(sol_dict, M, N, batch, K,
-                          D_io, C_in, A_in, mxsa_in, B_in, mxsb_in,
-                          blockK=blockK)
+    bufs = (A_buf, B_buf, mxsa_buf, mxsb_buf, C_buf, D_buf)
+    args = _mxBuildArgs(entry["sol_dict"], M, N, batch, K, blockK, bufs)
     # args[18] is lda; corrupt it so the kernel reads A with a wrong stride.
     args[18] = np.uint32(K + 1)
-    amdgpu_exec.execute_hsaco(
-        hsaco=hsaco, kernel_name=kernel_name, arguments=args,
-        grid_dim=(num_wg, 1, 1), block_dim=(sol_dict["NumThreads"], 1, 1),
-        num_iterations=1, verify_fn=capture,
-    )
-    D_gpu = result_holder["D_gpu"]
+    D_gpu = _mxLaunchAndCapture(entry, M, N, batch, K, blockK, bufs, args)
     kBlocks = K // blockK
     sa = np.full((M, kBlocks), 0x7F, dtype=np.uint8)
     sb = np.full((N, kBlocks), 0x7F, dtype=np.uint8)
-    D_ref_one = gemmMx(A_f32, B_f32, sa, sb, blockK=blockK)
-    D_ref = np.tile(np.asfortranarray(D_ref_one).ravel(order="F"), batch)
-    # Use fp32 machine-epsilon headroom; any non-trivial stride corruption should produce
-    # errors orders of magnitude larger than this per-element threshold.
+    D_ref = np.tile(np.asfortranarray(gemmMx(A_f32, B_f32, sa, sb, blockK=blockK)).ravel(order="F"), batch)
+    # Any non-trivial stride corruption produces errors orders of magnitude above this threshold.
     threshold = 10 * RTOL_FP32 * (np.abs(D_ref.astype(np.float64)) + 1.0)
-    n_diverge = int(np.sum(np.abs(D_gpu.astype(np.float64) - D_ref.astype(np.float64)) > threshold))
-    assert n_diverge >= len(D_gpu) // 2, (
-        f"poison-stride test: expected ≥50% divergence but only {n_diverge}/{len(D_gpu)} differ"
+    nDiverge = int(np.sum(np.abs(D_gpu.astype(np.float64) - D_ref.astype(np.float64)) > threshold))
+    assert nDiverge >= len(D_gpu) // 2, (
+        f"poison-stride test: expected ≥50% divergence but only {nDiverge}/{len(D_gpu)} differ"
     )
 
 
