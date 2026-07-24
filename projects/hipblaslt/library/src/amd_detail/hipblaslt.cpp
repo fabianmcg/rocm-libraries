@@ -905,8 +905,8 @@ namespace
     // fused epilogue on the host so the advertised API returns correct answers. The shim
     // emulates the full flow (residual add, RMSNorm), the full flow plus static per-tensor FP8
     // requant, and the decomposed flow (partial RMSNorm stats producer + RMSNorm scale-apply
-    // consumer) on column-major tensors. Unsupported stages/policies fall through to
-    // NOT_SUPPORTED.
+    // consumer), including the dynamic per-row quantized producer, on column-major tensors.
+    // Unsupported stages/policies fall through to NOT_SUPPORTED.
     bool fused_epilogue_cpu_shim_supported(const hipblasLtFusedEpilogueDescriptor* d)
     {
         const bool has_requant = fused_epilogue_has_requant(d);
@@ -918,9 +918,13 @@ namespace
         }
         if(has_requant)
         {
-            return fused_epilogue_has_stage(d, HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM)
-                   && d->requant_compute_mode == HIPBLASLT_REQUANT_SCALE_STATIC
-                   && d->requant_granularity == HIPBLASLT_REQUANT_SCALE_PER_TENSOR;
+            if(fused_epilogue_has_stage(d, HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM))
+                return d->requant_compute_mode == HIPBLASLT_REQUANT_SCALE_STATIC
+                       && d->requant_granularity == HIPBLASLT_REQUANT_SCALE_PER_TENSOR;
+            if(fused_epilogue_has_stage(d, HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS))
+                return d->requant_compute_mode == HIPBLASLT_REQUANT_SCALE_DYNAMIC_FROM_AMAX
+                       && d->requant_granularity == HIPBLASLT_REQUANT_SCALE_PER_ROW;
+            return false;
         }
         return true;
     }
@@ -949,6 +953,19 @@ namespace
     inline void shim_store(hip_bfloat16& d, float v)
     {
         d = hip_bfloat16(v);
+    }
+
+    template <typename QuantT>
+    constexpr float shim_quant_max()
+    {
+        return 0.0f;
+    }
+
+    template <>
+    constexpr float shim_quant_max<hipblaslt_f8>()
+    {
+        // OCP E4M3 maximum finite magnitude.
+        return 448.0f;
     }
 
     // Reduce path over each row of a column-major [M,N] tensor (leading dimension ld), using
@@ -1153,16 +1170,10 @@ namespace
         if(batch_count < 1)
             batch_count = 1;
 
-        float dequant_scale = 0.0f;
-        if(hipMemcpy(
-               &dequant_scale, fused->requant_scale, sizeof(float), hipMemcpyDeviceToHost)
-           != hipSuccess)
-            return HIPBLAS_STATUS_INTERNAL_ERROR;
-        if(dequant_scale == 0.0f)
-            return HIPBLAS_STATUS_INVALID_VALUE;
-
         const bool has_residual
             = fused_epilogue_has_stage(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RESIDUAL_ADD);
+        const bool has_producer
+            = fused_epilogue_has_stage(fused, HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS);
         const size_t span
             = static_cast<size_t>(batch_count - 1) * static_cast<size_t>(batch_stride)
               + static_cast<size_t>(n - 1) * static_cast<size_t>(ld) + static_cast<size_t>(m);
@@ -1190,6 +1201,10 @@ namespace
            != hipSuccess)
             return HIPBLAS_STATUS_INTERNAL_ERROR;
 
+        std::vector<float> rstd;
+        if(has_producer)
+            rstd.resize(static_cast<size_t>(batch_count) * m);
+
         fused_epilogue_reduce_host<WorkT>(h_work.data(),
                                           has_residual ? h_res.data() : nullptr,
                                           has_residual ? h_res_out.data() : nullptr,
@@ -1202,8 +1217,8 @@ namespace
                                           fused->rmsnorm_eps,
                                           has_residual,
                                           /*do_norm=*/true,
-                                          /*apply_scale=*/true,
-                                          nullptr);
+                                          /*apply_scale=*/!has_producer,
+                                          has_producer ? rstd.data() : nullptr);
 
         if(has_residual)
         {
@@ -1213,20 +1228,87 @@ namespace
                 return HIPBLAS_STATUS_INTERNAL_ERROR;
         }
 
-        float               amax = 0.0f;
         std::vector<QuantT> h_quant(span);
-        for(size_t idx = 0; idx < span; ++idx)
+        if(has_producer)
         {
-            const float x = shim_load(h_work[idx]);
-            amax          = std::max(amax, std::fabs(x));
-            h_quant[idx]  = QuantT(x / dequant_scale);
-        }
+            const float qmax = shim_quant_max<QuantT>();
+            if(qmax == 0.0f)
+                return HIPBLAS_STATUS_NOT_SUPPORTED;
 
-        if(fused->requant_amax != nullptr)
-        {
-            if(hipMemcpy(fused->requant_amax, &amax, sizeof(float), hipMemcpyHostToDevice)
+            std::vector<float> rho(static_cast<size_t>(batch_count) * m, 0.0f);
+            std::vector<float> amax(static_cast<size_t>(batch_count) * m, 0.0f);
+            for(int32_t b = 0; b < batch_count; ++b)
+            {
+                const int64_t base = static_cast<int64_t>(b) * batch_stride;
+                for(uint64_t i = 0; i < m; ++i)
+                {
+                    float h2_amax = 0.0f;
+                    for(uint64_t j = 0; j < n; ++j)
+                    {
+                        const int64_t e
+                            = base + static_cast<int64_t>(j) * ld + static_cast<int64_t>(i);
+                        h2_amax = std::max(h2_amax, std::fabs(shim_load(h_work[e])));
+                    }
+
+                    const size_t row = static_cast<size_t>(b) * m + i;
+                    const float  h2_scale = h2_amax == 0.0f ? 1.0f : h2_amax / qmax;
+                    rho[row]              = rstd[row] * (h2_amax == 0.0f ? 0.0f : h2_scale);
+                    amax[row]             = rstd[row] * h2_amax;
+
+                    for(uint64_t j = 0; j < n; ++j)
+                    {
+                        const int64_t e
+                            = base + static_cast<int64_t>(j) * ld + static_cast<int64_t>(i);
+                        h_quant[e] = QuantT(shim_load(h_work[e]) / h2_scale);
+                    }
+                }
+            }
+
+            if(hipMemcpy(fused->requant_scale,
+                         rho.data(),
+                         rho.size() * sizeof(float),
+                         hipMemcpyHostToDevice)
                != hipSuccess)
                 return HIPBLAS_STATUS_INTERNAL_ERROR;
+            if(fused->requant_amax != nullptr
+               && hipMemcpy(fused->requant_amax,
+                            amax.data(),
+                            amax.size() * sizeof(float),
+                            hipMemcpyHostToDevice)
+                      != hipSuccess)
+                return HIPBLAS_STATUS_INTERNAL_ERROR;
+
+            auto* stats        = fused->rmsnorm_stats;
+            stats->host_scale  = std::move(rho);
+            stats->rows        = m;
+            stats->batch       = batch_count;
+            stats->populated   = true;
+            stats->per_row_scale = fused->requant_scale;
+        }
+        else
+        {
+            float dequant_scale = 0.0f;
+            if(hipMemcpy(
+                   &dequant_scale, fused->requant_scale, sizeof(float), hipMemcpyDeviceToHost)
+               != hipSuccess)
+                return HIPBLAS_STATUS_INTERNAL_ERROR;
+            if(dequant_scale == 0.0f)
+                return HIPBLAS_STATUS_INVALID_VALUE;
+
+            float amax = 0.0f;
+            for(size_t idx = 0; idx < span; ++idx)
+            {
+                const float x = shim_load(h_work[idx]);
+                amax          = std::max(amax, std::fabs(x));
+                h_quant[idx]  = QuantT(x / dequant_scale);
+            }
+
+            if(fused->requant_amax != nullptr)
+            {
+                if(hipMemcpy(fused->requant_amax, &amax, sizeof(float), hipMemcpyHostToDevice)
+                   != hipSuccess)
+                    return HIPBLAS_STATUS_INTERNAL_ERROR;
+            }
         }
 
         if(hipMemcpy(d_device, h_quant.data(), span * sizeof(QuantT), hipMemcpyHostToDevice)
