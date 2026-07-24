@@ -15,6 +15,7 @@ Supported configuration subset (M1-M5; extended per milestone):
   - useInitialStrides = False
   - KernArgsVersion <= 2, useSFC = False
   - expertSchedulingMode = 0, debugKernel = False
+  - MX block-scaled A and/or B (MXBlockA/B != 0), stridedBatched only (M4)
 
 Unsupported combinations raise NotImplementedError, including:
   - GSU > 1 && streamK == 0
@@ -40,6 +41,18 @@ _dtypeFp8e4m3fnuz: int = 11  # rocisa::DataType::Float8_fnuz  (E4M3 fnuz)
 _dtypeBf8e5m2fnuz: int = 12  # rocisa::DataType::BFloat8_fnuz (E5M2 fnuz)
 _dtypeFp8e4m3fn: int = 15    # rocisa::DataType::Float8       (E4M3 OCP)
 _dtypeBf8e5m2: int = 16      # rocisa::DataType::BFloat8      (E5M2 OCP)
+
+
+def _readMxBlock(solutionParams: dict, axis: str) -> int:
+    """Read MXBlockA or MXBlockB from a solution dict (flat or nested ProblemType).
+
+    Returns 0 when the key is absent, indicating no MX scaling on that operand.
+    """
+    key = f"MXBlock{axis}"
+    if key in solutionParams:
+        return int(solutionParams[key])
+    pt = solutionParams.get("ProblemType") or {}
+    return int(pt.get(key, 0)) if pt else 0
 
 
 def _validateConfig(solutionParams: dict, problemParams: dict) -> None:
@@ -285,11 +298,15 @@ def _buildPointers(solutionParams: dict, tensors: dict) -> bytes:
 
     For stridedBatched: uses d/c/a/b direct device pointers.
     For non-stridedBatched: uses batchD/batchC, batchA/batchB pointer arrays.
+    MX scale pointers (mxsa after A, mxsb after B) are injected when
+    MXBlockA or MXBlockB are non-zero; only supported for stridedBatched.
     StreamK parallel-reduction replaces d/c with ws_d/ws_c; tree-reduction
     uses d/c directly (workspace is appended separately by _buildStreamKWorkspace).
     """
     stridedBatched = solutionParams.get("StridedBatched", True)
     streamK = solutionParams.get("StreamK", 0)
+    mxBlockA = _readMxBlock(solutionParams, "A")
+    mxBlockB = _readMxBlock(solutionParams, "B")
     # Parallel reduction is not exposed in M1; tree reduction uses d/c directly.
 
     buf = b""
@@ -302,7 +319,11 @@ def _buildPointers(solutionParams: dict, tensors: dict) -> bytes:
 
     if stridedBatched:
         buf += _packPtr(tensors["A"])
+        if mxBlockA:
+            buf += _packPtr(tensors.get("mxsa", 0))
         buf += _packPtr(tensors["B"])
+        if mxBlockB:
+            buf += _packPtr(tensors.get("mxsb", 0))
     else:
         buf += _packPtr(tensors["batchA"])
         buf += _packPtr(tensors["batchB"])
@@ -316,16 +337,23 @@ def _buildPointers(solutionParams: dict, tensors: dict) -> bytes:
 
 
 def _buildStrides(solutionParams: dict, problemParams: dict) -> bytes:
-    """Build stride uint32 slots for D, C, A, B.
+    """Build stride uint32 slots for D, C, A, [mxsa,] B, [mxsb].
 
     With useInitialStridesCD=False and useInitialStridesAB=False, strides start
     from dimension index 1 (the C++ startStrideCD/startStrideAB = 1 case).
     For batched GEMM (4-element sizes), each tensor has 3 dimensions → 2 strides.
     For non-batched GEMM (3-element sizes), each tensor has 2 dimensions → 1 stride.
+
+    MX scale strides (strideMXSA after A, strideMXSB after B) are appended when
+    MXBlockA or MXBlockB are non-zero.  Use problemParams keys:
+      ld_mxsa, stride_mxsa  — leading dim and batch stride for scale A
+      ld_mxsb, stride_mxsb  — leading dim and batch stride for scale B
     """
     sizes = problemParams["sizes"]
     # Batched GEMM: 4 problem sizes [M, N, batch, K] → 3D tensors → 2 strides per tensor.
     batched = len(sizes) == 4
+    mxBlockA = _readMxBlock(solutionParams, "A")
+    mxBlockB = _readMxBlock(solutionParams, "B")
     buf = b""
 
     def packStrides(ld: int, batchStride: int) -> bytes:
@@ -337,7 +365,11 @@ def _buildStrides(solutionParams: dict, problemParams: dict) -> bytes:
     buf += packStrides(problemParams["ldd"], problemParams.get("stride_d", 0))
     buf += packStrides(problemParams["ldc"], problemParams.get("stride_c", 0))
     buf += packStrides(problemParams["lda"], problemParams.get("stride_a", 0))
+    if mxBlockA:
+        buf += packStrides(problemParams.get("ld_mxsa", 0), problemParams.get("stride_mxsa", 0))
     buf += packStrides(problemParams["ldb"], problemParams.get("stride_b", 0))
+    if mxBlockB:
+        buf += packStrides(problemParams.get("ld_mxsb", 0), problemParams.get("stride_mxsb", 0))
     return buf
 
 
@@ -467,11 +499,15 @@ def buildKernelArgs(
     problemParams:  problem dimensions with keys: sizes ([M, N, batch, K] or [M, N, K]),
                     ldd, ldc, lda, ldb, stride_d, stride_c, stride_a, stride_b,
                     alpha, beta, gsu (default 1).
+                    MX scale tensors (when MXBlockA/B non-zero in solutionParams):
+                      ld_mxsa, stride_mxsa  — leading dim and batch stride for scale A
+                      ld_mxsb, stride_mxsb  — leading dim and batch stride for scale B
 
     tensors:        device pointers (int) keyed by 'D', 'C', 'A', 'B'
                     (for stridedBatched=True), or 'batchD', 'batchC', 'batchA',
                     'batchB' (for stridedBatched=False), and optionally
-                    'workspace', 'flags' (for streamK > 0).
+                    'workspace', 'flags' (for streamK > 0),
+                    'mxsa', 'mxsb' (for MX-scaled kernels).
 
     cu_count:       device CU count (multiprocessor_count) needed when
                     WorkGroupMappingXCCGroup == -1. Pass 0 when not using

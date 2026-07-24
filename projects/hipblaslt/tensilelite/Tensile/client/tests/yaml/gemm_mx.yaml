@@ -1,0 +1,109 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+################################################################################
+# gemm_mx: MX block-scaled GEMM (TN, batched) for M4 client tests.
+#
+# Two BenchmarkProblems groups:
+#   0: F8+E8→S   MX float8 TN batched, gfx950 only
+#   1: F4+E8→S   MX float4 TN batched, gfx950 only
+#
+# Both groups use:
+#   - TransposeA=True, TransposeB=False (TN layout, standard for gfx950 MX)
+#   - MXBlockA=32, MXBlockB=32 (32-element scale blocks)
+#   - UseSubtileImpl=True (required for all gfx950 MX kernels)
+#   - StaggerU=0 (forced by UseSubtileImpl on gfx950)
+#   - WorkGroupMapping=4 (explicit non-zero, passes M4 filter)
+#   - DepthU=256 (2 * MI_K=128, natural for F8/F4 MX on gfx950)
+#   - MatrixInstruction [16,16,128,1,1,4,4,2,2] → MT128x128
+#   - ScheduleIterAlg=3, DirectToLds=1, PGR=1, PLR=1
+################################################################################
+GlobalParameters:
+  SyncsPerBenchmark: 0
+  MinimumRequiredVersion: 5.0.0
+  NumElementsToValidate: 128
+  DataInitTypeBeta: 0
+  DataInitTypeAlpha: 1
+  Device: 0
+
+BenchmarkProblems:
+  ##############################################################################
+  # Group 0: F8+E8→S (MX float8 OCP E4M3) TN batched, gfx950 only.
+  # DataType F8 (OCP E4M3), DestDataType s (float32).
+  # TransposeA=True, TransposeB=False → TN GEMM.
+  # MI [16,16,128,1,1,4,4,2,2] → v_mfma_f32_16x16x128_f8f6f4, MT=128x128.
+  ##############################################################################
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: F8
+      DestDataType: s
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      MXBlockA: 32
+      MXBlockB: 32
+      TransposeA: True
+      TransposeB: False
+      UseBeta: True
+      Batched: True
+      UseBias: 0
+    - # BenchmarkProblemSizeGroup
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 128, 1, 1, 4, 4, 2, 2]
+        - DepthU: [256]
+        - WorkGroupMapping: [4]
+        - PrefetchGlobalRead: [1]
+        - PrefetchLocalRead: [1]
+        - ScheduleIterAlg: [3]
+        - DirectToLds: [1]
+        - StaggerU: [0]
+        - UseSubtileImpl: [true]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [256,  256,  4, 256]
+          - Exact: [512,  512,  4, 512]
+
+  ##############################################################################
+  # Group 1: F4+E8→S (MX float4 E2M1) TN batched, gfx950 only.
+  # DataType F4 (E2M1), DestDataType s (float32).
+  # TransposeA=True, TransposeB=False → TN GEMM.
+  # MI [16,16,128,1,1,4,4,2,2] → v_mfma_f32_16x16x128_f8f6f4, MT=128x128.
+  ##############################################################################
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: F4
+      DestDataType: s
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      MXBlockA: 32
+      MXBlockB: 32
+      TransposeA: True
+      TransposeB: False
+      UseBeta: True
+      Batched: True
+      UseBias: 0
+    - # BenchmarkProblemSizeGroup
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 128, 1, 1, 4, 4, 2, 2]
+        - DepthU: [256]
+        - WorkGroupMapping: [4]
+        - PrefetchGlobalRead: [1]
+        - PrefetchLocalRead: [1]
+        - ScheduleIterAlg: [3]
+        - DirectToLds: [1]
+        - StaggerU: [0]
+        - UseSubtileImpl: [true]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [256,  256,  4, 256]
+          - Exact: [512,  512,  4, 512]

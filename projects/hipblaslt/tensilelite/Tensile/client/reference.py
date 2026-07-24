@@ -188,6 +188,53 @@ def gemmXf32(
     return D.astype(np.float32)
 
 
+def gemmMx(
+    A: np.ndarray,
+    B: np.ndarray,
+    scaleA: np.ndarray,
+    scaleB: np.ndarray,
+    blockK: int,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+    C: np.ndarray | None = None,
+) -> np.ndarray:
+    """Reference MX block-scaled GEMM with E8 (UE8M0) scale tensors.
+
+    A: (M, K) float32 — operand A already unpacked to logical float32.
+    B: (N, K) float32 — operand B already unpacked to logical float32.
+    scaleA: (M, K//blockK) uint8 — E8-encoded per-(row, K-block) scale for A.
+    scaleB: (N, K//blockK) uint8 — E8-encoded per-(row, K-block) scale for B.
+    blockK: number of K elements per MX scale block (e.g. 32 for gfx950).
+
+    D[m, n] = alpha * sum_kb(sa[m,kb] * sb[n,kb] * sum_{k in kb}(A[m,k] * B[n,k])) + beta*C[m,n]
+
+    Returns float32 D of shape (M, N).
+    """
+    from .mx_types import decodeE8
+
+    A_f = np.asarray(A, dtype=np.float32)
+    B_f = np.asarray(B, dtype=np.float32)
+    M, K = A_f.shape
+    N = B_f.shape[0]
+    kBlocks = K // blockK
+
+    sa = decodeE8(np.asarray(scaleA, dtype=np.uint8))  # (M, kBlocks)
+    sb = decodeE8(np.asarray(scaleB, dtype=np.uint8))  # (N, kBlocks)
+
+    D = np.zeros((M, N), dtype=np.float32)
+    for kb in range(kBlocks):
+        kStart = kb * blockK
+        kEnd = kStart + blockK
+        partial = A_f[:, kStart:kEnd] @ B_f[:, kStart:kEnd].T  # (M, N)
+        scale = np.outer(sa[:, kb], sb[:, kb])                  # (M, N)
+        D += partial * scale
+
+    D *= alpha
+    if beta != 0.0 and C is not None:
+        D += beta * np.asarray(C, dtype=np.float32)
+    return D
+
+
 def assertClose(
     gpu: np.ndarray,
     ref: np.ndarray,
