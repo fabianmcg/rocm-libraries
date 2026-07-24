@@ -80,7 +80,7 @@ Unit tests skip automatically on other chips. Python dependencies `amdgpu_exec`,
 
 | Path | Contents |
 |------|----------|
-| `tensilelite/` | Importable package `epilogues.tensilelite`; four modules described below. |
+| `epilogue_harness/` | Importable package `epilogues.epilogue_harness`; four modules described below. |
 | `unittests/` | pytest suites plus `conftest.py` and `epilogue_test_common.py`. |
 | `bench/` | Three standalone microbenchmark scripts. |
 | `gen/` | `gen_asm_logic.py` — registers a hand-written `.s` file as a custom kernel. |
@@ -90,7 +90,7 @@ Unit tests skip automatically on other chips. Python dependencies `amdgpu_exec`,
 | `torch/` | PyTorch GEMM+RMSNorm reference (`gemm_rmsnorm.py`). |
 | `docs/` | Design docs: `TUNING_PIPELINE.md`, `GEMM_PARTIALRMS_LIBRARY.md`, `LIBRARY_CREATION_GUIDE.md`, `KERNEL_SELECTION.md`, `PARTIALRMS_EXTENSION.md`, `HIPBLASLT_INTEGRATION_STATUS.md`, `gemm_rmsnorm_analysis.md`, `rstdscale_no_predicate.md`. |
 
-### `epilogues.tensilelite` package
+### `epilogues.epilogue_harness` package
 
 | Module | Key public symbols |
 |--------|--------------------|
