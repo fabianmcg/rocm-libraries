@@ -1,0 +1,27 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+
+[project]
+name = "tensilelite_profiler"
+version = "0.1.0"
+description = "TensileLite ROCprofiler-SDK hardware counter collection bindings"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = []
+
+[build-system]
+requires = ["scikit-build-core>=0.10", "nanobind>=2.0"]
+build-backend = "scikit_build_core.build"
+
+[tool.scikit-build]
+cmake.build-type = "Release"
+cmake.args = [
+    "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
+    "-DCMAKE_CXX_COMPILER=/opt/rocm/bin/amdclang++",
+    "-DTENSILELITE_CLIENT_ENABLE_ROCPROFSDK=ON",
+    "-Drocprofiler-sdk_DIR=/opt/rocm/core-7.14/lib/cmake/rocprofiler-sdk",
+]
+# Contents come from cmake install() rules (_tensilelite_profiler.so + __init__.py).
+wheel.packages = []
+# Persistent build tree for incremental rebuilds.
+build-dir = "build/{wheel_tag}"
