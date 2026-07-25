@@ -97,8 +97,8 @@ _gflopsLower = 100.0
 _gflopsUpper = 1_000_000.0
 
 # Tolerance for C++ reference comparison.
-_tolLarge = 0.05   # ±5% for M×N ≥ 1024²
-_tolSmall = 0.10   # ±10% for M×N < 1024²
+_tolLarge = 0.05   # ±5% for M×N ≥ 1024².
+_tolSmall = 0.10   # ±10% for M×N < 1024².
 
 # ---------------------------------------------------------------------------
 # Reference CSV helpers.

@@ -28,17 +28,17 @@ from .conftest import tensileliteProfilerAvailable, requires_gfx950, requires_ro
 try:
     import amdgpu_exec
     import ml_dtypes
-    HAVE_DEPS = True
+    haveDeps = True
 except ImportError:
     amdgpu_exec = None
     ml_dtypes = None
-    HAVE_DEPS = False
+    haveDeps = False
 
-_TESTS_DIR = os.path.dirname(__file__)
-_YAML_PATH = os.path.join(_TESTS_DIR, "yaml", "gemm_standard.yaml")
-_TENSILE_ROOT = os.path.abspath(os.path.join(_TESTS_DIR, "..", "..", "..", ".."))
-if _TENSILE_ROOT not in sys.path:
-    sys.path.insert(0, _TENSILE_ROOT)
+_testsDir = os.path.dirname(__file__)
+_yamlPath = os.path.join(_testsDir, "yaml", "gemm_standard.yaml")
+_tensileRoot = os.path.abspath(os.path.join(_testsDir, "..", "..", "..", ".."))
+if _tensileRoot not in sys.path:
+    sys.path.insert(0, _tensileRoot)
 
 from Tensile.client.harness import BenchmarkResult, KernelRunner
 
@@ -47,7 +47,7 @@ from Tensile.client.harness import BenchmarkResult, KernelRunner
 # ---------------------------------------------------------------------------
 
 def _deviceCuCount() -> int:
-    if not HAVE_DEPS:
+    if not haveDeps:
         return 0
     props = amdgpu_exec._runtime_module.hip_get_device_props(0)
     return int(props.get("multiprocessor_count", 0))
@@ -77,10 +77,10 @@ def _buildTypedArgs(sol_dict: dict, M: int, N: int, K: int,
     args += [np.uint32(M), np.uint32(N), np.uint32(1), np.uint32(K)]
     args += [D_arr, C_arr, A_arr, B_arr]
     args += [
-        np.uint32(M), np.uint32(M * N),   # ldd, strideD
-        np.uint32(M), np.uint32(M * N),   # ldc, strideC
-        np.uint32(M), np.uint32(M * K),   # lda, strideA
-        np.uint32(N), np.uint32(N * K),   # ldb, strideB
+        np.uint32(M), np.uint32(M * N),   # ldd, strideD.
+        np.uint32(M), np.uint32(M * N),   # ldc, strideC.
+        np.uint32(M), np.uint32(M * K),   # lda, strideA.
+        np.uint32(N), np.uint32(N * K),   # ldb, strideB.
     ]
     args += [np.float32(1.0), np.float32(0.0)]
     return args, num_wg
@@ -113,7 +113,7 @@ def _buildGemmArgList(sol_dict, M, N, batch, K, D_buf, C_buf, A_buf, B_buf):
 
 def _compileBf16Kernel():
     """Compile and return one bf16 stridedBatched=True solution (or None)."""
-    if not HAVE_DEPS:
+    if not haveDeps:
         return None
     try:
         from pathlib import Path
@@ -139,7 +139,7 @@ def _compileBf16Kernel():
         assembler = Assembler(Path(cxx), co_version="6")
         debugConfig = DebugConfig()
 
-        sols = solutionsFromYaml(_YAML_PATH, assembler, isaInfoMap, debugConfig, problemIdx=2)
+        sols = solutionsFromYaml(_yamlPath, assembler, isaInfoMap, debugConfig, problemIdx=2)
         for sol, sid in sols:
             if sol.get("WorkGroupMapping", 0) == 0:
                 continue
@@ -287,9 +287,9 @@ class TestImportOrdering:
 
         # Call after the module is already initialised — expect CONFIGURATION_LOCKED.
         status = force_configure(configure_fn)
-        _CONFIGURATION_LOCKED = 16  # ROCPROFILER_STATUS_ERROR_CONFIGURATION_LOCKED
-        assert status == _CONFIGURATION_LOCKED, (
-            f"expected CONFIGURATION_LOCKED ({_CONFIGURATION_LOCKED}), "
+        _configurationLocked = 16  # ROCPROFILER_STATUS_ERROR_CONFIGURATION_LOCKED.
+        assert status == _configurationLocked, (
+            f"expected CONFIGURATION_LOCKED ({_configurationLocked}), "
             f"got status {status}"
         )
 

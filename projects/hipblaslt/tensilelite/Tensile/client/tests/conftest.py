@@ -17,7 +17,7 @@ import os
 import pytest
 
 try:
-    import amdgpu_exec  # noqa: F401
+    import amdgpu_exec  # noqa: F401.
     haveDeps = True
 except ImportError:
     haveDeps = False
@@ -71,9 +71,9 @@ def pytest_configure(config):
     )
     # Initialize parity data storage, used by test_parity.py.
     config._parityData = {
-        "features": [],   # list of (feature, status, evidence) tuples
+        "features": [],   # list of (feature, status, evidence) tuples.
         "gflops": [],     # list of (feature, problemSize, pyGflops, cppGflops) tuples
-        "discrepancies": [],  # list of (feature, message) tuples
+        "discrepancies": [],  # list of (feature, message) tuples.
     }
 
 
