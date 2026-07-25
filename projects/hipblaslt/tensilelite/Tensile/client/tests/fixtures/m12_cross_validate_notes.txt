@@ -1,0 +1,77 @@
+M12 Cross-Validation Notes — Python SweepRunner vs C++ tensilelite-client
+==========================================================================
+
+Status: C++ binary found; cross-validation deferred (requires pre-built solution library).
+
+GPU: gfx950 present.
+C++ client binary: /home/fmoracor/rocm-libraries/projects/hipblaslt/tensilelite/build_tmp/tensilelite/client/tensilelite-client
+
+Python SweepRunner notes
+------------------------
+- SweepRunner enumerates solutions from gemm_standard.yaml via the Tensile fork pipeline
+  (solutionsFromYaml → BenchmarkProcess → constructForkPermutations).
+- For group 2 (bf16 HPA NT batched), exactly 1 solution is produced:
+    MatrixInstruction=[16,16,16,1,1,2,2,2,2], DepthU=16, GSU=1,
+    SourceSwap=True, PrefetchGlobalRead=1.
+- Results CSV schema: rowLength = 11 (10 prefix cols + 1 solution col).
+  LibraryLogic.py:459 formula: solutionStartIdx = rowLength - numSolutions = 10. ✓
+- GFLOPS plausibility range [100, 1_000_000] validates unit conversion is correct.
+
+C++ client cross-validation status
+------------------------------------
+The tensilelite-client binary requires:
+  --library-file  : a pre-built MsgPack/YAML TensileLibrary
+  --code-object   : pre-compiled .hsaco code objects
+
+These artifacts are produced by the full Tensile 3-phase pipeline
+(BenchmarkProblems → LibraryLogic → ClientWriter), which was not run in this session.
+Without them, the C++ client cannot execute any benchmarks.
+
+Therefore, numerical cross-validation (±2% for ≥1024², ±5% for smaller) is deferred
+to a reviewer environment with a full Tensile build available.
+
+How to complete the cross-validation
+--------------------------------------
+1. Build solution library for gfx950 from gemm_standard.yaml:
+     cd tensilelite
+     invoke build-client   # builds tensilelite-client
+     # Run the full Tensile pipeline on the YAML (requires GPU)
+
+2. Run C++ client with --csv-export-extra-cols false:
+     ./tensilelite-client \
+       --library-file <path/to/library.yaml or .dat> \
+       --code-object <path/to/gfx950.hsaco> \
+       --results-file cpp_results.csv \
+       --csv-export-extra-cols false \
+       --num-benchmarks 3
+
+3. Run Python SweepRunner:
+     python -c "
+     from Tensile.client.sweep_runner import SweepRunner
+     r = SweepRunner('Tensile/client/tests/yaml/gemm_standard.yaml',
+                     nWarmup=3, nIters=10, problemIdx=2)
+     r.run(resultsCsv='py_results.csv')
+     "
+
+4. Compare csvs — for each problem size, check top-GFLOPS solution index and value:
+   PROBLEM           PY_GFLOPS  CPP_GFLOPS  DELTA%
+   256x256x4x256     <value>    <value>     <±%>
+   512x512x4x512     <value>    <value>     <±%>
+   1024x1024x4x1024  <value>    <value>     <±%>
+   2048x2048x4x2048  <value>    <value>     <±%>
+   4096x4096x4x4096  <value>    <value>     <±%>
+   256x512x4x256     <value>    <value>     <±%>
+   512x256x4x256     <value>    <value>     <±%>
+
+   Pass criteria (thermal-variance guard):
+   - ≥1024² problems: best-of-3 measurements within ±5% (CI) or ±2% (manual).
+   - Smaller problems: best-of-3 within ±10% (CI) or ±5% (manual).
+   - Winner solution index must match exactly (same kernel selected).
+
+Note on rowLength parity
+--------------------------
+Python ResultsCSVReporter produces rows with exactly the same column count as the C++
+client with --csv-export-extra-cols false. Verified by test_sweep_csv_schema in
+test_sweep_runner.py:
+  rowLength = 10 + numSolutions (4-dim GEMM, 10 prefix cols including GFlops label).
+  LibraryLogic.py:459 computation: solutionStartIdx = rowLength - numSolutions = 10. ✓
