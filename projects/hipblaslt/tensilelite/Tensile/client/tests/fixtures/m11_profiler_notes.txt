@@ -1,0 +1,53 @@
+M11 ROCprofiler-SDK Notes
+========================
+
+Module build status
+-------------------
+tensilelite_profiler built and installed successfully against:
+  rocprofiler-sdk 1.3.2 at /opt/rocm/core-7.14/lib/cmake/rocprofiler-sdk/
+
+All six Python functions are exported:
+  initialize, start, stop, enable, disable, fetch.
+
+CONFIGURATION_LOCKED behavior
+------------------------------
+The plan states that ROCPROFILER_STATUS_ERROR_CONFIGURATION_LOCKED is returned
+by rocprofiler_force_configure when "HSA was initialized by a HIP call before
+import".  This was tested and found to be INCORRECT for rocprofiler-sdk 1.3.2.
+
+Tested scenarios that do NOT trigger CONFIGURATION_LOCKED:
+  - amdgpu_exec.get_chip() (calls hipGetDeviceProperties)
+  - amdgpu_exec.GpuBuffer(1024) (allocates GPU memory)
+  - amdgpu_exec.GpuModule(hsaco) (loads code object)
+  - ctypes call to hsa_init()
+  - ROCPROFILER_TOOL_LIBRARIES env var with a pre-loaded tool
+
+What DOES trigger CONFIGURATION_LOCKED (value 16):
+  - Calling rocprofiler_force_configure a second time after a successful
+    first call in the same process (verified via ctypes).
+
+This means the "import before any HIP call" constraint is a best practice
+recommendation (necessary for correct profiling), but it cannot be enforced
+via CONFIGURATION_LOCKED detection in the current SDK version.
+
+The TestImportOrdering test has been updated accordingly:
+  - test_error_message_substring_present_in_source: verifies the error-handling
+    code exists in bindings.cpp.
+  - test_second_force_configure_is_locked: verifies the actual locking mechanism
+    via direct ctypes call.
+
+SQ_WAVES multi-dimension note
+------------------------------
+On gfx950 (MI350), SQ_WAVES is reported per XCC x SE x INST dimension.
+The counter string format is:
+  SQ_WAVES(XCC=0,SE=0,INST=0): 0, SQ_WAVES(XCC=0,SE=1,INST=0): 4, ...
+Some (XCC, SE) pairs report 0 (no work dispatched to that shader engine).
+The test asserts that the sum across all dimensions is positive, not that
+any single dimension value is positive.
+
+GPU test results
+----------------
+TestProfilerUnavailable:                               3/3 passed (no GPU required).
+TestImportOrdering::test_error_message_substring:      PASS.
+TestImportOrdering::test_second_force_configure:       PASS (gfx950).
+TestCounterCollection::test_sq_waves_positive:         PASS (gfx950, sum=64).

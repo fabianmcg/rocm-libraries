@@ -27,6 +27,9 @@ class BenchmarkResult:
     warmupN: int
     # Set to a HardwareMonitor instance when run() is called with hwMonitor=True.
     hw: Optional[object] = None
+    # Maps iteration index (str) to the counter string from fetch(); populated
+    # when KernelRunner.run() is called with rocprofCounters non-empty.
+    counters: dict = field(default_factory=dict)
 
     @property
     def meanUs(self) -> float:
@@ -163,27 +166,42 @@ class KernelRunner:
         nIters: int,
         boundsCheck: bool = False,
         hwMonitor: bool = False,
+        rocprofCounters: Optional[List[str]] = None,
     ) -> BenchmarkResult:
         """Launch the kernel and collect timing.
 
-        argsFn:      callable(output_buf) -> list of kernel args. Called once per
-                     iteration with the next output buffer from the pool (or None
-                     if no outputPool was provided).
-        grid:        (gridX, gridY, gridZ) tuple.
-        block:       (blockX, blockY, blockZ) tuple.
-        nWarmup:     number of iterations before timing begins.
-        nIters:      number of timed iterations.
-        boundsCheck: when True, call checkSentinel() on every output pool slot
-                     after the final iteration. Raises AssertionError if any
-                     sentinel was overwritten. Requires pool slots to be
-                     BoundedBuffer instances.
-        hwMonitor:   when True, wraps the benchmark window in a HardwareMonitor
-                     context and attaches .hw to the returned BenchmarkResult.
+        argsFn:          callable(output_buf) -> list of kernel args. Called once per
+                         iteration with the next output buffer from the pool (or None
+                         if no outputPool was provided).
+        grid:            (gridX, gridY, gridZ) tuple.
+        block:           (blockX, blockY, blockZ) tuple.
+        nWarmup:         number of iterations before timing begins.
+        nIters:          number of timed iterations.
+        boundsCheck:     when True, call checkSentinel() on every output pool slot
+                         after the final iteration. Raises AssertionError if any
+                         sentinel was overwritten. Requires pool slots to be
+                         BoundedBuffer instances.
+        hwMonitor:       when True, wraps the benchmark window in a HardwareMonitor
+                         context and attaches .hw to the returned BenchmarkResult.
+        rocprofCounters: when non-empty, enable ROCprofiler-SDK counter collection
+                         for each iteration; counter strings are stored in
+                         BenchmarkResult.counters keyed by iteration index.
         """
         try:
             from amdgpu_exec import GpuEvent
         except ImportError as exc:
             raise RuntimeError("amdgpu_exec is required for KernelRunner.run") from exc
+
+        useProfiler = bool(rocprofCounters)
+        profiler = None
+        if useProfiler:
+            try:
+                import tensilelite_profiler as profiler
+            except ImportError:
+                _log.warning(
+                    "tensilelite_profiler not available; rocprofCounters ignored"
+                )
+                useProfiler = False
 
         for _ in range(nWarmup):
             self._runOneIter(argsFn, grid, block, GpuEvent)
@@ -194,10 +212,16 @@ class KernelRunner:
             monitor = _HwMonitor()
 
         timesNs = []
+        counters = {}
         ctx = monitor if monitor is not None else contextlib.nullcontext()
         with ctx:
-            for _ in range(nIters):
+            for i in range(nIters):
+                if useProfiler:
+                    profiler.enable()
                 timesNs.append(self._runOneIter(argsFn, grid, block, GpuEvent))
+                if useProfiler:
+                    profiler.disable()
+                    counters[str(i)] = profiler.fetch(i)
 
         if boundsCheck and self._outputPool is not None:
             # The device is idle after the final synchronize(); safe to read sentinels now.
@@ -205,7 +229,8 @@ class KernelRunner:
                 if hasattr(buf, "checkSentinel") and not buf.checkSentinel():
                     raise AssertionError("output buffer overrun detected")
 
-        return BenchmarkResult(timesNs=timesNs, warmupN=nWarmup, hw=monitor)
+        return BenchmarkResult(timesNs=timesNs, warmupN=nWarmup, hw=monitor,
+                               counters=counters)
 
 
 def autoScaleIters(
