@@ -9,11 +9,12 @@ initialization.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 import statistics
-from dataclasses import dataclass
-from typing import List, Union
+from dataclasses import dataclass, field
+from typing import List, Optional, Union
 
 _log = logging.getLogger(__name__)
 
@@ -24,6 +25,8 @@ class BenchmarkResult:
 
     timesNs: List[int]
     warmupN: int
+    # Set to a HardwareMonitor instance when run() is called with hwMonitor=True.
+    hw: Optional[object] = None
 
     @property
     def meanUs(self) -> float:
@@ -65,6 +68,10 @@ class BufferPool:
         buf = self._slots[self._idx]
         self._idx = (self._idx + 1) % len(self._slots)
         return buf
+
+    def iterSlots(self):
+        """Yield each buffer slot in allocation order."""
+        return iter(self._slots)
 
     def freeAll(self) -> None:
         for buf in self._slots:
@@ -133,6 +140,20 @@ class KernelRunner:
         functions = [m.get_function(kernelName) for m in modules]
         return cls(functions=functions, outputPool=None)
 
+    def _runOneIter(self, argsFn, grid: tuple, block: tuple, GpuEvent) -> int:
+        """Execute one kernel iteration, advance the call counter, return elapsed ns."""
+        fn = self._functions[self._call_count % len(self._functions)]
+        out_buf = self._outputPool.next() if self._outputPool is not None else None
+        args = argsFn(out_buf)
+        start = GpuEvent()
+        stop = GpuEvent()
+        start.record()
+        fn.launch(grid, block, args)
+        stop.record()
+        stop.synchronize()
+        self._call_count += 1
+        return stop.elapsed_ns(start)
+
     def run(
         self,
         argsFn,
@@ -140,41 +161,51 @@ class KernelRunner:
         block: tuple,
         nWarmup: int,
         nIters: int,
+        boundsCheck: bool = False,
+        hwMonitor: bool = False,
     ) -> BenchmarkResult:
         """Launch the kernel and collect timing.
 
-        argsFn:  callable(output_buf) -> list of kernel args. Called once per
-                 iteration with the next output buffer from the pool (or None
-                 if no outputPool was provided).
-        grid:    (gridX, gridY, gridZ) tuple.
-        block:   (blockX, blockY, blockZ) tuple.
-        nWarmup: number of iterations before timing begins.
-        nIters:  number of timed iterations.
+        argsFn:      callable(output_buf) -> list of kernel args. Called once per
+                     iteration with the next output buffer from the pool (or None
+                     if no outputPool was provided).
+        grid:        (gridX, gridY, gridZ) tuple.
+        block:       (blockX, blockY, blockZ) tuple.
+        nWarmup:     number of iterations before timing begins.
+        nIters:      number of timed iterations.
+        boundsCheck: when True, call checkSentinel() on every output pool slot
+                     after the final iteration. Raises AssertionError if any
+                     sentinel was overwritten. Requires pool slots to be
+                     BoundedBuffer instances.
+        hwMonitor:   when True, wraps the benchmark window in a HardwareMonitor
+                     context and attaches .hw to the returned BenchmarkResult.
         """
         try:
             from amdgpu_exec import GpuEvent
         except ImportError as exc:
             raise RuntimeError("amdgpu_exec is required for KernelRunner.run") from exc
 
+        for _ in range(nWarmup):
+            self._runOneIter(argsFn, grid, block, GpuEvent)
+
+        monitor = None
+        if hwMonitor:
+            from Tensile.client.hw_monitor import HardwareMonitor as _HwMonitor
+            monitor = _HwMonitor()
+
         timesNs = []
-        total = nWarmup + nIters
-        for i in range(total):
-            fn = self._functions[self._call_count % len(self._functions)]
-            out_buf = self._outputPool.next() if self._outputPool is not None else None
-            args = argsFn(out_buf)
+        ctx = monitor if monitor is not None else contextlib.nullcontext()
+        with ctx:
+            for _ in range(nIters):
+                timesNs.append(self._runOneIter(argsFn, grid, block, GpuEvent))
 
-            start = GpuEvent()
-            stop = GpuEvent()
-            start.record()
-            fn.launch(grid, block, args)
-            stop.record()
-            stop.synchronize()
+        if boundsCheck and self._outputPool is not None:
+            # The device is idle after the final synchronize(); safe to read sentinels now.
+            for buf in self._outputPool.iterSlots():
+                if hasattr(buf, "checkSentinel") and not buf.checkSentinel():
+                    raise AssertionError("output buffer overrun detected")
 
-            self._call_count += 1
-            if i >= nWarmup:
-                timesNs.append(stop.elapsed_ns(start))
-
-        return BenchmarkResult(timesNs=timesNs, warmupN=nWarmup)
+        return BenchmarkResult(timesNs=timesNs, warmupN=nWarmup, hw=monitor)
 
 
 def autoScaleIters(
