@@ -6,9 +6,9 @@ This module ports the argument-layout logic from
 ContractionSolution.cpp:singleCallArgs (lines 548-1130) and kernelArgs
 (lines 1557-1714) to Python.
 
-Supported configuration subset (M1-M5; extended per milestone):
+Supported configuration subset (M1-M6-partial; extended per milestone):
   - stridedBatched in {True, False}
-  - streamK in {0, 3}  (M6+ adds 4, 5)
+  - streamK in {0, 3, 4, 5}  (4=dynamic SK, 5=hybrid SK added in M6)
   - streamKAtomic = 0 only (atomic=1 skips workspace+flags block)
   - groupedGemm = False
   - GSU = 1, globalAccumulation in {0, 1, 2}
@@ -65,9 +65,10 @@ def _validateConfig(solutionParams: dict, problemParams: dict) -> None:
     streamKAtomic = solutionParams.get("StreamKAtomic", 0)
     if streamKAtomic != 0:
         raise NotImplementedError("streamKAtomic != 0 not supported (skips workspace+flags block)")
-    if streamK not in (0, 3):
+    if streamK not in (0, 3, 4, 5):
         raise NotImplementedError(
-            f"streamK={streamK} not supported; supported: 0 (standard), 3 (two-tile SK)"
+            f"streamK={streamK} not supported; supported: "
+            "0 (standard), 3 (two-tile SK), 4 (dynamic SK), 5 (hybrid SK)"
         )
     if solutionParams.get("UseSFC", False):
         raise NotImplementedError("useSFC=True not supported (different internalArg1 packing)")
@@ -477,6 +478,96 @@ def _buildStreamK3Args(solutionParams: dict, problemParams: dict) -> bytes:
     return buf
 
 
+def _buildStreamK4Args(solutionParams: dict, problemParams: dict) -> bytes:
+    """Build the six StreamK=4 (dynamic SK) argument slots.
+
+    Appended after alpha/beta. sk4_args must be provided in problemParams under
+    the "sk4" key with fields: iters_per_tile, tiles, sk_tiles, sk_split, sk_grid.
+    sk_iters_per_wi and total_items are computed here via the CeilDivide pattern
+    from ContractionSolution.cpp:778-806.
+    """
+    sk4 = problemParams.get("sk4", {})
+    iters_per_tile = int(sk4.get("iters_per_tile", 1))
+    tiles = int(sk4.get("tiles", 1))
+    sk_tiles = int(sk4.get("sk_tiles", 0))
+    sk_split = int(sk4.get("sk_split", 2))
+    sk_grid = int(sk4.get("sk_grid", 1))
+
+    # Mirrors CeilDivide(itersPerTile, skSplit) then recalculate skSplit.
+    sk_iters_per_wi = math.ceil(iters_per_tile / max(1, sk_split))
+    sk_split = math.ceil(iters_per_tile / max(1, sk_iters_per_wi))
+    total_items = (tiles - sk_tiles) + sk_tiles * sk_split
+
+    buf = struct.pack("<I", iters_per_tile)
+    buf += struct.pack("<I", total_items)
+    buf += struct.pack("<I", sk_tiles)
+    buf += struct.pack("<I", sk_split)
+    buf += struct.pack("<I", sk_iters_per_wi)
+    buf += struct.pack("<I", sk_grid)
+    return buf
+
+
+def _buildStreamK5DynamicArgs(sk5: dict) -> bytes:
+    """Build six SK5-dynamic slots (same layout as SK4 plus the mode bit).
+
+    Mode bit 30 of the SKTiles slot signals the dynamic sub-mode to the kernel.
+    """
+    iters_per_tile = int(sk5.get("iters_per_tile", 1))
+    tiles = int(sk5.get("tiles", 1))
+    sk_tiles = int(sk5.get("sk_tiles", 0))
+    sk_split = int(sk5.get("sk_split", 2))
+    sk_grid = int(sk5.get("sk_grid", 1))
+
+    sk_iters_per_wi = math.ceil(iters_per_tile / max(1, sk_split))
+    sk_split = math.ceil(iters_per_tile / max(1, sk_iters_per_wi))
+    total_items = (tiles - sk_tiles) + sk_tiles * sk_split
+    # Bit 30 marks the dynamic (SK4-like) sub-mode; bit 31 is reserved for magic-div.
+    packed_sk_tiles = sk_tiles | 0x40000000
+
+    buf = struct.pack("<I", iters_per_tile)
+    buf += struct.pack("<I", total_items)
+    buf += struct.pack("<I", packed_sk_tiles)
+    buf += struct.pack("<I", sk_split)
+    buf += struct.pack("<I", sk_iters_per_wi)
+    buf += struct.pack("<I", sk_grid)
+    return buf
+
+
+def _buildStreamK5StaticArgs(sk5: dict) -> bytes:
+    """Build six SK5-static slots (mirrors standalone SK3 arg packing).
+
+    Accepts pre-computed sk_iters_per_wg and sk_tiles; magic numbers are
+    derived here from iters_per_tile using the same algorithm as SK3.
+    """
+    iters_per_tile = int(sk5.get("iters_per_tile", 1))
+    sk_iters_per_wg = int(sk5.get("sk_iters_per_wg", 0))
+    sk_grid = int(sk5.get("sk_grid", 1))
+    sk_tiles = int(sk5.get("sk_tiles", 0))
+
+    magic, shift = _magicNumberAlg2(iters_per_tile)
+
+    buf = struct.pack("<I", iters_per_tile)
+    buf += struct.pack("<I", magic)
+    buf += struct.pack("<I", shift)
+    buf += struct.pack("<I", sk_iters_per_wg)
+    buf += struct.pack("<I", sk_grid)
+    buf += struct.pack("<I", sk_tiles)
+    return buf
+
+
+def _buildStreamK5Args(solutionParams: dict, problemParams: dict) -> bytes:
+    """Build six StreamK=5 (hybrid SK) argument slots.
+
+    Dispatches to the dynamic (SK4-like) or static (SK3-like) sub-path based
+    on problemParams["sk5"]["effective_dynamic"]. The caller must determine
+    effectiveDynamic from ContractionSolution::streamK5EffectiveDynamic.
+    """
+    sk5 = problemParams.get("sk5", {})
+    if sk5.get("effective_dynamic", True):
+        return _buildStreamK5DynamicArgs(sk5)
+    return _buildStreamK5StaticArgs(sk5)
+
+
 def _readPTFlag(solutionParams: dict, key: str, default=None):
     """Read an epilogue flag from solutionParams, trying top-level then ProblemType.
 
@@ -640,7 +731,7 @@ def buildKernelArgs(
                     UseSFC, SupportCustomWGM, SupportCustomStaggerU,
                     MacroTile0, MacroTile1, WorkGroupMapping,
                     StaggerU, StaggerUMapping, _staggerStrideShift,
-                    StreamK, StreamKAtomic, GlobalSplitU,
+                    StreamK (0/3/4/5), StreamKAtomic, GlobalSplitU,
                     GlobalSplitUCoalesced, GlobalSplitUWorkGroupMappingRoundRobin,
                     StridedBatched, UseBeta.
                     Epilogue flags are read from the nested ProblemType sub-dict
@@ -679,8 +770,13 @@ def buildKernelArgs(
     buf += _buildStrides(solutionParams, problemParams)
     buf += _buildAlphaBeta(solutionParams, problemParams)
 
-    if solutionParams.get("StreamK", 0) == 3:
+    streamK = solutionParams.get("StreamK", 0)
+    if streamK == 3:
         buf += _buildStreamK3Args(solutionParams, problemParams)
+    elif streamK == 4:
+        buf += _buildStreamK4Args(solutionParams, problemParams)
+    elif streamK == 5:
+        buf += _buildStreamK5Args(solutionParams, problemParams)
 
     buf += _buildEpilogueArgs(solutionParams, problemParams, tensors)
     return buf
