@@ -14,7 +14,9 @@ import ctypes
 import logging
 import math
 import os
+import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -247,12 +249,20 @@ class SweepRunner:
         Index into BenchmarkProblems[] to select the problem group.
     groupIdx:
         Sub-group index within the selected BenchmarkProblems group.
+    saveCoPath:
+        Directory to save compiled .co files (one per kernel). When None,
+        compiled HSACO bytes are used only for in-process benchmarking.
     """
 
     def __init__(self, yamlPath: str, libraryPath: Optional[str] = None,
                  nWarmup: int = 2, nIters: int = 10,
                  rotatingBuffers: int = 8, icacheCopies="auto",
-                 problemIdx: int = 0, groupIdx: int = 0) -> None:
+                 problemIdx: int = 0, groupIdx: int = 0,
+                 saveCoPath: Optional[str] = None,
+                 pinClocks: bool = False,
+                 timingInstrumentation: bool = False,
+                 mxScaleFormat=None,
+                 amdSmiPath: Optional[str] = None) -> None:
         self._yamlPath = yamlPath
         self._libraryPath = libraryPath
         self._nWarmup = nWarmup
@@ -261,18 +271,28 @@ class SweepRunner:
         self._icacheCopies = icacheCopies
         self._problemIdx = problemIdx
         self._groupIdx = groupIdx
+        self._saveCoPath = saveCoPath
+        self._pinClocks = pinClocks
+        self._timingInstrumentation = timingInstrumentation
+        self._mxScaleFormat = mxScaleFormat
+        self._amdSmiPath = amdSmiPath
 
     def _compileAll(self, chip: str, assembler, isaInfoMap,
                     debugConfig) -> list:
         """Compile all solutions from the YAML group; return compiled entries.
 
-        Each entry is a dict with keys: solDict, rawDict, kernelName, hsaco, sid.
+        Each entry is a dict with keys: solDict, rawDict, kernelName, hsaco,
+        sid, solution. When saveCoPath is set, each compiled HSACO is also
+        written to {saveCoPath}/{kernelName}.co for use by the C++ client.
         Solutions that fail to compile or are filtered are skipped with a warning.
         """
         import amdgpu_exec
         from epilogues.epilogue_harness.yaml_solution_builder import (
             solutionsFromYaml, _injectInternalArgsSupport,
         )
+
+        if self._saveCoPath is not None:
+            os.makedirs(self._saveCoPath, exist_ok=True)
 
         try:
             sols = solutionsFromYaml(
@@ -295,12 +315,18 @@ class SweepRunner:
             except Exception as exc:
                 _log.warning("solution %s failed to compile: %s", sid, exc)
                 continue
+            if self._saveCoPath is not None:
+                coPath = os.path.join(self._saveCoPath, f"{kernelName}.co")
+                with open(coPath, "wb") as f:
+                    f.write(hsaco)
+                _log.info("saved .co: %s", coPath)
             compiled.append({
                 "solDict": solDict,
                 "rawDict": rawDict,
                 "kernelName": kernelName,
                 "hsaco": hsaco,
                 "sid": sid,
+                "solution": sol,
             })
         return compiled
 
@@ -388,6 +414,25 @@ class SweepRunner:
                 winner = max(valid, key=lambda r: r.gflops)
                 luRep.writeRow(list(probSize), winner.solutionIdx, winner.gflops)
 
+    def _runSudoCmd(self, args: list, desc: str):
+        """Run a sudo command; raise PermissionError on failure or missing sudo."""
+        try:
+            result = subprocess.run(["sudo"] + args, capture_output=True)
+        except FileNotFoundError:
+            raise PermissionError("sudo not found; clock pinning requires sudo")
+        if result.returncode != 0:
+            raise PermissionError(f"clock {desc} failed with returncode {result.returncode}")
+
+    def _applyClockPin(self):
+        """Pin GPU clocks and fan speed; sleep 1 second to allow stabilization."""
+        self._runSudoCmd([self._amdSmiPath, "set", "-g", "0", "--fan", "255"], "fan set")
+        self._runSudoCmd([self._amdSmiPath, "set", "-g", "0", "--perf-level", "HIGH"], "perf-level set")
+        time.sleep(1)
+
+    def _resetClockPin(self):
+        """Reset GPU clocks and fan speed to driver defaults after benchmarking."""
+        self._runSudoCmd([self._amdSmiPath, "reset", "-g", "0", "--clocks", "--fans"], "reset")
+
     def _compile(self):
         """Detect chip, set up Tensile, compile all solutions; return (compiled, chip)."""
         import amdgpu_exec
@@ -426,13 +471,19 @@ class SweepRunner:
         luRep = LibraryUpdateReporter(libraryUpdateFile) if libraryUpdateFile else None
         if csvRep:
             csvRep.writeHeader()
-        allResults = []
-        for probSize in probSizes:
-            sizeResults = self._benchmarkProblem(probSize, compiled, cuCount)
-            allResults.extend(sizeResults)
-            self._reportProblem(probSize, sizeResults, csvRep, luRep)
-        if csvRep:
-            csvRep.close()
-        if luRep:
-            luRep.close()
+        if self._pinClocks and self._amdSmiPath:
+            self._applyClockPin()
+        try:
+            allResults = []
+            for probSize in probSizes:
+                sizeResults = self._benchmarkProblem(probSize, compiled, cuCount)
+                allResults.extend(sizeResults)
+                self._reportProblem(probSize, sizeResults, csvRep, luRep)
+        finally:
+            if self._pinClocks and self._amdSmiPath:
+                self._resetClockPin()
+            if csvRep:
+                csvRep.close()
+            if luRep:
+                luRep.close()
         return allResults
