@@ -1,0 +1,2 @@
+status, reason
+blocked, C++ client requires a pre-built solution library (TensileLibrary.yaml + .co/.hsaco) produced by the full Tensile 3-phase pipeline. See cpp_client_reference_cmd.txt for the commands to generate real data.
