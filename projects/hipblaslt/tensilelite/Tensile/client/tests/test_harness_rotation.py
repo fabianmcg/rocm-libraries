@@ -44,7 +44,7 @@ _TENSILE_ROOT = os.path.abspath(os.path.join(_TESTS_DIR, "..", "..", "..", "..")
 if _TENSILE_ROOT not in sys.path:
     sys.path.insert(0, _TENSILE_ROOT)
 
-from Tensile.client.harness import BenchmarkResult, BufferPool, KernelRunner, auto_scale_iters
+from Tensile.client.harness import BenchmarkResult, BufferPool, KernelRunner, autoScaleIters
 from Tensile.client.gemm_args import (
     _computeInternalArg0,
     _computeInternalArg1,
@@ -220,26 +220,26 @@ class TestBufferPool:
 
 
 # ---------------------------------------------------------------------------
-# Task 7.4 — auto_scale_iters (pure Python)
+# Task 7.4 — autoScaleIters (pure Python)
 # ---------------------------------------------------------------------------
 
 
 class TestTimingHelpers:
-    """auto_scale_iters replicates BenchmarkTimer::numEnqueuesPerSync."""
+    """autoScaleIters replicates BenchmarkTimer::numEnqueuesPerSync."""
 
     def test_no_flop_budget_returns_base(self):
-        assert auto_scale_iters(flops=1_000_000, minFlopsPerSync=0) == 1
+        assert autoScaleIters(flops=1_000_000, minFlopsPerSync=0) == 1
 
     def test_flop_budget_scales_up(self):
         # 10 GFLOPS per iteration, 100 GFLOPS budget → 10 iterations.
         flops = 10_000_000_000
-        result = auto_scale_iters(flops=flops, minFlopsPerSync=100_000_000_000)
+        result = autoScaleIters(flops=flops, minFlopsPerSync=100_000_000_000)
         assert result == 10
 
     def test_max_enqueues_clamps(self):
         # Budget demands 10 but max is 5.
         flops = 10_000_000_000
-        result = auto_scale_iters(
+        result = autoScaleIters(
             flops=flops,
             minFlopsPerSync=100_000_000_000,
             maxEnqueuesPerSync=5,
@@ -249,7 +249,7 @@ class TestTimingHelpers:
     def test_negative_max_means_no_limit(self):
         # maxEnqueuesPerSync=-1 → no upper bound.
         flops = 1_000
-        result = auto_scale_iters(
+        result = autoScaleIters(
             flops=flops,
             minFlopsPerSync=1_000_000,
             numEnqueuesPerSync=1,
@@ -259,12 +259,12 @@ class TestTimingHelpers:
 
     def test_zero_flops_does_not_divide_by_zero(self):
         # flops=0 is treated as max(0, 1) = 1.
-        result = auto_scale_iters(flops=0, minFlopsPerSync=100, numEnqueuesPerSync=1)
+        result = autoScaleIters(flops=0, minFlopsPerSync=100, numEnqueuesPerSync=1)
         assert result == 100
 
     def test_base_always_respected(self):
         # Even when flops budget needs fewer enqueues, numEnqueuesPerSync is the floor.
-        result = auto_scale_iters(
+        result = autoScaleIters(
             flops=1_000_000_000_000,
             minFlopsPerSync=100,
             numEnqueuesPerSync=7,
@@ -310,7 +310,7 @@ class TestTimingStats:
         C_buf.copy_from_host(C_np)
 
         args, num_wg = _buildArgs(sol_dict, M, N, batch, K, D_buf, C_buf, A_buf, B_buf)
-        runner = KernelRunner.from_hsaco(hsaco, kernel_name, nModuleCopies=1)
+        runner = KernelRunner.fromHsaco(hsaco, kernel_name, nModuleCopies=1)
         result = runner.run(
             argsFn=lambda _: args,
             grid=(num_wg, 1, 1),
@@ -368,7 +368,7 @@ class TestModuleRotation:
 
         # Run with 1 module copy, read reference output.
         D_buf.memset(0)
-        runner1 = KernelRunner.from_hsaco(hsaco, kernel_name, nModuleCopies=1)
+        runner1 = KernelRunner.fromHsaco(hsaco, kernel_name, nModuleCopies=1)
         runner1.run(
             argsFn=lambda _: args,
             grid=(num_wg, 1, 1),
@@ -381,7 +381,7 @@ class TestModuleRotation:
 
         # Run with 4 module copies, compare output.
         D_buf.memset(0)
-        runner4 = KernelRunner.from_hsaco(hsaco, kernel_name, nModuleCopies=4)
+        runner4 = KernelRunner.fromHsaco(hsaco, kernel_name, nModuleCopies=4)
         runner4.run(
             argsFn=lambda _: args,
             grid=(num_wg, 1, 1),
@@ -435,7 +435,7 @@ class TestIcacheCopyCount:
 
 
 class TestGflopsPlausibility:
-    """GFLOPS for a 1024x1024x1024 bf16 GEMM is in [100, 2000]."""
+    """GFLOPS for a 1024x1024x1024 bf16 GEMM is in [100, 1_000_000]."""
 
     @requires_gfx950
     def test_gflops_in_range(self, bf16Entry):
@@ -467,7 +467,7 @@ class TestGflopsPlausibility:
         C_buf.copy_from_host(C_np)
 
         args, num_wg = _buildArgs(sol_dict, M, N, batch, K, D_buf, C_buf, A_buf, B_buf)
-        runner = KernelRunner.from_hsaco(hsaco, kernel_name, nModuleCopies=1)
+        runner = KernelRunner.fromHsaco(hsaco, kernel_name, nModuleCopies=1)
         result = runner.run(
             argsFn=lambda _: args,
             grid=(num_wg, 1, 1),

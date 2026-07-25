@@ -95,7 +95,7 @@ class KernelRunner:
         self._call_count = 0
 
     @classmethod
-    def from_hsaco(
+    def fromHsaco(
         cls,
         hsacoBytes: bytes,
         kernelName: str,
@@ -111,7 +111,7 @@ class KernelRunner:
         try:
             from amdgpu_exec import GpuModule
         except ImportError as exc:
-            raise RuntimeError("amdgpu_exec is required for KernelRunner.from_hsaco") from exc
+            raise RuntimeError("amdgpu_exec is required for KernelRunner.fromHsaco") from exc
 
         if nModuleCopies == "auto":
             if coPath is not None:
@@ -120,12 +120,12 @@ class KernelRunner:
                     nModuleCopies = get_icache_module_copies(coPath)
                 except ImportError:
                     _log.warning(
-                        "tensilelite_runtime not available; falling back to nModuleCopies=1."
+                        "tensilelite_runtime not available; falling back to nModuleCopies=1"
                     )
                     nModuleCopies = 1
             else:
                 _log.warning(
-                    "nModuleCopies='auto' with no coPath; falling back to nModuleCopies=1."
+                    "nModuleCopies='auto' with no coPath; falling back to nModuleCopies=1"
                 )
                 nModuleCopies = 1
 
@@ -177,7 +177,7 @@ class KernelRunner:
         return BenchmarkResult(timesNs=timesNs, warmupN=nWarmup)
 
 
-def auto_scale_iters(
+def autoScaleIters(
     flops: int,
     minFlopsPerSync: int,
     numEnqueuesPerSync: int = 1,
