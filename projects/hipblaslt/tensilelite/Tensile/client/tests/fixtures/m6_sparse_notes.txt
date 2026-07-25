@@ -1,0 +1,17 @@
+M6-partial: Sparse 2:4 GPU test status
+=======================================
+
+GPU sparse GEMM tests (TestSparseGpuGfx950 in test_gemm_sparse.py) are
+currently skipped because no gfx950-specific 2:4 sparse kernel YAML was
+located in the repository at M6-partial implementation time.
+
+To enable GPU sparse tests:
+1. Locate or generate a sparse GEMM kernel YAML targeting gfx950
+   (look in tensilelite/Tensile/Tests/ or a library logic directory).
+2. Load the solution via enumerateAllSolutions, filter for sparse kernels
+   (SparseA=True or CompressedA=True in the solution dict).
+3. Allocate compressed A and metadata via compress24() from sparse.py.
+4. Run the kernel and compare against the dense reference via gemm().
+
+The compress24/decompress24 CPU functions (sparse.py) are fully tested
+by TestCompress24 and TestDecompress24FromKnown in test_gemm_sparse.py.

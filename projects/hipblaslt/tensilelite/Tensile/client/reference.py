@@ -362,6 +362,19 @@ def computeAmaxD(D: np.ndarray) -> float:
     return float(np.max(np.abs(D)))
 
 
+def gemmGrouped(groups: list) -> list:
+    """Reference for grouped GEMM: compute one gemm() per group dict.
+
+    Each group dict must contain 'A', 'B', and optionally 'alpha', 'beta', 'C'.
+    Returns a list of float64 result arrays, one per group.
+    """
+    results = []
+    for g in groups:
+        D = gemm(g["A"], g["B"], g.get("alpha", 1.0), g.get("beta", 0.0), g.get("C"))
+        results.append(D)
+    return results
+
+
 def computeETensor(D: np.ndarray) -> np.ndarray:
     """Return a copy of D before any output cast (the pre-cast accumulator)."""
     return D.copy()
