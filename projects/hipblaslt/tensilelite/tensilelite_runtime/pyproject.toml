@@ -1,0 +1,22 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+
+[project]
+name = "tensilelite_runtime"
+version = "0.1.0"
+description = "TensileLite runtime Python bindings (ELF probing, ContractionSolution)"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = []
+
+[build-system]
+requires = ["scikit-build-core>=0.10", "nanobind>=2.0"]
+build-backend = "scikit_build_core.build"
+
+[tool.scikit-build]
+cmake.build-type = "Release"
+cmake.args = ["-DCMAKE_POLICY_VERSION_MINIMUM=3.5"]
+# Contents come from cmake install() rules (_tensilelite_runtime.so + __init__.py).
+wheel.packages = []
+# Persistent build tree for incremental rebuilds.
+build-dir = "build/{wheel_tag}"
