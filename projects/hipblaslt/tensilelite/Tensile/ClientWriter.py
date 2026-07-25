@@ -231,7 +231,29 @@ def runNewClient(scriptPath, clientParametersPath, cxxCompiler: str, cCompiler: 
     printWarning("ClientWriter Benchmark Process exited with error: {}".format(e))
 
 
-def runClient(libraryLogicPath, forBenchmark, enableTileSelection, cxxCompiler: str, cCompiler: str, outputPath, configPaths=None):
+def _runWithPythonHarness(configPaths, buildPath):
+  """Run the benchmark sweep using SweepRunner (Python harness, single-GPU path).
+
+  Returns 0 on success, 1 on failure. Lazy-imports SweepRunner to avoid
+  circular imports at module load time.
+  """
+  from Tensile.client.sweep_runner import SweepRunner
+  runner = SweepRunner(
+      yamlPath=configPaths[0],
+      pinClocks=globalParameters["PinClocks"],
+      timingInstrumentation=globalParameters["TimingInstrumentation"],
+      mxScaleFormat=globalParameters.get("MXScaleFormat"),
+      amdSmiPath=globalParameters.get("AMDSMIPath"),
+  )
+  try:
+    runner.run(resultsCsv=str(buildPath / "results.csv"))
+    return 0
+  except Exception as exc:
+    printWarning("Python client sweep failed: %s" % exc)
+    return 1
+
+
+def runClient(libraryLogicPath, forBenchmark, enableTileSelection, cxxCompiler: str, cCompiler: str, outputPath, configPaths=None, use_python_client: bool = True):
   buildPath = ensurePath(outputPath / "build")
   timingEnabled = globalParameters.get("TimingInstrumentation", False)
   parallelGpus = globalParameters.get("ParallelGpuExecution", 1)
@@ -250,9 +272,14 @@ def runClient(libraryLogicPath, forBenchmark, enableTileSelection, cxxCompiler: 
   else:
     numGpus = parallelGpus
 
+  if not use_python_client:
+    print1("# Deprecated: use_python_client=False is deprecated and will be removed in a future release.")
+
   with timing_context("python_client_execution"):
     # Use parallel execution only for benchmarking with multiple GPUs
     if numGpus > 1 and forBenchmark:
+      if use_python_client:
+        print1("# Warning: Python harness not used in multi-GPU mode; using runClientParallel.")
       return runClientParallel(buildPath, configPaths, numGpus, timingEnabled, getClientExecutablePath)
 
     # --cpu-only plumbing: short-circuit the device boundary. The client-config writing
@@ -266,7 +293,10 @@ def runClient(libraryLogicPath, forBenchmark, enableTileSelection, cxxCompiler: 
       print1("# CpuOnly: skipping device-bound client launch; returning returncode 0.")
       return 0
 
-    # Original single-GPU path
+    if use_python_client:
+      return _runWithPythonHarness(configPaths, buildPath)
+
+    # Legacy C++ subprocess path.
     runScriptName = writeRunScript(buildPath, forBenchmark, enableTileSelection, cxxCompiler, cCompiler, buildPath, configPaths)
 
     with ClientExecutionLock(globalParameters["ClientExecutionLockPath"]):
