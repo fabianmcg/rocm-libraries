@@ -387,6 +387,14 @@ class SweepRunner:
                 winner = max(valid, key=lambda r: r.gflops)
                 luRep.writeRow(list(probSize), winner.solutionIdx, winner.gflops)
 
+    def _compile(self):
+        """Detect chip, set up Tensile, compile all solutions; return (compiled, chip)."""
+        import amdgpu_exec
+        chip = amdgpu_exec.get_chip()
+        assembler, isaInfoMap, debugConfig = _setupTensile(chip)
+        compiled = self._compileAll(chip, assembler, isaInfoMap, debugConfig)
+        return compiled, chip
+
     def run(self, resultsCsv: Optional[str] = None,
             libraryUpdateFile: Optional[str] = None,
             hwMonitor: bool = False,
@@ -399,12 +407,9 @@ class SweepRunner:
         hwMonitor, boundsCheck, rocprofCounters: reserved for future use.
         Returns a flat list of SweepResult (one per problem_size × solution).
         """
-        import amdgpu_exec
         from epilogues.epilogue_harness.yaml_solution_builder import problemSizesFromYaml
 
-        chip = amdgpu_exec.get_chip()
-        assembler, isaInfoMap, debugConfig = _setupTensile(chip)
-        compiled = self._compileAll(chip, assembler, isaInfoMap, debugConfig)
+        compiled, _ = self._compile()
         if not compiled:
             _log.warning("no solutions compiled; sweep returns empty")
             return []
