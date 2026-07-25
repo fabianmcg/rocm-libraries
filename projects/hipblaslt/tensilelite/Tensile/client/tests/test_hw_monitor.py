@@ -47,7 +47,7 @@ import Tensile.client.hw_monitor as _hw_mod
 
 
 # ---------------------------------------------------------------------------
-# Compilation helpers (mirrors test_harness_rotation.py pattern)
+# Compilation helpers (mirrors test_harness_rotation.py pattern).
 # ---------------------------------------------------------------------------
 
 
@@ -167,7 +167,7 @@ def _buildArgs(sol_dict, M, N, batch, K, D_buf, C_buf, A_buf, B_buf, alpha=1.0, 
 
 
 # ---------------------------------------------------------------------------
-# Session fixture
+# Session fixture.
 # ---------------------------------------------------------------------------
 
 
@@ -179,7 +179,7 @@ def bf16Entry():
 
 
 # ---------------------------------------------------------------------------
-# TestHwMonitorNoAmdsmi — pure Python, no GPU required
+# TestHwMonitorNoAmdsmi — pure Python, no GPU required.
 # ---------------------------------------------------------------------------
 
 
@@ -241,7 +241,7 @@ class TestHwMonitorNoAmdsmi:
 
 
 # ---------------------------------------------------------------------------
-# TestHwMonitorWithAmdsmi — GPU required
+# TestHwMonitorWithAmdsmi — GPU required.
 # ---------------------------------------------------------------------------
 
 
@@ -266,7 +266,6 @@ class TestHwMonitorWithAmdsmi:
             "(falls back to hotspot temperature when edge sensor is N/A)"
         )
 
-    @requires_gfx950
     def _allocBf16Bufs(self, M, N, batch, K):
         """Allocate and upload bf16 A/B/C/D GpuBuffers; return (A_buf, B_buf, C_buf, D_buf)."""
         from amdgpu_exec import GpuBuffer

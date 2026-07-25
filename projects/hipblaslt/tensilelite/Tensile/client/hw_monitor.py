@@ -31,12 +31,12 @@ _amdsmiMod = None
 _amdsmiInitialized: bool = False
 _amdsmiProcessors: list = []
 
-# (tempEdgeDegC, gpuClkMhz, socClkMhz, memClkMhz)
+# (tempEdgeDegC, gpuClkMhz, socClkMhz, memClkMhz).
 _Sample = Tuple[float, float, float, float]
 
 
 # ---------------------------------------------------------------------------
-# Module import helpers
+# Module import helpers.
 # ---------------------------------------------------------------------------
 
 
@@ -84,7 +84,7 @@ def _initAmdsmi(mod) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Collection helpers
+# Collection helpers.
 # ---------------------------------------------------------------------------
 
 
@@ -160,7 +160,7 @@ def _selectCollectFn(mod, proc) -> Optional[Callable[[], _Sample]]:
 
 
 # ---------------------------------------------------------------------------
-# Public class
+# Public class.
 # ---------------------------------------------------------------------------
 
 
