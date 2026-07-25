@@ -2,6 +2,60 @@
 
 Supplementary reference for `AGENTS.md` — load this when you need test commands, custom builds, linting, CMake options, or supported targets.
 
+## Python Harness (primary testing path for M1–M13)
+
+The Python client harness (`Tensile/client/`) provides assembly-level kernel compilation,
+benchmarking, and CSV reporting that match the C++ tensilelite-client in output format.
+Use it for development, CI, and parity validation — it does not require a pre-built
+solution library (compiles kernels from YAML via the Tensile assembler on demand).
+
+```bash
+# All harness tests (unit + GPU)
+tox -e unit
+
+# Only profiler counter tests (requires tensilelite_profiler C extension)
+tox -e unit -k requires_rocprof
+
+# Generate parity report after running parity tests
+tox -e unit -- Tensile/client/tests/test_parity.py --generate-parity-report
+
+# Parity report is written to Tensile/client/parity_report.md
+```
+
+### SweepRunner — benchmark all solutions in a YAML
+
+```python
+from Tensile.client.sweep_runner import SweepRunner
+
+runner = SweepRunner(
+    yamlPath="Tensile/client/tests/yaml/gemm_standard.yaml",
+    nWarmup=3,
+    nIters=15,
+    rotatingBuffers=8,
+    icacheCopies="auto",
+    problemIdx=2,   # bf16 HPA group
+    groupIdx=0,
+)
+results = runner.run(
+    resultsCsv="results.csv",
+    libraryUpdateFile="library_update.yaml",
+)
+# results is a list of SweepResult(solutionIdx, solutionName, problemSize, benchmark, gflops)
+```
+
+### LibraryRunner — dispatch via a pre-built production library
+
+```python
+from Tensile.client.library_runner import LibraryRunner
+
+runner = LibraryRunner(
+    libraryPath="path/to/TensileLibrary.yaml",
+    coPath="path/to/TensileLibrary_gfx950.co",
+)
+# Find best solution for a problem and benchmark it
+result = runner.run(problemSize=(1024, 1024, 4, 1024))
+```
+
 ## Running Tests
 
 ```bash

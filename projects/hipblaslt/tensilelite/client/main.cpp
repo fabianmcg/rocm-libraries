@@ -24,6 +24,10 @@
  *
  *******************************************************************************/
 
+// Retained as a reference implementation.
+// The Python harness in Tensile/client/ provides equivalent functionality.
+// See Tensile/client/parity_report.md for parity validation results.
+
 #include <Tensile/Contractions.hpp>
 #include <Tensile/DataTypes.hpp>
 #include <Tensile/EmbeddedLibrary.hpp>
