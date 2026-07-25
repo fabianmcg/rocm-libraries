@@ -15,7 +15,6 @@ Pure-Python reporter tests run under plain tox -e unit.
 from __future__ import annotations
 
 import csv
-import io
 import os
 import sys
 import tempfile

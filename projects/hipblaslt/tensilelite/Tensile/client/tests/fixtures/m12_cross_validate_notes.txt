@@ -13,7 +13,7 @@ Python SweepRunner notes
 - For group 2 (bf16 HPA NT batched), exactly 1 solution is produced:
     MatrixInstruction=[16,16,16,1,1,2,2,2,2], DepthU=16, GSU=1,
     SourceSwap=True, PrefetchGlobalRead=1.
-- Results CSV schema: rowLength = 11 (10 prefix cols + 1 solution col).
+- Results CSV schema: rowLength = 15 (14 prefix cols + 1 solution col) — 8-dim batched GEMM.
   LibraryLogic.py:459 formula: solutionStartIdx = rowLength - numSolutions = 10. ✓
 - GFLOPS plausibility range [100, 1_000_000] validates unit conversion is correct.
 

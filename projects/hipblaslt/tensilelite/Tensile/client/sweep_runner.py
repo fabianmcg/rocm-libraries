@@ -304,54 +304,46 @@ class SweepRunner:
             })
         return compiled
 
+    def _allocBufs(self, solDict, M, N, batch, K):
+        """Allocate device buffers for one benchmark run; caller must free."""
+        from amdgpu_exec import GpuBuffer
+        aSize = M * K * batch * _aElemSize(solDict)
+        bSize = N * K * batch * _aElemSize(solDict)
+        dSize = M * N * batch * _dElemSize(solDict)
+        return (GpuBuffer(aSize), GpuBuffer(bSize), GpuBuffer(dSize),
+                BufferPool(nSlots=self._rotatingBuffers, sizeBytes=dSize,
+                           gpuBufferCls=GpuBuffer))
+
     def _benchmarkOne(self, entry: dict, M: int, N: int, batch: int,
                       K: int, cuCount: int):
         """Benchmark one (solution, problem) pair.
 
         Returns (gflops, BenchmarkResult) on success, or (-1.0, None) on error.
         """
-        from amdgpu_exec import GpuBuffer
-
         solDict = entry["solDict"]
-        numWg = _computeNumWg(solDict, M, N, batch)
-        numThreads = solDict["NumThreads"]
-        aSize = M * K * batch * _aElemSize(solDict)
-        bSize = N * K * batch * _aElemSize(solDict)
-        dSize = M * N * batch * _dElemSize(solDict)
-
-        aBuf = GpuBuffer(aSize)
-        bBuf = GpuBuffer(bSize)
-        cBuf = GpuBuffer(dSize)
-        dPool = BufferPool(nSlots=self._rotatingBuffers, sizeBytes=dSize,
-                           gpuBufferCls=GpuBuffer)
+        aBuf, bBuf, cBuf, dPool = self._allocBufs(solDict, M, N, batch, K)
         try:
-            runner = _makeRunner(entry["hsaco"], entry["kernelName"],
-                                 self._icacheCopies)
+            runner = _makeRunner(entry["hsaco"], entry["kernelName"], self._icacheCopies)
 
             def argsFn(_ignored):
-                dBuf = dPool.next()
                 return _buildSweepArgs(solDict, M, N, batch, K,
-                                       dBuf, cBuf, aBuf, bBuf, cuCount)
+                                       dPool.next(), cBuf, aBuf, bBuf, cuCount)
 
             benchResult = runner.run(
                 argsFn=argsFn,
-                grid=(numWg, 1, 1),
-                block=(numThreads, 1, 1),
+                grid=(_computeNumWg(solDict, M, N, batch), 1, 1),
+                block=(solDict["NumThreads"], 1, 1),
                 nWarmup=self._nWarmup,
                 nIters=self._nIters,
             )
-            totalFlops = 2 * M * N * K * batch
-            gflops = totalFlops / (benchResult.meanUs * 1e-6) / 1e9
+            gflops = 2 * M * N * K * batch / (benchResult.meanUs * 1e-6) / 1e9
             return gflops, benchResult
         except Exception as exc:
             _log.warning("benchmark failed for %s size=(%d,%d,%d,%d): %s",
                          entry["sid"], M, N, batch, K, exc)
             return -1.0, None
         finally:
-            aBuf.free()
-            bBuf.free()
-            cBuf.free()
-            dPool.freeAll()
+            aBuf.free(); bBuf.free(); cBuf.free(); dPool.freeAll()
 
     def _benchmarkProblem(self, probSize: tuple, compiled: list,
                           cuCount: int) -> list:
@@ -375,6 +367,26 @@ class SweepRunner:
             ))
         return results
 
+    def _reportProblem(self, probSize, sizeResults, csvRep, luRep):
+        """Write CSV and library-update rows for one problem size."""
+        M, N, batch, K = probSize[0], probSize[1], probSize[2], probSize[3]
+        if len(probSize) >= 8:
+            ldd, ldc, lda, ldb = probSize[4], probSize[5], probSize[6], probSize[7]
+        else:
+            lda, ldb, ldd, ldc = M, N, M, M
+        if csvRep:
+            solResults = [(r.solutionName, r.gflops) for r in sizeResults]
+            csvRep.writeRow(
+                sizeParams={"sizes": list(probSize), "ldd": ldd, "ldc": ldc,
+                            "lda": lda, "ldb": ldb, "totalFlops": 2 * M * N * K * batch},
+                solutionResults=solResults,
+            )
+        if luRep:
+            valid = [r for r in sizeResults if r.gflops > 0]
+            if valid:
+                winner = max(valid, key=lambda r: r.gflops)
+                luRep.writeRow(list(probSize), winner.solutionIdx, winner.gflops)
+
     def run(self, resultsCsv: Optional[str] = None,
             libraryUpdateFile: Optional[str] = None,
             hwMonitor: bool = False,
@@ -385,7 +397,6 @@ class SweepRunner:
         resultsCsv:        path to write results.csv (omit to skip).
         libraryUpdateFile: path to write the library-update YAML (omit to skip).
         hwMonitor, boundsCheck, rocprofCounters: reserved for future use.
-
         Returns a flat list of SweepResult (one per problem_size × solution).
         """
         import amdgpu_exec
@@ -394,66 +405,28 @@ class SweepRunner:
         chip = amdgpu_exec.get_chip()
         assembler, isaInfoMap, debugConfig = _setupTensile(chip)
         compiled = self._compileAll(chip, assembler, isaInfoMap, debugConfig)
-
         if not compiled:
             _log.warning("no solutions compiled; sweep returns empty")
             return []
-
-        probSizes = problemSizesFromYaml(
-            self._yamlPath,
-            problemIdx=self._problemIdx,
-            groupIdx=self._groupIdx,
-        )
+        probSizes = problemSizesFromYaml(self._yamlPath,
+                                         problemIdx=self._problemIdx,
+                                         groupIdx=self._groupIdx)
         cuCount = _deviceCuCount()
         solNames = [e["sid"] for e in compiled]
-
-        # Determine numSizeDims from the actual problem size tuple length.
-        # For a batched GEMM, problemSizesFromYaml returns 8-element tuples:
-        # (M, N, batch, K, ldd, ldc, lda, ldb) — TotalIndices + NumIndicesLD.
+        # numSizeDims from actual tuple length — batched GEMM returns 8-dim tuples.
         numSizeDims = len(probSizes[0]) if probSizes else 4
-
         csvRep = (ResultsCSVReporter(resultsCsv, solNames, numSizeDims=numSizeDims)
                   if resultsCsv else None)
-        luRep = (LibraryUpdateReporter(libraryUpdateFile)
-                 if libraryUpdateFile else None)
-
+        luRep = LibraryUpdateReporter(libraryUpdateFile) if libraryUpdateFile else None
         if csvRep:
             csvRep.writeHeader()
-
         allResults = []
         for probSize in probSizes:
-            M, N, batch, K = probSize[0], probSize[1], probSize[2], probSize[3]
-            # For 8-dim tuples, positions 4-7 are ldd, ldc, lda, ldb.
-            if len(probSize) >= 8:
-                ldd, ldc, lda, ldb = probSize[4], probSize[5], probSize[6], probSize[7]
-            else:
-                lda, ldb, ldd, ldc = M, N, M, M
             sizeResults = self._benchmarkProblem(probSize, compiled, cuCount)
             allResults.extend(sizeResults)
-
-            if csvRep:
-                solResults = [(r.solutionName, r.gflops) for r in sizeResults]
-                totalFlops = 2 * M * N * K * batch
-                csvRep.writeRow(
-                    sizeParams={
-                        "sizes": list(probSize),
-                        "ldd": ldd, "ldc": ldc,
-                        "lda": lda, "ldb": ldb,
-                        "totalFlops": totalFlops,
-                    },
-                    solutionResults=solResults,
-                )
-
-            if luRep:
-                valid = [r for r in sizeResults if r.gflops > 0]
-                if valid:
-                    winner = max(valid, key=lambda r: r.gflops)
-                    luRep.writeRow(list(probSize), winner.solutionIdx,
-                                   winner.gflops)
-
+            self._reportProblem(probSize, sizeResults, csvRep, luRep)
         if csvRep:
             csvRep.close()
         if luRep:
             luRep.close()
-
         return allResults
