@@ -260,8 +260,6 @@ class SweepRunner:
                  problemIdx: int = 0, groupIdx: int = 0,
                  saveCoPath: Optional[str] = None,
                  pinClocks: bool = False,
-                 timingInstrumentation: bool = False,
-                 mxScaleFormat=None,
                  amdSmiPath: Optional[str] = None) -> None:
         self._yamlPath = yamlPath
         self._libraryPath = libraryPath
@@ -273,9 +271,39 @@ class SweepRunner:
         self._groupIdx = groupIdx
         self._saveCoPath = saveCoPath
         self._pinClocks = pinClocks
-        self._timingInstrumentation = timingInstrumentation
-        self._mxScaleFormat = mxScaleFormat
         self._amdSmiPath = amdSmiPath
+
+    def _compileOneSolution(self, sol, sid, chip: str, assembler,
+                            debugConfig) -> Optional[dict]:
+        """Compile one solution; return a compiled entry dict or None on failure."""
+        import amdgpu_exec
+        from epilogues.epilogue_harness.yaml_solution_builder import (
+            _injectInternalArgsSupport,
+        )
+
+        rawDict = dict(sol)
+        solDict = _injectInternalArgsSupport(rawDict, chip)
+        if _shouldSkip(rawDict, solDict):
+            return None
+        try:
+            asmStr, kernelName = _generateAsm(sol, assembler, debugConfig)
+            hsaco = amdgpu_exec.compile_asm_to_hsaco(asmStr, chip)
+        except Exception as exc:
+            _log.warning("solution %s failed to compile: %s", sid, exc)
+            return None
+        if self._saveCoPath is not None:
+            coPath = os.path.join(self._saveCoPath, f"{kernelName}.co")
+            with open(coPath, "wb") as f:
+                f.write(hsaco)
+            _log.info("saved .co: %s", coPath)
+        return {
+            "solDict": solDict,
+            "rawDict": rawDict,
+            "kernelName": kernelName,
+            "hsaco": hsaco,
+            "sid": sid,
+            "solution": sol,
+        }
 
     def _compileAll(self, chip: str, assembler, isaInfoMap,
                     debugConfig) -> list:
@@ -286,10 +314,7 @@ class SweepRunner:
         written to {saveCoPath}/{kernelName}.co for use by the C++ client.
         Solutions that fail to compile or are filtered are skipped with a warning.
         """
-        import amdgpu_exec
-        from epilogues.epilogue_harness.yaml_solution_builder import (
-            solutionsFromYaml, _injectInternalArgsSupport,
-        )
+        from epilogues.epilogue_harness.yaml_solution_builder import solutionsFromYaml
 
         if self._saveCoPath is not None:
             os.makedirs(self._saveCoPath, exist_ok=True)
@@ -305,29 +330,9 @@ class SweepRunner:
 
         compiled = []
         for sol, sid in sols:
-            rawDict = dict(sol)
-            solDict = _injectInternalArgsSupport(rawDict, chip)
-            if _shouldSkip(rawDict, solDict):
-                continue
-            try:
-                asmStr, kernelName = _generateAsm(sol, assembler, debugConfig)
-                hsaco = amdgpu_exec.compile_asm_to_hsaco(asmStr, chip)
-            except Exception as exc:
-                _log.warning("solution %s failed to compile: %s", sid, exc)
-                continue
-            if self._saveCoPath is not None:
-                coPath = os.path.join(self._saveCoPath, f"{kernelName}.co")
-                with open(coPath, "wb") as f:
-                    f.write(hsaco)
-                _log.info("saved .co: %s", coPath)
-            compiled.append({
-                "solDict": solDict,
-                "rawDict": rawDict,
-                "kernelName": kernelName,
-                "hsaco": hsaco,
-                "sid": sid,
-                "solution": sol,
-            })
+            entry = self._compileOneSolution(sol, sid, chip, assembler, debugConfig)
+            if entry is not None:
+                compiled.append(entry)
         return compiled
 
     def _allocBufs(self, solDict, M, N, batch, K):
@@ -441,6 +446,17 @@ class SweepRunner:
         compiled = self._compileAll(chip, assembler, isaInfoMap, debugConfig)
         return compiled, chip
 
+    def _openReporters(self, resultsCsv: Optional[str], solNames: list,
+                       numSizeDims: int,
+                       libraryUpdateFile: Optional[str]):
+        """Open CSV and library-update reporters; write the CSV header."""
+        csvRep = (ResultsCSVReporter(resultsCsv, solNames, numSizeDims=numSizeDims)
+                  if resultsCsv else None)
+        luRep = LibraryUpdateReporter(libraryUpdateFile) if libraryUpdateFile else None
+        if csvRep:
+            csvRep.writeHeader()
+        return csvRep, luRep
+
     def run(self, resultsCsv: Optional[str] = None,
             libraryUpdateFile: Optional[str] = None,
             hwMonitor: bool = False,
@@ -466,11 +482,8 @@ class SweepRunner:
         solNames = [e["sid"] for e in compiled]
         # numSizeDims from actual tuple length — batched GEMM returns 8-dim tuples.
         numSizeDims = len(probSizes[0]) if probSizes else 4
-        csvRep = (ResultsCSVReporter(resultsCsv, solNames, numSizeDims=numSizeDims)
-                  if resultsCsv else None)
-        luRep = LibraryUpdateReporter(libraryUpdateFile) if libraryUpdateFile else None
-        if csvRep:
-            csvRep.writeHeader()
+        csvRep, luRep = self._openReporters(resultsCsv, solNames, numSizeDims,
+                                            libraryUpdateFile)
         if self._pinClocks and self._amdSmiPath:
             self._applyClockPin()
         try:

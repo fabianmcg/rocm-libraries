@@ -228,7 +228,7 @@ def runNewClient(scriptPath, clientParametersPath, cxxCompiler: str, cCompiler: 
   try:
     subprocess.run(args, check=True)
   except (subprocess.CalledProcessError, OSError) as e:
-    printWarning("ClientWriter Benchmark Process exited with error: {}".format(e))
+    printWarning("clientWriter benchmark process exited with error: {}".format(e))
 
 
 def _runWithPythonHarness(configPaths, buildPath):
@@ -237,23 +237,24 @@ def _runWithPythonHarness(configPaths, buildPath):
   Returns 0 on success, 1 on failure. Lazy-imports SweepRunner to avoid
   circular imports at module load time.
   """
+  # SweepRunner requires a BenchmarkProblems YAML (not a .ini file).
+  # Production callers pass .ini paths; this function is only reachable when
+  # use_python_client=True is explicitly set by the caller.
   from Tensile.client.sweep_runner import SweepRunner
   runner = SweepRunner(
       yamlPath=configPaths[0],
       pinClocks=globalParameters["PinClocks"],
-      timingInstrumentation=globalParameters["TimingInstrumentation"],
-      mxScaleFormat=globalParameters.get("MXScaleFormat"),
       amdSmiPath=globalParameters.get("AMDSMIPath"),
   )
   try:
     runner.run(resultsCsv=str(buildPath / "results.csv"))
     return 0
   except Exception as exc:
-    printWarning("Python client sweep failed: %s" % exc)
+    printWarning("python client sweep failed: %s" % exc)
     return 1
 
 
-def runClient(libraryLogicPath, forBenchmark, enableTileSelection, cxxCompiler: str, cCompiler: str, outputPath, configPaths=None, use_python_client: bool = True):
+def runClient(libraryLogicPath, forBenchmark, enableTileSelection, cxxCompiler: str, cCompiler: str, outputPath, configPaths=None, use_python_client: bool = False):
   buildPath = ensurePath(outputPath / "build")
   timingEnabled = globalParameters.get("TimingInstrumentation", False)
   parallelGpus = globalParameters.get("ParallelGpuExecution", 1)
@@ -271,9 +272,6 @@ def runClient(libraryLogicPath, forBenchmark, enableTileSelection, cxxCompiler: 
     print1(f"# Auto-detected {numGpus} GPUs for parallel execution")
   else:
     numGpus = parallelGpus
-
-  if not use_python_client:
-    print1("# Deprecated: use_python_client=False is deprecated and will be removed in a future release.")
 
   with timing_context("python_client_execution"):
     # Use parallel execution only for benchmarking with multiple GPUs
@@ -304,7 +302,7 @@ def runClient(libraryLogicPath, forBenchmark, enableTileSelection, cxxCompiler: 
       process.communicate()
 
   if process.returncode:
-    printWarning("ClientWriter Benchmark Process exited with code %u" % process.returncode)
+    printWarning("clientWriter benchmark process exited with code %u" % process.returncode)
 
   return process.returncode
 

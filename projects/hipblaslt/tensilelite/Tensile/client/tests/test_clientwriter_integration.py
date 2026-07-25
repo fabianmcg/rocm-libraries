@@ -59,8 +59,6 @@ def integrationSweep():
         problemIdx=_PROBLEM_IDX,
         groupIdx=_GROUP_IDX,
         pinClocks=False,
-        timingInstrumentation=False,
-        mxScaleFormat=None,
         amdSmiPath=None,
     )
     return runner.run()
