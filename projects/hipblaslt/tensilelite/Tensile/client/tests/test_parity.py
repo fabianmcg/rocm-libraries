@@ -105,8 +105,12 @@ _tolSmall = 0.10   # ±10% for M×N < 1024².
 # ---------------------------------------------------------------------------
 
 
-def _loadCppReference(csvPath) -> dict:
-    """Load C++ reference CSV. Returns {} if placeholder (first line starts with 'status')."""
+def _loadCppReference(csvPath, dtype=None) -> dict:
+    """Load C++ reference CSV. Returns {} if placeholder (first line starts with 'status').
+
+    When dtype is provided (e.g. 'Float', 'BFloat16'), only rows whose DataType
+    column matches are included. Rows without a DataType column are always included.
+    """
     if not os.path.exists(csvPath):
         return {}
     with open(csvPath) as f:
@@ -119,6 +123,9 @@ def _loadCppReference(csvPath) -> dict:
         reader = csv.DictReader(f)
         for row in reader:
             try:
+                rowDtype = row.get("DataType", "")
+                if dtype and rowDtype and rowDtype != dtype:
+                    continue
                 gflops = float(row.get("GFlops", 0))
                 sizes = (int(row.get("SizeI", 0)), int(row.get("SizeJ", 0)),
                          int(row.get("SizeL", 0)), int(row.get("SizeK", 0)))
@@ -128,19 +135,21 @@ def _loadCppReference(csvPath) -> dict:
     return result
 
 
-def _compareCppGflops(pyGflops, cppRef, sizeKey, label, tol):
+def _compareCppGflops(pyGflops, cppRef, sizeKey, label, tol) -> bool:
     """Assert Python GFLOPS is within tol of C++ reference for sizeKey.
 
-    Skips gracefully if sizeKey not in cppRef (placeholder or missing problem).
+    Returns True if the comparison was made, False if sizeKey is absent from
+    cppRef (the caller may skip sizes not present without failing the test).
     """
     if sizeKey not in cppRef:
-        pytest.skip(f"no C++ reference for {label} {sizeKey}")
+        return False
     cppGflops = cppRef[sizeKey]
     delta = abs(pyGflops - cppGflops) / max(cppGflops, 1)
     assert delta <= tol, (
         f"gflops delta for {label} exceeds {tol:.0%}: "
         f"python={pyGflops:.1f} cpp={cppGflops:.1f} delta={delta:.1%}"
     )
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +158,12 @@ def _compareCppGflops(pyGflops, cppRef, sizeKey, label, tol):
 
 
 def _runSweep(yamlPath, problemIdx, groupIdx=0, nWarmup=3, nIters=15):
-    """Run SweepRunner and return list of SweepResult, or [] on failure."""
+    """Run SweepRunner and return list of SweepResult, or [] on failure.
+
+    Uses icacheCopies=1 and rotatingBuffers=1 for stable per-iteration timing.
+    SweepResult.gflops is computed from p50Us (median) in _benchmarkOne, so
+    single-iteration GPU spikes do not inflate the reported value.
+    """
     if not haveDeps:
         return []
     try:
@@ -157,8 +171,8 @@ def _runSweep(yamlPath, problemIdx, groupIdx=0, nWarmup=3, nIters=15):
             yamlPath=yamlPath,
             nWarmup=nWarmup,
             nIters=nIters,
-            rotatingBuffers=8,
-            icacheCopies="auto",
+            rotatingBuffers=1,
+            icacheCopies=1,
             problemIdx=problemIdx,
             groupIdx=groupIdx,
         )
@@ -264,21 +278,25 @@ def test_fp32_gflops_plausible(fp32ParitySweep, request):
 def test_fp32_cpp_reference(fp32ParitySweep, request):
     """fp32 GEMM Python GFLOPS vs C++ reference."""
     csvPath = os.path.join(_fixturesDir, "cpp_client_reference.csv")
-    cppRef = _loadCppReference(csvPath)
+    cppRef = _loadCppReference(csvPath, dtype="Float")
     if not cppRef:
         _recordFeature(request.config, "fp32 vs C++ reference", "SKIP",
                        "C++ client requires pre-built library (see cpp_client_reference_cmd.txt)")
         pytest.skip("C++ reference CSV not yet populated")
     if not fp32ParitySweep:
         pytest.skip("no sweep results (no solutions compiled or no GPU)")
+    compared = 0
     for M, N, batch, K in _fp32Sizes:
         gflops = _gflopsForSize(fp32ParitySweep, M, N, batch, K)
         if gflops is None:
             continue
+        sizeKey = (M, N, batch, K)
         tol = _toleranceFor(M, N)
-        _compareCppGflops(gflops, cppRef, (M, N, batch, K), f"fp32 {M}x{N}x{batch}x{K}", tol)
-        _recordGflops(request.config, "fp32", (M, N, batch, K), gflops,
-                      cppRef.get((M, N, batch, K)))
+        if _compareCppGflops(gflops, cppRef, sizeKey, f"fp32 {M}x{N}x{batch}x{K}", tol):
+            compared += 1
+            _recordGflops(request.config, "fp32", sizeKey, gflops, cppRef.get(sizeKey))
+    if compared == 0:
+        pytest.skip("no matching sizes in C++ reference CSV")
     _recordFeature(request.config, "fp32 vs C++ reference", "PASS",
                    "within tolerance of C++ GFLOPS")
 
@@ -311,21 +329,25 @@ def test_bf16_gflops_plausible(bf16ParitySweep, request):
 def test_bf16_cpp_reference(bf16ParitySweep, request):
     """bf16 GEMM Python GFLOPS vs C++ reference."""
     csvPath = os.path.join(_fixturesDir, "cpp_client_reference.csv")
-    cppRef = _loadCppReference(csvPath)
+    cppRef = _loadCppReference(csvPath, dtype="BFloat16")
     if not cppRef:
         _recordFeature(request.config, "bf16 vs C++ reference", "SKIP",
                        "C++ client requires pre-built library (see cpp_client_reference_cmd.txt)")
         pytest.skip("C++ reference CSV not yet populated")
     if not bf16ParitySweep:
         pytest.skip("no sweep results (no solutions compiled or no GPU)")
+    compared = 0
     for M, N, batch, K in _bf16Sizes:
         gflops = _gflopsForSize(bf16ParitySweep, M, N, batch, K)
         if gflops is None:
             continue
+        sizeKey = (M, N, batch, K)
         tol = _toleranceFor(M, N)
-        _compareCppGflops(gflops, cppRef, (M, N, batch, K), f"bf16 {M}x{N}x{batch}x{K}", tol)
-        _recordGflops(request.config, "bf16", (M, N, batch, K), gflops,
-                      cppRef.get((M, N, batch, K)))
+        if _compareCppGflops(gflops, cppRef, sizeKey, f"bf16 {M}x{N}x{batch}x{K}", tol):
+            compared += 1
+            _recordGflops(request.config, "bf16", sizeKey, gflops, cppRef.get(sizeKey))
+    if compared == 0:
+        pytest.skip("no matching sizes in C++ reference CSV")
     _recordFeature(request.config, "bf16 vs C++ reference", "PASS",
                    "within tolerance of C++ GFLOPS")
 

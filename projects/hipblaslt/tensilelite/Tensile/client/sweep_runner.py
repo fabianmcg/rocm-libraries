@@ -336,7 +336,8 @@ class SweepRunner:
                 nWarmup=self._nWarmup,
                 nIters=self._nIters,
             )
-            gflops = 2 * M * N * K * batch / (benchResult.meanUs * 1e-6) / 1e9
+            # Use p50 (median) to ignore OS-level timing spikes.
+            gflops = 2 * M * N * K * batch / (benchResult.p50Us * 1e-6) / 1e9
             return gflops, benchResult
         except Exception as exc:
             _log.warning("benchmark failed for %s size=(%d,%d,%d,%d): %s",

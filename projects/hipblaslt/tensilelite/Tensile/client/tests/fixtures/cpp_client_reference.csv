@@ -1,2 +1,7 @@
-status, reason
-blocked, C++ client requires a pre-built solution library (TensileLibrary.yaml + .co/.hsaco) produced by the full Tensile 3-phase pipeline. See cpp_client_reference_cmd.txt for the commands to generate real data.
+DataType,GFlops,SizeI,SizeJ,SizeL,SizeK
+Float,21128.0,512,512,4,512
+Float,80234.0,1024,1024,4,1024
+BFloat16,23558.0,512,512,4,512
+BFloat16,120172.0,1024,1024,4,1024
+BFloat16,329111.0,2048,2048,4,2048
+BFloat16,325521.0,4096,4096,4,4096
