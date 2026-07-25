@@ -30,12 +30,12 @@ except ImportError:
 
 from .conftest import requires_gfx950
 
-_TESTS_DIR = os.path.dirname(__file__)
-_YAML_PATH = os.path.join(_TESTS_DIR, "yaml", "gemm_streamk45_gpu.yaml")
-_TENSILE_ROOT = os.path.abspath(os.path.join(_TESTS_DIR, "..", "..", "..", ".."))
+_testsDir = os.path.dirname(__file__)
+_yamlPath = os.path.join(_testsDir, "yaml", "gemm_streamk45_gpu.yaml")
+_tensileRoot = os.path.abspath(os.path.join(_testsDir, "..", "..", "..", ".."))
 
-if _TENSILE_ROOT not in sys.path:
-    sys.path.insert(0, _TENSILE_ROOT)
+if _tensileRoot not in sys.path:
+    sys.path.insert(0, _tensileRoot)
 
 from Tensile.client.gemm_args import (
     buildKernelArgs,
@@ -358,7 +358,7 @@ def _compileSk(problemIdx: int):
         from epilogues.epilogue_harness.yaml_solution_builder import solutionsFromYaml
         chip = amdgpu_exec.get_chip()
         assembler, isaInfoMap, debugConfig = _setupTensile(chip)
-        sols = solutionsFromYaml(_YAML_PATH, assembler, isaInfoMap, debugConfig,
+        sols = solutionsFromYaml(_yamlPath, assembler, isaInfoMap, debugConfig,
                                  problemIdx=problemIdx)
     except Exception as exc:
         import warnings

@@ -23,21 +23,21 @@ import pytest
 
 try:
     import amdgpu_exec
-    HAVE_DEPS = True
+    haveDeps = True
 except ImportError:
     amdgpu_exec = None
-    HAVE_DEPS = False
+    haveDeps = False
 
 from Tensile.client.gemm_args import buildGroupedGemmArgs
 from Tensile.client.reference import gemm, gemmFp16, gemmGrouped, assertClose, RTOL_FP16, ATOL_FP16
 from .conftest import requires_gfx950
 
-_TESTS_DIR = os.path.dirname(__file__)
-_GROUPED_YAML = os.path.join(_TESTS_DIR, "yaml", "gemm_grouped_gpu.yaml")
-_TENSILE_ROOT = os.path.abspath(os.path.join(_TESTS_DIR, "..", "..", "..", ".."))
+_testsDir = os.path.dirname(__file__)
+_groupedYaml = os.path.join(_testsDir, "yaml", "gemm_grouped_gpu.yaml")
+_tensileRoot = os.path.abspath(os.path.join(_testsDir, "..", "..", "..", ".."))
 
-if _TENSILE_ROOT not in sys.path:
-    sys.path.insert(0, _TENSILE_ROOT)
+if _tensileRoot not in sys.path:
+    sys.path.insert(0, _tensileRoot)
 
 
 # ===========================================================================
@@ -298,7 +298,7 @@ def _generateAsm(solution, assembler, debugConfig):
 
 def _compileGrouped():
     """Compile grouped GEMM solutions from gemm_grouped_gpu.yaml."""
-    if not HAVE_DEPS:
+    if not haveDeps:
         return []
     try:
         from epilogues.epilogue_harness.yaml_solution_builder import (
@@ -306,7 +306,7 @@ def _compileGrouped():
         )
         chip = amdgpu_exec.get_chip()
         assembler, isaInfoMap, debugConfig = _setupTensile(chip)
-        sols = solutionsFromYaml(_GROUPED_YAML, assembler, isaInfoMap, debugConfig,
+        sols = solutionsFromYaml(_groupedYaml, assembler, isaInfoMap, debugConfig,
                                  problemIdx=0)
     except Exception as exc:
         import warnings
@@ -486,7 +486,7 @@ class TestGemmGroupedGpu:
     @requires_gfx950
     def test_gpu_two_groups_nn_fp16(self, groupedKernels):
         """Grouped GEMM: kernel compiles from gemm_grouped_gpu.yaml; GPU dispatch pending."""
-        if not HAVE_DEPS:
+        if not haveDeps:
             pytest.skip("amdgpu_exec not installed")
         usable = [e for e in groupedKernels if e["sol_dict"].get("WorkGroupMapping", 0) != 0]
         if not usable:
