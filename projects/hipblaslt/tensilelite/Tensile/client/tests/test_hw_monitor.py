@@ -26,20 +26,20 @@ import pytest
 try:
     import amdgpu_exec
     import ml_dtypes
-    HAVE_DEPS = True
+    haveDeps = True
 except ImportError:
     amdgpu_exec = None
     ml_dtypes = None
-    HAVE_DEPS = False
+    haveDeps = False
 
 from .conftest import requires_gfx950
 
-_TESTS_DIR = os.path.dirname(__file__)
-_YAML_PATH = os.path.join(_TESTS_DIR, "yaml", "gemm_standard.yaml")
-_TENSILE_ROOT = os.path.abspath(os.path.join(_TESTS_DIR, "..", "..", "..", ".."))
+_testsDir = os.path.dirname(__file__)
+_yamlPath = os.path.join(_testsDir, "yaml", "gemm_standard.yaml")
+_tensileRoot = os.path.abspath(os.path.join(_testsDir, "..", "..", "..", ".."))
 
-if _TENSILE_ROOT not in sys.path:
-    sys.path.insert(0, _TENSILE_ROOT)
+if _tensileRoot not in sys.path:
+    sys.path.insert(0, _tensileRoot)
 
 from Tensile.client.harness import BenchmarkResult, KernelRunner
 from Tensile.client.hw_monitor import HardwareMonitor
@@ -87,14 +87,14 @@ def _generateAsm(solution, assembler, debugConfig):
 
 def _compileBf16Solutions():
     """Compile bf16 HPA solutions from YAML group 2."""
-    if not HAVE_DEPS:
+    if not haveDeps:
         return []
     try:
         from epilogues.epilogue_harness.yaml_solution_builder import solutionsFromYaml
         from epilogues.epilogue_harness.yaml_solution_builder import _injectInternalArgsSupport
         chip = amdgpu_exec.get_chip()
         assembler, isaInfoMap, debugConfig = _setupTensile(chip)
-        sols = solutionsFromYaml(_YAML_PATH, assembler, isaInfoMap, debugConfig, problemIdx=2)
+        sols = solutionsFromYaml(_yamlPath, assembler, isaInfoMap, debugConfig, problemIdx=2)
     except Exception as exc:
         import warnings
         warnings.warn(f"could not compile bf16 solutions: {exc}")
@@ -127,7 +127,7 @@ def _compileBf16Solutions():
 
 
 def _deviceCuCount() -> int:
-    if not HAVE_DEPS:
+    if not haveDeps:
         return 0
     props = amdgpu_exec._runtime_module.hip_get_device_props(0)
     return int(props.get("multiprocessor_count", 0))
@@ -251,7 +251,7 @@ class TestHwMonitorWithAmdsmi:
     @requires_gfx950
     def test_monitor_values_plausible(self):
         """Clock and temperature are non-zero after a brief polling window."""
-        if not HAVE_DEPS:
+        if not haveDeps:
             pytest.skip("amdgpu_exec not installed")
 
         mon = HardwareMonitor(deviceId=0, intervalMs=10)
@@ -267,46 +267,41 @@ class TestHwMonitorWithAmdsmi:
         )
 
     @requires_gfx950
-    def test_kernel_runner_with_hw_monitor(self, bf16Entry):
-        """run(hwMonitor=True) attaches a HardwareMonitor with plausible readings."""
-        if not HAVE_DEPS or ml_dtypes is None:
-            pytest.skip("amdgpu_exec or ml_dtypes not installed")
-        if bf16Entry is None:
-            pytest.skip("no bf16 solution compiled")
-
+    def _allocBf16Bufs(self, M, N, batch, K):
+        """Allocate and upload bf16 A/B/C/D GpuBuffers; return (A_buf, B_buf, C_buf, D_buf)."""
         from amdgpu_exec import GpuBuffer
-
-        sol_dict = bf16Entry["sol_dict"]
-        kernel_name = bf16Entry["kernel_name"]
-        hsaco = bf16Entry["hsaco"]
-        M, N, batch, K = 512, 512, 1, 512
-        num_threads = sol_dict["NumThreads"]
-
         rng = np.random.default_rng(seed=9)
         A_np = np.asfortranarray(rng.random((M, K)).astype(ml_dtypes.bfloat16))
         B_np = np.asfortranarray(rng.random((N, K)).astype(ml_dtypes.bfloat16))
         C_np = np.zeros(M * N * batch, dtype=ml_dtypes.bfloat16)
-        D_np = np.zeros(M * N * batch, dtype=ml_dtypes.bfloat16)
-
         A_buf = GpuBuffer(A_np.nbytes)
         B_buf = GpuBuffer(B_np.nbytes)
         C_buf = GpuBuffer(C_np.nbytes)
-        D_buf = GpuBuffer(D_np.nbytes)
+        D_buf = GpuBuffer(M * N * batch * 2)
         A_buf.copy_from_host(A_np)
         B_buf.copy_from_host(B_np)
         C_buf.copy_from_host(C_np)
+        return A_buf, B_buf, C_buf, D_buf
 
+    def test_kernel_runner_with_hw_monitor(self, bf16Entry):
+        """run(hwMonitor=True) attaches a HardwareMonitor with plausible readings."""
+        if not haveDeps or ml_dtypes is None:
+            pytest.skip("amdgpu_exec or ml_dtypes not installed")
+        if bf16Entry is None:
+            pytest.skip("no bf16 solution compiled")
+        sol_dict = bf16Entry["sol_dict"]
+        M, N, batch, K = 512, 512, 1, 512
+        A_buf, B_buf, C_buf, D_buf = self._allocBf16Bufs(M, N, batch, K)
         args, num_wg = _buildArgs(sol_dict, M, N, batch, K, D_buf, C_buf, A_buf, B_buf)
-        runner = KernelRunner.fromHsaco(hsaco, kernel_name, nModuleCopies=1)
+        runner = KernelRunner.fromHsaco(bf16Entry["hsaco"], bf16Entry["kernel_name"], nModuleCopies=1)
         result = runner.run(
             argsFn=lambda _: args,
             grid=(num_wg, 1, 1),
-            block=(num_threads, 1, 1),
+            block=(sol_dict["NumThreads"], 1, 1),
             nWarmup=2,
             nIters=10,
             hwMonitor=True,
         )
-
         assert result.hw is not None, "expected hw field to be set"
         assert result.hw.avgGpuClockMhz > 0, (
             f"expected avgGpuClockMhz > 0, got {result.hw.avgGpuClockMhz}"
@@ -315,6 +310,5 @@ class TestHwMonitorWithAmdsmi:
             f"expected avgTempEdge > 0, got {result.hw.avgTempEdge} "
             "(falls back to hotspot temperature when edge sensor is N/A)"
         )
-
         for buf in [A_buf, B_buf, C_buf, D_buf]:
             buf.free()

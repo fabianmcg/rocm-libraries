@@ -41,7 +41,7 @@ _Sample = Tuple[float, float, float, float]
 
 
 def _importAmdsmi():
-    """Return the amdsmi module, or None if not available on this system."""
+    """Return the amdsmi module, or None if not available on this system"""
     global _amdsmiMod
     if _amdsmiMod is not None:
         return _amdsmiMod
@@ -51,7 +51,7 @@ def _importAmdsmi():
         try:
             mod = __import__(name)
             _amdsmiMod = mod
-            _log.debug("imported gpu metrics module '%s'.", name)
+            _log.debug("imported gpu metrics module '%s'", name)
             return mod
         except ImportError:
             pass
@@ -64,7 +64,7 @@ def _importAmdsmi():
     try:
         import amdsmi as _sys_amdsmi  # noqa: PLC0415
         _amdsmiMod = _sys_amdsmi
-        _log.debug("imported gpu metrics module 'amdsmi' via %s.", smi_path)
+        _log.debug("imported gpu metrics module 'amdsmi' via %s", smi_path)
         return _sys_amdsmi
     except ImportError:
         pass
@@ -73,7 +73,7 @@ def _importAmdsmi():
 
 
 def _initAmdsmi(mod) -> list:
-    """Initialize amdsmi once per process and return processor handles."""
+    """Initialize amdsmi once per process and return processor handles"""
     global _amdsmiInitialized, _amdsmiProcessors
     if _amdsmiInitialized:
         return _amdsmiProcessors
@@ -89,14 +89,14 @@ def _initAmdsmi(mod) -> list:
 
 
 def _asFloat(val) -> float:
-    """Convert an amdsmi metric value to float, treating 'N/A' or None as 0.0."""
+    """Convert an amdsmi metric value to float, treating 'N/A' or None as 0.0"""
     if val is None or val == "N/A":
         return 0.0
     return float(val)
 
 
 def _gfxClkAvg(metrics: dict) -> float:
-    """Return the average GFX clock in MHz across all XCDs, or 0.0."""
+    """Return the average GFX clock in MHz across all XCDs, or 0.0"""
     clks = metrics.get("current_gfxclks")
     if isinstance(clks, list):
         valid = [float(v) for v in clks if v != "N/A"]
@@ -105,7 +105,7 @@ def _gfxClkAvg(metrics: dict) -> float:
 
 
 def _edgeTemp(metrics: dict) -> float:
-    """Return edge temperature in degrees C, falling back to hotspot."""
+    """Return edge temperature in degrees C, falling back to hotspot"""
     temp = _asFloat(metrics.get("temperature_edge"))
     if temp == 0.0:
         temp = _asFloat(metrics.get("temperature_hotspot"))
@@ -113,14 +113,14 @@ def _edgeTemp(metrics: dict) -> float:
 
 
 def _collectFromMetricsInfo(mod, proc) -> Callable[[], _Sample]:
-    """Return a closure that samples via amdsmi_get_gpu_metrics_info."""
-    _log.info("hardware monitor: using amdsmi_get_gpu_metrics_info.")
+    """Return a closure that samples via amdsmi_get_gpu_metrics_info"""
+    _log.info("hardware monitor: using amdsmi_get_gpu_metrics_info")
 
     def collect() -> _Sample:
         try:
             m = mod.amdsmi_get_gpu_metrics_info(proc)
         except Exception as exc:
-            _log.debug("amdsmi_get_gpu_metrics_info failed: %s.", exc)
+            _log.debug("amdsmi_get_gpu_metrics_info failed: %s", exc)
             return (0.0, 0.0, 0.0, 0.0)
         return (
             _edgeTemp(m),
@@ -138,20 +138,20 @@ def _collectFromActivity(mod, proc) -> Callable[[], _Sample]:
     amdsmi_get_gpu_activity does not expose temperature or clock speeds;
     all metric fields will remain 0.0 with this fallback.
     """
-    _log.info("hardware monitor: using amdsmi_get_gpu_activity (no temp/clock data).")
+    _log.info("hardware monitor: using amdsmi_get_gpu_activity (no temp/clock data)")
 
     def collect() -> _Sample:
         try:
             mod.amdsmi_get_gpu_activity(proc)
         except Exception as exc:
-            _log.debug("amdsmi_get_gpu_activity failed: %s.", exc)
+            _log.debug("amdsmi_get_gpu_activity failed: %s", exc)
         return (0.0, 0.0, 0.0, 0.0)
 
     return collect
 
 
 def _selectCollectFn(mod, proc) -> Optional[Callable[[], _Sample]]:
-    """Select the richest available metrics collection function."""
+    """Select the richest available metrics collection function"""
     if hasattr(mod, "amdsmi_get_gpu_metrics_info"):
         return _collectFromMetricsInfo(mod, proc)
     if hasattr(mod, "amdsmi_get_gpu_activity"):
@@ -194,18 +194,18 @@ class HardwareMonitor:
     def __enter__(self) -> "HardwareMonitor":
         mod = _importAmdsmi()
         if mod is None:
-            _log.warning("amdsmi/pyamdsmi not available; hardware monitoring is a no-op.")
+            _log.warning("amdsmi/pyamdsmi not available; hardware monitoring is a no-op")
             return self
 
         try:
             procs = _initAmdsmi(mod)
         except Exception as exc:
-            _log.warning("amdsmi_init failed (%s); hardware monitoring is a no-op.", exc)
+            _log.warning("amdsmi_init failed (%s); hardware monitoring is a no-op", exc)
             return self
 
         if self.deviceId >= len(procs):
             _log.warning(
-                "device %d not found (%d devices); hardware monitoring is a no-op.",
+                "device %d not found (%d devices); hardware monitoring is a no-op",
                 self.deviceId,
                 len(procs),
             )
@@ -213,7 +213,7 @@ class HardwareMonitor:
 
         collectFn = _selectCollectFn(mod, procs[self.deviceId])
         if collectFn is None:
-            _log.warning("no supported amdsmi metrics API found; hardware monitoring is a no-op.")
+            _log.warning("no supported amdsmi metrics API found; hardware monitoring is a no-op")
             return self
 
         self._stopEvent.clear()
@@ -225,7 +225,7 @@ class HardwareMonitor:
         return self
 
     def _pollLoop(self, collectFn: Callable[[], _Sample]) -> None:
-        """Daemon thread body: poll at intervalMs until stop is signalled."""
+        """Daemon thread body: poll at intervalMs until stop is signalled"""
         while not self._stopEvent.is_set():
             self._samples.append(collectFn())
             self._stopEvent.wait(timeout=self.intervalMs / 1000.0)
@@ -238,7 +238,7 @@ class HardwareMonitor:
         self._computeAverages()
 
     def _computeAverages(self) -> None:
-        """Compute per-field averages from accumulated samples."""
+        """Compute per-field averages from accumulated samples"""
         n = len(self._samples)
         if n == 0:
             return
