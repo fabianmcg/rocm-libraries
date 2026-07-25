@@ -19,7 +19,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from .conftest import TENSILELITE_PROFILER_AVAILABLE, requires_gfx950, requires_rocprof
+from .conftest import tensileliteProfilerAvailable, requires_gfx950, requires_rocprof
 
 # ---------------------------------------------------------------------------
 # Dependency guards

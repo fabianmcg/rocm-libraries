@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 """Pytest configuration for Tensile/client harness tests.
 
-Defines HAVE_DEPS, requires_deps, and requires_gfx950. The chip is detected
+Defines haveDeps, requires_deps, and requires_gfx950. The chip is detected
 lazily at test-setup time, not at collection time, so that HIP initialization
 does not happen before session fixtures (important for M11 ROCprofiler-SDK).
 
@@ -18,9 +18,9 @@ import pytest
 
 try:
     import amdgpu_exec  # noqa: F401
-    HAVE_DEPS = True
+    haveDeps = True
 except ImportError:
-    HAVE_DEPS = False
+    haveDeps = False
 
 # IMPORTANT: tensilelite_profiler must be imported before any HIP call.
 # The try/except here runs at collection time, which is safe because no
@@ -29,11 +29,11 @@ try:
     import tensilelite_profiler as _profMod
     if not hasattr(_profMod, 'initialize'):
         raise ImportError("tensilelite_profiler C extension not installed")
-    TENSILELITE_PROFILER_AVAILABLE = True
+    tensileliteProfilerAvailable = True
 except (ImportError, RuntimeError):
-    TENSILELITE_PROFILER_AVAILABLE = False
+    tensileliteProfilerAvailable = False
 
-requires_deps = pytest.mark.skipif(not HAVE_DEPS, reason="amdgpu_exec not installed")
+requires_deps = pytest.mark.skipif(not haveDeps, reason="amdgpu_exec not installed")
 
 # IMPORTANT: do NOT call get_chip() here. get_chip() triggers HIP initialization
 # on first use. A module-level call runs during test COLLECTION, which would
@@ -79,12 +79,12 @@ def pytest_configure(config):
 
 def pytest_runtest_setup(item):
     if item.get_closest_marker("requires_gfx950") is not None:
-        if not HAVE_DEPS:
+        if not haveDeps:
             pytest.skip("amdgpu_exec not installed")
         if _currentChip() != "gfx950":
             pytest.skip("requires gfx950 GPU")
     if item.get_closest_marker("requires_rocprof") is not None:
-        if not TENSILELITE_PROFILER_AVAILABLE:
+        if not tensileliteProfilerAvailable:
             pytest.skip("tensilelite_profiler not available")
 
 
