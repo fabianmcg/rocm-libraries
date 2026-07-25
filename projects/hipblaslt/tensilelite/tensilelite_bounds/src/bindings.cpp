@@ -62,23 +62,19 @@ const HipApi *HipApi::load()
     static HipApi api;
     bool ok = true;
 
-    // Resolves one symbol; prints to stderr and sets ok=false if absent.
-    auto loadSym = [&ok, handle](auto &fp, const char *sym) {
-        void *p = ::dlsym(handle, sym);
-        if(!p)
-        {
+    // Resolve one symbol; set ok=false and print to stderr if absent.
+    auto resolve = [&](void **fp, const char *sym) {
+        *fp = ::dlsym(handle, sym);
+        if(!*fp) {
             std::fprintf(stderr, "HIP runtime: symbol '%s' not found in libamdhip64.so\n", sym);
             ok = false;
-            return;
         }
-        static_assert(sizeof(p) == sizeof(fp), "function pointer size mismatch");
-        *reinterpret_cast<void **>(&fp) = p;
     };
 
-    loadSym(api.malloc, "hipMalloc");
-    loadSym(api.free, "hipFree");
-    loadSym(api.memcpy, "hipMemcpy");
-    loadSym(api.getErrorString, "hipGetErrorString");
+    resolve(reinterpret_cast<void **>(&api.malloc), "hipMalloc");
+    resolve(reinterpret_cast<void **>(&api.free), "hipFree");
+    resolve(reinterpret_cast<void **>(&api.memcpy), "hipMemcpy");
+    resolve(reinterpret_cast<void **>(&api.getErrorString), "hipGetErrorString");
 
     if(!ok)
     {

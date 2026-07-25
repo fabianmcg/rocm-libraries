@@ -28,28 +28,28 @@ import pytest
 try:
     import amdgpu_exec
     import ml_dtypes
-    HAVE_DEPS = True
+    haveDeps = True
 except ImportError:
     amdgpu_exec = None
     ml_dtypes = None
-    HAVE_DEPS = False
+    haveDeps = False
 
 try:
     from tensilelite_bounds import BoundedBuffer
-    HAVE_BOUNDS = True
+    haveBounds = True
 except ImportError:
     BoundedBuffer = None
-    HAVE_BOUNDS = False
+    haveBounds = False
 
 from .conftest import requires_gfx950
 
 # Skip markers — require both tensilelite_bounds and amdgpu_exec.
-requires_bounds = pytest.mark.skipif(
-    not HAVE_BOUNDS,
+requiresBounds = pytest.mark.skipif(
+    not haveBounds,
     reason="tensilelite_bounds not installed",
 )
-requires_deps_and_bounds = pytest.mark.skipif(
-    not (HAVE_BOUNDS and HAVE_DEPS),
+requiresDepsAndBounds = pytest.mark.skipif(
+    not (haveBounds and haveDeps),
     reason="tensilelite_bounds or amdgpu_exec/ml_dtypes not installed",
 )
 
@@ -57,12 +57,12 @@ requires_deps_and_bounds = pytest.mark.skipif(
 # Module-level paths
 # ---------------------------------------------------------------------------
 
-_TESTS_DIR = os.path.dirname(__file__)
-_YAML_PATH = os.path.join(_TESTS_DIR, "yaml", "gemm_standard.yaml")
-_TENSILE_ROOT = os.path.abspath(os.path.join(_TESTS_DIR, "..", "..", "..", ".."))
+_testsDir = os.path.dirname(__file__)
+_yamlPath = os.path.join(_testsDir, "yaml", "gemm_standard.yaml")
+_tensileRoot = os.path.abspath(os.path.join(_testsDir, "..", "..", "..", ".."))
 
-if _TENSILE_ROOT not in sys.path:
-    sys.path.insert(0, _TENSILE_ROOT)
+if _tensileRoot not in sys.path:
+    sys.path.insert(0, _tensileRoot)
 
 from Tensile.client.harness import BufferPool, KernelRunner
 from Tensile.client.gemm_args import (
@@ -113,13 +113,13 @@ def _generateAsm(solution, assembler, debugConfig):
 
 def _compileBf16Solutions():
     """Compile bf16 HPA solutions from YAML group 2 (same as test_gemm_standard)."""
-    if not HAVE_DEPS:
+    if not haveDeps:
         return []
     try:
         from epilogues.epilogue_harness.yaml_solution_builder import solutionsFromYaml
         chip = amdgpu_exec.get_chip()
         assembler, isaInfoMap, debugConfig = _setupTensile(chip)
-        sols = solutionsFromYaml(_YAML_PATH, assembler, isaInfoMap, debugConfig, problemIdx=2)
+        sols = solutionsFromYaml(_yamlPath, assembler, isaInfoMap, debugConfig, problemIdx=2)
     except Exception as exc:
         import warnings
         warnings.warn(f"could not compile bf16 solutions: {exc}")
@@ -152,7 +152,7 @@ def _compileBf16Solutions():
 
 
 def _deviceCuCount() -> int:
-    if not HAVE_DEPS:
+    if not haveDeps:
         return 0
     props = amdgpu_exec._runtime_module.hip_get_device_props(0)
     return int(props.get("multiprocessor_count", 0))
@@ -294,7 +294,7 @@ def bf16Entry():
 class TestSentinelIntegrity:
     """Sentinel slots are intact immediately after BoundedBuffer construction."""
 
-    @requires_bounds
+    @requiresBounds
     def test_sentinel_intact_after_alloc(self):
         """checkSentinel() returns True before any kernel touches the buffer."""
         buf = BoundedBuffer(size_bytes=64, sentinel_slots=4)
@@ -303,7 +303,7 @@ class TestSentinelIntegrity:
         finally:
             buf.free()
 
-    @requires_bounds
+    @requiresBounds
     def test_sentinelPtr_differs_from_ptrValue_by_size(self):
         """sentinelPtr equals ptrValue + size_bytes."""
         size = 128
@@ -313,7 +313,7 @@ class TestSentinelIntegrity:
         finally:
             buf.free()
 
-    @requires_bounds
+    @requiresBounds
     def test_dataPtr_aliases_ptrValue(self):
         """dataPtr is an alias for ptrValue."""
         buf = BoundedBuffer(size_bytes=32, sentinel_slots=2)
@@ -333,7 +333,7 @@ class TestCorrectKernel:
 
     @requires_gfx950
     def test_bf16_gemm_no_overrun(self, bf16Entry):
-        if not HAVE_BOUNDS or not HAVE_DEPS or ml_dtypes is None:
+        if not haveBounds or not haveDeps or ml_dtypes is None:
             pytest.skip("tensilelite_bounds, amdgpu_exec, or ml_dtypes not installed")
         if bf16Entry is None:
             pytest.skip("no bf16 solution compiled")
@@ -347,7 +347,6 @@ class TestCorrectKernel:
         num_threads = sol_dict["NumThreads"]
 
         A_buf, B_buf, C_buf, D_pool, A_np, B_np = _allocBf16Bufs(sol_dict, M, N, batch, K)
-
         def make_args(out_buf):
             return _buildArgs(sol_dict, M, N, batch, K, out_buf, C_buf, A_buf, B_buf)[0]
 
@@ -386,7 +385,7 @@ class TestOverrunDetection:
     @requires_gfx950
     def test_sentinel_overwritten_by_overrun(self, bf16Entry):
         """BoundedBuffer(size_bytes=4) used as D; kernel writes 64*64*2 bytes → overrun."""
-        if not HAVE_BOUNDS or not HAVE_DEPS or ml_dtypes is None:
+        if not haveBounds or not haveDeps or ml_dtypes is None:
             pytest.skip("tensilelite_bounds, amdgpu_exec, or ml_dtypes not installed")
         if bf16Entry is None:
             pytest.skip("no bf16 solution compiled")
