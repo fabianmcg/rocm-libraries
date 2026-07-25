@@ -78,6 +78,20 @@ class TestGemmGroupedReference:
         ref = gemm(A, B, alpha=1.0, beta=0.0, C=None)
         np.testing.assert_array_equal(results[0], ref)
 
+    def test_poison_missing_key_raises(self):
+        """A group missing the 'A' key must propagate a KeyError."""
+        g = {"B": np.zeros((4, 4), dtype=np.float32)}
+        with pytest.raises((KeyError, TypeError)):
+            gemmGrouped([g])
+
+    def test_poison_shape_mismatch_raises(self):
+        """Incompatible A/B inner dimensions must propagate an exception."""
+        rng = np.random.default_rng(7)
+        A = rng.standard_normal((4, 3)).astype(np.float32)
+        B = rng.standard_normal((5, 4)).astype(np.float32)  # inner dim 5 != 3.
+        with pytest.raises((ValueError, Exception)):
+            gemmGrouped([{"A": A, "B": B}])
+
 
 # ===========================================================================
 # Task 6.6 (stub) — GPU grouped GEMM and workspace binding (requires M10)
