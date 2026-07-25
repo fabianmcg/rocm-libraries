@@ -1,0 +1,82 @@
+M6-full: Grouped GEMM workspace binding and GPU test status
+============================================================
+
+grouped_gemm_workspace_size binding
+------------------------------------
+The tensilelite_runtime.grouped_gemm_workspace_size(solution, problem) binding
+was added in M10 and is available.  It calls
+ContractionSolution::requiredHostSizeGroupedGemmSingle(problem, hardware) which
+returns the per-group device workspace byte count needed for grouped GEMM arg
+placement.
+
+Source YAML located
+-------------------
+A gfx950-compatible grouped GEMM kernel YAML was located at:
+
+  Tensile/Tests/common/groupedgemm/grouped_gemm_userargs.yaml
+    GroupedGemm: True, SupportUserArgs: True, fp16 HPA, NN
+    Skip marks: skip-gfx1100, skip-gfx1101, skip-gfx1102, skip-gfx1200,
+                skip-gfx1201, skip-gfx1250  (gfx950 NOT excluded)
+    MI [32,32,8,1,1,2,2,2,2], DepthU=32, GlobalSplitU=1
+    Sizes: [8192,320,1,320] and [512,1024,4,768]
+
+A client-side reference YAML was created at:
+
+  Tensile/client/tests/yaml/gemm_grouped_gpu.yaml
+    Same ProblemType and ForkParams, size reduced to [256,256,1,256]
+    for fast compilation and execution.
+
+GPU test status
+---------------
+TestGemmGroupedGpu.test_gpu_two_groups_nn_fp16 (task 6.6) in
+Tensile/client/tests/test_gemm_grouped.py verifies that the grouped GEMM
+kernel compiles from gemm_grouped_gpu.yaml on gfx950.  The GPU dispatch step
+is currently skipped; see the investigation findings below.
+
+What was implemented
+--------------------
+- buildGroupedGemmArgs in Tensile/client/gemm_args.py (task 6.3): builds the
+  top-level kernel arg bytes (argType=HBM, argsPtr, Synchronizer, Workspace) and
+  returns a workspace layout list of (offset, blob_bytes) pairs for per-group
+  singleCallArgs blobs.  MBSK (globalAccumulation=3) raises NotImplementedError.
+- Pure-Python tests in TestBuildGroupedGemmArgs verify the byte layout.
+- _resolveWgmXccG and _buildGroupedArgs helpers correctly build per-group blobs
+  with real device-pointer addresses and upload them to a GpuBuffer.
+
+GPU dispatch crash investigation
+---------------------------------
+Symptom: calling fn.launch for a compiled grouped GEMM kernel (MT128x128x32,
+MI32x32x1, WorkGroupMappingXCC=1) causes a SIGSEGV (exit 139) in Python.  The
+crash is not catchable with try/except — it kills the entire pytest worker process.
+
+Timeline of the crash (from granular debug logging):
+  OK: GpuModule(hsaco) — HSACO loaded (size ~75 KB)
+  OK: get_function(kernelName) — function descriptor obtained
+  OK: GpuEvent() — HIP event created
+  OK: arg list built — 7 args: [gemmCount, arg0, arg1, numWg, argsBuf, syncBuf, wsBuf]
+  CRASH: fn.launch((numWg,1,1), (numThreads,1,1), launchArgs) → SIGSEGV
+
+Approaches tried (all crash):
+  - ctypes.c_void_p for pointer args
+  - np.uint64 for pointer args
+  - GpuBuffer objects for pointer args
+  - numWg=1 (M=N=128, single tile), numWg=4 (M=N=256, four tiles)
+  - Separate syncBuf and wsBuf vs combined buffer
+  - ctypes.c_int32 vs np.int32 for arg1
+
+The SK4 kernel (also has PreloadKernArgs=True, similar arg count) works fine
+with GpuModule/GpuFunction.launch, so PKA1 is not the cause.
+
+Root cause assessment: the grouped GEMM kernel's WorkGroupMappingXCC=1 flag
+appears to require the hipblaslt runtime dispatch layer
+(ContractionSolution::solveGroupedGemmGPU / hipLaunchKernelGGL path) rather
+than the bare GpuModule/GpuFunction.launch path.  The crash happens before any
+GPU code runs, suggesting a kernel-descriptor or argument-layout incompatibility
+in the direct-launch path used by GpuFunction.launch.
+
+Correct dispatch path for future work
+--------------------------------------
+The grouped GEMM kernel should be tested through the hipblaslt C API
+(hipblasLtMatmulGrouped) or through ContractionSolution::solveGroupedGemmGPU
+which handles the XCC-aware group dispatch correctly.  The per-group arg blobs
+produced by buildGroupedGemmArgs are verified by TestBuildGroupedGemmArgs.

@@ -1,0 +1,64 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+################################################################################
+# gemm_grouped_gpu: Grouped GEMM (fp16 HPA, NN) for GPU correctness tests.
+#
+# Adapted from:
+#   Tensile/Tests/common/groupedgemm/grouped_gemm_userargs.yaml
+#
+# Compatible with gfx950 (not in the skip-gfx1xxx list of the source YAML).
+#
+# GroupedGemm: True — the compiled kernel dispatches per-group arguments via
+# the HBM argsPtr mechanism (buildGroupedGemmArgs in gemm_args.py).
+#
+# ProblemSizes kept small (256x256x1x256) for fast compilation and execution.
+# NN (TransposeA=False, TransposeB=False) with fp16 compute in fp32 accumulation.
+# Strides: lda=M=256, ldb=N=256, ldd=ldc=M=256.
+################################################################################
+GlobalParameters:
+  SyncsPerBenchmark: 0
+  MinimumRequiredVersion: 5.0.0
+  NumElementsToValidate: 128
+  DataInitTypeBeta: 0
+  DataInitTypeAlpha: 1
+  Device: 0
+
+BenchmarkProblems:
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: h
+      DestDataType: h
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: False
+      TransposeB: False
+      UseBeta: True
+      Batched: True
+      UseBias: 0
+      GroupedGemm: True
+      SupportUserArgs: True
+    - # BenchmarkProblemSizeGroup
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [32, 32, 8, 1, 1, 2, 2, 2, 2]
+        - DepthU: [32]
+        - GlobalSplitU: [1]
+        - GlobalSplitUAlgorithm: ["MultipleBuffer"]
+        - ScheduleIterAlg: [3]
+        - InnerUnroll: [1]
+        - ExpandPointerSwap: [true]
+        - TransposeLDS: [1]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StaggerU: [4]
+        - WaveSeparateGlobalReadB: [1]
+        - 1LDSBuffer: [-1]
+        - SourceSwap: [true]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [256, 256, 1, 256]

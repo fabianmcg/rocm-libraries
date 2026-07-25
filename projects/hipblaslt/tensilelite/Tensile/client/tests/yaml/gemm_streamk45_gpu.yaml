@@ -1,0 +1,114 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+################################################################################
+# gemm_streamk45_gpu: StreamK=4 and StreamK=5 hybrid GEMM for GPU correctness tests.
+#
+# Adapted from:
+#   Tensile/Tests/common/streamk/sk_dynamic.yaml (SK4, SGEMM NT)
+#   Tensile/Tests/common/streamk/sk_hybrid.yaml  (SK5, SGEMM NT)
+#
+# Both groups use DataType=s (fp32), TransposeA=False, TransposeB=True (NT).
+# MacroTile kept small ([32,32,2,1,1,2,2,2,2] → MT0=MT1=128) and DepthU=16
+# for fast compilation.  ProblemSizes use 512×512×1×512 for a non-trivial
+# but quick correctness check.
+#
+# GPU tests use the "all-data-parallel" mode (sk_tiles=0) so every WG
+# computes a complete output tile without streaming reduction — this makes
+# the result identical to standard GEMM and easy to verify with numpy.
+#
+# Compatible with gfx94x and gfx950 (not in the skip-gfx950 list of either
+# source YAML).
+#
+# Group 0: SGEMM NT StreamK=4 (dynamic SK).
+# Group 1: SGEMM NT StreamK=5 (hybrid SK; supports both static and dynamic paths).
+################################################################################
+GlobalParameters:
+  SyncsPerBenchmark: 0
+  MinimumRequiredVersion: 5.0.0
+  NumElementsToValidate: 128
+  DataInitTypeBeta: 0
+  DataInitTypeAlpha: 1
+  Device: 0
+
+BenchmarkProblems:
+  ##############################################################################
+  # Group 0: SGEMM NT StreamK=4 (dynamic SK)
+  ##############################################################################
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: s
+      TransposeA: False
+      TransposeB: True
+      UseBeta: True
+      Batched: True
+    - # BenchmarkProblemSizeGroup
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+        - PrefetchLocalRead: [1]
+      ForkParameters:
+        - 1LDSBuffer: [1]
+        - DepthU: [16]
+        - ExpandPointerSwap: [False]
+        - GlobalReadVectorWidthA: [1]
+        - GlobalReadVectorWidthB: [1]
+        - GlobalSplitU: [0]
+        - LocalReadVectorWidth: [1]
+        - MatrixInstruction:
+          - [32, 32, 2, 1, 1, 2, 2, 2, 2]
+        - MIArchVgpr: [false]
+        - PrefetchGlobalRead: [2]
+        - ScheduleIterAlg: [3]
+        - SourceSwap: [True]
+        - StoreRemapVectorWidth: [0]
+        - StreamK: [4]
+        - TransposeLDS: [0]
+        - VectorWidthA: [1]
+        - VectorWidthB: [1]
+        - WorkGroupMapping: [1]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [512, 512, 1, 512]
+
+  ##############################################################################
+  # Group 1: SGEMM NT StreamK=5 hybrid (static and dynamic paths)
+  ##############################################################################
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: s
+      TransposeA: False
+      TransposeB: True
+      UseBeta: True
+      Batched: True
+    - # BenchmarkProblemSizeGroup
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+        - PrefetchLocalRead: [1]
+        - 1LDSBuffer: [1]
+        - ExpandPointerSwap: [False]
+        - GlobalSplitU: [0]
+        - MIArchVgpr: [False]
+        - PrefetchGlobalRead: [2]
+        - ScheduleIterAlg: [3]
+        - SourceSwap: [True]
+        - StoreRemapVectorWidth: [0]
+        - StreamK: [5]
+        - TransposeLDS: [0]
+        - WorkGroupMapping: [1]
+      ForkParameters:
+        - DepthU: [16]
+        - GlobalReadVectorWidthA: [1]
+        - GlobalReadVectorWidthB: [1]
+        - LocalReadVectorWidth: [1]
+        - MatrixInstruction:
+          - [32, 32, 2, 1, 1, 2, 2, 2, 2]
+        - VectorWidthA: [1]
+        - VectorWidthB: [1]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [512, 512, 1, 512]

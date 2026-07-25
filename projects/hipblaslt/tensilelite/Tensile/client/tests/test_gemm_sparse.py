@@ -192,12 +192,19 @@ class TestDecompress24FromKnown:
 class TestSparseGpuGfx950:
     """GPU sparse GEMM correctness tests.
 
-    Skipped: no gfx950 sparse-kernel YAML was located at M6-partial time.
+    A gfx950-compatible sparse kernel YAML was located at:
+      Tensile/Tests/common/sparse/gfx94x/spmm_fp16_mi16.yaml
+    A client-side reference YAML was created at:
+      Tensile/client/tests/yaml/gemm_sparse_gpu.yaml
+    GPU dispatch is not yet implemented because gemm_args.py does not handle
+    the sparse arg layout (compressed A pointer + metadata pointer).
     See Tensile/client/tests/fixtures/m6_sparse_notes.txt for details.
     """
 
     def test_gpu_sparse_placeholder(self):
         pytest.skip(
-            "GPU sparse GEMM tests skipped — no gfx950 sparse kernel YAML "
-            "found at M6-partial. See fixtures/m6_sparse_notes.txt."
+            "GPU sparse GEMM test skipped — sparse arg layout (compressed A + "
+            "metadata pointer) not yet supported in gemm_args.py. "
+            "Source YAML: Tensile/Tests/common/sparse/gfx94x/spmm_fp16_mi16.yaml "
+            "(compatible with gfx950). See fixtures/m6_sparse_notes.txt."
         )

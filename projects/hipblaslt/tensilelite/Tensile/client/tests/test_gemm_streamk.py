@@ -4,21 +4,48 @@
 
 Pure-Python tests verify byte count, slot order, and computed field values
 against the CeilDivide logic from ContractionSolution.cpp:778-908.
-GPU tests require gfx950 and a StreamK=4/5 kernel YAML (skipped if absent).
+GPU tests require gfx950 and compile from gemm_streamk45_gpu.yaml (group 0 = SK4,
+group 1 = SK5).  Both GPU tests use all-data-parallel mode (sk_tiles=0) so
+every WG computes a complete output tile, giving a result identical to standard
+GEMM that can be verified against the numpy reference.
 """
 
 from __future__ import annotations
 
+import ctypes
 import math
+import os
 import struct
+import sys
 
+import numpy as np
 import pytest
+
+try:
+    import amdgpu_exec
+    HAVE_DEPS = True
+except ImportError:
+    amdgpu_exec = None
+    HAVE_DEPS = False
+
+from .conftest import requires_gfx950
+
+_TESTS_DIR = os.path.dirname(__file__)
+_YAML_PATH = os.path.join(_TESTS_DIR, "yaml", "gemm_streamk45_gpu.yaml")
+_TENSILE_ROOT = os.path.abspath(os.path.join(_TESTS_DIR, "..", "..", "..", ".."))
+
+if _TENSILE_ROOT not in sys.path:
+    sys.path.insert(0, _TENSILE_ROOT)
 
 from Tensile.client.gemm_args import (
     buildKernelArgs,
     _buildStreamK4Args,
     _buildStreamK5Args,
+    _computeInternalArg0,
+    _computeInternalArg1,
 )
+from Tensile.client.reference import gemm, assertClose, RTOL_FP32, ATOL_FP32
+from epilogues.epilogue_harness.yaml_solution_builder import _injectInternalArgsSupport
 
 
 # ---------------------------------------------------------------------------
@@ -180,8 +207,6 @@ class TestStreamK4Args:
         tensors = {"D": 0x1000, "C": 0x2000, "A": 0x3000, "B": 0x4000,
                    "workspace": 0x5000, "flags": 0x6000}
         buf = buildKernelArgs(sol, pp, tensors)
-        # SK4 block is 24 bytes; its presence is confirmed by checking that
-        # removing the epilogue leaves a buffer larger than without SK4.
         assert len(buf) > 0
 
     def test_streamk_1_still_raises(self):
@@ -285,20 +310,290 @@ class TestStreamK5StaticArgs:
 
 
 # ===========================================================================
-# GPU StreamK=4/5 tests — skipped (no gfx950 StreamK kernel YAML at M6)
+# GPU test infrastructure (mirrors test_gemm_standard.py pattern)
+# ===========================================================================
+
+
+def _setupTensile(chip: str):
+    """Initialize Tensile assembler and ISA map for kernel compilation."""
+    from pathlib import Path
+    from Tensile.Toolchain.Validators import validateToolchain
+    from Tensile.Toolchain.Component import Assembler
+    from Tensile.Common.Architectures import gfxToIsa
+    from Tensile.Common.Capabilities import makeIsaInfoMap
+    from Tensile.Common.GlobalParameters import assignGlobalParameters
+    from Tensile.Common.Types import DebugConfig
+
+    gfx = chip.split(":")[0]
+    cxx = validateToolchain("amdclang++")
+    isa = gfxToIsa(gfx)
+    isaInfoMap = makeIsaInfoMap([isa], cxx)
+    assignGlobalParameters({}, isaInfoMap)
+    assembler = Assembler(Path(cxx), co_version="6")
+    return assembler, isaInfoMap, DebugConfig()
+
+
+def _generateAsm(solution, assembler, debugConfig):
+    """Return (asm_str, kernel_name) for a solution."""
+    import rocisa
+    from Tensile.KernelWriterAssembly import KernelWriterAssembly
+    from Tensile.SolutionStructs.Naming import getKernelNameMin
+
+    kwa = KernelWriterAssembly(assembler, debugConfig)
+    ti = rocisa.rocIsa.getInstance()
+    kwa.setRocIsa(ti.getData(), ti.getOutputOptions())
+    kernel = solution.getKernels()[0]
+    kernel.duplicate = False
+    err, asmStr = kwa.getSourceFileString(kernel)
+    if err:
+        raise RuntimeError(f"assembly generation failed: {err}")
+    return asmStr, getKernelNameMin(kernel, splitGSU=False)
+
+
+def _compileSk(problemIdx: int):
+    """Compile SK solutions for one YAML problem group; return list of entry dicts."""
+    if not HAVE_DEPS:
+        return []
+    try:
+        from epilogues.epilogue_harness.yaml_solution_builder import solutionsFromYaml
+        chip = amdgpu_exec.get_chip()
+        assembler, isaInfoMap, debugConfig = _setupTensile(chip)
+        sols = solutionsFromYaml(_YAML_PATH, assembler, isaInfoMap, debugConfig,
+                                 problemIdx=problemIdx)
+    except Exception as exc:
+        import warnings
+        warnings.warn(f"could not compile SK solutions (problemIdx={problemIdx}): {exc}")
+        return []
+
+    compiled = []
+    for sol, sid in sols:
+        try:
+            asmStr, kernelName = _generateAsm(sol, assembler, debugConfig)
+            hsaco = amdgpu_exec.compile_asm_to_hsaco(asmStr, chip)
+        except Exception as exc:
+            import warnings
+            warnings.warn(f"SK solution {sid} failed to compile: {exc}")
+            continue
+        rawDict = dict(sol)
+        solDict = _injectInternalArgsSupport(rawDict, chip)
+        compiled.append({
+            "sol_dict": solDict,
+            "raw_dict": rawDict,
+            "kernel_name": kernelName,
+            "hsaco": hsaco,
+            "chip": chip,
+            "sid": sid,
+        })
+    return compiled
+
+
+def _filterSkSolution(entry: dict) -> bool:
+    """Return True if the solution has a non-zero WorkGroupMapping (is usable)."""
+    return entry["sol_dict"].get("WorkGroupMapping", 0) != 0
+
+
+def _deviceCuCount() -> int:
+    """Return the device CU count for device 0."""
+    if not HAVE_DEPS:
+        return 0
+    props = amdgpu_exec._runtime_module.hip_get_device_props(0)
+    return int(props.get("multiprocessor_count", 0))
+
+
+def _computeSk4DpParams(solDict: dict, M: int, N: int, K: int, batch: int) -> dict:
+    """Compute SK4 all-data-parallel params for a given problem.
+
+    With sk_tiles=0, every WG runs the data-parallel path and computes a
+    complete tile.  The result is numerically identical to standard GEMM.
+    """
+    mt0 = solDict["MacroTile0"]
+    mt1 = solDict["MacroTile1"]
+    depthU = solDict["DepthU"]
+    numTiles = math.ceil(M / mt0) * math.ceil(N / mt1) * batch
+    itersPerTile = max(1, math.ceil(K / depthU))
+    return {
+        "iters_per_tile": itersPerTile,
+        "tiles": numTiles,
+        "sk_tiles": 0,
+        "sk_split": 2,
+        "sk_grid": numTiles,
+    }
+
+
+def _computeSk5DpParams(solDict: dict, M: int, N: int, K: int, batch: int) -> dict:
+    """Compute SK5 all-data-parallel params (static path, sk_tiles=0)."""
+    mt0 = solDict["MacroTile0"]
+    mt1 = solDict["MacroTile1"]
+    depthU = solDict["DepthU"]
+    numTiles = math.ceil(M / mt0) * math.ceil(N / mt1) * batch
+    itersPerTile = max(1, math.ceil(K / depthU))
+    return {
+        "effective_dynamic": False,
+        "iters_per_tile": itersPerTile,
+        "sk_iters_per_wg": itersPerTile,
+        "sk_grid": numTiles,
+        "sk_tiles": 0,
+    }
+
+
+def _buildSkLaunchArgs(solDict: dict, M: int, N: int, batch: int, K: int,
+                       dBuf, cBuf, aBuf, bBuf, wsBuf, flagsBuf,
+                       numWg: int, skParamKey: str, skParams: dict) -> list:
+    """Build typed arg list for GpuFunction.launch: NT SGEMM with StreamK.
+
+    NT strides: lda=M (A is M×K col-major), ldb=N (B is N×K col-major),
+    ldd=ldc=M.  All buffer args must be GpuBuffer — SK kernels write workspace
+    and flags even in all-DP mode; InputArray host-pinned memory causes a GPU
+    page fault.  SK block (6 × uint32) is appended after alpha/beta.
+    """
+    arg0 = _computeInternalArg0(solDict, gsu=1)
+    arg1 = _computeInternalArg1(solDict, cu_count=_deviceCuCount())
+    gemmCount = (1 & 0x3FFFFFFF) | (0 << 30)
+
+    ppDummy = {
+        "sizes": [M, N, batch, K],
+        "ldd": M, "stride_d": M * N,
+        "ldc": M, "stride_c": M * N,
+        "lda": M, "stride_a": M * K,
+        "ldb": N, "stride_b": N * K,
+        "alpha": 1.0, "beta": 0.0, "gsu": 1,
+        skParamKey: skParams,
+    }
+    if skParamKey == "sk4":
+        skBlock = _buildStreamK4Args(solDict, ppDummy)
+    else:
+        skBlock = _buildStreamK5Args(solDict, ppDummy)
+
+    args = [
+        np.uint32(gemmCount), np.uint32(arg0), np.int32(arg1), np.uint32(numWg),
+        np.uint32(M), np.uint32(N), np.uint32(batch), np.uint32(K),
+        dBuf, cBuf, aBuf, bBuf, wsBuf, flagsBuf,
+        np.uint32(M), np.uint32(M * N),
+        np.uint32(M), np.uint32(M * N),
+        np.uint32(M), np.uint32(M * K),
+        np.uint32(N), np.uint32(N * K),
+        np.float32(1.0), np.float32(0.0),
+    ]
+    for i in range(6):
+        args.append(np.uint32(struct.unpack_from("<I", skBlock, i * 4)[0]))
+    return args
+
+
+def _runSkNtGemm(entry: dict, M: int, N: int, batch: int, K: int,
+                 skParamKey: str, skParams: dict, label: str):
+    """Execute one SK GEMM kernel (NT, fp32, stridedBatched) and verify output.
+
+    Uses all-data-parallel mode (sk_tiles=0) so no streaming reduction occurs
+    and the output matches the standard GEMM numpy reference.  All device
+    buffers are GpuBuffer; the kernel writes workspace and flags even in all-DP
+    mode so these must be writable device memory.
+    """
+    from amdgpu_exec import GpuBuffer, GpuModule, GpuEvent
+    solDict = entry["sol_dict"]
+    kernelName = entry["kernel_name"]
+    hsaco = entry["hsaco"]
+    numThreads = solDict["NumThreads"]
+    mt0, mt1 = solDict["MacroTile0"], solDict["MacroTile1"]
+    numWg = math.ceil(M / mt0) * math.ceil(N / mt1) * batch
+
+    rng = np.random.default_rng(seed=M * 5000 + N + K)
+    A_np = np.asfortranarray(rng.random((M, K)).astype(np.float32))
+    B_np = np.asfortranarray(rng.random((N, K)).astype(np.float32))  # NT: B is N×K
+    A_flat = np.tile(A_np.ravel(order='F'), batch)
+    B_flat = np.tile(B_np.ravel(order='F'), batch)
+
+    D_buf = GpuBuffer(M * N * batch * 4); D_buf.memset(0)
+    C_buf = GpuBuffer(M * N * batch * 4); C_buf.memset(0)
+    A_buf = GpuBuffer(A_flat.nbytes); A_buf.copy_from_host(A_flat)
+    B_buf = GpuBuffer(B_flat.nbytes); B_buf.copy_from_host(B_flat)
+    # SK kernels write workspace/flags even in all-DP mode (sk_tiles=0).
+    ws_buf = GpuBuffer(M * N * batch * 4 + 4096); ws_buf.memset(0)
+    flags_buf = GpuBuffer(max(numWg, 256) * 4); flags_buf.memset(0)
+
+    args = _buildSkLaunchArgs(solDict, M, N, batch, K,
+                              D_buf, C_buf, A_buf, B_buf, ws_buf, flags_buf,
+                              numWg, skParamKey, skParams)
+
+    module = GpuModule(hsaco)
+    fn = module.get_function(kernelName)
+    stop = GpuEvent()
+    fn.launch((numWg, 1, 1), (numThreads, 1, 1), args)
+    stop.record(); stop.synchronize()
+    module.unload()
+
+    D_host = np.zeros(M * N * batch, dtype=np.float32)
+    D_buf.copy_to_host(D_host)
+    for buf in [D_buf, C_buf, A_buf, B_buf, ws_buf, flags_buf]:
+        buf.free()
+
+    # NT reference: D = A @ B^T where A is (M,K) and B is (N,K).
+    A_slice = A_flat[:M * K].reshape(M, K, order='F')
+    B_slice = B_flat[:N * K].reshape(N, K, order='F')
+    D_ref = gemm(A_slice, B_slice.T, alpha=1.0, beta=0.0, C=None)
+    D_ref_flat = np.tile(np.asfortranarray(D_ref).ravel(order='F'), batch)
+    assertClose(D_host, D_ref_flat.astype(np.float32), rtol=RTOL_FP32, atol=ATOL_FP32,
+                label=label)
+
+
+# ---------------------------------------------------------------------------
+# Session-scoped compiled solution fixtures.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def sk4Kernels():
+    """Compile SK4 SGEMM NT solutions from YAML group 0."""
+    return _compileSk(0)
+
+
+@pytest.fixture(scope="session")
+def sk5Kernels():
+    """Compile SK5 SGEMM NT solutions from YAML group 1."""
+    return _compileSk(1)
+
+
+# ===========================================================================
+# GPU StreamK=4/5 tests
 # ===========================================================================
 
 
 class TestStreamKGpuGfx950:
-    """GPU StreamK=4/5 correctness tests — skipped at M6-partial.
+    """GPU StreamK=4 and SK=5 correctness tests using all-data-parallel mode.
 
-    A suitable StreamK=4 or SK=5 kernel YAML for gfx950 was not available
-    at M6-partial implementation time. Add GPU tests once a matching YAML
-    is provided.
+    Both tests use sk_tiles=0 so every WG runs the standard data-parallel path,
+    producing output equivalent to standard GEMM verified against numpy.
+    Adapted from Tensile/Tests/common/streamk/sk_dynamic.yaml (SK4) and
+    sk_hybrid.yaml (SK5).  Compatible with gfx950.
     """
 
-    def test_gpu_sk4_placeholder(self):
-        pytest.skip("GPU StreamK=4 test skipped — no gfx950 SK4 kernel YAML at M6")
+    @requires_gfx950
+    def test_gpu_sk4_data_parallel(self, sk4Kernels):
+        """StreamK=4 NT GEMM 512×512×1×512 in all-data-parallel mode."""
+        if not HAVE_DEPS:
+            pytest.skip("amdgpu_exec not installed")
+        entries = [e for e in sk4Kernels if _filterSkSolution(e)]
+        if not entries:
+            pytest.skip("no usable SK4 solution compiled from gemm_streamk45_gpu.yaml")
 
-    def test_gpu_sk5_placeholder(self):
-        pytest.skip("GPU StreamK=5 test skipped — no gfx950 SK5 kernel YAML at M6")
+        M, N, batch, K = 512, 512, 1, 512
+        entry = entries[0]
+        skParams = _computeSk4DpParams(entry["sol_dict"], M, N, K, batch)
+        _runSkNtGemm(entry, M, N, batch, K,
+                     skParamKey="sk4", skParams=skParams,
+                     label=f"SK4 M{M}N{N}B{batch}K{K} {entry['sid']}")
+
+    @requires_gfx950
+    def test_gpu_sk5_data_parallel(self, sk5Kernels):
+        """StreamK=5 NT GEMM 512×512×1×512 in all-data-parallel mode (static path)."""
+        if not HAVE_DEPS:
+            pytest.skip("amdgpu_exec not installed")
+        entries = [e for e in sk5Kernels if _filterSkSolution(e)]
+        if not entries:
+            pytest.skip("no usable SK5 solution compiled from gemm_streamk45_gpu.yaml")
+
+        M, N, batch, K = 512, 512, 1, 512
+        entry = entries[0]
+        skParams = _computeSk5DpParams(entry["sol_dict"], M, N, K, batch)
+        _runSkNtGemm(entry, M, N, batch, K,
+                     skParamKey="sk5", skParams=skParams,
+                     label=f"SK5 M{M}N{N}B{batch}K{K} {entry['sid']}")

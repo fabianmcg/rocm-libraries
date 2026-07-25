@@ -1,0 +1,74 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+################################################################################
+# gemm_sparse_gpu: 2:4 structured-sparse GEMM (fp16 HPA, NN) reference YAML.
+#
+# Adapted from:
+#   Tensile/Tests/common/sparse/gfx94x/spmm_fp16_mi16.yaml
+#
+# Compatible with gfx950 (not in the skip list of the source YAML, which only
+# excludes older non-MFMA architectures and RDNA).
+#
+# Sparse: 1 — the compiled kernel expects a compressed A matrix (K/2 columns)
+# and a uint8 metadata tensor that encodes the 2:4 sparsity pattern.
+# The compress24/decompress24 helpers in Tensile/client/sparse.py handle
+# compression and round-trip verification on the host.
+#
+# NOTE: GPU tests for this YAML are currently skipped because
+# Tensile/client/gemm_args.py does not yet handle the sparse arg layout
+# (compressed A pointer + metadata pointer after the B pointer).
+# See Tensile/client/tests/fixtures/m6_sparse_notes.txt for details.
+#
+# ProblemSizes kept small (256x256x1x32) for fast compilation when support
+# is eventually added.
+################################################################################
+GlobalParameters:
+  SyncsPerBenchmark: 0
+  MinimumRequiredVersion: 5.0.0
+  NumElementsToValidate: 128
+  DataInitTypeBeta: 0
+  DataInitTypeAlpha: 1
+  Device: 0
+
+BenchmarkProblems:
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: H
+      DestDataType: H
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: False
+      TransposeB: False
+      UseBeta: True
+      Sparse: 1
+      Batched: True
+    - # BenchmarkProblemSizeGroup
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 32, 1, 1, 1, 1, 1, 1]
+        - DepthU: [32]
+        - TransposeLDS: [-1]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - LdsPadMetadata: [-1]
+        - StaggerU: [0]
+        - ScheduleIterAlg: [3]
+        - PrefetchLocalRead: [0]
+        - ClusterLocalRead: [1]
+        - PrefetchGlobalRead: [0]
+        - StoreRemapVectorWidth: [-1]
+        - GlobalSplitU: [1]
+        - GlobalSplitUAlgorithm: [MultipleBuffer]
+        - 1LDSBuffer: [-1]
+        - DirectToVgprSparseMetadata: [false]
+        - WorkGroupMapping: [18]
+        - StoreVectorWidth: [-1]
+        - AssertFree0ElementMultiple: [8]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [256, 256, 1, 32]
