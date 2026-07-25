@@ -122,9 +122,9 @@ public:
     // Allocates sizeBytes + sentinelSlots*4 bytes and fills the sentinel region
     // with 0xDEADBEEF via synchronous H→D copy.
     BoundedBuffer(size_t sizeBytes, int sentinelSlots)
-        : _sizeBytes(sizeBytes)
+        : _ptr(nullptr)
+        , _sizeBytes(sizeBytes)
         , _sentinelSlots(sentinelSlots)
-        , _ptr(nullptr)
         , _freed(false)
     {
         if(sentinelSlots <= 0)
@@ -147,7 +147,7 @@ public:
         return reinterpret_cast<uintptr_t>(_ptr);
     }
 
-    // Device pointer to the first sentinel slot (ptr_value + size_bytes).
+    // Device pointer to the first sentinel slot (ptrValue + sizeBytes).
     uintptr_t sentinelPtr() const
     {
         return reinterpret_cast<uintptr_t>(static_cast<char *>(_ptr) + _sizeBytes);
@@ -222,17 +222,17 @@ NB_MODULE(_tensilelite_bounds, m)
                               "Device allocation with a sentinel region past the valid area.")
         .def(nb::init<size_t, int>(), nb::arg("size_bytes"), nb::arg("sentinel_slots") = 1,
              "Allocate size_bytes bytes plus sentinel_slots*4 sentinel bytes on the device.")
-        .def_prop_ro("ptr_value",
+        .def_prop_ro("ptrValue",
                      [](const BoundedBuffer &self) -> int64_t {
                          return static_cast<int64_t>(self.ptrValue());
                      },
                      "Device pointer (int) to the start of the valid region.")
-        .def_prop_ro("data_ptr",
+        .def_prop_ro("dataPtr",
                      [](const BoundedBuffer &self) -> int64_t {
                          return static_cast<int64_t>(self.ptrValue());
                      },
-                     "Alias for ptr_value.")
-        .def_prop_ro("sentinel_ptr",
+                     "Alias for ptrValue.")
+        .def_prop_ro("sentinelPtr",
                      [](const BoundedBuffer &self) -> int64_t {
                          return static_cast<int64_t>(self.sentinelPtr());
                      },

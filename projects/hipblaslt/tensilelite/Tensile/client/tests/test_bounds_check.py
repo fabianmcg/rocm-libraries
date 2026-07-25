@@ -174,10 +174,10 @@ def _buildArgs(sol_dict: dict, M: int, N: int, batch: int, K: int,
         args.append(np.uint32(num_wg))
     args.extend([np.uint32(M), np.uint32(N), np.uint32(batch), np.uint32(K)])
     args.extend([
-        ctypes.c_void_p(D_buf.ptr_value),
-        ctypes.c_void_p(C_buf.ptr_value),
-        ctypes.c_void_p(A_buf.ptr_value),
-        ctypes.c_void_p(B_buf.ptr_value),
+        ctypes.c_void_p(D_buf.ptrValue),
+        ctypes.c_void_p(int(C_buf.ptr)),
+        ctypes.c_void_p(int(A_buf.ptr)),
+        ctypes.c_void_p(int(B_buf.ptr)),
     ])
     lda, ldb, ldd, ldc = M, N, M, M
     stride_a, stride_b, stride_d, stride_c = M * K, N * K, M * N, M * N
@@ -189,6 +189,89 @@ def _buildArgs(sol_dict: dict, M: int, N: int, batch: int, K: int,
     ])
     args.extend([np.float32(alpha), np.float32(beta)])
     return args, num_wg
+
+
+# ---------------------------------------------------------------------------
+# Bounds-check test helpers
+# ---------------------------------------------------------------------------
+
+
+def _allocBf16Bufs(solDict, M, N, batch, K):
+    """Allocate and upload A, B, C as GpuBuffer and D as a 1-slot BoundedBuffer pool."""
+    from amdgpu_exec import GpuBuffer
+
+    rng = np.random.default_rng(seed=42)
+    A_np = np.asfortranarray(rng.random((M, K)).astype(ml_dtypes.bfloat16))
+    B_np = np.asfortranarray(rng.random((N, K)).astype(ml_dtypes.bfloat16))
+    C_np = np.zeros(M * N * batch, dtype=ml_dtypes.bfloat16)
+
+    A_buf = GpuBuffer(A_np.nbytes)
+    B_buf = GpuBuffer(B_np.nbytes)
+    C_buf = GpuBuffer(C_np.nbytes)
+    A_buf.copy_from_host(A_np)
+    B_buf.copy_from_host(B_np)
+    C_buf.copy_from_host(C_np)
+
+    D_size = M * N * batch * 2  # bf16 = 2 bytes per element.
+    D_pool = BufferPool(nSlots=1, sizeBytes=D_size, gpuBufferCls=BoundedBuffer)
+    return A_buf, B_buf, C_buf, D_pool, A_np, B_np
+
+
+def _verifyBf16Result(D_pool, A_np, B_np, M, N, batch):
+    """Copy D from device to host and compare to the numpy bf16 GEMM reference."""
+    from amdgpu_exec._runtime_module import Ptr
+    import amdgpu_exec._runtime_module as _rt
+
+    D_result = np.empty(M * N * batch, dtype=ml_dtypes.bfloat16)
+    _rt.hip_memcpy_device_to_host_async(
+        Ptr(D_result.ctypes.data),
+        Ptr(D_pool._slots[0].ptrValue),
+        D_result.nbytes,
+        None,
+    )
+    _rt.hip_device_synchronize()
+    D_ref = gemmBf16(A_np, B_np.T)
+    D_result_2d = D_result.reshape(M, N, order="F")
+    assertClose(D_result_2d.astype(np.float32), D_ref.astype(np.float32),
+                rtol=RTOL_BF16, atol=ATOL_BF16)
+
+
+def _runAndCheckSentinel(entry, M, N, batch, K, boundedBuf):
+    """Launch the kernel with boundedBuf as D and return boundedBuf.checkSentinel()."""
+    from amdgpu_exec import GpuBuffer, GpuEvent, GpuModule
+
+    sol_dict = entry["sol_dict"]
+    kernel_name = entry["kernel_name"]
+    hsaco = entry["hsaco"]
+    num_threads = sol_dict["NumThreads"]
+
+    rng = np.random.default_rng(seed=7)
+    A_np = np.asfortranarray(rng.random((M, K)).astype(ml_dtypes.bfloat16))
+    B_np = np.asfortranarray(rng.random((N, K)).astype(ml_dtypes.bfloat16))
+    C_np = np.zeros(M * N * batch, dtype=ml_dtypes.bfloat16)
+
+    A_buf = GpuBuffer(A_np.nbytes)
+    B_buf = GpuBuffer(B_np.nbytes)
+    C_buf = GpuBuffer(C_np.nbytes)
+    A_buf.copy_from_host(A_np)
+    B_buf.copy_from_host(B_np)
+    C_buf.copy_from_host(C_np)
+
+    args, num_wg = _buildArgs(sol_dict, M, N, batch, K, boundedBuf, C_buf, A_buf, B_buf)
+
+    module = GpuModule(hsaco)
+    fn = module.get_function(kernel_name)
+    start = GpuEvent()
+    stop = GpuEvent()
+    start.record()
+    fn.launch((num_wg, 1, 1), (num_threads, 1, 1), args)
+    stop.record()
+    stop.synchronize()
+
+    result = boundedBuf.checkSentinel()
+    for buf in [A_buf, B_buf, C_buf]:
+        buf.free()
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -221,21 +304,21 @@ class TestSentinelIntegrity:
             buf.free()
 
     @requires_bounds
-    def test_ptr_value_and_sentinel_ptr_differ_by_size(self):
-        """sentinel_ptr equals ptr_value + size_bytes."""
+    def test_sentinelPtr_differs_from_ptrValue_by_size(self):
+        """sentinelPtr equals ptrValue + size_bytes."""
         size = 128
         buf = BoundedBuffer(size_bytes=size, sentinel_slots=1)
         try:
-            assert buf.sentinel_ptr == buf.ptr_value + size
+            assert buf.sentinelPtr == buf.ptrValue + size
         finally:
             buf.free()
 
     @requires_bounds
-    def test_data_ptr_equals_ptr_value(self):
-        """data_ptr is an alias for ptr_value."""
+    def test_dataPtr_aliases_ptrValue(self):
+        """dataPtr is an alias for ptrValue."""
         buf = BoundedBuffer(size_bytes=32, sentinel_slots=2)
         try:
-            assert buf.data_ptr == buf.ptr_value
+            assert buf.dataPtr == buf.ptrValue
         finally:
             buf.free()
 
@@ -255,9 +338,7 @@ class TestCorrectKernel:
         if bf16Entry is None:
             pytest.skip("no bf16 solution compiled")
 
-        from amdgpu_exec import GpuBuffer, GpuModule
-        from amdgpu_exec._runtime_module import Ptr
-        import amdgpu_exec._runtime_module as _rt
+        from amdgpu_exec import GpuModule
 
         sol_dict = bf16Entry["sol_dict"]
         kernel_name = bf16Entry["kernel_name"]
@@ -265,21 +346,7 @@ class TestCorrectKernel:
         M, N, batch, K = 256, 256, 1, 256
         num_threads = sol_dict["NumThreads"]
 
-        rng = np.random.default_rng(seed=42)
-        A_np = np.asfortranarray(rng.random((M, K)).astype(ml_dtypes.bfloat16))
-        B_np = np.asfortranarray(rng.random((N, K)).astype(ml_dtypes.bfloat16))
-        C_np = np.zeros(M * N * batch, dtype=ml_dtypes.bfloat16)
-
-        A_buf = GpuBuffer(A_np.nbytes)
-        B_buf = GpuBuffer(B_np.nbytes)
-        C_buf = GpuBuffer(C_np.nbytes)
-        A_buf.copy_from_host(A_np)
-        B_buf.copy_from_host(B_np)
-        C_buf.copy_from_host(C_np)
-
-        # Allocate D as BoundedBuffer with 4 sentinel slots past the valid region.
-        D_size = M * N * batch * 2  # bf16 = 2 bytes per element
-        D_pool = BufferPool(nSlots=1, sizeBytes=D_size, gpuBufferCls=BoundedBuffer)
+        A_buf, B_buf, C_buf, D_pool, A_np, B_np = _allocBf16Bufs(sol_dict, M, N, batch, K)
 
         def make_args(out_buf):
             return _buildArgs(sol_dict, M, N, batch, K, out_buf, C_buf, A_buf, B_buf)[0]
@@ -287,8 +354,7 @@ class TestCorrectKernel:
         module = GpuModule(hsaco)
         fn = module.get_function(kernel_name)
         runner = KernelRunner(functions=[fn], outputPool=D_pool)
-        _, num_wg = _buildArgs(sol_dict, M, N, batch, K,
-                               D_pool._slots[0], C_buf, A_buf, B_buf)
+        _, num_wg = _buildArgs(sol_dict, M, N, batch, K, D_pool._slots[0], C_buf, A_buf, B_buf)
 
         # boundsCheck=True: runner calls checkSentinel() on each pool slot after run.
         result = runner.run(
@@ -301,22 +367,8 @@ class TestCorrectKernel:
         )
         assert result.timesNs, "expected at least one timing sample"
 
-        # Copy D from device to host using amdgpu_exec low-level API.
-        D_result = np.empty(M * N * batch, dtype=ml_dtypes.bfloat16)
-        _rt.hip_memcpy_device_to_host_async(
-            Ptr(D_result.ctypes.data),
-            Ptr(D_pool._slots[0].ptr_value),
-            D_result.nbytes,
-            None,
-        )
-        _rt.hip_device_synchronize()
-
         # GPU uses NT layout: D[m,n] = sum_k A[m,k]*B[n,k], stored column-major.
-        # Reference passes B transposed; GPU output is read back in Fortran order.
-        D_ref = gemmBf16(A_np, B_np.T)
-        D_result_2d = D_result.reshape(M, N, order="F")
-        assertClose(D_result_2d.astype(np.float32), D_ref.astype(np.float32),
-                    rtol=RTOL_BF16, atol=ATOL_BF16)
+        _verifyBf16Result(D_pool, A_np, B_np, M, N, batch)
 
         for buf in [A_buf, B_buf, C_buf]:
             buf.free()
@@ -339,45 +391,14 @@ class TestOverrunDetection:
         if bf16Entry is None:
             pytest.skip("no bf16 solution compiled")
 
-        from amdgpu_exec import GpuBuffer, GpuEvent, GpuModule
-
-        sol_dict = bf16Entry["sol_dict"]
-        kernel_name = bf16Entry["kernel_name"]
-        hsaco = bf16Entry["hsaco"]
         # Output will be M*N*2 = 64*64*2 = 8192 bytes, well past the 4-byte region.
         M, N, batch, K = 64, 64, 1, 64
-        num_threads = sol_dict["NumThreads"]
-
-        rng = np.random.default_rng(seed=7)
-        A_np = np.asfortranarray(rng.random((M, K)).astype(ml_dtypes.bfloat16))
-        B_np = np.asfortranarray(rng.random((N, K)).astype(ml_dtypes.bfloat16))
-        C_np = np.zeros(M * N * batch, dtype=ml_dtypes.bfloat16)
-
-        A_buf = GpuBuffer(A_np.nbytes)
-        B_buf = GpuBuffer(B_np.nbytes)
-        C_buf = GpuBuffer(C_np.nbytes)
-        A_buf.copy_from_host(A_np)
-        B_buf.copy_from_host(B_np)
-        C_buf.copy_from_host(C_np)
-
         # Only 4 bytes of valid region; kernel writes 8192 bytes → guaranteed overrun.
         D_buf = BoundedBuffer(size_bytes=4, sentinel_slots=4)
-
-        args, num_wg = _buildArgs(sol_dict, M, N, batch, K, D_buf, C_buf, A_buf, B_buf)
-
-        module = GpuModule(hsaco)
-        fn = module.get_function(kernel_name)
-        start = GpuEvent()
-        stop = GpuEvent()
-        start.record()
-        fn.launch((num_wg, 1, 1), (num_threads, 1, 1), args)
-        stop.record()
-        stop.synchronize()
-
-        assert not D_buf.checkSentinel(), (
-            "expected sentinel to be overwritten by an 8192-byte write into a 4-byte region"
-        )
-
-        for buf in [A_buf, B_buf, C_buf]:
-            buf.free()
-        D_buf.free()
+        try:
+            sentinel_ok = _runAndCheckSentinel(bf16Entry, M, N, batch, K, D_buf)
+            assert not sentinel_ok, (
+                "expected sentinel to be overwritten by an 8192-byte write into a 4-byte region"
+            )
+        finally:
+            D_buf.free()
