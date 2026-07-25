@@ -21,7 +21,9 @@ except ImportError:
 # The try/except here runs at collection time, which is safe because no
 # HIP call has happened yet (get_chip() is lazy and deferred to test-setup).
 try:
-    import tensilelite_profiler as _profiler_mod  # noqa: F401
+    import tensilelite_profiler as _profMod
+    if not hasattr(_profMod, 'initialize'):
+        raise ImportError("tensilelite_profiler C extension not installed")
     TENSILELITE_PROFILER_AVAILABLE = True
 except (ImportError, RuntimeError):
     TENSILELITE_PROFILER_AVAILABLE = False

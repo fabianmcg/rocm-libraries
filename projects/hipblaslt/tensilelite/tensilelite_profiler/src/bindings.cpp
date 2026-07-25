@@ -38,7 +38,7 @@ namespace nb = nanobind;
 namespace {
 
 struct DimInfo {
-    size_t      total;  // product of all dim instance_sizes
+    size_t      total;  // product of all dim instance_sizes.
     std::vector<rocprofiler_counter_record_dimension_info_t> dims;
     std::vector<std::string> dimNames;
     std::vector<size_t>      strides;
@@ -132,20 +132,20 @@ static void appendInstance(std::ostringstream&      ss,
 // Build the formatted counter string from the current dispatch record.
 static std::string formatRecord()
 {
-    auto& p = profiler();
+    PyProfiler& p = profiler();
     std::ostringstream ss;
     bool first = true;
     for(auto const& [name, id] : p.name2Id) {
         auto cit = p.record.find(id.handle);
         if(cit == p.record.end()) continue;
-        auto& info = p.dimInfos.at(id.handle);
+        DimInfo& info = p.dimInfos.at(id.handle);
         if(!first) ss << ',';
         first = false;
         if(info.total <= 1) {
             ss << name << ": ";
             appendScalar(ss, std::get<double>(cit->second));
         } else {
-            auto& vals = std::get<std::vector<double>>(cit->second);
+            std::vector<double>& vals = std::get<std::vector<double>>(cit->second);
             for(size_t i = 0; i < info.total; ++i) {
                 if(i != 0) ss << ',';
                 appendInstance(ss, name, info, vals, i);
@@ -165,7 +165,7 @@ static void dispatchCallback(rocprofiler_dispatch_counting_service_data_t dispat
                              rocprofiler_user_data_t*                     userData,
                              void*                                        /*callbackData*/)
 {
-    auto& p = profiler();
+    PyProfiler& p = profiler();
     std::lock_guard<std::mutex> lock(p.mutex);
     if(p.doProfile) {
         *config         = p.agentProfile;
@@ -204,7 +204,7 @@ static void recordCallback(rocprofiler_dispatch_counting_service_data_t /*dispat
                            rocprofiler_user_data_t                      /*userData*/,
                            void*                                        /*callbackData*/)
 {
-    auto& p = profiler();
+    PyProfiler& p = profiler();
     std::lock_guard<std::mutex> lock(p.mutex);
     p.record.clear();
     for(size_t i = 0; i < recordCount; ++i) {
@@ -219,8 +219,8 @@ static void recordCallback(rocprofiler_dispatch_counting_service_data_t /*dispat
 
 static int toolInitImpl(rocprofiler_client_finalize_t /*finiFunc*/, void* /*toolData*/)
 {
-    auto& p  = profiler();
-    auto  rc = rocprofiler_create_context(&p.context);
+    PyProfiler& p  = profiler();
+    rocprofiler_status_t rc = rocprofiler_create_context(&p.context);
     if(rc != ROCPROFILER_STATUS_SUCCESS) return -1;
     rc = rocprofiler_configure_callback_dispatch_counting_service(
         p.context, dispatchCallback, nullptr, recordCallback, nullptr);
@@ -265,10 +265,10 @@ static rocprofiler_agent_v0_t queryAgent(int deviceIdx)
         }
         return ROCPROFILER_STATUS_SUCCESS;
     };
-    auto rc = rocprofiler_query_available_agents(
+    rocprofiler_status_t rc = rocprofiler_query_available_agents(
         ROCPROFILER_AGENT_INFO_VERSION_0, cb, sizeof(rocprofiler_agent_v0_t), &ctx);
     if(rc != ROCPROFILER_STATUS_SUCCESS || !ctx.found)
-        throw std::runtime_error("GPU agent not found for given device index");
+        throw std::runtime_error("no GPU agent found for given device index");
     return ctx.agent;
 }
 
@@ -314,7 +314,7 @@ static void buildProfiles(PyProfiler& p, rocprofiler_agent_id_t agentId)
         if(c->failed) return ROCPROFILER_STATUS_ERROR_COUNTER_NOT_FOUND;
         return ROCPROFILER_STATUS_SUCCESS;
     };
-    auto rc = rocprofiler_iterate_agent_supported_counters(agentId, cb, &ctx);
+    rocprofiler_status_t rc = rocprofiler_iterate_agent_supported_counters(agentId, cb, &ctx);
     if(rc != ROCPROFILER_STATUS_SUCCESS || ctx.failed)
         throw std::runtime_error("one or more requested counters not available on this agent");
     rocprofiler_counter_config_id_t profile{};
@@ -327,7 +327,7 @@ static void buildProfiles(PyProfiler& p, rocprofiler_agent_id_t agentId)
 
 static void doStart()
 {
-    auto& p = profiler();
+    PyProfiler& p = profiler();
     std::lock_guard<std::mutex> lock(p.mutex);
     if(p.contextStarted || p.context.handle == 0) return;
     rocprofiler_start_context(p.context);
@@ -336,7 +336,7 @@ static void doStart()
 
 static void doStop()
 {
-    auto& p = profiler();
+    PyProfiler& p = profiler();
     std::lock_guard<std::mutex> lock(p.mutex);
     if(!p.contextStarted || p.context.handle == 0) return;
     rocprofiler_stop_context(p.context);
@@ -346,14 +346,14 @@ static void doStop()
 }  // namespace
 
 // ──────────────────────────────────────────────────────────────────────────
-// NB_MODULE
+// NB_MODULE helpers
 // ──────────────────────────────────────────────────────────────────────────
 
-NB_MODULE(_tensilelite_profiler, m)
+// Trigger rocprofiler tool registration and set the module docstring.
+static void _registerPyInit(nb::module_& m)
 {
-    // Trigger rocprofiler tool registration synchronously.
     // Must happen before HSA is initialised (i.e. before any HIP call).
-    auto status = rocprofiler_force_configure(rocprofiler_configure);
+    rocprofiler_status_t status = rocprofiler_force_configure(rocprofiler_configure);
     if(status == ROCPROFILER_STATUS_ERROR_CONFIGURATION_LOCKED)
         throw std::runtime_error("import tensilelite_profiler before any HIP call");
     if(status != ROCPROFILER_STATUS_SUCCESS) {
@@ -361,13 +361,16 @@ NB_MODULE(_tensilelite_profiler, m)
         msg << "rocprofiler_force_configure failed with status " << static_cast<int>(status);
         throw std::runtime_error(msg.str());
     }
-
     m.doc() = "TensileLite ROCprofiler-SDK hardware counter collection bindings.";
+}
 
+// Register all counter-collection Python bindings on the module.
+static void _registerCounterBindings(nb::module_& m)
+{
     m.def(
         "initialize",
         [](int deviceIdx, std::vector<std::string> const& names) {
-            auto& p = profiler();
+            PyProfiler& p = profiler();
             if(p.initialized) return;
             p.counterNames = {names.begin(), names.end()};
             p.agent        = queryAgent(deviceIdx);
@@ -378,23 +381,16 @@ NB_MODULE(_tensilelite_profiler, m)
         nb::arg("counter_names"),
         "Initialise the profiler for device_idx with the named hardware counters.");
 
-    m.def(
-        "start",
-        &doStart,
-        "Start the rocprofiler context (call after initialize).");
-
-    m.def(
-        "stop",
-        &doStop,
-        "Stop the rocprofiler context.");
+    m.def("start", &doStart, "Start the rocprofiler context (call after initialize).");
+    m.def("stop",  &doStop,  "Stop the rocprofiler context.");
 
     m.def(
         "enable",
         []() {
-            auto& p = profiler();
+            PyProfiler& p = profiler();
             std::lock_guard<std::mutex> lock(p.mutex);
-            p.promise  = std::promise<void>{};
-            p.future   = p.promise.get_future();
+            p.promise   = std::promise<void>{};
+            p.future    = p.promise.get_future();
             p.doProfile = true;
         },
         "Reset the promise and arm the profiler for the next kernel dispatch.");
@@ -402,7 +398,7 @@ NB_MODULE(_tensilelite_profiler, m)
     m.def(
         "disable",
         []() {
-            auto& p = profiler();
+            PyProfiler& p = profiler();
             std::lock_guard<std::mutex> lock(p.mutex);
             p.doProfile = false;
         },
@@ -411,7 +407,7 @@ NB_MODULE(_tensilelite_profiler, m)
     m.def(
         "fetch",
         [](int /*solutionIdx*/) -> std::string {
-            auto& p = profiler();
+            PyProfiler& p = profiler();
             {
                 // Release GIL while blocking: recordCallback fires from a
                 // C++ HSA signal thread and must not compete with Python.
@@ -423,4 +419,14 @@ NB_MODULE(_tensilelite_profiler, m)
         },
         nb::arg("solution_idx"),
         "Block until the counter record arrives and return a formatted string.");
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// NB_MODULE
+// ──────────────────────────────────────────────────────────────────────────
+
+NB_MODULE(_tensilelite_profiler, m)
+{
+    _registerPyInit(m);
+    _registerCounterBindings(m);
 }

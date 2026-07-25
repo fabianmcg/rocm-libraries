@@ -86,6 +86,31 @@ def _buildTypedArgs(sol_dict: dict, M: int, N: int, K: int,
     return args, num_wg
 
 
+def _allocGemmBufs(sol_dict, M, N, batch, K):
+    """Allocate and upload GPU buffers for a bf16 GEMM. Returns (A_buf, B_buf, C_buf, D_buf)."""
+    from amdgpu_exec import GpuBuffer
+    dtype = ml_dtypes.bfloat16
+    rng = np.random.default_rng(42)
+    A_flat = np.asfortranarray(rng.random((M, K)).astype(dtype)).ravel(order="F")
+    B_flat = np.asfortranarray(rng.random((N, K)).astype(dtype)).ravel(order="F")
+    C_flat = np.zeros(batch * M * N, dtype=dtype)
+    D_flat = np.zeros(batch * M * N, dtype=dtype)
+    A_buf = GpuBuffer(A_flat.nbytes)
+    A_buf.copy_from_host(A_flat)
+    B_buf = GpuBuffer(B_flat.nbytes)
+    B_buf.copy_from_host(B_flat)
+    C_buf = GpuBuffer(C_flat.nbytes)
+    C_buf.copy_from_host(C_flat)
+    D_buf = GpuBuffer(D_flat.nbytes)
+    D_buf.memset(0)
+    return A_buf, B_buf, C_buf, D_buf
+
+
+def _buildGemmArgList(sol_dict, M, N, batch, K, D_buf, C_buf, A_buf, B_buf):
+    """Build kernel arg list for a bf16 GEMM. Returns (args, num_wg)."""
+    return _buildTypedArgs(sol_dict, M, N, K, D_buf, C_buf, A_buf, B_buf)
+
+
 def _compileBf16Kernel():
     """Compile and return one bf16 stridedBatched=True solution (or None)."""
     if not HAVE_DEPS:
@@ -281,6 +306,7 @@ class TestCounterCollection:
     @requires_rocprof
     def test_sq_waves_positive(self):
         """SQ_WAVES counter is a positive integer after a bf16 GEMM dispatch."""
+        import re
         import tensilelite_profiler
         entry = _compileBf16Kernel()
         if entry is None:
@@ -291,27 +317,8 @@ class TestCounterCollection:
         hsaco = entry["hsaco"]
 
         M, N, K = 256, 256, 256
-        dtype = ml_dtypes.bfloat16
-        rng = np.random.default_rng(42)
-        A_np = np.asfortranarray(rng.random((M, K)).astype(dtype))
-        B_np = np.asfortranarray(rng.random((N, K)).astype(dtype))
-        D_np = np.zeros(M * N, dtype=dtype)
-        C_np = np.zeros(M * N, dtype=dtype)
-
-        from amdgpu_exec import GpuBuffer
-
-        A_flat = A_np.ravel(order="F")
-        B_flat = B_np.ravel(order="F")
-        A_buf = GpuBuffer(A_flat.nbytes)
-        A_buf.copy_from_host(A_flat)
-        B_buf = GpuBuffer(B_flat.nbytes)
-        B_buf.copy_from_host(B_flat)
-        C_buf = GpuBuffer(C_np.nbytes)
-        C_buf.copy_from_host(C_np)
-        D_buf = GpuBuffer(D_np.nbytes)
-        D_buf.memset(0)
-
-        args, num_wg = _buildTypedArgs(sol_dict, M, N, K, D_buf, C_buf, A_buf, B_buf)
+        A_buf, B_buf, C_buf, D_buf = _allocGemmBufs(sol_dict, M, N, 1, K)
+        args, num_wg = _buildGemmArgList(sol_dict, M, N, 1, K, D_buf, C_buf, A_buf, B_buf)
         num_threads = sol_dict["NumThreads"]
 
         module = amdgpu_exec.GpuModule(hsaco)
@@ -340,7 +347,6 @@ class TestCounterCollection:
 
         # SQ_WAVES is multi-dimensional on gfx950 (XCC × SE × INST).
         # Parse every dimension value and check their sum is positive.
-        import re
         values = [int(float(v)) for v in re.findall(r":\s*([\d.]+)", counter_str)]
         assert values, f"no numeric values found in '{counter_str}'"
         total = sum(values)

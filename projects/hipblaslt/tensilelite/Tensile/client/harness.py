@@ -157,6 +157,37 @@ class KernelRunner:
         self._call_count += 1
         return stop.elapsed_ns(start)
 
+    def _runWarmup(self, argsFn, grid: tuple, block: tuple, GpuEvent, nWarmup: int) -> None:
+        """Execute warmup iterations without timing."""
+        for _ in range(nWarmup):
+            self._runOneIter(argsFn, grid, block, GpuEvent)
+
+    def _runTimedIters(self, argsFn, grid: tuple, block: tuple, GpuEvent,
+                       nIters: int, profilerMod) -> tuple:
+        """Execute timed iterations, optionally collecting ROCprofiler counters.
+
+        Returns (timesNs, counters).
+        """
+        timesNs = []
+        counters = {}
+        for i in range(nIters):
+            if profilerMod is not None:
+                profilerMod.enable()
+            timesNs.append(self._runOneIter(argsFn, grid, block, GpuEvent))
+            if profilerMod is not None:
+                profilerMod.disable()
+                counters[str(i)] = profilerMod.fetch(i)
+        return timesNs, counters
+
+    def _checkBounds(self) -> None:
+        """Check sentinel values on all output pool slots after the run."""
+        if self._outputPool is None:
+            return
+        # The device is idle after the final synchronize(); safe to read sentinels now.
+        for buf in self._outputPool.iterSlots():
+            if hasattr(buf, "checkSentinel") and not buf.checkSentinel():
+                raise AssertionError("output buffer overrun detected")
+
     def run(
         self,
         argsFn,
@@ -192,42 +223,28 @@ class KernelRunner:
         except ImportError as exc:
             raise RuntimeError("amdgpu_exec is required for KernelRunner.run") from exc
 
-        useProfiler = bool(rocprofCounters)
-        profiler = None
-        if useProfiler:
+        profilerMod = None
+        if rocprofCounters:
             try:
-                import tensilelite_profiler as profiler
+                import tensilelite_profiler as profilerMod
             except ImportError:
-                _log.warning(
-                    "tensilelite_profiler not available; rocprofCounters ignored"
-                )
-                useProfiler = False
+                _log.warning("tensilelite_profiler not available; rocprofCounters ignored")
 
-        for _ in range(nWarmup):
-            self._runOneIter(argsFn, grid, block, GpuEvent)
+        self._runWarmup(argsFn, grid, block, GpuEvent, nWarmup)
 
         monitor = None
         if hwMonitor:
             from Tensile.client.hw_monitor import HardwareMonitor as _HwMonitor
             monitor = _HwMonitor()
 
-        timesNs = []
-        counters = {}
         ctx = monitor if monitor is not None else contextlib.nullcontext()
         with ctx:
-            for i in range(nIters):
-                if useProfiler:
-                    profiler.enable()
-                timesNs.append(self._runOneIter(argsFn, grid, block, GpuEvent))
-                if useProfiler:
-                    profiler.disable()
-                    counters[str(i)] = profiler.fetch(i)
+            timesNs, counters = self._runTimedIters(
+                argsFn, grid, block, GpuEvent, nIters, profilerMod
+            )
 
-        if boundsCheck and self._outputPool is not None:
-            # The device is idle after the final synchronize(); safe to read sentinels now.
-            for buf in self._outputPool.iterSlots():
-                if hasattr(buf, "checkSentinel") and not buf.checkSentinel():
-                    raise AssertionError("output buffer overrun detected")
+        if boundsCheck:
+            self._checkBounds()
 
         return BenchmarkResult(timesNs=timesNs, warmupN=nWarmup, hw=monitor,
                                counters=counters)
