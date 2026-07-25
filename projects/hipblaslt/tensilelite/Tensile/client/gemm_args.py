@@ -712,6 +712,34 @@ def _buildAmaxDSlots(outputAmaxD: bool, tensors: dict) -> bytes:
     return buf
 
 
+def _buildSingleCallArgs(
+    solutionParams: dict,
+    problemParams: dict,
+    tensors: dict,
+) -> bytes:
+    """Build the singleCallArgs portion: problem sizes, pointers, strides, scalars.
+
+    Ports ContractionSolution.cpp:singleCallArgs (lines 548-1130) excluding the
+    top-level kernelArgs header. Used for both single GEMM and per-group grouped
+    GEMM blobs in the device workspace.
+    """
+    buf = _buildProblemSizes(problemParams)
+    buf += _buildPointers(solutionParams, tensors)
+    buf += _buildStrides(solutionParams, problemParams)
+    buf += _buildAlphaBeta(solutionParams, problemParams)
+
+    streamK = solutionParams.get("StreamK", 0)
+    if streamK == 3:
+        buf += _buildStreamK3Args(solutionParams, problemParams)
+    elif streamK == 4:
+        buf += _buildStreamK4Args(solutionParams, problemParams)
+    elif streamK == 5:
+        buf += _buildStreamK5Args(solutionParams, problemParams)
+
+    buf += _buildEpilogueArgs(solutionParams, problemParams, tensors)
+    return buf
+
+
 def buildKernelArgs(
     solutionParams: dict,
     problemParams: dict,
@@ -762,21 +790,93 @@ def buildKernelArgs(
     Returns raw bytes suitable for use as the kernel argument buffer.
     """
     _validateConfig(solutionParams, problemParams)
-
-    # kernelArgs header comes first when useUniversalArgs=True (always for M1).
     buf = _buildKernelArgsHeader(solutionParams, problemParams, cu_count=cu_count)
-    buf += _buildProblemSizes(problemParams)
-    buf += _buildPointers(solutionParams, tensors)
-    buf += _buildStrides(solutionParams, problemParams)
-    buf += _buildAlphaBeta(solutionParams, problemParams)
-
-    streamK = solutionParams.get("StreamK", 0)
-    if streamK == 3:
-        buf += _buildStreamK3Args(solutionParams, problemParams)
-    elif streamK == 4:
-        buf += _buildStreamK4Args(solutionParams, problemParams)
-    elif streamK == 5:
-        buf += _buildStreamK5Args(solutionParams, problemParams)
-
-    buf += _buildEpilogueArgs(solutionParams, problemParams, tensors)
+    buf += _buildSingleCallArgs(solutionParams, problemParams, tensors)
     return buf
+
+
+def buildGroupedGemmArgs(
+    groups: list,
+    workspaceSizes: list,
+    synchronizerPtr: int,
+    argsPtr: int = 0,
+) -> tuple:
+    """Build top-level kernel args and workspace layout for grouped GEMM dispatch.
+
+    Ports ContractionSolution.cpp:generateSingleCallGroupedGemm (lines 2027-2094)
+    for the universal-args, argType=HBM path only.
+
+    groups: list of dicts, each containing:
+              solutionParams — solution parameter dict (same kernel for all groups),
+              problemParams  — per-group problem dimensions,
+              tensors        — per-group device pointer dict,
+              cu_count       — (optional) device CU count.
+    workspaceSizes: per-group device workspace byte counts obtained from
+                    tensilelite_runtime.grouped_gemm_workspace_size.
+    synchronizerPtr: device address for the top-level Synchronizer slot
+                     (inputs.grouped[0].Synchronizer in C++).
+    argsPtr: device address of the workspace buffer start (holds per-group blobs).
+             Defaults to 0; caller must substitute the actual allocated address.
+
+    Returns (top_level_bytes, workspace_layout) where workspace_layout is a list of
+    (offset_in_bytes, blob_bytes) pairs for copying into the device workspace.
+    Raise NotImplementedError for globalAccumulation == 3 (MBSK).
+    """
+    if not groups:
+        raise ValueError("groups must be non-empty")
+    if len(groups) != len(workspaceSizes):
+        raise ValueError(
+            f"groups ({len(groups)}) and workspaceSizes ({len(workspaceSizes)}) "
+            "must have the same length"
+        )
+
+    solutionParams = groups[0]["solutionParams"]
+    if solutionParams.get("GlobalAccumulation", 0) == 3:
+        raise NotImplementedError(
+            "globalAccumulation=3 (MBSK) not supported for grouped GEMM "
+            "(adds dstD/Synchronizer/GSUSync trailing slots per group)"
+        )
+
+    for g in groups:
+        _validateConfig(g["solutionParams"], g.get("problemParams", {}))
+
+    numGroups = len(groups)
+    version = solutionParams.get("KernArgsVersion", 0)
+    gsu = int(groups[0].get("problemParams", {}).get("gsu", 1))
+    cu_count = groups[0].get("cu_count", 0)
+
+    # Top-level gemmCount: N groups, argType=HBM (1) in high 2 bits.
+    gemmCount = (numGroups & 0x3FFFFFFF) | (1 << 30)
+    arg0 = _computeInternalArg0(solutionParams, gsu)
+
+    buf = struct.pack("<I", gemmCount)
+    buf += struct.pack("<I", arg0)
+    if version >= 1:
+        arg1 = _computeInternalArg1(solutionParams, cu_count=cu_count)
+        totalWg = sum(
+            _computeNumWorkGroups(g["solutionParams"], g.get("problemParams", {}))
+            for g in groups
+        )
+        buf += struct.pack("<i", arg1)
+        buf += struct.pack("<I", totalWg)
+
+    # argsPtr points to the device workspace start (per-group blob region).
+    # Workspace begins after all per-group blobs (accumulation scratch area).
+    totalBlobBytes = sum(workspaceSizes)
+    buf += _packPtr(argsPtr)
+    buf += _packPtr(synchronizerPtr)
+    buf += _packPtr(argsPtr + totalBlobBytes)
+
+    # Build per-group singleCallArgs blobs for device workspace placement.
+    workspaceLayout = []
+    offset = 0
+    for i, g in enumerate(groups):
+        blob = _buildSingleCallArgs(
+            g["solutionParams"],
+            g.get("problemParams", {}),
+            g.get("tensors", {}),
+        )
+        workspaceLayout.append((offset, blob))
+        offset += workspaceSizes[i]
+
+    return buf, workspaceLayout
