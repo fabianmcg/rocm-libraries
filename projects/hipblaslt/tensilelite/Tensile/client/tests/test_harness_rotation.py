@@ -478,10 +478,10 @@ class TestGflopsPlausibility:
 
         gflops = result.gflops(M, N, K)
         # Lower bound (100 GFLOPS) catches ns-treated-as-µs bugs.
-        # Upper bound (1_000_000 GFLOPS = 1 Exa-FLOPS) catches µs-treated-as-ms bugs
+        # Upper bound (1_000_000 GFLOPS = 1 Exa-FLOPS) catches µs-treated-as-ms bugs,
         # while remaining safely above any real hardware peak (gfx950 ~383 TFLOPS bf16).
         assert 100 <= gflops <= 1_000_000, (
-            f"GFLOPS {gflops:.1f} is outside [100, 1000000] — "
+            f"gflops {gflops:.1f} is outside [100, 1000000] — "
             "possible unit-conversion bug or kernel not running"
         )
 
