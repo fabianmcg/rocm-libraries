@@ -1,0 +1,51 @@
+M5 Missing Kernel Configurations for gfx950
+============================================
+
+The following epilogue types have no compiled kernel in
+Tensile/client/tests/yaml/gemm_epilogues.yaml for gfx950.  Their GPU test
+classes exist in test_gemm_epilogues.py but all test methods issue
+pytest.skip() with an explanatory message.
+
+ScaleAlphaVec (UseScaleAlphaVec != 0)
+--------------------------------------
+Reason: UseScaleAlphaVec kernels require a ProblemType that enables the
+ScaleAlphaVec feature (UseScaleAlphaVec=1 or 3).  Adding such a group to
+gemm_epilogues.yaml would also require building the Bias slot alongside it
+(biasSource=3 triggers factorDim), making the arg-layout test substantially
+more complex.  The byte-layout is already verified by
+TestBuildKernelArgsEpilogue.test_scale_alpha_vec_adds_8_bytes.  GPU
+correctness tests are deferred until a dedicated YAML group is added with
+a kernel that isolates UseScaleAlphaVec without co-dependencies.
+Affected tests: TestScaleAlphaVecGpu (all four methods).
+
+AmaxD (OutputAmaxD=True)
+------------------------
+Reason: OutputAmaxD kernels additionally require the AmaxD workspace and
+sync pointers (24 extra bytes in the arg layout).  The byte-level layout is
+verified by TestBuildKernelArgsEpilogue.test_amax_d_adds_24_bytes.
+No gfx950 BenchmarkProblems YAML with OutputAmaxD=True is currently present
+in the gemm_epilogues.yaml file; adding one would require building and
+benchmarking an entirely new problem group.  GPU correctness tests are
+deferred until that group is added.
+Affected tests: TestAmaxDGpu (test_amax_d_fp32, test_amax_d_bf16).
+
+ETensor (UseE=True)
+-------------------
+Reason: UseE kernels write a copy of the pre-cast accumulator to a separate
+E tensor.  This requires additional pointer and stride slots in the arg
+layout (_buildESlots).  No gfx950 BenchmarkProblems YAML with UseE=True is
+currently present in gemm_epilogues.yaml.  GPU correctness tests are deferred
+until a suitable YAML group is added.
+Affected tests: TestETensorGpu (test_e_tensor_fp32, test_e_tensor_bf16).
+
+Multi-epilogue combinations (bias+Relu, bias+ScaleAB+Gelu, ScaleAB+ScaleCD+AmaxD)
+-----------------------------------------------------------------------------------
+Reason: Kernels that combine multiple epilogue flags simultaneously (e.g.
+UseBias=1 AND ActivationType=relu, or UseScaleAB="Scalar" AND UseScaleCD=True
+AND OutputAmaxD=True) are not present in gemm_epilogues.yaml.  Each such
+combination results in a distinct ProblemType requiring its own BenchmarkProblems
+group and associated YAML solutions.  Adding these groups is tracked as a future
+enhancement.  The individual epilogue byte-layout tests in
+TestBuildKernelArgsEpilogue cover the combined slot ordering
+(e.g. test_combined_scale_ab_and_bias verifies ScaleAB+Bias ordering).
+Affected tests: TestMultiEpilogueGpu (all six methods).

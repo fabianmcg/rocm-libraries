@@ -489,7 +489,7 @@ class TestBuildKernelArgsEpilogue:
         pp = _basePP()
         tensors = {"D": 0, "C": 0, "A": 0, "B": 0}
         buf = buildKernelArgs(sol, pp, tensors)
-        # header=16, sizes=16, ptrs=32, strides=24 (non-batched 3-stride each = 1*4*4=16? No)
+        # header=16, sizes=16, ptrs=32, strides=24 (non-batched 3-stride each = 1*4*4=16? No).
         # Actually: sizes=[64,64,1,64] → 4 items → batched, so 2 strides per tensor.
         # header=16, sizes=16, D+C+A+B ptrs=32, strides=8*4=32, alpha+beta=8 → 104 bytes.
         assert len(buf) == 104
@@ -539,7 +539,7 @@ class TestBuildKernelArgsEpilogue:
         assert len(yes_buf) == len(no_buf) + 8
 
     def test_bias_adds_16_bytes(self):
-        """UseBias=1 appends bias ptr + bias_type + strideBias (4+4+8=16 bytes)."""
+        """UseBias=1 appends bias ptr + bias_type + strideBias (8+4+4=16 bytes)."""
         sol_no = _minimalSol(useBias=0)
         sol_yes = _minimalSol(useBias=1)
         pp = {**_basePP(), "biasType": 0, "strideBias": 1}
@@ -849,7 +849,7 @@ def _runBiasGpu(entry, M, N, batch, K, np_dtype, ref_fn, rtol, atol, label):
     num_threads = sol_dict["NumThreads"]
 
     rng = np.random.default_rng(seed=M * 1000 + N + K)
-    A_np, B_np, A_buf, B_buf, C_buf, D_buf = _allocBatched(M, N, K, batch, np_dtype, rng)
+    _, _, A_buf, B_buf, C_buf, D_buf = _allocBatched(M, N, K, batch, np_dtype, rng)
     # Col bias: float32 vector of length M (one value per row, broadcast over all columns).
     bias = rng.random(M).astype(np.float32)
 
@@ -927,7 +927,7 @@ def _runReluGpu(entry, M, N, batch, K, np_dtype, ref_fn, rtol, atol, label):
     num_threads = sol_dict["NumThreads"]
 
     rng = np.random.default_rng(seed=M * 1000 + N + K + 1)
-    A_np, B_np, A_buf, B_buf, C_buf, D_buf = _allocBatched(M, N, K, batch, np_dtype, rng)
+    _, _, A_buf, B_buf, C_buf, D_buf = _allocBatched(M, N, K, batch, np_dtype, rng)
     result = {}
 
     def capture(arguments):
@@ -1011,7 +1011,7 @@ def test_bias_poison_fp32(fp32BiasKernels, size):
     num_threads = sol_dict["NumThreads"]
 
     rng = np.random.default_rng(seed=42)
-    A_np, B_np, A_buf, B_buf, C_buf, D_buf = _allocBatched(M, N, K, batch, np.float32, rng)
+    _, _, A_buf, B_buf, C_buf, D_buf = _allocBatched(M, N, K, batch, np.float32, rng)
     # Col bias has M elements (one per row). Poison with large values to detect effect.
     correct_bias = np.zeros(M, dtype=np.float32)
     poison_bias = (rng.random(M) + 1.0).astype(np.float32)  # guaranteed nonzero.
@@ -1048,17 +1048,14 @@ def test_bias_poison_fp32(fp32BiasKernels, size):
     )
 
 
-@requires_gfx950
 @pytest.mark.parametrize("size", [(256, 256, 4, 256)], ids=["M256N256B4K256"])
-def test_scaleab_poison_fp32(fp32BiasKernels, size):
+def test_scaleab_poison_fp32(size):
     """ScaleAB poison: changing scaleA changes the output.
 
     Uses the fp32 bias kernel (no ScaleAB) only to verify the layout;
     this test exercises the slot via pure Python layout verification.
     """
     # This is a pure Python layout poison test — no GPU execution needed.
-    from Tensile.client.gemm_args import buildKernelArgs
-
     sol = _minimalSol(useScaleAB="Scalar")
     pp = _basePP()
     tensors_a = {"D": 0, "C": 0, "A": 0, "B": 0, "scaleA": 0x1000, "scaleB": 0x2000}
@@ -1157,3 +1154,307 @@ def test_relu_bf16(bf16ReluKernels, size):
         _runReluGpu(entry, M, N, batch, K, ml_dtypes.bfloat16,
                     gemmBf16, RTOL_BF16, ATOL_BF16,
                     label=f"bf16 relu M{M}N{N}B{batch}K{K} {sid}")
+
+
+# ===========================================================================
+# Session-scoped compiled solution fixtures for ScaleCD.
+# ===========================================================================
+
+
+@pytest.fixture(scope="session")
+def bf16ScaleCdKernels():
+    """Compile bf16+ScaleCD solutions (group 6)."""
+    return _compileSolutions(_GRP_BF16_SCALE_CD)
+
+
+@pytest.fixture(scope="session")
+def fp32ScaleCdKernels():
+    """Compile fp32+ScaleCD solutions (group 7)."""
+    return _compileSolutions(_GRP_FP32_SCALE_CD)
+
+
+# ===========================================================================
+# ScaleCD GPU helper: typed args and run helper.
+# ===========================================================================
+
+
+def _buildScaleCdTypedArgs(sol_dict, M, N, batch, K,
+                            D_arr, C_arr, A_arr, B_arr,
+                            scaleC_arr, scaleD_arr, alpha=1.0, beta=0.0):
+    """Build typed args for NT stridedBatched GEMM with ScaleCD epilogue.
+
+    After alpha/beta the ScaleCD slot adds scaleC pointer then scaleD pointer.
+    """
+    from Tensile.client.gemm_args import _computeInternalArg0, _computeInternalArg1
+
+    version = sol_dict.get("KernArgsVersion", 0)
+    mt0 = sol_dict["MacroTile0"]
+    mt1 = sol_dict["MacroTile1"]
+    num_wg = math.ceil(M / mt0) * math.ceil(N / mt1) * batch
+    arg0 = _computeInternalArg0(sol_dict, gsu=1)
+    gemm_count = (1 & 0x3FFFFFFF) | (0 << 30)
+
+    args = [np.uint32(gemm_count), np.uint32(arg0)]
+    if version >= 1:
+        arg1 = _computeInternalArg1(sol_dict, cu_count=_deviceCuCount())
+        args.append(np.int32(arg1))
+        args.append(np.uint32(num_wg))
+
+    args.extend([np.uint32(M), np.uint32(N), np.uint32(batch), np.uint32(K)])
+    args.extend([D_arr, C_arr, A_arr, B_arr])
+
+    lda, ldb, ldd, ldc = M, N, M, M
+    sa, sb, sd, sc = M * K, N * K, M * N, M * N
+    args.extend([
+        np.uint32(ldd), np.uint32(sd),
+        np.uint32(ldc), np.uint32(sc),
+        np.uint32(lda), np.uint32(sa),
+        np.uint32(ldb), np.uint32(sb),
+    ])
+
+    args.extend([np.float32(alpha), np.float32(beta)])
+    # ScaleCD epilogue: scaleC pointer then scaleD pointer.
+    args.append(scaleC_arr)
+    args.append(scaleD_arr)
+    return args
+
+
+def _runScaleCdGpu(entry, M, N, batch, K, np_dtype, ref_fn, rtol, atol, label):
+    """Execute one ScaleCD GEMM kernel and verify output against reference.
+
+    Uses scaleC=scaleD=2.0 and beta=1.0 with an all-zero C buffer.  beta=1.0
+    ensures the kernel does not take the beta=0 fast path, which bypasses the
+    ScaleD epilogue.  With C=0 the C contribution vanishes and the reference is
+    still scaleD * A @ B = 2 * GEMM.
+    """
+    sol_dict = entry["sol_dict"]
+    kernel_name = entry["kernel_name"]
+    hsaco = entry["hsaco"]
+    num_wg = (math.ceil(M / sol_dict["MacroTile0"])
+              * math.ceil(N / sol_dict["MacroTile1"]) * batch)
+    num_threads = sol_dict["NumThreads"]
+
+    rng = np.random.default_rng(seed=M * 1000 + N + K + 2)
+    _, _, A_buf, B_buf, C_buf, D_buf = _allocBatched(M, N, K, batch, np_dtype, rng)
+
+    # Equal scalar values ensure the test is agnostic to slot ordering.
+    scale_val = np.float32(2.0)
+    scaleC_np = np.array([scale_val], dtype=np.float32)
+    scaleD_np = np.array([scale_val], dtype=np.float32)
+
+    result = {}
+
+    def capture(arguments):
+        result["D"] = np.array(arguments[8].array, dtype=np_dtype).copy()
+
+    D_io = amdgpu_exec.InOutArray(D_buf)
+    C_in = amdgpu_exec.InputArray(C_buf)
+    A_in = amdgpu_exec.InputArray(A_buf)
+    B_in = amdgpu_exec.InputArray(B_buf)
+    scaleC_in = amdgpu_exec.InputArray(scaleC_np)
+    scaleD_in = amdgpu_exec.InputArray(scaleD_np)
+
+    # beta=1.0 forces the kernel to go through the full epilogue code path
+    # (including ScaleD).  C is all-zeros so the C contribution is always 0.
+    args = _buildScaleCdTypedArgs(sol_dict, M, N, batch, K,
+                                   D_io, C_in, A_in, B_in,
+                                   scaleC_in, scaleD_in, beta=1.0)
+    amdgpu_exec.execute_hsaco(
+        hsaco=hsaco, kernel_name=kernel_name, arguments=args,
+        grid_dim=(num_wg, 1, 1), block_dim=(num_threads, 1, 1),
+        num_iterations=1, verify_fn=capture,
+    )
+
+    D_gpu = result["D"]
+    A_slice = A_buf[:M * K].reshape(M, K, order='F')
+    B_slice = B_buf[:N * K].reshape(N, K, order='F')
+    # Reference: scaleD * alpha * A @ B (C=0 so beta*scaleC*C = 0).
+    D_ref_one = ref_fn(A_slice, B_slice.T, 1.0, 0.0, None)
+    D_ref_one = D_ref_one.astype(np.float64) * float(scale_val)
+    D_ref_flat = np.tile(np.asfortranarray(D_ref_one).ravel(order='F'), batch)
+    assertClose(D_gpu, D_ref_flat, rtol=rtol, atol=atol, label=label)
+
+
+# ===========================================================================
+# Task 5.3 — GPU correctness: ScaleCD (fp32 and bf16)
+# ===========================================================================
+
+
+class TestScaleCDGpu:
+    """GPU correctness tests for UseScaleCD kernels on gfx950."""
+
+    @requires_gfx950
+    @pytest.mark.parametrize("size", _PROBLEM_SIZES,
+                             ids=[f"M{m}N{n}B{b}K{k}" for m, n, b, k in _PROBLEM_SIZES])
+    def test_scale_cd_fp32(self, fp32ScaleCdKernels, size):
+        """fp32 NT stridedBatched + ScaleCD correctness."""
+        if not HAVE_DEPS:
+            pytest.skip("amdgpu_exec not installed")
+        entries = [e for e in fp32ScaleCdKernels if _filterSolution(e)]
+        if not entries:
+            pytest.skip("no fp32 ScaleCD solution compiled")
+
+        M, N, batch, K = size
+        for entry in entries:
+            sid = entry["sid"]
+            _runScaleCdGpu(entry, M, N, batch, K, np.float32,
+                           gemm, RTOL_FP32, ATOL_FP32,
+                           label=f"fp32 scaleCD M{M}N{N}B{batch}K{K} {sid}")
+
+    @requires_gfx950
+    @pytest.mark.parametrize("size", _PROBLEM_SIZES,
+                             ids=[f"M{m}N{n}B{b}K{k}" for m, n, b, k in _PROBLEM_SIZES])
+    def test_scale_cd_bf16(self, bf16ScaleCdKernels, size):
+        """bf16 HPA NT stridedBatched + ScaleCD correctness."""
+        if not HAVE_DEPS:
+            pytest.skip("amdgpu_exec not installed")
+        if ml_dtypes is None:
+            pytest.skip("ml_dtypes not installed")
+        entries = [e for e in bf16ScaleCdKernels if _filterSolution(e)]
+        if not entries:
+            pytest.skip("no bf16 ScaleCD solution compiled")
+
+        M, N, batch, K = size
+        for entry in entries:
+            sid = entry["sid"]
+            _runScaleCdGpu(entry, M, N, batch, K, ml_dtypes.bfloat16,
+                           gemmBf16, RTOL_BF16, ATOL_BF16,
+                           label=f"bf16 scaleCD M{M}N{N}B{batch}K{K} {sid}")
+
+
+# ===========================================================================
+# Task 5.3 — Stub GPU tests: ScaleAlphaVec, AmaxD, ETensor, multi-epilogue.
+#
+# These kernel configurations are not present in gemm_epilogues.yaml for gfx950.
+# See Tensile/client/tests/fixtures/m5_missing_kernels.txt for the explanation.
+# ===========================================================================
+
+
+class TestScaleAlphaVecGpu:
+    """ScaleAlphaVec GPU tests — skipped: no kernel compiled for gfx950.
+
+    UseScaleAlphaVec kernels require a different ProblemType not present in
+    gemm_epilogues.yaml.  See m5_missing_kernels.txt.
+    """
+
+    @requires_gfx950
+    def test_scale_alpha_vec_fp32_per_row(self):
+        pytest.skip(
+            "no ScaleAlphaVec kernel compiled for gfx950 — "
+            "see Tensile/client/tests/fixtures/m5_missing_kernels.txt"
+        )
+
+    @requires_gfx950
+    def test_scale_alpha_vec_fp32_per_col(self):
+        pytest.skip(
+            "no ScaleAlphaVec kernel compiled for gfx950 — "
+            "see Tensile/client/tests/fixtures/m5_missing_kernels.txt"
+        )
+
+    @requires_gfx950
+    def test_scale_alpha_vec_bf16_per_row(self):
+        pytest.skip(
+            "no ScaleAlphaVec kernel compiled for gfx950 — "
+            "see Tensile/client/tests/fixtures/m5_missing_kernels.txt"
+        )
+
+    @requires_gfx950
+    def test_scale_alpha_vec_bf16_per_col(self):
+        pytest.skip(
+            "no ScaleAlphaVec kernel compiled for gfx950 — "
+            "see Tensile/client/tests/fixtures/m5_missing_kernels.txt"
+        )
+
+
+class TestAmaxDGpu:
+    """AmaxD GPU tests — skipped: no kernel compiled for gfx950.
+
+    OutputAmaxD kernels require a different ProblemType not present in
+    gemm_epilogues.yaml.  See m5_missing_kernels.txt.
+    """
+
+    @requires_gfx950
+    def test_amax_d_fp32(self):
+        pytest.skip(
+            "no AmaxD kernel compiled for gfx950 — "
+            "see Tensile/client/tests/fixtures/m5_missing_kernels.txt"
+        )
+
+    @requires_gfx950
+    def test_amax_d_bf16(self):
+        pytest.skip(
+            "no AmaxD kernel compiled for gfx950 — "
+            "see Tensile/client/tests/fixtures/m5_missing_kernels.txt"
+        )
+
+
+class TestETensorGpu:
+    """E-tensor GPU tests — skipped: no kernel compiled for gfx950.
+
+    UseE kernels require a different ProblemType not present in
+    gemm_epilogues.yaml.  See m5_missing_kernels.txt.
+    """
+
+    @requires_gfx950
+    def test_e_tensor_fp32(self):
+        pytest.skip(
+            "no ETensor kernel compiled for gfx950 — "
+            "see Tensile/client/tests/fixtures/m5_missing_kernels.txt"
+        )
+
+    @requires_gfx950
+    def test_e_tensor_bf16(self):
+        pytest.skip(
+            "no ETensor kernel compiled for gfx950 — "
+            "see Tensile/client/tests/fixtures/m5_missing_kernels.txt"
+        )
+
+
+class TestMultiEpilogueGpu:
+    """Multi-epilogue GPU tests — skipped: no multi-epilogue kernel compiled for gfx950.
+
+    Kernels combining bias+Relu, bias+ScaleAB+Gelu, or ScaleAB+ScaleCD+AmaxD
+    are not present in gemm_epilogues.yaml.  See m5_missing_kernels.txt.
+    """
+
+    @requires_gfx950
+    def test_bias_relu_fp32(self):
+        pytest.skip(
+            "no bias+Relu combined kernel compiled for gfx950 — "
+            "see Tensile/client/tests/fixtures/m5_missing_kernels.txt"
+        )
+
+    @requires_gfx950
+    def test_bias_relu_bf16(self):
+        pytest.skip(
+            "no bias+Relu combined kernel compiled for gfx950 — "
+            "see Tensile/client/tests/fixtures/m5_missing_kernels.txt"
+        )
+
+    @requires_gfx950
+    def test_bias_scaleab_gelu_fp32(self):
+        pytest.skip(
+            "no bias+ScaleAB+Gelu combined kernel compiled for gfx950 — "
+            "see Tensile/client/tests/fixtures/m5_missing_kernels.txt"
+        )
+
+    @requires_gfx950
+    def test_bias_scaleab_gelu_bf16(self):
+        pytest.skip(
+            "no bias+ScaleAB+Gelu combined kernel compiled for gfx950 — "
+            "see Tensile/client/tests/fixtures/m5_missing_kernels.txt"
+        )
+
+    @requires_gfx950
+    def test_scaleab_scalecd_amaxd_fp32(self):
+        pytest.skip(
+            "no ScaleAB+ScaleCD+AmaxD combined kernel compiled for gfx950 — "
+            "see Tensile/client/tests/fixtures/m5_missing_kernels.txt"
+        )
+
+    @requires_gfx950
+    def test_scaleab_scalecd_amaxd_bf16(self):
+        pytest.skip(
+            "no ScaleAB+ScaleCD+AmaxD combined kernel compiled for gfx950 — "
+            "see Tensile/client/tests/fixtures/m5_missing_kernels.txt"
+        )
