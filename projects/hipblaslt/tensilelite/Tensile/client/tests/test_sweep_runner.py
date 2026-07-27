@@ -525,3 +525,124 @@ def test_sweep_csv_solution_start_idx(bf16Sweep):
                 assert val != 0.0 or val == pytest.approx(-1.0), (
                     f"unexpected zero GFLOPS at col {col}"
                 )
+
+
+# ===========================================================================
+# Task: Library-mode SweepRunner
+# ===========================================================================
+
+
+class TestLibraryModeUnit:
+    """Pure-Python library-mode helpers (no GPU)."""
+
+    def test_dtype_int_to_rt_name(self):
+        from Tensile.client.sweep_runner import _dtypeIntToRtName
+        assert _dtypeIntToRtName(7) == "BFloat16"
+        assert _dtypeIntToRtName(0) == "Float"
+        assert _dtypeIntToRtName(4) == "Half"
+
+    def test_dtype_int_to_rt_name_unsupported(self):
+        from Tensile.client.sweep_runner import _dtypeIntToRtName
+        with pytest.raises(NotImplementedError):
+            _dtypeIntToRtName(999)
+
+    def test_library_path_stored(self):
+        r = SweepRunner(yamlPath="/x.yaml",
+                        libraryPath="/lib/TensileLibrary.yaml")
+        assert r._libraryPath == "/lib/TensileLibrary.yaml"
+
+    def test_discover_code_objects(self, tmp_path):
+        lib = tmp_path / "TensileLibrary.yaml"
+        lib.write_text("x")
+        (tmp_path / "kernel_0.co").write_bytes(b"")
+        (tmp_path / "kernel_1.co").write_bytes(b"")
+        r = SweepRunner(yamlPath="/x.yaml", libraryPath=str(lib))
+        found = r._discoverCodeObjects()
+        assert len(found) == 2
+        assert all(p.endswith(".co") for p in found)
+
+    def test_discover_code_objects_missing(self, tmp_path):
+        lib = tmp_path / "TensileLibrary.yaml"
+        lib.write_text("x")
+        r = SweepRunner(yamlPath="/x.yaml", libraryPath=str(lib))
+        with pytest.raises(FileNotFoundError):
+            r._discoverCodeObjects()
+
+
+def _findBf16Library():
+    """Locate a bf16 BBS TensileLibrary for library-mode GPU tests, or None."""
+    import glob
+    env = os.environ.get("TENSILELITE_TEST_LIBRARY")
+    if env and os.path.exists(env):
+        return env
+    if os.path.exists("/tmp/cpp_ref/BFloat16/TensileLibrary.yaml"):
+        return "/tmp/cpp_ref/BFloat16/TensileLibrary.yaml"
+    pattern = os.path.join(
+        _TESTS_DIR, "..", "..", "..", ".tox", "unit", "tmp", "**",
+        "Cijk_Ailk_Bjlk_BBS_BH_UserArgs_00", "**", "gfx950",
+        "TensileLibrary.yaml")
+    matches = glob.glob(pattern, recursive=True)
+    return matches[0] if matches else None
+
+
+@pytest.fixture(scope="session")
+def bf16LibrarySweep():
+    """Run SweepRunner in library mode over gemm_standard.yaml group 2 (bf16)."""
+    if not HAVE_DEPS:
+        return None
+    lib = _findBf16Library()
+    if lib is None:
+        return None
+    csvTmp = tempfile.NamedTemporaryFile(suffix=".csv", delete=False)
+    csvPath = csvTmp.name
+    csvTmp.close()
+    runner = SweepRunner(
+        yamlPath=_YAML_PATH, libraryPath=lib,
+        nWarmup=1, nIters=3, rotatingBuffers=2, icacheCopies=1,
+        problemIdx=2, groupIdx=0,
+    )
+    results = runner.run(resultsCsv=csvPath)
+    return results, csvPath, lib
+
+
+@requires_gfx950
+def test_library_mode_one_result_per_size(bf16LibrarySweep):
+    """Library mode yields at most one winner per problem size."""
+    if not HAVE_DEPS:
+        pytest.skip("amdgpu_exec not installed")
+    if bf16LibrarySweep is None:
+        pytest.skip("no bf16 library found")
+    results, _csv, _lib = bf16LibrarySweep
+    if not results:
+        pytest.skip("library matched no problem sizes")
+    sizes = [r.problemSize for r in results]
+    assert len(sizes) == len(set(sizes))
+
+
+@requires_gfx950
+def test_library_mode_gflops_plausible(bf16LibrarySweep):
+    """Library-mode GFLOPS fall in [100, 1_000_000]."""
+    if not HAVE_DEPS:
+        pytest.skip("amdgpu_exec not installed")
+    if bf16LibrarySweep is None:
+        pytest.skip("no bf16 library found")
+    results, _csv, _lib = bf16LibrarySweep
+    successful = [r for r in results if r.gflops > 0]
+    if not successful:
+        pytest.skip("no successful library-mode results")
+    for r in successful:
+        assert 100 <= r.gflops <= 1_000_000, (
+            f"GFLOPS {r.gflops:.1f} on {r.problemSize} out of range")
+
+
+@requires_gfx950
+def test_library_mode_csv_has_winner_column(bf16LibrarySweep):
+    """The library-mode results CSV ends with a single 'Winner' column."""
+    if not HAVE_DEPS:
+        pytest.skip("amdgpu_exec not installed")
+    if bf16LibrarySweep is None:
+        pytest.skip("no bf16 library found")
+    _results, csvPath, _lib = bf16LibrarySweep
+    with open(csvPath) as fh:
+        header = [h.strip() for h in next(csv.reader(fh))]
+    assert header[-1] == "Winner"

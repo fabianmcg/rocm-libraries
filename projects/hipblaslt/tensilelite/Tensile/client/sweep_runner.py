@@ -1,11 +1,19 @@
 # Copyright Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier: MIT
-"""SweepRunner: enumerate, compile, and benchmark all solutions in a YAML.
+"""SweepRunner: enumerate, compile, and benchmark solutions from a YAML.
 
-Orchestrates: enumerate solutions via the Tensile fork pipeline → compile to
-HSACO → benchmark each (problem_size, solution) pair with KernelRunner using
-rotating output buffers and I-cache module rotation → write results.csv and
-library-update YAML.
+Two operating modes are supported:
+
+Compile mode (libraryPath=None): enumerate ALL fork solutions from the YAML,
+compile each to HSACO, and benchmark every (problem_size, solution) pair.
+The results CSV has one GFLOPS column per solution, one row per size.
+
+Library mode (libraryPath set): load a pre-built TensileLibrary.yaml.  For
+each problem size, LibraryRunner.find_best selects the single best solution;
+only that winner is benchmarked via the same KernelRunner path as compile mode.
+The results CSV has a single Winner column, one row per size.  No compilation.
+The .co file is loaded from the library directory (the same pre-built code
+object the C++ client uses).
 """
 
 from __future__ import annotations
@@ -368,6 +376,19 @@ def _shouldSkip(rawDict: dict, solDict: dict) -> bool:
     return solDict.get("StaggerU", 0) == 0 and isp.get("SupportCustomStaggerU", False)
 
 
+# DataTypeEnum integer code -> tensilelite_runtime dtype name.
+_rtDtypeNames = {0: "Float", 1: "Double", 4: "Half", 7: "BFloat16",
+                 8: "Int8", 10: "XFloat32"}
+
+
+def _dtypeIntToRtName(code: int) -> str:
+    """Map a DataTypeEnum integer code to a tensilelite_runtime dtype name."""
+    name = _rtDtypeNames.get(code)
+    if name is None:
+        raise NotImplementedError(f"unsupported dtype code for library mode: {code}")
+    return name
+
+
 # ---------------------------------------------------------------------------
 # SweepRunner.
 # ---------------------------------------------------------------------------
@@ -381,7 +402,10 @@ class SweepRunner:
     yamlPath:
         Path to a benchmark YAML file (BenchmarkProblems format).
     libraryPath:
-        Unused at present; reserved for future LibraryRunner integration.
+        When set, enables library mode: load this TensileLibrary.yaml and
+        benchmark only the single winner selected by LibraryRunner.find_best
+        for each problem size.  The .co file is read from the same directory
+        as the YAML.  When None (default), compile mode is used.
     nWarmup:
         Number of warmup iterations before timing begins.
     nIters:
@@ -692,6 +716,190 @@ class SweepRunner:
                 winner = max(valid, key=lambda r: r.gflops)
                 luRep.writeRow(list(probSize), winner.solutionIdx, winner.gflops)
 
+    def _problemTypeFields(self, solDict: dict) -> dict:
+        """Extract dtype/transpose fields for building a runtime Problem."""
+        pt = solDict.get("ProblemType") or {}
+        aCode = _readDtypeInt(solDict, "DataType")
+        dCode = _readDtypeInt(solDict, "DestDataType")
+        if dCode == -1:
+            dCode = aCode
+        return {
+            "aName": _dtypeIntToRtName(aCode),
+            "dName": _dtypeIntToRtName(dCode),
+            "transA": bool(pt.get("TransposeA", False)),
+            "transB": bool(pt.get("TransposeB", False)),
+            "hpa": bool(pt.get("HighPrecisionAccumulate", False)),
+        }
+
+    def _enumerateSolutionMetadata(self, chip: str, assembler, isaInfoMap,
+                                   debugConfig):
+        """Return (solDictByName, ptFields) from the YAML without compiling.
+
+        solDictByName maps getKernelNameMin(kernel) -> a metadata dict with keys
+        solDict, rawDict, sid, index. ptFields captures the shared problem-type
+        dtype/transpose info used to build runtime Problem objects.
+        """
+        from Tensile.client.yaml_solution_builder import (
+            solutionsFromYaml, _injectInternalArgsSupport,
+        )
+        from Tensile.SolutionStructs.Naming import getKernelNameMin
+
+        sols = solutionsFromYaml(
+            self._yamlPath, assembler, isaInfoMap, debugConfig,
+            problemIdx=self._problemIdx, groupIdx=self._groupIdx,
+        )
+        byName = {}
+        ptFields = None
+        for idx, (sol, sid) in enumerate(sols):
+            solDict = _injectInternalArgsSupport(dict(sol), chip)
+            name = getKernelNameMin(sol.getKernels()[0], splitGSU=False)
+            byName[name] = {"solDict": solDict, "rawDict": dict(sol),
+                            "sid": sid, "index": idx}
+            if ptFields is None:
+                ptFields = self._problemTypeFields(solDict)
+        return byName, ptFields
+
+    def _discoverCodeObjects(self) -> list:
+        """Return sorted .co file paths in the library directory."""
+        import glob
+        libDir = os.path.dirname(os.path.abspath(self._libraryPath))
+        coPaths = sorted(glob.glob(os.path.join(libDir, "*.co")))
+        if not coPaths:
+            raise FileNotFoundError(f"no .co files found next to library: {libDir}")
+        return coPaths
+
+    def _coBytesForKernel(self, kernelName: str, coPaths: list,
+                          cache: dict):
+        """Return the .co bytes exporting kernelName, or None; caches by name."""
+        if kernelName in cache:
+            return cache[kernelName]
+        from amdgpu_exec import GpuModule
+        for coPath in coPaths:
+            with open(coPath, "rb") as f:
+                data = f.read()
+            # one-shot probe for the exported symbol; the temporary module is discarded.
+            try:
+                GpuModule(data).get_function(kernelName)
+            except Exception:
+                continue
+            cache[kernelName] = data
+            return data
+        cache[kernelName] = None
+        return None
+
+    def _makeRtProblem(self, probSize: tuple, ptFields: dict):
+        """Build a tensilelite_runtime Problem for one problem size."""
+        import tensilelite_runtime as rt
+        M, N, batch, K = probSize[0], probSize[1], probSize[2], probSize[3]
+        return rt.Problem(
+            M=M, N=N, K=K,
+            dtype_a=ptFields["aName"], dtype_b=ptFields["aName"],  # standard GEMM: B input dtype matches A.
+            dtype_c=ptFields["dName"], dtype_d=ptFields["dName"],
+            trans_a=ptFields["transA"], trans_b=ptFields["transB"],
+            high_precision_accumulate=ptFields["hpa"],
+            batch_size=batch,
+        )
+
+    def _resolveWinnerEntry(self, probSize, libRunner, ptFields, byName,
+                            coPaths, coCache):
+        """Find the library winner for probSize; build a benchmark entry or None."""
+        prob = self._makeRtProblem(probSize, ptFields)
+        sol = libRunner.find_best(prob)
+        if sol is None:
+            _log.warning("library found no solution for size=%s", probSize)
+            return None
+        name = sol.kernel_name
+        meta = byName.get(name)
+        if meta is None:
+            _log.warning("winner %s not in YAML enumeration; skip size=%s",
+                         name, probSize)
+            return None
+        coBytes = self._coBytesForKernel(name, coPaths, coCache)
+        if coBytes is None:
+            _log.warning("no .co exports %s; skip size=%s", name, probSize)
+            return None
+        return {"solDict": meta["solDict"], "rawDict": meta["rawDict"],
+                "kernelName": name, "hsaco": coBytes, "sid": meta["sid"],
+                "solution": None, "solutionIdx": meta["index"]}
+
+    def _benchmarkLibrary(self, probSize, libRunner, ptFields, byName,
+                          coPaths, coCache, cuCount):
+        """Benchmark the library winner for one size; return a SweepResult or None."""
+        M, N, batch, K = probSize[0], probSize[1], probSize[2], probSize[3]
+        entry = self._resolveWinnerEntry(probSize, libRunner, ptFields, byName,
+                                         coPaths, coCache)
+        if entry is None:
+            return None
+        gflops, br = self._benchmarkOne(entry, M, N, batch, K, cuCount)
+        if br is None:
+            br = BenchmarkResult(timesNs=[], warmupN=self._nWarmup)
+        validation = "SKIPPED"
+        if self._numElementsToValidate != 0:
+            validation = self._verifyOne(entry, M, N, batch, K, cuCount)
+        return SweepResult(solutionIdx=entry["solutionIdx"], solutionName=entry["sid"],
+                           problemSize=probSize, benchmark=br, gflops=gflops,
+                           validation=validation)
+
+    def _reportLibraryProblem(self, probSize, result, csvRep, luRep):
+        """Write one winner row (CSV + library-update) for a library-mode size."""
+        M, N, batch, K = probSize[0], probSize[1], probSize[2], probSize[3]
+        if len(probSize) >= 8:
+            ldd, ldc, lda, ldb = probSize[4], probSize[5], probSize[6], probSize[7]
+        else:
+            lda, ldb, ldd, ldc = M, N, M, M
+        gflops = result.gflops if result else -1.0
+        if csvRep:
+            validation = result.validation if result else "SKIPPED"
+            csvRep.writeRow(
+                sizeParams={"sizes": list(probSize), "ldd": ldd, "ldc": ldc,
+                            "lda": lda, "ldb": ldb,
+                            "totalFlops": 2 * M * N * K * batch},
+                solutionResults=[("Winner", gflops)],
+                validation=validation)
+        if luRep and result and result.gflops > 0:
+            luRep.writeRow(list(probSize), result.solutionIdx, result.gflops)
+
+    def _runLibrary(self, resultsCsv, libraryUpdateFile):
+        """Library-mode sweep: benchmark the per-size winner from a pre-built library."""
+        from Tensile.client.library_runner import LibraryRunner
+        from Tensile.client.yaml_solution_builder import problemSizesFromYaml
+        import amdgpu_exec
+
+        chip = amdgpu_exec.get_chip()
+        assembler, isaInfoMap, debugConfig = _setupTensile(chip)
+        byName, ptFields = self._enumerateSolutionMetadata(
+            chip, assembler, isaInfoMap, debugConfig)
+        if not byName:
+            _log.warning("no solutions enumerated; library sweep returns empty")
+            return []
+        coPaths = self._discoverCodeObjects()
+        libRunner = LibraryRunner(self._libraryPath)
+        probSizes = problemSizesFromYaml(
+            self._yamlPath, problemIdx=self._problemIdx, groupIdx=self._groupIdx)
+        cuCount = _deviceCuCount()
+        numSizeDims = len(probSizes[0]) if probSizes else 4
+        csvRep, luRep = self._openReporters(
+            resultsCsv, ["Winner"], numSizeDims, libraryUpdateFile)
+        coCache = {}
+        try:
+            if self._pinClocks and self._amdSmiPath:
+                self._applyClockPin()
+            allResults = []
+            for probSize in probSizes:
+                result = self._benchmarkLibrary(
+                    probSize, libRunner, ptFields, byName, coPaths, coCache, cuCount)
+                if result is not None:
+                    allResults.append(result)
+                self._reportLibraryProblem(probSize, result, csvRep, luRep)
+        finally:
+            if self._pinClocks and self._amdSmiPath:
+                self._resetClockPin()
+            if csvRep:
+                csvRep.close()
+            if luRep:
+                luRep.close()
+        return allResults
+
     def _runSudoCmd(self, args: list, desc: str):
         """Run a sudo command; raise PermissionError on failure or missing sudo."""
         try:
@@ -731,18 +939,8 @@ class SweepRunner:
             csvRep.writeHeader()
         return csvRep, luRep
 
-    def run(self, resultsCsv: Optional[str] = None,
-            libraryUpdateFile: Optional[str] = None,
-            hwMonitor: bool = False,
-            boundsCheck: bool = False,
-            rocprofCounters=None) -> list:
-        """Run the sweep and return a list of SweepResult.
-
-        resultsCsv:        path to write results.csv (omit to skip).
-        libraryUpdateFile: path to write the library-update YAML (omit to skip).
-        hwMonitor, boundsCheck, rocprofCounters: reserved for future use.
-        Returns a flat list of SweepResult (one per problem_size × solution).
-        """
+    def _runCompile(self, resultsCsv, libraryUpdateFile):
+        """Compile-mode sweep: compile all YAML solutions and benchmark every size."""
         from Tensile.client.yaml_solution_builder import problemSizesFromYaml
 
         compiled, _ = self._compile()
@@ -758,9 +956,9 @@ class SweepRunner:
         numSizeDims = len(probSizes[0]) if probSizes else 4
         csvRep, luRep = self._openReporters(resultsCsv, solNames, numSizeDims,
                                             libraryUpdateFile)
-        if self._pinClocks and self._amdSmiPath:
-            self._applyClockPin()
         try:
+            if self._pinClocks and self._amdSmiPath:
+                self._applyClockPin()
             allResults = []
             for probSize in probSizes:
                 sizeResults = self._benchmarkProblem(probSize, compiled, cuCount)
@@ -774,3 +972,19 @@ class SweepRunner:
             if luRep:
                 luRep.close()
         return allResults
+
+    def run(self, resultsCsv: Optional[str] = None,
+            libraryUpdateFile: Optional[str] = None,
+            hwMonitor: bool = False,
+            boundsCheck: bool = False,
+            rocprofCounters=None) -> list:
+        """Run the sweep and return a list of SweepResult.
+
+        resultsCsv:        path to write results.csv (omit to skip).
+        libraryUpdateFile: path to write the library-update YAML (omit to skip).
+        hwMonitor, boundsCheck, rocprofCounters: reserved for future use.
+        Returns a flat list of SweepResult (one per problem_size × solution).
+        """
+        if self._libraryPath is not None:
+            return self._runLibrary(resultsCsv, libraryUpdateFile)
+        return self._runCompile(resultsCsv, libraryUpdateFile)
