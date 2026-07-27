@@ -18,7 +18,7 @@ GlobalParameters:
   ForceRedoLibraryClient: True
   EnqueuesPerSync: 1
   SyncsPerBenchmark: 0
-  NumElementsToValidate: 0
+  NumElementsToValidate: -1
   ValidationMaxToPrint: 4
   ValidationPrintValids: False
   KernelTime: True
@@ -46,16 +46,17 @@ BenchmarkProblems:
       ForkParameters:
         - MatrixInstruction:
           - [16, 16, 16, 1, 1, 2, 2, 2, 2]
-        - DepthU: [16, 32]
+          - [32, 32, 8, 1, 1, 2, 2, 2, 2]
+        - DepthU: [16, 32, 64]
         - GlobalSplitU: [1]
-        - SourceSwap: [True]
+        - SourceSwap: [True, False]
         - PrefetchGlobalRead: [1]
       BenchmarkJoinParameters:
       BenchmarkFinalParameters:
         - ProblemSizes:
-          - Exact: [512, 512, 1, 512]
-          - Exact: [1024, 1024, 1, 1024]
           - Exact: [2048, 2048, 1, 2048]
+          - Exact: [4096, 4096, 1, 4096]
+          - Exact: [8192, 8192, 1, 8192]
 
 # gfx950-specific: targeting another architecture requires editing ScheduleName and ArchitectureName below.
 LibraryLogic:
