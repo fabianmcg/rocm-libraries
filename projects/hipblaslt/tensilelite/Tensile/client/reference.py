@@ -397,9 +397,14 @@ def assertClose(
     atol: float,
     label: str = "output",
 ) -> None:
-    """Assert gpu ≈ ref within tolerance, reporting the worst offender on failure."""
+    """Assert gpu ≈ ref within tolerance, reporting the worst offender on failure.
+
+    Uses the same formula as the C++ client's Reference.hpp AlmostEqual:
+      |gpu - ref| < rtol * (|gpu| + |ref| + 1)
+    The +1 handles near-zero values; the symmetric sum mirrors the C++ check.
+    """
     diff = np.abs(gpu.astype(np.float64) - ref.astype(np.float64))
-    tol = atol + rtol * np.abs(ref.astype(np.float64))
+    tol = rtol * (np.abs(gpu.astype(np.float64)) + np.abs(ref.astype(np.float64)) + 1.0)
     bad = np.where(diff > tol)
     if len(bad[0]) == 0:
         return
