@@ -1,0 +1,768 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+#
+# bench_bf16_f16_8192.yaml: comprehensive gfx950 bf16/f16 HPA sweep at 8192^3.
+#
+# Kernel parameters taken verbatim from:
+#   Tensile/Tests/common/gemm/gfx950/subtile_bf16.yaml   (BF16 MI=[16,16,32,...], DU=64)
+#   Tensile/Tests/common/gemm/gfx950/custom_mainloop_scheduling.yaml (BF16 NN, LDSTrInst)
+#   Tensile/Tests/common/gemm/bf16_tn.yaml               (BF16 MI=[16,16,16,...], DU=32/64)
+#   Tensile/Tests/common/gemm/fp16_tn.yaml               (F16  MI=[16,16,16,...] & [32,32,8,...])
+#   Tensile/client/bench_comparison.yaml                 (BF16 NN CMS variants)
+#
+# Notes:
+#   - StreamK: [0] only — StreamK=3 requires the hipblaslt runtime, not the standalone client.
+#   - SyncsPerBenchmark: 1 to avoid -nan GFLOPS from divide-by-zero.
+#   - NumElementsToValidate: 0 — validation is done separately via bench_sweep.sh.
+
+GlobalParameters:
+  MinimumRequiredVersion: 5.0.0
+  CMakeBuildType: Release
+  PrintLevel: 1
+  ForceRedoBenchmarkProblems: True
+  ForceRedoLibraryLogic: True
+  ForceRedoLibraryClient: True
+  NumElementsToValidate: 0
+  ValidationMaxToPrint: 4
+  ValidationPrintValids: False
+  KernelTime: True
+  SyncsPerBenchmark: 1
+  Device: 0
+  UseEffLike: False
+  PrintWinnersOnly: True
+  DataInitTypeBeta: 0
+  DataInitTypeAlpha: 1
+  DataInitTypeA: 12
+  DataInitTypeB: 13
+
+BenchmarkProblems:
+  ########################################
+  # BF16 HPA TN — large symmetric tiles
+  # Source: Tensile/Tests/common/gemm/gfx950/subtile_bf16.yaml (groups 1 and 2)
+  # MI=[16,16,32,...], DU=64, UseSubtileImpl=true
+  ########################################
+  -
+    - # ProblemType: BF16 HPA TN
+      OperationType: GEMM
+      DataType: b
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: True
+      TransposeB: False
+      UseBeta: True
+      Batched: True
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          # 2x2 wave group — symmetric
+          - [16, 16, 32, 1, 1, 4, 4,  2, 2]   # MT 128x128
+          - [16, 16, 32, 1, 1, 8, 8,  2, 2]   # MT 256x256
+          - [16, 16, 32, 1, 1, 10, 10, 2, 2]  # MT 320x320
+          - [16, 16, 32, 1, 1, 9, 9,  2, 2]   # MT 288x288
+          # 2x2 wave group — asymmetric
+          - [16, 16, 32, 1, 1, 6, 4,  2, 2]   # MT 192x128
+          - [16, 16, 32, 1, 1, 8, 6,  2, 2]   # MT 256x192
+          - [16, 16, 32, 1, 1, 12, 8, 2, 2]   # MT 384x256
+          - [16, 16, 32, 1, 1, 8, 12, 2, 2]   # MT 256x384
+          - [16, 16, 32, 1, 1, 14, 6, 2, 2]   # MT 448x192
+          - [16, 16, 32, 1, 1, 6, 14, 2, 2]   # MT 192x448
+          - [16, 16, 32, 1, 1, 16, 4, 2, 2]   # MT 512x128
+          - [16, 16, 32, 1, 1, 4, 16, 2, 2]   # MT 128x512
+          - [16, 16, 32, 1, 1, 3, 4,  2, 2]   # MT 96x128  (odd M wavetile)
+          - [16, 16, 32, 1, 1, 1, 4,  2, 2]   # MT 32x128  (MIWT 1x4)
+          - [16, 16, 32, 1, 1, 4, 2,  2, 2]   # MT 128x64  (MIWT 4x2)
+          - [16, 16, 32, 1, 1, 2, 2,  2, 2]   # MT 64x64
+          # 4x1 wave group
+          - [16, 16, 32, 1, 1, 2, 2,  4, 1]   # MT 128x32
+          - [16, 16, 32, 1, 1, 2, 6,  4, 1]   # MT 128x96
+          - [16, 16, 32, 1, 1, 8, 8,  4, 1]   # MT 512x128
+          - [16, 16, 32, 1, 1, 5, 20, 4, 1]   # MT 320x320
+          # 1x4 wave group
+          - [16, 16, 32, 1, 1, 8, 8,  1, 4]   # MT 128x512
+          - [16, 16, 32, 1, 1, 20, 5, 1, 4]   # MT 320x320
+          - [16, 16, 32, 1, 1, 24, 4, 1, 4]   # MT 384x256
+          - [16, 16, 32, 1, 1, 32, 2, 1, 4]   # MT 512x128
+        - PrefetchGlobalRead: [0, 1, 2]
+        - PrefetchLocalRead: [0]
+        - DepthU: [64]
+        - ScheduleIterAlg: [3]
+        - DirectToLds: [1]
+        - StreamK: [0]
+        - StaggerU: [0]
+        - UseSubtileImpl: [true]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [8192, 8192, 1, 8192]
+
+  ########################################
+  # BF16 HPA TN — large DU variants
+  # Source: Tensile/Tests/common/gemm/gfx950/subtile_bf16.yaml (group 2: DU=128,192)
+  # Representative subset of tiles with DU=128 and DU=192
+  ########################################
+  -
+    - # ProblemType: BF16 HPA TN (large DU)
+      OperationType: GEMM
+      DataType: b
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: True
+      TransposeB: False
+      UseBeta: True
+      Batched: True
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 32, 1, 1, 4, 4,  2, 2]   # MT 128x128
+          - [16, 16, 32, 1, 1, 8, 8,  2, 2]   # MT 256x256
+          - [16, 16, 32, 1, 1, 6, 4,  2, 2]   # MT 192x128
+          - [16, 16, 32, 1, 1, 2, 6,  4, 1]   # MT 128x96 (4x1 WG)
+        - PrefetchGlobalRead: [0, 1, 2]
+        - PrefetchLocalRead: [0]
+        - DepthU: [128, 192]
+        - ScheduleIterAlg: [3]
+        - DirectToLds: [1]
+        - StreamK: [0]
+        - StaggerU: [0]
+        - UseSubtileImpl: [true]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [8192, 8192, 1, 8192]
+
+  ########################################
+  # BF16 HPA NN — CMS kernel variants
+  # Source: Tensile/Tests/common/gemm/gfx950/custom_mainloop_scheduling.yaml
+  #         Tensile/client/bench_comparison.yaml
+  # Covers UseCustomMainLoopSchedule=[0,1] and LDSTrInst variants
+  ########################################
+  -
+    - # ProblemType: BF16 HPA NN (CMS)
+      OperationType: GEMM
+      DataType: b
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: False
+      TransposeB: False
+      UseBeta: True
+      Batched: True
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 32, 1, 1, 8, 8,  2, 2]   # MT 256x256
+          - [16, 16, 32, 1, 1, 6, 8,  2, 2]   # MT 192x256
+          - [16, 16, 32, 1, 1, 8, 7,  2, 2]   # MT 256x224
+          - [16, 16, 32, 1, 1, 8, 6,  2, 2]   # MT 256x192
+          - [16, 16, 32, 1, 1, 7, 8,  2, 2]   # MT 224x256
+          - [16, 16, 32, 1, 1, 6, 10, 2, 2]   # MT 192x320
+        - PrefetchGlobalRead: [2]
+        - PrefetchLocalRead: [1]
+        - DepthU: [64]
+        - ScheduleIterAlg: [3]
+        - TransposeLDS: [1]
+        - LocalReadVectorWidth: [8]
+        - GlobalReadVectorWidthA: [8]
+        - GlobalReadVectorWidthB: [8]
+        - DirectToLds: [1]
+        - StreamK: [0]
+        - LdsPadA: [8]
+        - LdsPadB: [8]
+        - StaggerU: [0]
+        - WorkGroupMapping: [16]
+        - WorkGroupMappingXCC: [2]
+        - 1LDSBuffer: [0]
+        - NonTemporalD: [4]
+        - SourceSwap: [true]
+        - UseSgprForGRO: [0]
+        - UseCustomMainLoopSchedule: [0, 1]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [8192, 8192, 1, 8192]
+
+  ########################################
+  # BF16 HPA NN — standard tiles (from bf16_tn.yaml NN group)
+  # MI=[16,16,16,...] and [32,32,8,...] variants for non-subtile path
+  # Source: Tensile/Tests/common/gemm/bf16_tn.yaml (NN groups)
+  ########################################
+  -
+    - # ProblemType: BF16 HPA NN (standard tiles)
+      OperationType: GEMM
+      DataType: b
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: False
+      TransposeB: False
+      UseBeta: True
+      Batched: True
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 16, 1, 1,  1, 1,  4, 1]  # MT 16x16  (4x1 WG)
+          - [16, 16, 16, 1, 1,  2, 1,  4, 1]  # MT 32x16
+          - [16, 16, 16, 1, 1,  4, 1,  4, 1]  # MT 64x16
+          - [16, 16, 16, 1, 1,  1, 1,  2, 2]  # MT 16x16  (2x2 WG)
+          - [16, 16, 16, 1, 1,  3, 1,  2, 2]  # MT 48x16
+          - [16, 16, 16, 1, 1,  5, 1,  2, 2]  # MT 80x16
+          - [16, 16, 16, 1, 1,  7, 1,  2, 2]  # MT 112x16
+          - [32, 32,  8, 1, 1,  1, 1,  4, 1]  # MT 32x32  (32x32 MI)
+          - [32, 32,  8, 1, 1,  2, 1,  4, 1]  # MT 64x32
+          - [16, 16, 16, 1, 1,  3, 3,  2, 2]  # MT 48x48
+          - [16, 16, 16, 1, 1,  5, 5,  2, 2]  # MT 80x80
+          - [16, 16, 16, 1, 1,  7, 7,  2, 2]  # MT 112x112
+          - [32, 32,  8, 1, 1,  2, 2,  4, 1]  # MT 64x64
+          - [32, 32,  8, 1, 1,  1, 1,  2, 2]  # MT 32x32  (2x2 WG)
+          - [32, 32,  8, 1, 1,  2, 2,  2, 2]  # MT 64x64  (2x2 WG)
+          - [32, 32,  8, 1, 1,  4, 2,  2, 2]  # MT 128x64
+          - [32, 32,  8, 1, 1,  2, 8,  4, 1]  # MT 64x256
+          - [16, 16, 16, 1, 1,  7, 6,  2, 2]  # MT 112x96
+          - [16, 16, 16, 1, 1,  7, 4,  1, 4]  # MT 112x64 (1x4 WG)
+          - [16, 16, 16, 1, 1, 15, 4,  1, 4]  # MT 240x64
+          - [16, 16, 16, 1, 1,  9, 4,  1, 4]  # MT 144x64
+        - PrefetchGlobalRead: [2]
+        - PrefetchLocalRead: [1]
+        - ClusterLocalRead: [1]
+        - DepthU: [32, 64]
+        - LocalReadVectorWidth: [8]
+        - ScheduleIterAlg: [3]
+        - TransposeLDS: [0, 1]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - GlobalSplitU: [1]
+        - GlobalSplitUAlgorithm: ["MultipleBuffer"]
+        - SourceSwap: [false, true]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [8192, 8192, 1, 8192]
+
+  ########################################
+  # BF16 HPA NT — standard tiles
+  # Source: Tensile/Tests/common/gemm/bf16_tn.yaml (NT / TT groups, dot2_gfx950.yaml TT)
+  ########################################
+  -
+    - # ProblemType: BF16 HPA NT
+      OperationType: GEMM
+      DataType: b
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: False
+      TransposeB: True
+      UseBeta: True
+      Batched: True
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 16, 1, 1,  1, 1,  4, 1]
+          - [16, 16, 16, 1, 1,  2, 1,  2, 2]
+          - [16, 16, 16, 1, 1,  5, 1,  2, 2]
+          - [16, 16, 16, 1, 1,  7, 1,  2, 2]
+          - [32, 32,  8, 1, 1,  1, 1,  4, 1]
+          - [32, 32,  8, 1, 1,  2, 1,  4, 1]
+          - [16, 16, 16, 1, 1,  3, 3,  4, 1]
+          - [16, 16, 16, 1, 1,  4, 3,  4, 1]
+          - [16, 16, 16, 1, 1,  1, 5,  4, 1]
+          - [16, 16, 16, 1, 1,  2, 5,  4, 1]
+          - [16, 16, 16, 1, 1,  3, 5,  2, 2]
+          - [16, 16, 16, 1, 1,  5, 5,  2, 2]
+          - [16, 16, 16, 1, 1,  7, 5,  2, 2]
+          - [32, 32,  8, 1, 1,  1, 5,  4, 1]
+          - [32, 32,  8, 1, 1,  2, 5,  4, 1]
+          - [16, 16, 16, 1, 1,  1, 7,  4, 1]
+          - [16, 16, 16, 1, 1,  2, 7,  4, 1]
+          - [16, 16, 16, 1, 1,  3, 7,  2, 2]
+          - [16, 16, 16, 1, 1,  7, 7,  2, 2]
+          - [32, 32,  8, 1, 1,  2, 7,  4, 1]
+          - [16, 16, 16, 1, 1,  1, 9,  4, 1]
+          - [16, 16, 16, 1, 1,  4, 9,  4, 1]
+          - [16, 16, 16, 1, 1,  1, 11, 4, 1]
+          - [16, 16, 16, 1, 1,  4, 11, 4, 1]
+          - [16, 16, 16, 1, 1,  2, 3,  1, 4]
+          - [16, 16, 16, 1, 1,  5, 3,  1, 4]
+          - [16, 16, 16, 1, 1, 11, 3,  1, 4]
+          - [32, 32,  8, 1, 1,  3, 3,  2, 2]
+          - [16, 16, 16, 1, 1,  1, 13, 4, 1]
+          - [16, 16, 16, 1, 1,  3, 14, 4, 1]
+          - [16, 16, 16, 1, 1,  1, 15, 4, 1]
+          - [16, 16, 16, 1, 1,  4, 15, 4, 1]
+        - PrefetchGlobalRead: [2]
+        - PrefetchLocalRead: [1]
+        - ClusterLocalRead: [1]
+        - DepthU: [32, 64]
+        - LocalReadVectorWidth: [8]
+        - ScheduleIterAlg: [3]
+        - TransposeLDS: [0, 1]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - GlobalSplitU: [1]
+        - GlobalSplitUAlgorithm: ["MultipleBuffer"]
+        - SourceSwap: [false, true]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [8192, 8192, 1, 8192]
+
+  ########################################
+  # BF16 HPA TT — standard tiles
+  # Source: Tensile/Tests/common/gemm/gfx950/dot2_gfx950.yaml (TT group)
+  # Uses [16,16,16,...] and [32,32,8,...] MI for TT transpose
+  ########################################
+  -
+    - # ProblemType: BF16 HPA TT
+      OperationType: GEMM
+      DataType: b
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: True
+      TransposeB: True
+      UseBeta: True
+      Batched: True
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 16, 1, 1,  1, 1,  4, 1]
+          - [16, 16, 16, 1, 1,  2, 1,  4, 1]
+          - [16, 16, 16, 1, 1,  3, 1,  2, 2]
+          - [16, 16, 16, 1, 1,  5, 1,  2, 2]
+          - [16, 16, 16, 1, 1,  7, 1,  2, 2]
+          - [32, 32,  8, 1, 1,  1, 1,  4, 1]
+          - [32, 32,  8, 1, 1,  2, 1,  4, 1]
+          - [16, 16, 16, 1, 1,  1, 3,  4, 1]
+          - [16, 16, 16, 1, 1,  2, 3,  4, 1]
+          - [16, 16, 16, 1, 1,  3, 3,  2, 2]
+          - [16, 16, 16, 1, 1,  5, 3,  2, 2]
+          - [32, 32,  8, 1, 1,  1, 3,  4, 1]
+          - [16, 16, 16, 1, 1,  1, 5,  2, 2]
+          - [16, 16, 16, 1, 1,  5, 5,  2, 2]
+          - [32, 32,  8, 1, 1,  2, 5,  4, 1]
+          - [16, 16, 16, 1, 1,  1, 7,  4, 1]
+          - [16, 16, 16, 1, 1,  3, 7,  2, 2]
+          - [16, 16, 16, 1, 1,  7, 7,  2, 2]
+          - [32, 32,  8, 1, 1,  2, 7,  4, 1]
+          - [16, 16, 16, 1, 1,  1, 9,  4, 1]
+          - [16, 16, 16, 1, 1,  4, 9,  4, 1]
+          - [16, 16, 16, 1, 1,  1, 11, 4, 1]
+          - [16, 16, 16, 1, 1,  1, 13, 4, 1]
+          - [16, 16, 16, 1, 1,  4, 15, 4, 1]
+          - [32, 32,  8, 1, 1,  3, 4,  2, 2]
+          - [16, 16, 16, 1, 1,  1, 4,  1, 4]
+          - [16, 16, 16, 1, 1,  7, 4,  1, 4]
+          - [16, 16, 16, 1, 1, 11, 4,  1, 4]
+          - [16, 16, 16, 1, 1,  3, 2,  1, 4]
+          - [16, 16, 16, 1, 1,  9, 2,  1, 4]
+          - [32, 32,  8, 1, 1,  5, 2,  1, 4]
+          - [32, 32,  8, 1, 1,  7, 2,  1, 4]
+        - PrefetchGlobalRead: [2]
+        - PrefetchLocalRead: [1]
+        - ClusterLocalRead: [1]
+        - DepthU: [32, 64]
+        - LocalReadVectorWidth: [8]
+        - ScheduleIterAlg: [3]
+        - TransposeLDS: [0, 1]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - GlobalSplitU: [1]
+        - GlobalSplitUAlgorithm: ["MultipleBuffer"]
+        - SourceSwap: [false, true]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [8192, 8192, 1, 8192]
+
+  ########################################
+  # F16 HPA TN — subtile path
+  # Source: Tensile/Tests/common/gemm/fp16_tn.yaml (TN group)
+  # MI=[16,16,16,...] and [32,32,8,...], DU=32/64
+  ########################################
+  -
+    - # ProblemType: F16 HPA TN
+      OperationType: GEMM
+      DataType: h
+      DestDataType: h
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: True
+      TransposeB: False
+      UseBeta: True
+      Batched: True
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 16, 1, 1,  1, 1,  4, 1]
+          - [16, 16, 16, 1, 1,  2, 1,  4, 1]
+          - [16, 16, 16, 1, 1,  3, 1,  4, 1]
+          - [16, 16, 16, 1, 1,  4, 1,  4, 1]
+          - [16, 16, 16, 1, 1,  1, 1,  2, 2]
+          - [16, 16, 16, 1, 1,  2, 1,  2, 2]
+          - [16, 16, 16, 1, 1,  3, 1,  2, 2]
+          - [32, 32,  8, 1, 1,  1, 1,  4, 1]
+          - [16, 16, 16, 1, 1,  5, 1,  2, 2]
+          - [16, 16, 16, 1, 1,  7, 1,  2, 2]
+          - [32, 32,  8, 1, 1,  2, 1,  4, 1]
+          - [16, 16, 16, 1, 1,  1, 3,  4, 1]
+          - [16, 16, 16, 1, 1,  3, 3,  4, 1]
+          - [16, 16, 16, 1, 1,  1, 1,  1, 4]
+          - [16, 16, 16, 1, 1,  5, 1,  1, 4]
+          - [16, 16, 16, 1, 1,  9, 1,  1, 4]
+          - [16, 16, 16, 1, 1, 11, 1,  1, 4]
+          - [16, 16, 16, 1, 1, 13, 1,  1, 4]
+          - [16, 16, 16, 1, 1, 15, 1,  1, 4]
+          - [32, 32,  8, 1, 1,  1, 1,  2, 2]
+          - [32, 32,  8, 1, 1,  2, 1,  2, 2]
+          - [32, 32,  8, 1, 1,  3, 1,  2, 2]
+          - [16, 16, 16, 1, 1,  1, 5,  4, 1]
+          - [16, 16, 16, 1, 1,  4, 5,  4, 1]
+          - [16, 16, 16, 1, 1,  3, 5,  2, 2]
+          - [16, 16, 16, 1, 1,  7, 5,  2, 2]
+          - [32, 32,  8, 1, 1,  2, 5,  4, 1]
+          - [16, 16, 16, 1, 1,  2, 7,  4, 1]
+          - [16, 16, 16, 1, 1,  4, 7,  4, 1]
+          - [16, 16, 16, 1, 1,  3, 7,  2, 2]
+          - [16, 16, 16, 1, 1,  7, 7,  2, 2]
+          - [32, 32,  8, 1, 1,  2, 7,  4, 1]
+          - [16, 16, 16, 1, 1,  1, 9,  4, 1]
+          - [16, 16, 16, 1, 1,  2, 9,  4, 1]
+          - [16, 16, 16, 1, 1,  4, 9,  4, 1]
+          - [16, 16, 16, 1, 1,  1, 11, 4, 1]
+          - [16, 16, 16, 1, 1,  3, 11, 4, 1]
+          - [16, 16, 16, 1, 1,  1, 13, 4, 1]
+          - [16, 16, 16, 1, 1,  2, 13, 4, 1]
+          - [16, 16, 16, 1, 1,  1, 15, 4, 1]
+          - [16, 16, 16, 1, 1,  4, 15, 4, 1]
+          - [32, 32,  8, 1, 1,  2, 8,  4, 1]
+          - [16, 16, 16, 1, 1,  3, 2,  1, 4]
+          - [16, 16, 16, 1, 1,  7, 2,  1, 4]
+          - [16, 16, 16, 1, 1, 11, 2,  1, 4]
+          - [16, 16, 16, 1, 1, 15, 2,  1, 4]
+          - [32, 32,  8, 1, 1,  3, 2,  1, 4]
+          - [32, 32,  8, 1, 1,  7, 2,  1, 4]
+          - [16, 16, 16, 1, 1,  1, 4,  1, 4]
+          - [16, 16, 16, 1, 1,  3, 4,  1, 4]
+          - [16, 16, 16, 1, 1,  5, 4,  1, 4]
+          - [16, 16, 16, 1, 1,  9, 4,  1, 4]
+          - [16, 16, 16, 1, 1, 13, 4,  1, 4]
+          - [32, 32,  8, 1, 1,  2, 4,  2, 2]
+          - [32, 32,  8, 1, 1,  3, 4,  2, 2]
+          - [32, 32,  8, 1, 1,  5, 2,  1, 4]
+          - [16, 16, 16, 1, 1,  5, 3,  1, 4]
+          - [16, 16, 16, 1, 1,  7, 3,  1, 4]
+          - [16, 16, 16, 1, 1, 11, 3,  1, 4]
+          - [16, 16, 16, 1, 1, 15, 3,  1, 4]
+          - [32, 32,  8, 1, 1,  2, 3,  2, 2]
+          - [16, 16, 16, 1, 1,  6, 5,  2, 2]
+          - [16, 16, 16, 1, 1,  7, 6,  2, 2]
+          - [32, 32,  8, 1, 1,  2, 6,  4, 1]
+          - [32, 32,  8, 1, 1,  1, 7,  4, 1]
+          - [16, 16, 16, 1, 1,  3, 14, 4, 1]
+          - [16, 16, 16, 1, 1,  2, 15, 4, 1]
+          - [16, 16, 16, 1, 1,  3, 15, 4, 1]
+          - [32, 32,  8, 1, 1,  1, 2,  1, 4]
+          - [32, 32,  8, 1, 1,  2, 2,  2, 2]
+          - [32, 32,  8, 1, 1,  4, 2,  2, 2]
+          - [32, 32,  8, 1, 1,  2, 2,  1, 4]
+        - PrefetchGlobalRead: [2]
+        - PrefetchLocalRead: [1]
+        - ClusterLocalRead: [1]
+        - DepthU: [32, 64]
+        - LocalReadVectorWidth: [8]
+        - ScheduleIterAlg: [3]
+        - TransposeLDS: [0, 1]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - 1LDSBuffer: [-1]
+        - GlobalSplitU: [1]
+        - GlobalSplitUAlgorithm: ["MultipleBuffer"]
+        - SourceSwap: [false, true]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [8192, 8192, 1, 8192]
+
+  ########################################
+  # F16 HPA NN — standard tiles
+  # Source: Tensile/Tests/common/gemm/fp16_tn.yaml (NN groups)
+  # MI=[16,16,16,...] and [32,32,8,...], DU=32/64
+  ########################################
+  -
+    - # ProblemType: F16 HPA NN
+      OperationType: GEMM
+      DataType: h
+      DestDataType: h
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: False
+      TransposeB: False
+      UseBeta: True
+      Batched: True
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 16, 1, 1,  1, 1,  4, 1]
+          - [16, 16, 16, 1, 1,  2, 1,  4, 1]
+          - [16, 16, 16, 1, 1,  4, 1,  4, 1]
+          - [16, 16, 16, 1, 1,  1, 1,  2, 2]
+          - [16, 16, 16, 1, 1,  3, 1,  2, 2]
+          - [16, 16, 16, 1, 1,  5, 1,  2, 2]
+          - [16, 16, 16, 1, 1,  6, 1,  2, 2]
+          - [16, 16, 16, 1, 1,  7, 1,  2, 2]
+          - [32, 32,  8, 1, 1,  1, 1,  4, 1]
+          - [32, 32,  8, 1, 1,  2, 1,  4, 1]
+          - [16, 16, 16, 1, 1,  2, 1,  2, 2]
+          - [16, 16, 16, 1, 1,  1, 3,  4, 1]
+          - [16, 16, 16, 1, 1,  2, 3,  4, 1]
+          - [16, 16, 16, 1, 1,  3, 3,  4, 1]
+          - [16, 16, 16, 1, 1,  4, 3,  4, 1]
+          - [16, 16, 16, 1, 1,  3, 3,  2, 2]
+          - [16, 16, 16, 1, 1,  5, 3,  2, 2]
+          - [16, 16, 16, 1, 1,  7, 3,  2, 2]
+          - [32, 32,  8, 1, 1,  1, 3,  4, 1]
+          - [32, 32,  8, 1, 1,  2, 3,  4, 1]
+          - [16, 16, 16, 1, 1,  1, 5,  4, 1]
+          - [16, 16, 16, 1, 1,  4, 5,  4, 1]
+          - [16, 16, 16, 1, 1,  1, 5,  2, 2]
+          - [16, 16, 16, 1, 1,  5, 5,  2, 2]
+          - [16, 16, 16, 1, 1,  7, 5,  2, 2]
+          - [32, 32,  8, 1, 1,  1, 5,  4, 1]
+          - [16, 16, 16, 1, 1,  2, 7,  4, 1]
+          - [16, 16, 16, 1, 1,  4, 7,  4, 1]
+          - [16, 16, 16, 1, 1,  5, 7,  2, 2]
+          - [16, 16, 16, 1, 1,  7, 7,  2, 2]
+          - [32, 32,  8, 1, 1,  2, 7,  4, 1]
+          - [16, 16, 16, 1, 1,  1, 9,  4, 1]
+          - [16, 16, 16, 1, 1,  2, 9,  4, 1]
+          - [16, 16, 16, 1, 1,  4, 9,  4, 1]
+          - [16, 16, 16, 1, 1,  1, 11, 4, 1]
+          - [16, 16, 16, 1, 1,  4, 11, 4, 1]
+          - [16, 16, 16, 1, 1,  1, 13, 4, 1]
+          - [16, 16, 16, 1, 1,  4, 13, 4, 1]
+          - [16, 16, 16, 1, 1,  1, 15, 4, 1]
+          - [16, 16, 16, 1, 1,  4, 15, 4, 1]
+          - [16, 16, 16, 1, 1,  3, 14, 4, 1]
+          - [32, 32,  8, 1, 1,  2, 8,  4, 1]
+          - [16, 16, 16, 1, 1,  1, 2,  1, 4]
+          - [16, 16, 16, 1, 1,  5, 2,  1, 4]
+          - [16, 16, 16, 1, 1,  9, 2,  1, 4]
+          - [16, 16, 16, 1, 1, 11, 2,  1, 4]
+          - [16, 16, 16, 1, 1, 13, 2,  1, 4]
+          - [16, 16, 16, 1, 1, 15, 2,  1, 4]
+          - [16, 16, 16, 1, 1,  1, 4,  1, 4]
+          - [16, 16, 16, 1, 1,  7, 4,  1, 4]
+          - [16, 16, 16, 1, 1, 11, 4,  1, 4]
+          - [16, 16, 16, 1, 1, 15, 4,  1, 4]
+          - [32, 32,  8, 1, 1,  1, 2,  1, 4]
+          - [32, 32,  8, 1, 1,  2, 2,  1, 4]
+          - [32, 32,  8, 1, 1,  3, 2,  1, 4]
+          - [32, 32,  8, 1, 1,  5, 2,  1, 4]
+          - [32, 32,  8, 1, 1,  7, 2,  1, 4]
+          - [32, 32,  8, 1, 1,  2, 2,  2, 2]
+          - [32, 32,  8, 1, 1,  4, 2,  2, 2]
+          - [32, 32,  8, 1, 1,  2, 4,  2, 2]
+          - [32, 32,  8, 1, 1,  3, 4,  2, 2]
+          - [16, 16, 16, 1, 1,  6, 3,  2, 2]
+          - [16, 16, 16, 1, 1,  6, 5,  2, 2]
+          - [16, 16, 16, 1, 1,  7, 6,  2, 2]
+          - [32, 32,  8, 1, 1,  2, 6,  4, 1]
+        - PrefetchGlobalRead: [2]
+        - PrefetchLocalRead: [1]
+        - ClusterLocalRead: [1]
+        - DepthU: [32, 64]
+        - LocalReadVectorWidth: [8]
+        - ScheduleIterAlg: [3]
+        - TransposeLDS: [1]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - 1LDSBuffer: [-1]
+        - GlobalSplitU: [1]
+        - GlobalSplitUAlgorithm: ["MultipleBuffer", "MultipleBufferSingleKernel"]
+        - SourceSwap: [true]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [8192, 8192, 1, 8192]
+
+  ########################################
+  # F16 HPA NT — standard tiles
+  # Source: Tensile/Tests/common/ductile/gfx950/f16_nt_multi_size.yaml
+  # MI=[16,16,32,...] for NT transpose on gfx950
+  ########################################
+  -
+    - # ProblemType: F16 HPA NT
+      OperationType: GEMM
+      DataType: h
+      DestDataType: h
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: False
+      TransposeB: True
+      UseBeta: True
+      Batched: True
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          # From ductile/gfx950/f16_nt_multi_size.yaml Groups
+          - [16, 16, 32, 1, 1, 1, 1, 1, 1]   # MT 16x16
+          - [16, 16, 32, 1, 1, 2, 1, 1, 1]   # MT 32x16
+          - [16, 16, 32, 1, 1, 1, 2, 1, 1]   # MT 16x32
+          - [16, 16, 32, 1, 1, 2, 2, 1, 1]   # MT 32x32
+          - [16, 16, 32, 1, 1, 4, 1, 1, 1]   # MT 64x16
+          - [16, 16, 32, 1, 1, 3, 2, 1, 1]   # MT 48x32
+          - [16, 16, 32, 1, 1, 4, 2, 1, 1]   # MT 64x32
+          - [32, 32, 16, 1, 1, 1, 1, 1, 1]   # MT 32x32
+          - [32, 32, 16, 1, 1, 2, 1, 1, 1]   # MT 64x32
+          # From fp16_tn.yaml for TN (same MI tuples apply to NT in gfx950)
+          - [16, 16, 16, 1, 1,  1, 1,  4, 1]
+          - [16, 16, 16, 1, 1,  2, 1,  2, 2]
+          - [16, 16, 16, 1, 1,  1, 1,  1, 4]
+          - [16, 16, 16, 1, 1,  5, 1,  2, 2]
+          - [16, 16, 16, 1, 1,  9, 1,  1, 4]
+          - [16, 16, 16, 1, 1,  1, 5,  4, 1]
+          - [16, 16, 16, 1, 1,  3, 5,  2, 2]
+          - [16, 16, 16, 1, 1,  5, 5,  2, 2]
+          - [16, 16, 16, 1, 1,  1, 7,  4, 1]
+          - [16, 16, 16, 1, 1,  3, 7,  2, 2]
+          - [16, 16, 16, 1, 1,  7, 7,  2, 2]
+          - [32, 32,  8, 1, 1,  1, 1,  4, 1]
+          - [32, 32,  8, 1, 1,  2, 1,  4, 1]
+          - [32, 32,  8, 1, 1,  1, 3,  2, 2]
+          - [32, 32,  8, 1, 1,  3, 3,  2, 2]
+          - [16, 16, 16, 1, 1,  1, 9,  4, 1]
+          - [16, 16, 16, 1, 1,  4, 9,  4, 1]
+          - [16, 16, 16, 1, 1,  1, 11, 4, 1]
+          - [16, 16, 16, 1, 1,  1, 13, 4, 1]
+          - [16, 16, 16, 1, 1,  1, 15, 4, 1]
+          - [16, 16, 16, 1, 1,  4, 15, 4, 1]
+          - [16, 16, 16, 1, 1,  5, 3,  1, 4]
+          - [16, 16, 16, 1, 1,  9, 3,  1, 4]
+          - [16, 16, 16, 1, 1,  1, 4,  1, 4]
+          - [16, 16, 16, 1, 1,  7, 4,  1, 4]
+          - [32, 32,  8, 1, 1,  2, 8,  4, 1]
+        - PrefetchGlobalRead: [2]
+        - PrefetchLocalRead: [1]
+        - ClusterLocalRead: [1]
+        - DepthU: [32, 64]
+        - LocalReadVectorWidth: [8]
+        - ScheduleIterAlg: [3]
+        - TransposeLDS: [0, 1]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - 1LDSBuffer: [-1]
+        - GlobalSplitU: [1]
+        - GlobalSplitUAlgorithm: ["MultipleBuffer"]
+        - SourceSwap: [false, true]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [8192, 8192, 1, 8192]
+
+  ########################################
+  # F16 HPA TT — standard tiles
+  # Source: Tensile/Tests/common/gemm/fp16_tn.yaml (TT group)
+  ########################################
+  -
+    - # ProblemType: F16 HPA TT
+      OperationType: GEMM
+      DataType: h
+      DestDataType: h
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: True
+      TransposeB: True
+      UseBeta: True
+      Batched: True
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 16, 1, 1,  1, 1,  4, 1]
+          - [16, 16, 16, 1, 1,  2, 1,  4, 1]
+          - [16, 16, 16, 1, 1,  3, 1,  4, 1]
+          - [16, 16, 16, 1, 1,  4, 1,  4, 1]
+          - [16, 16, 16, 1, 1,  1, 1,  2, 2]
+          - [16, 16, 16, 1, 1,  3, 1,  2, 2]
+          - [16, 16, 16, 1, 1,  5, 1,  2, 2]
+          - [16, 16, 16, 1, 1,  7, 1,  2, 2]
+          - [32, 32,  8, 1, 1,  1, 1,  4, 1]
+          - [32, 32,  8, 1, 1,  2, 1,  4, 1]
+          - [16, 16, 16, 1, 1,  1, 3,  4, 1]
+          - [16, 16, 16, 1, 1,  2, 3,  4, 1]
+          - [16, 16, 16, 1, 1,  3, 3,  2, 2]
+          - [16, 16, 16, 1, 1,  5, 3,  2, 2]
+          - [32, 32,  8, 1, 1,  1, 3,  4, 1]
+          - [32, 32,  8, 1, 1,  2, 3,  4, 1]
+          - [16, 16, 16, 1, 1,  1, 5,  4, 1]
+          - [16, 16, 16, 1, 1,  3, 5,  4, 1]
+          - [16, 16, 16, 1, 1,  5, 5,  2, 2]
+          - [16, 16, 16, 1, 1,  7, 5,  2, 2]
+          - [32, 32,  8, 1, 1,  2, 5,  4, 1]
+          - [16, 16, 16, 1, 1,  1, 7,  4, 1]
+          - [16, 16, 16, 1, 1,  3, 7,  4, 1]
+          - [16, 16, 16, 1, 1,  7, 7,  2, 2]
+          - [32, 32,  8, 1, 1,  2, 7,  4, 1]
+          - [16, 16, 16, 1, 1,  1, 9,  4, 1]
+          - [16, 16, 16, 1, 1,  4, 9,  4, 1]
+          - [16, 16, 16, 1, 1,  1, 11, 4, 1]
+          - [16, 16, 16, 1, 1,  4, 11, 4, 1]
+          - [16, 16, 16, 1, 1,  1, 13, 4, 1]
+          - [16, 16, 16, 1, 1,  4, 13, 4, 1]
+          - [16, 16, 16, 1, 1,  1, 15, 4, 1]
+          - [32, 32,  8, 1, 1,  2, 8,  4, 1]
+          - [16, 16, 16, 1, 1,  3, 2,  1, 4]
+          - [16, 16, 16, 1, 1,  7, 2,  1, 4]
+          - [16, 16, 16, 1, 1, 11, 2,  1, 4]
+          - [16, 16, 16, 1, 1, 15, 2,  1, 4]
+          - [32, 32,  8, 1, 1,  5, 2,  1, 4]
+          - [32, 32,  8, 1, 1,  7, 2,  1, 4]
+          - [16, 16, 16, 1, 1,  1, 4,  1, 4]
+          - [16, 16, 16, 1, 1,  5, 4,  1, 4]
+          - [16, 16, 16, 1, 1, 11, 4,  1, 4]
+          - [32, 32,  8, 1, 1,  2, 4,  2, 2]
+          - [32, 32,  8, 1, 1,  3, 4,  2, 2]
+        - PrefetchGlobalRead: [2]
+        - PrefetchLocalRead: [1]
+        - ClusterLocalRead: [1]
+        - DepthU: [32, 64]
+        - LocalReadVectorWidth: [8]
+        - ScheduleIterAlg: [3]
+        - TransposeLDS: [0, 1]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - 1LDSBuffer: [-1]
+        - GlobalSplitU: [1]
+        - GlobalSplitUAlgorithm: ["MultipleBuffer"]
+        - SourceSwap: [false, true]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [8192, 8192, 1, 8192]
+
+LibraryLogic:
+  ScheduleName: "gfx950"
+  ArchitectureName: "gfx950"
+  DeviceNames: ["Device 75a0"]
+
+LibraryClient:
