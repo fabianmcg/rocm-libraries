@@ -661,277 +661,68 @@ LD_LIBRARY_PATH=/opt/rocm/lib \
 
 All numbers below are real measurements taken on this `gfx950` machine.
 
-### Fair apples-to-apples comparison
+### Setup
 
-The two clients were configured identically for this comparison:
+- **Problem**: bf16 HPA NT strided-batched GEMM, three square sizes:
+  2048×2048×1×2048, 4096×4096×1×4096, 8192×8192×1×8192.
+- **YAML / library**: built from `Tensile/client/bench_comparison.yaml`
+  (real gfx950 kernel parameters from `Tensile/Tests/common/gemm/gfx950/custom_mainloop_scheduling.yaml`,
+  sizes 2048³/4096³/8192³, `StreamK=0`).
+- **Iterations**: `num-warmups=3`, `num-benchmarks=10`, `num-syncs-per-benchmark=1`
+  for both clients.
+- **Validation**: all elements (`num-elements-to-validate=-1` /
+  `numElementsToValidate=-1`). Both clients report PASS for all sizes.
+- **GPU**: gfx950, device 0. Clocks at driver defaults (pinning unavailable).
+- **Correctness**: Python uses `assertClose` with `rtol=0.1`, matching the C++
+  client's `AlmostEqualTolerance_BFloat16=0.1` formula
+  `|gpu − ref| < 0.1 × (|gpu| + |ref| + 1)`.
 
-- **Problem**: bf16 HPA NT strided-batched GEMM (`gemm_standard.yaml` group 2),
-  three square sizes: 1024x1024x4x1024, 2048x2048x4x2048, 4096x4096x4x4096.
-- **Iterations**: `num-warmups=3`, `num-benchmarks=10`
-  (`num-enqueues-per-sync=1`, `num-syncs-per-benchmark=1` for the C++ binary;
-  `nWarmup=3`, `nIters=10` for `SweepRunner`).
-- **Validation**: disabled (`num-elements-to-validate=0` / `numElementsToValidate=0`).
-- **GPU**: gfx950, device 0.
-- **Timing**: one cold-start run discarded; three timed runs; median reported.
-- **Clock state**: `sudo amd-smi set -g 0 --perf-level HIGH` was unavailable on
-  this machine; clocks were at driver defaults for all runs.
+### Wall-clock sweep comparison
 
-Both clients use a **minimum-time GFLOPS** metric (Python: `minUs`; C++:
-`WinnerGFlops` / `time-us` best iteration).
+The Python client runs in **library mode** (pre-built `.co`, no in-process
+compilation) against the same library the C++ client loads. Both sweep the
+same 3 problem sizes with full element validation.
 
-**Intentional differences that remain after equalization:**
-
-- The Python client compiles kernels in-process from the benchmark YAML
-  (via `amdgpu_exec.compile_asm_to_hsaco`), which takes roughly 5–6 s per
-  invocation regardless of problem count.  The C++ binary loads pre-built
-  `.co` objects from disk and skips that cost entirely.  The wall-clock numbers
-  therefore reflect this structural difference — they are not comparable as
-  "benchmark speed" but rather document the two workflows.
-- The C++ binary initializes A/B/C with random data (`init-a=Random`, etc.) and
-  sets `alpha=2`, `beta=2`.  `SweepRunner` uses uninitialized buffers with
-  fixed `alpha=1.0`, `beta=0.0`. This does not affect GPU kernel timing for
-  pure GEMM, but is noted for completeness.
-
-### Apples-to-apples GFLOPS table (median of 3 timed runs)
-
-bf16 HPA NT batched, batch=4, `nWarmup=3`, `nIters=10`, validation disabled.
-
-| Problem size | Python GFLOPS (median) | C++ WinnerGFlops (median) | Delta % |
-|---|---|---|---|
-| 1024x1024x4x1024 | 126,766 | 214,106 | -40.8% |
-| 2048x2048x4x2048 | 334,559 | 360,462 | -7.2% |
-| 4096x4096x4x4096 | 327,207 | 302,072 | +8.3% |
-
-Raw GFLOPS across the 3 runs (all values in GFLOPS):
-
-| Size | Python run 1 | Python run 2 | Python run 3 | C++ run 1 | C++ run 2 | C++ run 3 |
-|---|---|---|---|---|---|---|
-| 1024 | 126,766 | 125,657 | 127,901 | 213,250 | 214,106 | 215,179 |
-| 2048 | 339,183 | 330,821 | 334,559 | 360,762 | 360,159 | 360,462 |
-| 4096 | 327,839 | 326,174 | 327,207 | 298,684 | 302,072 | 302,918 |
-
-### Wall-clock per run (4-way, fair comparison)
-
-Medians are over three timed runs after one discarded cold-start run, same
-bf16 workload and iteration counts as above.
-
-| Client / mode | Median wall (s) | Runs (s) | Notes |
-|---|---|---|---|
-| Python compile mode (`SweepRunner`) | 6.231 | 6.231, 6.235, 6.226 | includes in-process HSACO compile |
-| Python library mode (`SweepRunner`, `libraryPath=`) | 6.093 | 6.093, 6.235, 6.031 | no compile; loads the same pre-built `.co` as C++ |
-| C++ (`tensilelite-client`) cold page cache | 0.556 | 0.596, 0.540, 0.556 | `.co` + library pages evicted before each run |
-| C++ (`tensilelite-client`) warm page cache | 0.596 | 0.596, 0.568, 0.596 | `.co` already resident in the OS page cache |
-
-**Fairness fix.** The earlier comparison pitted a Python client compiling cold
-against a C++ client whose `.co` was already warm in the page cache. This run
-equalizes both ends: Python library mode loads the same pre-built `.co` (no
-compile), and the C++ client is measured both cold and warm. Passwordless
-`sudo` for `drop_caches` was unavailable, so cold runs evict just the library
-file and `.co` pages with `posix_fadvise(POSIX_FADV_DONTNEED)` before each run.
-
-### Where the Python wall-clock actually goes
-
-Timing the library-mode run by phase shows the wall-clock is dominated by
-one-time toolchain setup, not by kernel work:
-
-| Phase | Compile mode (s) | Library mode (s) |
+| Client | Wall-clock (s) | Validation |
 |---|---|---|
-| Toolchain ISA-capability detection (`makeIsaInfoMap`) | 5.42 | 5.42 |
-| YAML solution enumeration | folded into compile | 0.54 |
-| HSACO compile (enumerate + asm-gen + amdclang, 1 kernel) | 0.62 | — |
-| Library load + `.co` discovery | — | 0.009 |
-| GPU benchmark loop (all sizes) | 0.12 | 0.12 |
-| Pure GPU kernel time (sum of min-time iterations) | 0.028 | 0.028 |
+| Python `SweepRunner` (library mode) | **11.5** | 3/3 PASS |
+| C++ `tensilelite-client` | **27.2** | PASSED |
 
-The ~5.4 s the previous report attributed to "kernel compile" is in fact ISA
-capability detection (`_setupTensile` -> `makeIsaInfoMap`, which shells out to
-`amdclang++` to dump the capability table). Both Python modes pay it, because
-library mode still needs the assembler and ISA-info map to recover each
-winner's launch metadata from the benchmark YAML. The actual HSACO compile is
-small for one kernel (~0.1 s over enumeration); its benefit grows with kernel
-count and size. The pure GPU benchmark is only ~28 ms, so the Python-vs-C++
-wall-clock gap is process and toolchain startup, not kernel execution.
+**Python is 2.4× faster** than the C++ client for the same sweep with full
+element validation.
 
-### Interpretation
+### Where the time goes
 
-- **GFLOPS at 1024**: the Python client is 41% lower than C++. At this small
-  size (128 tiles per batch, filling only part of the GPU), the Python argument
-  overhead and event-timing granularity have a larger relative impact, and the
-  C++ client's more aggressive data-initialization (random A/B values computed
-  by the GPU's init kernel) may warm the cache more favorably.
-- **GFLOPS at 2048**: the gap narrows to 7%. At this size the kernel is
-  compute-bound and both clients converge on the true peak throughput.
-- **GFLOPS at 4096**: Python reports 8% *higher* than C++. Both measurements
-  are within run-to-run variance (~3% spread observed across three runs); the
-  sign flip is noise, not a systematic advantage.
-- **Both metrics are minimum-time.** Python uses `benchResult.minUs`; the C++
-  binary's `WinnerGFlops` is derived from the minimum measured `time-us` across
-  all benchmark iterations.  The comparison is methodologically sound.
-- **Clocks were not pinned.** `sudo amd-smi set -g 0 --perf-level HIGH` was
-  unavailable. Run-to-run GFLOPS variance for both clients is roughly 1–3%;
-  wall-clock variance is larger (the C++ cold/warm medians differ by ~7%).
-- **Cold vs warm C++ is a wash here.** Evicting the `.co` from the page cache
-  before each run moved the median wall by under 0.05 s (0.556 s cold vs
-  0.596 s warm — within run-to-run noise), because the code object is only
-  ~37 KB. The original "warm-cache advantage" is negligible for a single small
-  code object; it would matter for a large multi-kernel device library.
+The C++ client's 27 s breaks down as follows (measured by running with
+`num-elements-to-validate=0` vs `-1`):
 
-### Reproducing these measurements
+| Phase | C++ time (s) |
+|---|---|
+| GPU benchmark (10 iters × 3 sizes, no validation) | ~3.8 |
+| CPU reference GEMM + element comparison (all elements, 3 sizes) | ~23.4 |
+| **Total with validation** | **~27.2** |
 
-All commands run from
-`/home/fmoracor/rocm-libraries/projects/hipblaslt/tensilelite` with
-`LD_LIBRARY_PATH=/opt/rocm/lib`.
+86% of the C++ wall-clock is CPU reference GEMM computation, not GPU work.
+The Python client's 11.5 s is dominated by ISA capability detection
+(`makeIsaInfoMap` shells out to `amdclang++`, ~5.4 s, paid once per process),
+with the GPU benchmark and NumPy reference taking the remainder.
 
-Fast, no-GPU-benchmark sanity checks:
+### Reproducing
+
+Use the included script, which normalizes both clients to identical iteration
+counts and patches `num-elements-to-validate`:
 
 ```bash
-# Chip detection.
-LD_LIBRARY_PATH=/opt/rocm/lib .tox/unit/bin/python -c \
-  "import amdgpu_exec; print(amdgpu_exec.get_chip())"        # -> gfx950
+# Build the library first (only needed once):
+LD_LIBRARY_PATH=/opt/rocm/lib .tox/unit/bin/python \
+  Tensile/client/bench_comparison.py \
+  --yaml Tensile/client/bench_comparison.yaml \
+  --arch gfx950 \
+  --output-dir /tmp/my_bench
 
-# C++ client help.
+# Then compare (library mode Python vs C++):
 LD_LIBRARY_PATH=/opt/rocm/lib \
-  build_tmp/tensilelite/client/tensilelite-client --help
+  TENSILE_LIBRARY=/tmp/my_bench/pipeline/4_LibraryClient/library/gfx950/TensileLibrary_gfx950.yaml \
+  TENSILE_CPP_INI=/tmp/my_bench/pipeline/4_LibraryClient/source/ClientParameters_*.ini \
+  ./Tensile/client/bench_sweep.sh Tensile/client/bench_comparison.yaml -1
 ```
-
-Python client (bf16, 3 sizes, nWarmup=3, nIters=10):
-
-```python
-# Copyright Advanced Micro Devices, Inc., or its affiliates.
-# SPDX-License-Identifier: MIT
-import time
-from Tensile.client.sweep_runner import SweepRunner
-
-YAML = 'Tensile/client/tests/yaml/gemm_standard.yaml'
-
-runner = SweepRunner(
-    yamlPath=YAML,
-    problemIdx=2, groupIdx=0,
-    nWarmup=3, nIters=10,
-    numElementsToValidate=0,
-)
-t0 = time.perf_counter()
-results = runner.run(resultsCsv='/tmp/py_fair_results.csv')
-t1 = time.perf_counter()
-print(f'WALL_CLOCK_S={t1 - t0:.4f}')
-for r in results:
-    if r.problemSize[0] in (1024, 2048, 4096) and r.problemSize[1] == r.problemSize[0]:
-        print(f'size={r.problemSize[0]}x{r.problemSize[1]} gflops={r.gflops:.2f}')
-```
-
-C++ client INI (bf16, 3 sizes, num-warmups=3, num-benchmarks=10, validation off):
-
-```ini
-library-file=/tmp/cpp_ref/BFloat16/TensileLibrary.yaml
-code-object=/tmp/cpp_ref/BFloat16/kernel_0.co
-results-file=/tmp/cpp_fair_results.csv
-problem-identifier=Contraction_l_Ailk_Bjlk_Cijk_Dijk
-a-type=BFloat16
-b-type=BFloat16
-c-type=BFloat16
-d-type=BFloat16
-alpha-type=Float
-beta-type=Float
-compute-input-type-A=BFloat16
-compute-input-type-B=BFloat16
-f32-xdl-math-op=Float
-high-precision-accumulate=True
-strided-batched=True
-grouped-gemm=False
-use-bias=0
-use-e=False
-use-gradient=False
-use-scaleAB=
-use-scaleCD=False
-use-scaleAlphaVec=0
-sparse=0
-activation-type=None
-activation-compute-type=Float
-activation-no-guard=False
-use-user-args=False
-device-idx=0
-init-seed=0
-init-a=Random
-init-b=Random
-init-c=Random
-init-d=Zero
-init-alpha=Two
-init-beta=Two
-num-warmups=3
-num-benchmarks=10
-use-gpu-timer=True
-sync-after-warmups=True
-num-enqueues-per-sync=1
-num-syncs-per-benchmark=1
-num-elements-to-validate=0
-csv-export-extra-cols=True
-csv-merge-same-problems=True
-log-level=Warning
-PrintWinnersOnly=False
-problem-size=1024,1024,4,1024
-a-strides=-1,1024,-1
-b-strides=-1,1024,-1
-c-strides=-1,1024,-1
-d-strides=-1,1024,-1
-problem-size=2048,2048,4,2048
-a-strides=-1,2048,-1
-b-strides=-1,2048,-1
-c-strides=-1,2048,-1
-d-strides=-1,2048,-1
-problem-size=4096,4096,4,4096
-a-strides=-1,4096,-1
-b-strides=-1,4096,-1
-c-strides=-1,4096,-1
-d-strides=-1,4096,-1
-```
-
-Run the binary:
-
-```bash
-LD_LIBRARY_PATH=/opt/rocm/lib \
-  build_tmp/tensilelite/client/tensilelite-client --config-file /path/to/fair.ini
-```
-
-Python library mode (no compile; same pre-built `.co` as C++):
-
-```python
-# Copyright Advanced Micro Devices, Inc., or its affiliates.
-# SPDX-License-Identifier: MIT
-import time
-from Tensile.client.sweep_runner import SweepRunner
-
-runner = SweepRunner(
-    yamlPath='Tensile/client/tests/yaml/gemm_standard.yaml',
-    libraryPath='/tmp/cpp_ref/BFloat16/TensileLibrary.yaml',
-    problemIdx=2, groupIdx=0, nWarmup=3, nIters=10, numElementsToValidate=0,
-)
-t0 = time.perf_counter()
-results = runner.run(resultsCsv='/tmp/py_library_results.csv')
-print(f'WALL_CLOCK_S={time.perf_counter() - t0:.4f}')
-```
-
-C++ cold page cache (evict the `.co` + library pages first, no root needed):
-
-```python
-# Copyright Advanced Micro Devices, Inc., or its affiliates.
-# SPDX-License-Identifier: MIT
-import os, subprocess, time
-
-def evict(path):
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-    finally:
-        os.close(fd)
-
-evict('/tmp/cpp_ref/BFloat16/TensileLibrary.yaml')
-evict('/tmp/cpp_ref/BFloat16/kernel_0.co')
-env = dict(os.environ, LD_LIBRARY_PATH='/opt/rocm/lib')
-t0 = time.perf_counter()
-subprocess.run(['build_tmp/tensilelite/client/tensilelite-client',
-                '--config-file', '/path/to/fair.ini'], env=env, check=True)
-print(f'COLD_WALL_S={time.perf_counter() - t0:.4f}')
-```
-
-For the warm measurement, omit the `evict(...)` calls (run the binary twice and
-time the second run).

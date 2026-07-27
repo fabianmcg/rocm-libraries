@@ -15,7 +15,10 @@ build-backend = "scikit_build_core.build"
 
 [tool.scikit-build]
 cmake.build-type = "Release"
-cmake.args = ["-DCMAKE_POLICY_VERSION_MINIMUM=3.5"]
+cmake.args = [
+    "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
+    "-DCMAKE_CXX_COMPILER=/opt/rocm/bin/amdclang++",
+]
 # Contents come from cmake install() rules (_tensilelite_runtime.so + __init__.py).
 wheel.packages = []
 # Persistent build tree for incremental rebuilds.

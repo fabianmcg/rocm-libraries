@@ -5,6 +5,8 @@
 #include "ElfUtils.hpp"
 #endif
 
+#include "LibraryBindings.hpp"
+
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/string.h>
 
@@ -35,4 +37,6 @@ NB_MODULE(_tensilelite_runtime, m)
         nb::arg("co_path"),
         "Return the recommended number of GpuModule copies for I-cache rotation.");
 #endif
+
+    bindLibraryTypes(m);
 }

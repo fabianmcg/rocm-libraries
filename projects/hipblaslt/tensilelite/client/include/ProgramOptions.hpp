@@ -449,7 +449,12 @@ namespace TensileLite
 
                 std::function<std::any(std::string const&)> parser() const override
                 {
-                    return [](std::string const& s) { return std::any(split_string(s)); };
+                    // Store each command-line token as one whole string so that
+                    // callers like parse_arg_nums can do their own comma-split.
+                    // This matches parse_config_line behaviour for INI files.
+                    return [](std::string const& s) {
+                        return std::any(std::vector<std::string>{s});
+                    };
                 }
 
                 /** Boost config file behaviour: each line is one value (no comma split). */

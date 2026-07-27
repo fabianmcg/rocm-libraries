@@ -26,6 +26,10 @@ COMPONENTS = {
         "projects/hipblaslt/tensilelite/rocisa/**",
         "shared/stinkytofu/**",
     ],
+    "tensilelite": [
+        "projects/hipblaslt/tensilelite/**",
+        "shared/stinkytofu/**",
+    ],
     "miopen": [
         "projects/miopen/**",
         ".github/workflows/component-ci-miopen.yml",

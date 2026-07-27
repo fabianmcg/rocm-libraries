@@ -771,7 +771,8 @@ def _benchmarkProblemType(backendConfig, problemTypeConfig, problemSizeGroupConf
                                     benchmarkStep.icacheFlushArgs, conProblemType,
                                     sourcePath, codeObjectFiles, resultsFileName,
                                     outFile, deviceId, gfxName, libraryFile=cachedLibraryFile,
-                                    gateTypeArgs=getattr(benchmarkStep, "gateTypeArgs", None), probSolMap=probSolMap)
+                                    gateTypeArgs=getattr(benchmarkStep, "gateTypeArgs", None), probSolMap=probSolMap,
+                                    benchmarkYaml=solutionsFileName)
 
             # I think the size portion of this yaml could be removed,
             # but for now it's needed, so we update it even in the cache case
