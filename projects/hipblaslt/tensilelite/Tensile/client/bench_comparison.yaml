@@ -1,14 +1,14 @@
 # Copyright Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier: MIT
-################################################################################
-# bench_comparison.yaml: minimal full-pipeline bf16 HPA NT GEMM used by
-# bench_comparison.py. Drives BenchmarkProblems -> LibraryLogic -> ClientWriter
-# to build a fresh device library, which is then benchmarked by both the Python
-# SweepRunner (library mode) and the C++ tensilelite-client.
 #
-# Single ProblemType group (bf16 HPA, NT), small fork (2 DepthU values) so the
-# whole pipeline completes in well under 10 minutes on gfx950.
-################################################################################
+# bench_comparison.yaml: real-world gfx950 bf16 HPA sweep for client benchmarking.
+#
+# Kernel parameters taken verbatim from:
+#   Tensile/Tests/common/gemm/gfx950/custom_mainloop_scheduling.yaml
+# Groups 1-2 (BBS NN, UseCustomMainLoopSchedule=[0,1]) kept; groups with
+# Range-only small sizes replaced with large Exact sizes for the benchmark.
+# LibraryLogic/LibraryClient sections added to make this a full pipeline YAML.
+
 GlobalParameters:
   MinimumRequiredVersion: 5.0.0
   CMakeBuildType: Release
@@ -25,38 +25,565 @@ GlobalParameters:
   Device: 0
   UseEffLike: False
   PrintWinnersOnly: True
+  DataInitTypeBeta: 0
+  DataInitTypeAlpha: 1
+  DataInitTypeA: 12
+  DataInitTypeB: 13
 
 BenchmarkProblems:
+  ########################################
+  # BBS NN — [16,16,32,1,1,8,8,2,2] CMS
+  ########################################
   -
-    - # ProblemType: bf16 HPA NT (BBS)
+    - # ProblemType
       OperationType: GEMM
       DataType: b
       DestDataType: b
       ComputeDataType: s
       HighPrecisionAccumulate: True
       TransposeA: False
-      TransposeB: True
+      TransposeB: False
       UseBeta: True
       Batched: True
-      UseBias: 0
-    - # BenchmarkProblemSizeGroup
+    - # Group 1: UseCustomMainLoopSchedule 0 and 1
       InitialSolutionParameters:
       BenchmarkCommonParameters:
         - KernelLanguage: ["Assembly"]
       ForkParameters:
         - MatrixInstruction:
-          - [16, 16, 16, 1, 1, 2, 2, 2, 2]
-          - [32, 32, 8, 1, 1, 2, 2, 2, 2]
-        - DepthU: [16, 32, 64]
-        - GlobalSplitU: [1]
-        - SourceSwap: [True, False]
-        - PrefetchGlobalRead: [1, 2]
-        - ThreadTile:
-          - [4, 4]
-          - [8, 8]
-        - WorkGroup:
-          - [16, 16, 1]
-          - [32, 8, 1]
+           - [16, 16, 32, 1, 1, 8, 8, 2, 2]
+        - PrefetchGlobalRead: [2]
+        - PrefetchLocalRead: [1]
+        - DepthU: [64]
+        - ScheduleIterAlg: [3]
+        - ExpandPointerSwap: [false]
+        - TransposeLDS: [1]
+        - LocalReadVectorWidth: [8]
+        - GlobalReadVectorWidthA: [8]
+        - GlobalReadVectorWidthB: [8]
+        - DirectToLds: [1]
+        - StreamK: [3]
+        - LdsPadA: [8]
+        - LdsPadB: [8]
+        - StaggerU: [0]
+        - WorkGroupMapping: [16]
+        - WorkGroupMappingXCC: [2]
+        - 1LDSBuffer: [0]
+        - NonTemporalD: [4]
+        - SourceSwap: [true]
+        - UseSgprForGRO: [0]
+        - UseCustomMainLoopSchedule: [0, 1]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [2048, 2048, 1, 2048]
+          - Exact: [4096, 4096, 1, 4096]
+          - Exact: [8192, 8192, 1, 8192]
+    - # Group 2: LDSTrInst, UseCustomMainLoopSchedule 0 and 1
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+           - [16, 16, 32, 1, 1, 6, 8, 2, 2]
+        - PrefetchGlobalRead: [2]
+        - PrefetchLocalRead: [1]
+        - DepthU: [64]
+        - ScheduleIterAlg: [3]
+        - ExpandPointerSwap: [false]
+        - TransposeLDS: [1]
+        - LocalReadVectorWidth: [8]
+        - GlobalReadVectorWidthA: [8]
+        - GlobalReadVectorWidthB: [8]
+        - DirectToLds: [1]
+        - StreamK: [3]
+        - LdsPadA: [8]
+        - LdsPadB: [8]
+        - StaggerU: [0]
+        - WorkGroupMapping: [16]
+        - WorkGroupMappingXCC: [2]
+        - 1LDSBuffer: [0]
+        - NonTemporalD: [4]
+        - SourceSwap: [true]
+        - UseSgprForGRO: [0]
+        - UseCustomMainLoopSchedule: [0, 1]
+        - LDSTrInst: [true]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [2048, 2048, 1, 2048]
+          - Exact: [4096, 4096, 1, 4096]
+          - Exact: [8192, 8192, 1, 8192]
+    - # Group 3: [16,16,32,1,1,8,8,2,2] SourceSwap=false
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+           - [16, 16, 32, 1, 1, 8, 8, 2, 2]
+        - PrefetchGlobalRead: [2]
+        - PrefetchLocalRead: [1]
+        - DepthU: [64]
+        - ScheduleIterAlg: [3]
+        - ExpandPointerSwap: [false]
+        - TransposeLDS: [1]
+        - LocalReadVectorWidth: [8]
+        - GlobalReadVectorWidthA: [8]
+        - GlobalReadVectorWidthB: [8]
+        - DirectToLds: [1]
+        - StreamK: [3]
+        - LdsPadA: [8]
+        - LdsPadB: [8]
+        - StaggerU: [0]
+        - WorkGroupMapping: [16]
+        - WorkGroupMappingXCC: [2]
+        - 1LDSBuffer: [0]
+        - NonTemporalD: [4]
+        - SourceSwap: [false]
+        - UseSgprForGRO: [0]
+        - UseCustomMainLoopSchedule: [0, 1]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [2048, 2048, 1, 2048]
+          - Exact: [4096, 4096, 1, 4096]
+          - Exact: [8192, 8192, 1, 8192]
+    - # Group 4: [16,16,32,1,1,7,8,2,2]
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 32, 1, 1, 7, 8, 2, 2]
+        - PrefetchGlobalRead: [2]
+        - PrefetchLocalRead: [1]
+        - DepthU: [64]
+        - ScheduleIterAlg: [3]
+        - ExpandPointerSwap: [false]
+        - LDSTrInst: [true]
+        - LocalReadVectorWidth: [8]
+        - GlobalReadVectorWidthA: [8]
+        - GlobalReadVectorWidthB: [8]
+        - DirectToLds: [1]
+        - StreamK: [3]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StaggerU: [0]
+        - WorkGroupMapping: [16]
+        - WorkGroupMappingXCC: [2]
+        - 1LDSBuffer: [0]
+        - UseCustomMainLoopSchedule: [0, 1]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [2048, 2048, 1, 2048]
+          - Exact: [4096, 4096, 1, 4096]
+          - Exact: [8192, 8192, 1, 8192]
+    - # Group 5: [16,16,32,1,1,8,7,2,2]
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+           - [16, 16, 32, 1, 1, 8, 7, 2, 2]
+        - PrefetchGlobalRead: [2]
+        - PrefetchLocalRead: [1]
+        - DepthU: [64]
+        - ScheduleIterAlg: [3]
+        - ExpandPointerSwap: [false]
+        - TransposeLDS: [1]
+        - LocalReadVectorWidth: [8]
+        - GlobalReadVectorWidthA: [8]
+        - GlobalReadVectorWidthB: [8]
+        - DirectToLds: [1]
+        - StreamK: [3]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StaggerU: [0]
+        - WorkGroupMapping: [16]
+        - WorkGroupMappingXCC: [2]
+        - 1LDSBuffer: [0]
+        - NonTemporalD: [4]
+        - SourceSwap: [true]
+        - UseSgprForGRO: [0]
+        - UseCustomMainLoopSchedule: [0, 1]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [2048, 2048, 1, 2048]
+          - Exact: [4096, 4096, 1, 4096]
+          - Exact: [8192, 8192, 1, 8192]
+    - # Group 6: [16,16,32,1,1,8,6,2,2]
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+           - [16, 16, 32, 1, 1, 8, 6, 2, 2]
+        - PrefetchGlobalRead: [2]
+        - PrefetchLocalRead: [1]
+        - DepthU: [64]
+        - ScheduleIterAlg: [3]
+        - ExpandPointerSwap: [false]
+        - TransposeLDS: [1]
+        - LocalReadVectorWidth: [8]
+        - GlobalReadVectorWidthA: [8]
+        - GlobalReadVectorWidthB: [8]
+        - DirectToLds: [1]
+        - StreamK: [3]
+        - LdsPadA: [8]
+        - LdsPadB: [8]
+        - StaggerU: [0]
+        - WorkGroupMapping: [16]
+        - WorkGroupMappingXCC: [2]
+        - 1LDSBuffer: [0]
+        - NonTemporalD: [4]
+        - SourceSwap: [true]
+        - UseSgprForGRO: [0]
+        - UseCustomMainLoopSchedule: [0, 1]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [2048, 2048, 1, 2048]
+          - Exact: [4096, 4096, 1, 4096]
+          - Exact: [8192, 8192, 1, 8192]
+    - # Group 7: [16,16,32,1,1,6,8,2,2]
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+           - [16, 16, 32, 1, 1, 6, 8, 2, 2]
+        - PrefetchGlobalRead: [2]
+        - PrefetchLocalRead: [1]
+        - DepthU: [64]
+        - ScheduleIterAlg: [3]
+        - ExpandPointerSwap: [false]
+        - TransposeLDS: [1]
+        - LDSTrInst: [false]
+        - LocalReadVectorWidth: [8]
+        - GlobalReadVectorWidthA: [8]
+        - GlobalReadVectorWidthB: [8]
+        - DirectToLds: [1]
+        - StreamK: [3]
+        - LdsPadA: [8]
+        - LdsPadB: [8]
+        - StaggerU: [0]
+        - WorkGroupMapping: [16]
+        - WorkGroupMappingXCC: [2]
+        - 1LDSBuffer: [0]
+        - NonTemporalD: [4]
+        - SourceSwap: [true]
+        - UseSgprForGRO: [0]
+        - UseCustomMainLoopSchedule: [0, 1]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [2048, 2048, 1, 2048]
+          - Exact: [4096, 4096, 1, 4096]
+          - Exact: [8192, 8192, 1, 8192]
+    - # Group 8: [16,16,32,1,1,6,10,2,2]
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+           - [16, 16, 32, 1, 1, 6, 10, 2, 2]
+        - PrefetchGlobalRead: [2]
+        - PrefetchLocalRead: [1]
+        - DepthU: [64]
+        - ScheduleIterAlg: [3]
+        - ExpandPointerSwap: [false]
+        - TransposeLDS: [1]
+        - LDSTrInst: [true]
+        - LocalReadVectorWidth: [8]
+        - GlobalReadVectorWidthA: [8]
+        - GlobalReadVectorWidthB: [8]
+        - DirectToLds: [1]
+        - StreamK: [3]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - 1LDSBuffer: [0]
+        - NonTemporalD: [5]
+        - SourceSwap: [true]
+        - ClusterLocalRead: [0]
+        - StoreSyncOpt: [1]
+        - UseSgprForGRO: [0]
+        - UseCustomMainLoopSchedule: [0, 1]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [2048, 2048, 1, 2048]
+          - Exact: [4096, 4096, 1, 4096]
+          - Exact: [8192, 8192, 1, 8192]
+    - # Group 9: [16,16,32,1,1,10,6,2,2]
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+           - [16, 16, 32, 1, 1, 10, 6, 2, 2]
+        - PrefetchGlobalRead: [2]
+        - PrefetchLocalRead: [1]
+        - DepthU: [64]
+        - ScheduleIterAlg: [3]
+        - ExpandPointerSwap: [false]
+        - TransposeLDS: [1]
+        - LocalReadVectorWidth: [8]
+        - GlobalReadVectorWidthA: [8]
+        - GlobalReadVectorWidthB: [8]
+        - DirectToLds: [1]
+        - StreamK: [3]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StaggerU: [0]
+        - 1LDSBuffer: [0]
+        - NonTemporalA: [3]
+        - NonTemporalB: [3]
+        - NonTemporalD: [4]
+        - SourceSwap: [true]
+        - LdsBlockSizePerPadA: [-1]
+        - LdsBlockSizePerPadB: [-1]
+        - LDSTrInst: [True]
+        - UseSgprForGRO: [0]
+        - UseCustomMainLoopSchedule: [0, 1]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [2048, 2048, 1, 2048]
+          - Exact: [4096, 4096, 1, 4096]
+          - Exact: [8192, 8192, 1, 8192]
+    - # Group 10: [16,16,32,1,1,5,8,2,2]
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+           - [16, 16, 32, 1, 1, 5, 8, 2, 2]
+        - PrefetchGlobalRead: [2]
+        - PrefetchLocalRead: [1]
+        - DepthU: [64]
+        - ScheduleIterAlg: [3]
+        - ExpandPointerSwap: [false]
+        - TransposeLDS: [1]
+        - LocalReadVectorWidth: [8]
+        - GlobalReadVectorWidthA: [8]
+        - GlobalReadVectorWidthB: [8]
+        - DirectToLds: [1]
+        - StreamK: [3]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StaggerU: [0]
+        - WorkGroupMapping: [0]
+        - WorkGroupMappingXCC: [-1]
+        - 1LDSBuffer: [0]
+        - NonTemporalD: [4]
+        - SourceSwap: [true]
+        - UseSgprForGRO: [0]
+        - UseCustomMainLoopSchedule: [0, 1]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [2048, 2048, 1, 2048]
+          - Exact: [4096, 4096, 1, 4096]
+          - Exact: [8192, 8192, 1, 8192]
+    - # Group 11: [16,16,32,1,1,4,8,2,2]
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+           - [16, 16, 32, 1, 1, 4, 8, 2, 2]
+        - PrefetchGlobalRead: [2]
+        - PrefetchLocalRead: [1]
+        - DepthU: [64]
+        - ScheduleIterAlg: [3]
+        - ExpandPointerSwap: [false]
+        - TransposeLDS: [1]
+        - LDSTrInst: [true]
+        - LocalReadVectorWidth: [8]
+        - GlobalReadVectorWidthA: [8]
+        - GlobalReadVectorWidthB: [8]
+        - DirectToLds: [1]
+        - StreamK: [3]
+        - StaggerU: [0]
+        - 1LDSBuffer: [0]
+        - NonTemporalD: [4]
+        - SourceSwap: [true]
+        - UseSgprForGRO: [0]
+        - UseCustomMainLoopSchedule: [0, 1]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [2048, 2048, 1, 2048]
+          - Exact: [4096, 4096, 1, 4096]
+          - Exact: [8192, 8192, 1, 8192]
+    - # Group 12: [16,16,32,1,1,8,3,2,2] LDSTrInst MaxLDS
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+           - [16, 16, 32, 1, 1, 8, 3, 2, 2]
+        - PrefetchGlobalRead: [2]
+        - PrefetchLocalRead: [1]
+        - DepthU: [64]
+        - ScheduleIterAlg: [3]
+        - ExpandPointerSwap: [false]
+        - TransposeLDS: [1]
+        - LocalReadVectorWidth: [8]
+        - GlobalReadVectorWidthA: [8]
+        - GlobalReadVectorWidthB: [8]
+        - DirectToLds: [1]
+        - StreamK: [3]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StaggerU: [0]
+        - LDSTrInst: [true]
+        - 1LDSBuffer: [0]
+        - NonTemporalD: [4]
+        - SourceSwap: [true]
+        - UseSgprForGRO: [0]
+        - UseCustomMainLoopSchedule: [0, 1]
+        - MaxLDS: [163840]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [2048, 2048, 1, 2048]
+          - Exact: [4096, 4096, 1, 4096]
+          - Exact: [8192, 8192, 1, 8192]
+    - # Group 13: [16,16,32,1,1,7,4,2,2]
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+           - [16, 16, 32, 1, 1, 7, 4, 2, 2]
+        - PrefetchGlobalRead: [2]
+        - PrefetchLocalRead: [1]
+        - DepthU: [64]
+        - ScheduleIterAlg: [3]
+        - ExpandPointerSwap: [false]
+        - TransposeLDS: [1]
+        - LDSTrInst: [true]
+        - LocalReadVectorWidth: [8]
+        - GlobalReadVectorWidthA: [8]
+        - GlobalReadVectorWidthB: [8]
+        - DirectToLds: [1]
+        - StreamK: [3]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StaggerU: [0]
+        - 1LDSBuffer: [0]
+        - NonTemporalD: [4]
+        - SourceSwap: [true]
+        - UseSgprForGRO: [0]
+        - UseCustomMainLoopSchedule: [0, 1]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [2048, 2048, 1, 2048]
+          - Exact: [4096, 4096, 1, 4096]
+          - Exact: [8192, 8192, 1, 8192]
+    - # Group 14: [16,16,32,1,1,4,7,2,2]
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+           - [16, 16, 32, 1, 1, 4, 7, 2, 2]
+        - PrefetchGlobalRead: [2]
+        - PrefetchLocalRead: [1]
+        - DepthU: [64]
+        - ScheduleIterAlg: [3]
+        - ExpandPointerSwap: [false]
+        - TransposeLDS: [1]
+        - LocalReadVectorWidth: [8]
+        - GlobalReadVectorWidthA: [8]
+        - GlobalReadVectorWidthB: [8]
+        - DirectToLds: [1]
+        - StreamK: [3]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StaggerU: [0]
+        - WorkGroupMapping: [0]
+        - WorkGroupMappingXCC: [-1]
+        - 1LDSBuffer: [0]
+        - NonTemporalD: [4]
+        - SourceSwap: [true]
+        - UseSgprForGRO: [0]
+        - UseCustomMainLoopSchedule: [0, 1]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [2048, 2048, 1, 2048]
+          - Exact: [4096, 4096, 1, 4096]
+          - Exact: [8192, 8192, 1, 8192]
+    - # Group 15: [16,16,32,1,1,10,6,2,2] NonTemporalD=4
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+           - [16, 16, 32, 1, 1, 10, 6, 2, 2]
+        - PrefetchGlobalRead: [2]
+        - PrefetchLocalRead: [1]
+        - DepthU: [64]
+        - ScheduleIterAlg: [3]
+        - ExpandPointerSwap: [false]
+        - TransposeLDS: [1]
+        - LocalReadVectorWidth: [8]
+        - GlobalReadVectorWidthA: [8]
+        - GlobalReadVectorWidthB: [8]
+        - DirectToLds: [1]
+        - StreamK: [3]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StaggerU: [0]
+        - 1LDSBuffer: [0]
+        - NonTemporalA: [3]
+        - NonTemporalB: [3]
+        - NonTemporalD: [4]
+        - SourceSwap: [true]
+        - LdsBlockSizePerPadA: [-1]
+        - LdsBlockSizePerPadB: [-1]
+        - LDSTrInst: [True]
+        - UseSgprForGRO: [0]
+        - UseCustomMainLoopSchedule: [0, 1]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [2048, 2048, 1, 2048]
+          - Exact: [4096, 4096, 1, 4096]
+          - Exact: [8192, 8192, 1, 8192]
+    - # Group 16: [16,16,32,1,1,8,6,2,2] LdsPadA=8
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+           - [16, 16, 32, 1, 1, 8, 6, 2, 2]
+        - PrefetchGlobalRead: [2]
+        - PrefetchLocalRead: [1]
+        - DepthU: [64]
+        - ScheduleIterAlg: [3]
+        - ExpandPointerSwap: [false]
+        - TransposeLDS: [1]
+        - LocalReadVectorWidth: [8]
+        - GlobalReadVectorWidthA: [8]
+        - GlobalReadVectorWidthB: [8]
+        - DirectToLds: [1]
+        - StreamK: [3]
+        - LdsPadA: [8]
+        - LdsPadB: [8]
+        - StaggerU: [0]
+        - WorkGroupMapping: [16]
+        - WorkGroupMappingXCC: [2]
+        - 1LDSBuffer: [0]
+        - NonTemporalD: [4]
+        - SourceSwap: [true]
+        - UseSgprForGRO: [0]
+        - UseCustomMainLoopSchedule: [0, 1]
       BenchmarkJoinParameters:
       BenchmarkFinalParameters:
         - ProblemSizes:
@@ -64,7 +591,6 @@ BenchmarkProblems:
           - Exact: [4096, 4096, 1, 4096]
           - Exact: [8192, 8192, 1, 8192]
 
-# gfx950-specific: targeting another architecture requires editing ScheduleName and ArchitectureName below.
 LibraryLogic:
   ScheduleName: "gfx950"
   ArchitectureName: "gfx950"
