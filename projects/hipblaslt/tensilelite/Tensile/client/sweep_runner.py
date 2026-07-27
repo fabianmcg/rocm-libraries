@@ -772,20 +772,44 @@ class SweepRunner:
             solutionsFromYaml, _injectInternalArgsSupport,
         )
         from Tensile.SolutionStructs.Naming import getKernelNameMin
+        from Tensile import LibraryIO
 
-        sols = solutionsFromYaml(
-            self._yamlPath, assembler, isaInfoMap, debugConfig,
-            problemIdx=self._problemIdx, groupIdx=self._groupIdx,
-        )
         byName = {}
         ptFields = None
-        for idx, (sol, sid) in enumerate(sols):
-            solDict = _injectInternalArgsSupport(dict(sol), chip)
-            name = getKernelNameMin(sol.getKernels()[0], splitGSU=False)
-            byName[name] = {"solDict": solDict, "rawDict": dict(sol),
-                            "sid": sid, "index": idx}
-            if ptFields is None:
-                ptFields = self._problemTypeFields(solDict)
+        globalIdx = 0
+        # Enumerate all problem groups so library winners from any group can be found.
+        try:
+            data = LibraryIO.readYAML(self._yamlPath)
+            numProblems = len(data.get("BenchmarkProblems", []))
+        except Exception:
+            numProblems = 1
+        for pIdx in range(numProblems):
+            gIdx = 0
+            while True:
+                try:
+                    sols = solutionsFromYaml(
+                        self._yamlPath, assembler, isaInfoMap, debugConfig,
+                        problemIdx=pIdx, groupIdx=gIdx,
+                    )
+                except (IndexError, KeyError):
+                    break
+                if not sols:
+                    gIdx += 1
+                    if gIdx > 32:
+                        break
+                    continue
+                for sol, sid in sols:
+                    solDict = _injectInternalArgsSupport(dict(sol), chip)
+                    name = getKernelNameMin(sol.getKernels()[0], splitGSU=False)
+                    if name not in byName:
+                        byName[name] = {"solDict": solDict, "rawDict": dict(sol),
+                                        "sid": sid, "index": globalIdx}
+                        globalIdx += 1
+                    if ptFields is None:
+                        ptFields = self._problemTypeFields(solDict)
+                gIdx += 1
+                if gIdx > 32:
+                    break
         return byName, ptFields
 
     def _discoverCodeObjects(self) -> list:
