@@ -332,7 +332,7 @@ def runClient(libraryLogicPath, forBenchmark, enableTileSelection, cxxCompiler: 
       print1("# CpuOnly: skipping device-bound client launch; returning returncode 0.")
       return 0
 
-    if use_python_client:
+    if use_python_client and not forBenchmark:
       return _runWithPythonHarness(configPaths, buildPath)
 
     # Legacy C++ subprocess path; caller explicitly opted out of the Python harness.
