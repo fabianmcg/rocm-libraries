@@ -70,8 +70,16 @@ else
     echo "--- C++ tensilelite-client (INI: ${CPP_INI}) ---"
     TMP_INI="$(mktemp /tmp/bench_sweep_XXXXXX.ini)"
     cp "${CPP_INI}" "${TMP_INI}"
-    sed -i "s/^num-elements-to-validate=.*/num-elements-to-validate=${VALIDATE}/" "${TMP_INI}"
-    grep -q "num-elements-to-validate" "${TMP_INI}" || echo "num-elements-to-validate=${VALIDATE}" >> "${TMP_INI}"
+    # Patch validation and iteration counts to match what the Python client uses.
+    for KEY in "num-elements-to-validate=${VALIDATE}" \
+               "num-benchmarks=10" \
+               "num-syncs-per-benchmark=1" \
+               "num-warmups=3"; do
+        K="${KEY%%=*}"
+        V="${KEY#*=}"
+        sed -i "s/^${K}=.*/${K}=${V}/" "${TMP_INI}"
+        grep -q "^${K}=" "${TMP_INI}" || echo "${K}=${V}" >> "${TMP_INI}"
+    done
     time "${CPP_CLIENT}" --config-file "${TMP_INI}"
     rm -f "${TMP_INI}"
 fi
