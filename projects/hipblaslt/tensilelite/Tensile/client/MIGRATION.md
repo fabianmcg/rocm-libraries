@@ -66,8 +66,10 @@ enumerate solutions and problem sizes, `_setupTensile` +
 handed to the two reporters. `gemm_args` supplies the two internal argument
 words the kernel needs. `reference.py`, `library_runner.py`, `hw_monitor.py`,
 `mx_types.py`, and `sparse.py` are auxiliary: `reference.py` powers correctness
-tests, `library_runner.py` is a separate query path over a pre-built library,
-and the rest support features that are not yet wired into the sweep loop.
+tests, `library_runner.py` backs `SweepRunner`'s library mode (dispatching
+through a pre-built library instead of compiling) and is also usable directly
+as a query path. `hw_monitor.py`, `mx_types.py`, and `sparse.py` support
+features that are not yet wired into the sweep loop.
 
 ### Data flow (benchmark YAML / .ini to results.csv)
 
@@ -149,6 +151,13 @@ multi-GPU benchmark request also falls back to the C++ `runClientParallel`.
 - **In-process compile + benchmark.** The sweep generates and compiles kernels
   in-process via `amdgpu_exec`; there is no standalone binary and no pre-built
   kernel library required for the sweep itself.
+- **Two sweep modes.** `SweepRunner` supports compile mode (default,
+  `libraryPath=None`: enumerate and compile every candidate solution, one
+  GFLOPS column per solution) and **library mode** (`libraryPath=` a pre-built
+  `TensileLibrary.yaml`: `LibraryRunner.find_best` selects one winner per
+  problem size, which is benchmarked from the pre-built `.co` with no compile
+  step; the CSV has a single `Winner` column). Both modes share the same
+  `KernelRunner` benchmark path and support `numElementsToValidate`.
 - **NumPy CPU reference** replaces the C++ `Reference.cpp`, and it lives in the
   test suite (`reference.py`), not inside the benchmark run loop.
 - **Rotation in Python.** Output-buffer rotation (`BufferPool`) and I-cache
@@ -187,6 +196,13 @@ icacheCopies="auto", problemIdx=0, groupIdx=0, saveCoPath=None, pinClocks=False,
 amdSmiPath=None)`. If `yamlPath` ends in `.ini`, it is resolved via
 `_resolveYamlFromIni` (the INI is parsed under a synthetic `[default]` section,
 and the `benchmark-yaml` value is returned; `KeyError` if that key is absent).
+When `libraryPath` names a pre-built `TensileLibrary.yaml`, the sweep runs in
+**library mode**: for each problem size `LibraryRunner.find_best` picks the
+single winning solution, whose pre-built `.co` is discovered next to the library
+file and benchmarked through the same `KernelRunner` path (no compilation).
+Launch metadata is recovered by matching the winner's `kernel_name` to the
+benchmark-YAML enumeration via `getKernelNameMin`; results carry one `Winner`
+row per size.
 `run(resultsCsv=None, libraryUpdateFile=None, hwMonitor=False, boundsCheck=False,
 rocprofCounters=None) -> list[SweepResult]`. Internals include `_setupTensile`,
 `_generateAsm` (`KernelWriterAssembly.getSourceFileString`, kernel name from
@@ -247,6 +263,7 @@ computes a stable identifier.
 `LibraryRunner(library_path, device_id=0)` queries a pre-built solution library
 through the `tensilelite_runtime` bindings (the M10 feature): `find_best`,
 `find_top_n`, `filter_by_predicate`. The runtime import is lazy.
+`SweepRunner` library mode uses `find_best` to select the winner per problem size.
 
 ### `gemm_args.py`
 
@@ -536,6 +553,35 @@ TilesPerCu, TotalGranularity, WinnerGFlops, WinnerTimeUS, WinnerIdx, WinnerName,
 `", "` separator, and both report a minimum-time GFLOPS metric, so downstream
 tooling that keys off those columns keeps working.
 
+### (f) Library mode (benchmark a pre-built library, no compile)
+
+Point `SweepRunner` at a pre-built `TensileLibrary.yaml` via `libraryPath` to
+skip compilation entirely. For each problem size, `LibraryRunner.find_best`
+selects the winning solution; only that winner is benchmarked, loading the
+pre-built `.co` discovered alongside the library file — the same code object the
+C++ client uses. The results CSV has a single `Winner` GFLOPS column (one row
+per size) instead of one column per solution.
+
+```python
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+from Tensile.client.sweep_runner import SweepRunner
+
+runner = SweepRunner(
+    yamlPath="Tensile/client/tests/yaml/gemm_standard.yaml",
+    libraryPath="/tmp/cpp_ref/BFloat16/TensileLibrary.yaml",
+    problemIdx=2, groupIdx=0,
+    nWarmup=3, nIters=10, numElementsToValidate=0,
+)
+results = runner.run(resultsCsv="/tmp/py_library_results.csv")
+for r in results:
+    print(r.problemSize, r.solutionName, f"{r.gflops:.1f}")
+```
+
+The benchmark YAML still supplies the problem sizes and problem type; the
+library supplies the winner and code object. If `find_best` returns no match
+for a size (predicate mismatch), that size is skipped with a warning.
+
 ---
 
 ## 5. Migration guide (from the old C++ tensilelite-client binary)
@@ -664,17 +710,47 @@ Raw GFLOPS across the 3 runs (all values in GFLOPS):
 | 2048 | 339,183 | 330,821 | 334,559 | 360,762 | 360,159 | 360,462 |
 | 4096 | 327,839 | 326,174 | 327,207 | 298,684 | 302,072 | 302,918 |
 
-### Wall-clock per run
+### Wall-clock per run (4-way, fair comparison)
 
-| Client | Run 1 (s) | Run 2 (s) | Run 3 (s) | Median (s) | Compilation share |
-|---|---|---|---|---|---|
-| Python (`SweepRunner`) | 6.20 | 5.52 | 6.18 | 6.18 | ~5–6 s (kernel compile) |
-| C++ (`tensilelite-client`) | 0.656 | 0.689 | 0.683 | 0.683 | 0 (pre-built `.co`) |
+Medians are over three timed runs after one discarded cold-start run, same
+bf16 workload and iteration counts as above.
 
-The Python wall-clock is dominated by in-process assembly generation and HSACO
-compilation (~5–6 s). The GPU benchmark time itself at the 2048 size is
-approximately `(3 + 10) * 202 µs = 2.6 ms`; the rest is compilation overhead.
-The C++ binary pays no compilation cost.
+| Client / mode | Median wall (s) | Runs (s) | Notes |
+|---|---|---|---|
+| Python compile mode (`SweepRunner`) | 6.231 | 6.231, 6.235, 6.226 | includes in-process HSACO compile |
+| Python library mode (`SweepRunner`, `libraryPath=`) | 6.093 | 6.093, 6.235, 6.031 | no compile; loads the same pre-built `.co` as C++ |
+| C++ (`tensilelite-client`) cold page cache | 0.556 | 0.596, 0.540, 0.556 | `.co` + library pages evicted before each run |
+| C++ (`tensilelite-client`) warm page cache | 0.596 | 0.596, 0.568, 0.596 | `.co` already resident in the OS page cache |
+
+**Fairness fix.** The earlier comparison pitted a Python client compiling cold
+against a C++ client whose `.co` was already warm in the page cache. This run
+equalizes both ends: Python library mode loads the same pre-built `.co` (no
+compile), and the C++ client is measured both cold and warm. Passwordless
+`sudo` for `drop_caches` was unavailable, so cold runs evict just the library
+file and `.co` pages with `posix_fadvise(POSIX_FADV_DONTNEED)` before each run.
+
+### Where the Python wall-clock actually goes
+
+Timing the library-mode run by phase shows the wall-clock is dominated by
+one-time toolchain setup, not by kernel work:
+
+| Phase | Compile mode (s) | Library mode (s) |
+|---|---|---|
+| Toolchain ISA-capability detection (`makeIsaInfoMap`) | 5.42 | 5.42 |
+| YAML solution enumeration | folded into compile | 0.54 |
+| HSACO compile (enumerate + asm-gen + amdclang, 1 kernel) | 0.62 | — |
+| Library load + `.co` discovery | — | 0.009 |
+| GPU benchmark loop (all sizes) | 0.12 | 0.12 |
+| Pure GPU kernel time (sum of min-time iterations) | 0.028 | 0.028 |
+
+The ~5.4 s the previous report attributed to "kernel compile" is in fact ISA
+capability detection (`_setupTensile` -> `makeIsaInfoMap`, which shells out to
+`amdclang++` to dump the capability table). Both Python modes pay it, because
+library mode still needs the assembler and ISA-info map to recover each
+winner's launch metadata from the benchmark YAML. The actual HSACO compile is
+small for one kernel (~0.1 s over enumeration); its benefit grows with kernel
+count and size. The pure GPU benchmark is only ~28 ms, so the Python-vs-C++
+wall-clock gap is process and toolchain startup, not kernel execution.
 
 ### Interpretation
 
@@ -692,7 +768,13 @@ The C++ binary pays no compilation cost.
   binary's `WinnerGFlops` is derived from the minimum measured `time-us` across
   all benchmark iterations.  The comparison is methodologically sound.
 - **Clocks were not pinned.** `sudo amd-smi set -g 0 --perf-level HIGH` was
-  unavailable. Run-to-run variance for both clients is roughly 1–3%.
+  unavailable. Run-to-run GFLOPS variance for both clients is roughly 1–3%;
+  wall-clock variance is larger (the C++ cold/warm medians differ by ~7%).
+- **Cold vs warm C++ is a wash here.** Evicting the `.co` from the page cache
+  before each run moved the median wall by under 0.05 s (0.556 s cold vs
+  0.596 s warm — within run-to-run noise), because the code object is only
+  ~37 KB. The original "warm-cache advantage" is negligible for a single small
+  code object; it would matter for a large multi-kernel device library.
 
 ### Reproducing these measurements
 
@@ -809,3 +891,47 @@ Run the binary:
 LD_LIBRARY_PATH=/opt/rocm/lib \
   build_tmp/tensilelite/client/tensilelite-client --config-file /path/to/fair.ini
 ```
+
+Python library mode (no compile; same pre-built `.co` as C++):
+
+```python
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+import time
+from Tensile.client.sweep_runner import SweepRunner
+
+runner = SweepRunner(
+    yamlPath='Tensile/client/tests/yaml/gemm_standard.yaml',
+    libraryPath='/tmp/cpp_ref/BFloat16/TensileLibrary.yaml',
+    problemIdx=2, groupIdx=0, nWarmup=3, nIters=10, numElementsToValidate=0,
+)
+t0 = time.perf_counter()
+results = runner.run(resultsCsv='/tmp/py_library_results.csv')
+print(f'WALL_CLOCK_S={time.perf_counter() - t0:.4f}')
+```
+
+C++ cold page cache (evict the `.co` + library pages first, no root needed):
+
+```python
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+import os, subprocess, time
+
+def evict(path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    finally:
+        os.close(fd)
+
+evict('/tmp/cpp_ref/BFloat16/TensileLibrary.yaml')
+evict('/tmp/cpp_ref/BFloat16/kernel_0.co')
+env = dict(os.environ, LD_LIBRARY_PATH='/opt/rocm/lib')
+t0 = time.perf_counter()
+subprocess.run(['build_tmp/tensilelite/client/tensilelite-client',
+                '--config-file', '/path/to/fair.ini'], env=env, check=True)
+print(f'COLD_WALL_S={time.perf_counter() - t0:.4f}')
+```
+
+For the warm measurement, omit the `evict(...)` calls (run the binary twice and
+time the second run).
