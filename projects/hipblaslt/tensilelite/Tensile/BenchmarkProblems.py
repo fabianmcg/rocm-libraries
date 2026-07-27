@@ -707,6 +707,9 @@ def _benchmarkProblemType(backendConfig, problemTypeConfig, problemSizeGroupConf
                     else:
                         msg += "\nYou should re-run with \"PrintSolutionRejectionReason: True\"" \
                                 "to see why each parameter combination was rejected."
+                    if globalParameters.get("SkipGroupsWithNoSolutions", False):
+                        printWarning(msg + " Skipping this group.")
+                        return resultsFileName, 0
                     printExit(msg)
 
                 for solution in solutions:
