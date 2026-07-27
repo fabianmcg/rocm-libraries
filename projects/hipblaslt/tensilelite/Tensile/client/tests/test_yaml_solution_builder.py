@@ -1,19 +1,18 @@
 # Copyright Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier: MIT
-"""Unit tests for epilogue_harness.yaml_solution_builder.enumerateAllSolutions.
+"""Unit tests for Tensile.client.yaml_solution_builder.enumerateAllSolutions.
 
 Tests use in-memory YAML dicts written to temporary files so that rocisa is
 not required (yaml.safe_load is used, not LibraryIO.readYAML).
 """
 
-import os
 import textwrap
 
 import pytest
 import yaml
 
-from epilogues.epilogue_harness.yaml_solution_builder import (
-    _CHIP_TO_KERNS_ARGS_VERSION,
+from Tensile.client.yaml_solution_builder import (
+    _chipToKernArgsVersion,
     _injectInternalArgsSupport,
     _iterRawSolutions,
     enumerateAllSolutions,
@@ -23,11 +22,6 @@ from epilogues.epilogue_harness.yaml_solution_builder import (
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-_EPILOGUES_YAML_DIR = os.path.join(
-    os.path.dirname(__file__),
-    "..", "..", "..", "epilogues", "yaml",
-)
 
 
 def _writeYaml(tmp_path, content: str) -> str:
@@ -167,7 +161,7 @@ def test_inject_reads_isp_block():
 def test_inject_fallback_to_chip_table():
     sol = {"MacroTile0": 64}
     result = _injectInternalArgsSupport(sol, chip="gfx942")
-    assert result["KernArgsVersion"] == _CHIP_TO_KERNS_ARGS_VERSION["gfx942"]
+    assert result["KernArgsVersion"] == _chipToKernArgsVersion["gfx942"]
     assert result["SupportCustomWGM"] is False
     assert result["UseUniversalArgs"] is True
 
@@ -243,26 +237,5 @@ def test_enumerate_augments_with_chip_fallback(tmp_path):
     with open(path, "w") as f:
         yaml.dump(data, f)
     result = enumerateAllSolutions(path, chip="gfx942")
-    assert result[0][2]["KernArgsVersion"] == _CHIP_TO_KERNS_ARGS_VERSION["gfx942"]
+    assert result[0][2]["KernArgsVersion"] == _chipToKernArgsVersion["gfx942"]
 
-
-# ---------------------------------------------------------------------------
-# Verify existing epilogue YAML files do not crash (return empty).
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "yaml_name",
-    [
-        "gemm_partial_rms_k1.yaml",
-        "gemm_partial_rms_k1_rowmajor.yaml",
-    ],
-)
-def test_enumerate_existing_epilogue_yaml_empty(yaml_name):
-    """Calling enumerateAllSolutions on epilogue input-spec YAMLs returns []."""
-    path = os.path.join(_EPILOGUES_YAML_DIR, yaml_name)
-    if not os.path.exists(path):
-        pytest.skip(f"{yaml_name} not found")
-    result = enumerateAllSolutions(path, chip="gfx942")
-    # Input-spec YAMLs have no SolutionSummationExpansion.
-    assert result == []

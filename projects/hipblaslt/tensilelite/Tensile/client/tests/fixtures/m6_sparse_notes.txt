@@ -1,17 +1,45 @@
-M6-partial: Sparse 2:4 GPU test status
-=======================================
+M6-full: Sparse 2:4 GPU test status
+=====================================
 
-GPU sparse GEMM tests (TestSparseGpuGfx950 in test_gemm_sparse.py) are
-currently skipped because no gfx950-specific 2:4 sparse kernel YAML was
-located in the repository at M6-partial implementation time.
+Source YAML located
+-------------------
+A gfx950-compatible sparse GEMM kernel YAML was located at:
+
+  Tensile/Tests/common/sparse/gfx94x/spmm_fp16_mi16.yaml
+    Sparse: 1, fp16 HPA, NN (TransposeA=False, TransposeB=False)
+    Skip marks: skip-gfx900-9xx and skip-gfx1xxx (gfx950 NOT excluded)
+    MI [16,16,32,1,1,1,1,1,1], DepthU=32
+    Sizes: [16,16,1,16] and [256,256,1,32]
+
+A client-side reference YAML was created at:
+
+  Tensile/client/tests/yaml/gemm_sparse_gpu.yaml
+    Same ProblemType and ForkParams, size kept at [256,256,1,32].
+    NOTE: GPU dispatch is not yet implemented (see below).
+
+Why GPU sparse tests remain skipped
+-------------------------------------
+The sparse GEMM kernel expects:
+  - A compressed matrix (K/2 columns, uint8 or fp16 dtype)
+  - A metadata tensor (uint8, shape M x (K/8)) encoding the 2:4 sparsity pattern
+  - These pointers appear after the B pointer in singleCallArgs
+
+gemm_args.py does not yet support this sparse arg layout.  The standard
+_buildPointers function packs D, C, A, B only; it does not handle the
+compressed_A + metadata slots that the sparse kernel reads.
 
 To enable GPU sparse tests:
-1. Locate or generate a sparse GEMM kernel YAML targeting gfx950
-   (look in tensilelite/Tensile/Tests/ or a library logic directory).
-2. Load the solution via enumerateAllSolutions, filter for sparse kernels
-   (SparseA=True or CompressedA=True in the solution dict).
-3. Allocate compressed A and metadata via compress24() from sparse.py.
-4. Run the kernel and compare against the dense reference via gemm().
+1. Add sparse pointer slots to _buildPointers in gemm_args.py:
+     if sparse:
+         buf += _packPtr(tensors.get("compressed_A", 0))
+         buf += _packPtr(tensors.get("metadata", 0))
+2. Add sparse stride slots to _buildStrides.
+3. In the test, allocate GPU buffers for compressed_A and metadata,
+   populate them using compress24() from Tensile/client/sparse.py.
+4. Use gemmFp16 on the decompressed A (via decompress24) for reference.
 
-The compress24/decompress24 CPU functions (sparse.py) are fully tested
-by TestCompress24 and TestDecompress24FromKnown in test_gemm_sparse.py.
+CPU compress/decompress tests
+------------------------------
+TestCompress24 and TestDecompress24FromKnown in test_gemm_sparse.py
+fully test the compress24/decompress24 helpers in Tensile/client/sparse.py.
+These are CPU-only and pass without any GPU.

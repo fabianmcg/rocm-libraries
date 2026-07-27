@@ -301,7 +301,7 @@ def _compileGrouped():
     if not haveDeps:
         return []
     try:
-        from epilogues.epilogue_harness.yaml_solution_builder import (
+        from Tensile.client.yaml_solution_builder import (
             solutionsFromYaml, _injectInternalArgsSupport,
         )
         chip = amdgpu_exec.get_chip()
@@ -322,7 +322,7 @@ def _compileGrouped():
             import warnings
             warnings.warn(f"grouped solution {sid} failed to compile: {exc}")
             continue
-        from epilogues.epilogue_harness.yaml_solution_builder import _injectInternalArgsSupport
+        from Tensile.client.yaml_solution_builder import _injectInternalArgsSupport
         rawDict = dict(sol)
         solDict = _injectInternalArgsSupport(rawDict, chip)
         compiled.append({

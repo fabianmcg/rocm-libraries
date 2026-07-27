@@ -45,7 +45,7 @@ from Tensile.client.gemm_args import (
     _computeInternalArg1,
 )
 from Tensile.client.reference import gemm, assertClose, RTOL_FP32, ATOL_FP32
-from epilogues.epilogue_harness.yaml_solution_builder import _injectInternalArgsSupport
+from Tensile.client.yaml_solution_builder import _injectInternalArgsSupport
 
 
 # ---------------------------------------------------------------------------
@@ -355,7 +355,7 @@ def _compileSk(problemIdx: int):
     if not HAVE_DEPS:
         return []
     try:
-        from epilogues.epilogue_harness.yaml_solution_builder import solutionsFromYaml
+        from Tensile.client.yaml_solution_builder import solutionsFromYaml
         chip = amdgpu_exec.get_chip()
         assembler, isaInfoMap, debugConfig = _setupTensile(chip)
         sols = solutionsFromYaml(_yamlPath, assembler, isaInfoMap, debugConfig,

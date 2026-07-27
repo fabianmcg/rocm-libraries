@@ -8,7 +8,7 @@ GPU benchmarking. This avoids the need to hand-construct Solution dicts.
 
 KernArgsVersion chip table (used as fallback when InternalSupportParams is absent):
 
-    _CHIP_TO_KERNS_ARGS_VERSION = {
+    _chipToKernArgsVersion = {
         "gfx908": 0, "gfx90a": 0,
         "gfx940": 1, "gfx941": 1,
         "gfx942": 2, "gfx950": 2,
@@ -64,59 +64,6 @@ def problemSizesFromYaml(yamlPath, problemIdx=0, groupIdx=0):
     return [tuple(int(x) for x in p.sizes) for p in step.problemSizes.problems]
 
 
-def readTestAxes(yamlPath, section, mt1=None):
-    """Read test axis lists from the TestAxes section of a benchmark YAML.
-
-    section: key under TestAxes (e.g. "K1", "Pipeline").
-
-    Returns a dict with keys present in that section:
-      "M":       [(m, label), ...] — expanded from MMultipliers/MFractions/MOffsets/MFixed
-                 against mt1 (required when any M* key is present).
-      "NHidden": [...]
-      "K":       [...]
-    """
-    from Tensile import LibraryIO
-    data = LibraryIO.readYAML(yamlPath)
-    cfg = data.get("TestAxes", {}).get(section, {})
-    if not cfg:
-        raise KeyError(f"TestAxes.{section} not found in {yamlPath}")
-
-    result = {}
-
-    if "NHidden" in cfg:
-        result["NHidden"] = list(cfg["NHidden"])
-    if "K" in cfg:
-        result["K"] = list(cfg["K"])
-
-    mKeys = {"MMultipliers", "MFractions", "MOffsets", "MFixed"}
-    if mKeys & set(cfg):
-        if mt1 is None:
-            raise ValueError(f"mt1 required to expand M shapes in TestAxes.{section}")
-        seen = set()
-        mShapes = []
-
-        def addM(m, label):
-            m = max(1, m)
-            if m not in seen:
-                seen.add(m)
-                mShapes.append((m, label))
-
-        for mult in cfg.get("MMultipliers", []):
-            addM(mt1 * mult, f"{mult}xMT1")
-        for num, den in cfg.get("MFractions", []):
-            addM(mt1 * num // den, f"MT1_{num}d{den}")
-        for baseMult, delta in cfg.get("MOffsets", []):
-            m = mt1 * abs(baseMult) + delta
-            sign = "p" if delta >= 0 else "m"
-            addM(m, f"{abs(baseMult)}MT1{sign}{abs(delta)}")
-        for m in cfg.get("MFixed", []):
-            addM(m, f"M{m}")
-
-        result["M"] = mShapes
-
-    return result
-
-
 def solutionId(solution):
     """Return a short stable string identifying a solution by its tile dimensions and flags."""
     mt0 = solution["MacroTile0"]
@@ -148,7 +95,7 @@ def solutionsFromYaml(yamlPath, assembler, isaInfoMap, debugConfig,
 # KernArgsVersion fallback table (no ArchitectureSet field in tuning YAMLs).
 # ---------------------------------------------------------------------------
 
-_CHIP_TO_KERNS_ARGS_VERSION: dict[str, int] = {
+_chipToKernArgsVersion: dict[str, int] = {
     "gfx908": 0,
     "gfx90a": 0,
     "gfx940": 1,
@@ -167,11 +114,11 @@ def _kernArgsVersionForChip(chip: str) -> int:
     version=0 silently, since a wrong version produces incorrect argument
     layouts.
     """
-    if chip not in _CHIP_TO_KERNS_ARGS_VERSION:
+    if chip not in _chipToKernArgsVersion:
         raise NotImplementedError(
             f"unsupported chip for KernArgsVersion lookup: {chip}"
         )
-    return _CHIP_TO_KERNS_ARGS_VERSION[chip]
+    return _chipToKernArgsVersion[chip]
 
 
 def _injectInternalArgsSupport(solution: dict, chip: str | None) -> dict:
@@ -271,7 +218,7 @@ def enumerateAllSolutions(
     isaInfoMap needed.
 
     Returns a list of (group_idx, solution_idx, solution_dict) triples where
-    each solution_dict is augmented with the following keys (task 0.8):
+    each solution_dict is augmented with the following keys:
       KernArgsVersion, SupportCustomWGM, SupportCustomStaggerU,
       SupportUserGSU, UseSFC, UseUniversalArgs,
       GlobalSplitUCoalesced, GlobalSplitUWorkGroupMappingRoundRobin

@@ -70,7 +70,7 @@ from Tensile.client.gemm_args import (
     _computeInternalArg1,
 )
 from Tensile.client.reference import gemmBf16, assertClose, RTOL_BF16, ATOL_BF16
-from epilogues.epilogue_harness.yaml_solution_builder import _injectInternalArgsSupport
+from Tensile.client.yaml_solution_builder import _injectInternalArgsSupport
 
 # ---------------------------------------------------------------------------
 # Shared helpers (mirrors test_harness_rotation.py pattern)
@@ -116,7 +116,7 @@ def _compileBf16Solutions():
     if not haveDeps:
         return []
     try:
-        from epilogues.epilogue_harness.yaml_solution_builder import solutionsFromYaml
+        from Tensile.client.yaml_solution_builder import solutionsFromYaml
         chip = amdgpu_exec.get_chip()
         assembler, isaInfoMap, debugConfig = _setupTensile(chip)
         sols = solutionsFromYaml(_yamlPath, assembler, isaInfoMap, debugConfig, problemIdx=2)

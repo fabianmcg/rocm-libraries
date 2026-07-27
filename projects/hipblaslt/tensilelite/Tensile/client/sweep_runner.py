@@ -10,6 +10,7 @@ library-update YAML.
 
 from __future__ import annotations
 
+import configparser
 import ctypes
 import logging
 import math
@@ -254,6 +255,26 @@ class SweepRunner:
         compiled HSACO bytes are used only for in-process benchmarking.
     """
 
+    def _resolveYamlFromIni(self, iniPath: str) -> str:
+        """Extract the benchmark YAML path from a ClientParameters .ini file.
+
+        Parses the flat key=value .ini using configparser with a synthetic section
+        header and returns the value of the benchmark-yaml key.
+        Raises KeyError when the key is absent.
+        """
+        config = configparser.RawConfigParser(strict=False)
+        with open(iniPath) as f:
+            content = f.read()
+        config.read_string('[default]\n' + content)
+        section = config['default']
+        if 'benchmark-yaml' not in section:
+            raise KeyError(
+                f"benchmark-yaml key not found in .ini file: {iniPath}; "
+                "re-generate the .ini with a version of ClientWriter that "
+                "writes this key"
+            )
+        return section['benchmark-yaml']
+
     def __init__(self, yamlPath: str, libraryPath: Optional[str] = None,
                  nWarmup: int = 2, nIters: int = 10,
                  rotatingBuffers: int = 8, icacheCopies="auto",
@@ -261,7 +282,10 @@ class SweepRunner:
                  saveCoPath: Optional[str] = None,
                  pinClocks: bool = False,
                  amdSmiPath: Optional[str] = None) -> None:
-        self._yamlPath = yamlPath
+        if yamlPath.endswith('.ini'):
+            self._yamlPath = self._resolveYamlFromIni(yamlPath)
+        else:
+            self._yamlPath = yamlPath
         self._libraryPath = libraryPath
         self._nWarmup = nWarmup
         self._nIters = nIters
@@ -277,7 +301,7 @@ class SweepRunner:
                             debugConfig) -> Optional[dict]:
         """Compile one solution; return a compiled entry dict or None on failure."""
         import amdgpu_exec
-        from epilogues.epilogue_harness.yaml_solution_builder import (
+        from Tensile.client.yaml_solution_builder import (
             _injectInternalArgsSupport,
         )
 
@@ -314,7 +338,7 @@ class SweepRunner:
         written to {saveCoPath}/{kernelName}.co for use by the C++ client.
         Solutions that fail to compile or are filtered are skipped with a warning.
         """
-        from epilogues.epilogue_harness.yaml_solution_builder import solutionsFromYaml
+        from Tensile.client.yaml_solution_builder import solutionsFromYaml
 
         if self._saveCoPath is not None:
             os.makedirs(self._saveCoPath, exist_ok=True)
@@ -367,8 +391,8 @@ class SweepRunner:
                 nWarmup=self._nWarmup,
                 nIters=self._nIters,
             )
-            # Use p50 (median) to ignore OS-level timing spikes.
-            gflops = 2 * M * N * K * batch / (benchResult.p50Us * 1e-6) / 1e9
+            # Use min (best iteration) to match C++ WinnerGFlops (= minimum time).
+            gflops = 2 * M * N * K * batch / (benchResult.minUs * 1e-6) / 1e9
             return gflops, benchResult
         except Exception as exc:
             _log.warning("benchmark failed for %s size=(%d,%d,%d,%d): %s",
@@ -469,7 +493,7 @@ class SweepRunner:
         hwMonitor, boundsCheck, rocprofCounters: reserved for future use.
         Returns a flat list of SweepResult (one per problem_size × solution).
         """
-        from epilogues.epilogue_harness.yaml_solution_builder import problemSizesFromYaml
+        from Tensile.client.yaml_solution_builder import problemSizesFromYaml
 
         compiled, _ = self._compile()
         if not compiled:

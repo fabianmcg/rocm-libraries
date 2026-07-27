@@ -68,7 +68,7 @@ from Tensile.client.reference import (
     RTOL_BF16, ATOL_BF16,
     _ACT_ARG_COUNT,
 )
-from epilogues.epilogue_harness.yaml_solution_builder import _injectInternalArgsSupport
+from Tensile.client.yaml_solution_builder import _injectInternalArgsSupport
 
 # ---------------------------------------------------------------------------
 # YAML problem-group indices (matching gemm_epilogues.yaml comment).
@@ -721,7 +721,7 @@ def _compileSolutions(problem_idx: int) -> list[dict]:
     if not HAVE_DEPS:
         return []
     try:
-        from epilogues.epilogue_harness.yaml_solution_builder import solutionsFromYaml
+        from Tensile.client.yaml_solution_builder import solutionsFromYaml
         chip = amdgpu_exec.get_chip()
         assembler, isaInfoMap, debugConfig = _setupTensile(chip)
         sols = solutionsFromYaml(_YAML_PATH, assembler, isaInfoMap, debugConfig,

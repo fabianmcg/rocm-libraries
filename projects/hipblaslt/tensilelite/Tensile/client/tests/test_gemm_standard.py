@@ -64,7 +64,7 @@ from Tensile.client.reference import (
     RTOL_FP16, ATOL_FP16,
     RTOL_BF16, ATOL_BF16,
 )
-from epilogues.epilogue_harness.yaml_solution_builder import _injectInternalArgsSupport
+from Tensile.client.yaml_solution_builder import _injectInternalArgsSupport
 
 # ---------------------------------------------------------------------------
 # Problem group indices in gemm_standard.yaml.
@@ -502,7 +502,7 @@ class TestGemmBf16Reference:
 def _setupTensile(chip: str):
     """Initialize Tensile assembler + ISA map for kernel compilation.
 
-    Mirrors the setup_tensile helper from epilogue_harness.partialrms_helpers.
+    Mirrors the setup_tensile helper pattern used across the client tests.
     """
     from pathlib import Path
     from Tensile.Toolchain.Validators import validateToolchain
@@ -549,7 +549,7 @@ def _compileSolutions(problem_idx: int):
     if not HAVE_DEPS:
         return []
     try:
-        from epilogues.epilogue_harness.yaml_solution_builder import solutionsFromYaml
+        from Tensile.client.yaml_solution_builder import solutionsFromYaml
         chip = amdgpu_exec.get_chip()
         assembler, isaInfoMap, debugConfig = _setupTensile(chip)
         sols = solutionsFromYaml(_YAML_PATH, assembler, isaInfoMap, debugConfig,

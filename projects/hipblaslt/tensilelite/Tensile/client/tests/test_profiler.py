@@ -117,7 +117,7 @@ def _compileBf16Kernel():
         return None
     try:
         from pathlib import Path
-        from epilogues.epilogue_harness.yaml_solution_builder import (
+        from Tensile.client.yaml_solution_builder import (
             solutionsFromYaml, _injectInternalArgsSupport,
         )
         from Tensile.Toolchain.Validators import validateToolchain

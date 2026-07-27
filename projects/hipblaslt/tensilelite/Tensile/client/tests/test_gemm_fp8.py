@@ -60,7 +60,7 @@ from Tensile.client.reference import (
     ATOL_FP32,
     RTOL_FP32,
 )
-from epilogues.epilogue_harness.yaml_solution_builder import _injectInternalArgsSupport
+from Tensile.client.yaml_solution_builder import _injectInternalArgsSupport
 
 # ---------------------------------------------------------------------------
 # Tolerance constants for fp8 correctness checks.
@@ -283,7 +283,7 @@ def _compileFp8Solutions(problemIdx: int):
     if not haveDeps:
         return []
     try:
-        from epilogues.epilogue_harness.yaml_solution_builder import solutionsFromYaml
+        from Tensile.client.yaml_solution_builder import solutionsFromYaml
         chip = amdgpu_exec.get_chip()
         assembler, isaInfoMap, debugConfig = _setupTensile(chip)
         sols = solutionsFromYaml(_yamlPath, assembler, isaInfoMap, debugConfig,

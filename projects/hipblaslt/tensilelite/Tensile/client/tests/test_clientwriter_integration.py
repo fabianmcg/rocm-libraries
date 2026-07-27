@@ -115,6 +115,41 @@ def test_sweep_returns_non_empty_results(integrationSweep):
 
 
 # ---------------------------------------------------------------------------
+# Task 14.2 — .ini resolution unit test (no GPU required).
+# ---------------------------------------------------------------------------
+
+
+def test_ini_resolve_yaml_path(tmp_path):
+    """SweepRunner.__init__ resolves a .ini path to the embedded benchmark-yaml value.
+
+    Constructs a minimal mock .ini containing the benchmark-yaml key and verifies
+    that _resolveYamlFromIni returns the correct YAML path.  No GPU or compilation
+    needed.
+    """
+    iniPath = str(tmp_path / "ClientParameters.ini")
+    expectedYaml = _YAML_PATH
+    with open(iniPath, "w") as f:
+        f.write("library-file=/some/TensileLibrary.yaml\n")
+        f.write(f"benchmark-yaml={expectedYaml}\n")
+        f.write("results-file=/some/results.csv\n")
+
+    runner = SweepRunner(yamlPath=iniPath)
+    assert runner._yamlPath == expectedYaml, (
+        f"expected {expectedYaml!r}, got {runner._yamlPath!r}"
+    )
+
+
+def test_ini_missing_benchmark_yaml_raises(tmp_path):
+    """SweepRunner raises KeyError when benchmark-yaml is absent from the .ini."""
+    iniPath = str(tmp_path / "ClientParameters.ini")
+    with open(iniPath, "w") as f:
+        f.write("library-file=/some/TensileLibrary.yaml\n")
+
+    with pytest.raises(KeyError, match="benchmark-yaml"):
+        SweepRunner(yamlPath=iniPath)
+
+
+# ---------------------------------------------------------------------------
 # Task 14.2 — runClient() integration with use_python_client=True.
 # ---------------------------------------------------------------------------
 
@@ -147,6 +182,48 @@ def test_runclient_python_harness_returns_zero(tmp_path):
             outputPath=tmp_path,
             configPaths=[_YAML_PATH],
             use_python_client=True,
+        )
+    finally:
+        globalParameters["CpuOnly"] = origCpuOnly
+        globalParameters["ParallelGpuExecution"] = origParallel
+
+    assert rc == 0, f"runClient() returned {rc}; expected 0"
+
+
+@requires_gfx950
+@pytest.mark.slow
+def test_runclient_ini_path_returns_zero(tmp_path):
+    """runClient() resolves a .ini path to its benchmark YAML and returns 0.
+
+    Creates a mock .ini containing benchmark-yaml pointing at the test YAML
+    and calls runClient() with use_python_client=True (the new default) to
+    verify the end-to-end .ini -> YAML resolution path.
+    """
+    if not HAVE_DEPS:
+        pytest.skip("amdgpu_exec not installed")
+
+    from Tensile.ClientWriter import runClient
+    from Tensile.Common.GlobalParameters import globalParameters
+
+    iniPath = str(tmp_path / "ClientParameters.ini")
+    with open(iniPath, "w") as f:
+        f.write("library-file=/some/TensileLibrary.yaml\n")
+        f.write(f"benchmark-yaml={_YAML_PATH}\n")
+        f.write("results-file=/some/results.csv\n")
+
+    origCpuOnly = globalParameters.get("CpuOnly", False)
+    origParallel = globalParameters.get("ParallelGpuExecution", 1)
+    globalParameters["CpuOnly"] = False
+    globalParameters["ParallelGpuExecution"] = 1
+    try:
+        rc = runClient(
+            libraryLogicPath=None,
+            forBenchmark=True,
+            enableTileSelection=False,
+            cxxCompiler="amdclang++",
+            cCompiler="amdclang",
+            outputPath=tmp_path,
+            configPaths=[iniPath],
         )
     finally:
         globalParameters["CpuOnly"] = origCpuOnly

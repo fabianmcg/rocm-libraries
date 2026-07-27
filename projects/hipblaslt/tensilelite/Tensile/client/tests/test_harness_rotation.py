@@ -49,7 +49,7 @@ from Tensile.client.gemm_args import (
     _computeInternalArg0,
     _computeInternalArg1,
 )
-from epilogues.epilogue_harness.yaml_solution_builder import _injectInternalArgsSupport
+from Tensile.client.yaml_solution_builder import _injectInternalArgsSupport
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +96,7 @@ def _compileBf16Solutions():
     if not HAVE_DEPS:
         return []
     try:
-        from epilogues.epilogue_harness.yaml_solution_builder import solutionsFromYaml
+        from Tensile.client.yaml_solution_builder import solutionsFromYaml
         chip = amdgpu_exec.get_chip()
         assembler, isaInfoMap, debugConfig = _setupTensile(chip)
         sols = solutionsFromYaml(_YAML_PATH, assembler, isaInfoMap, debugConfig, problemIdx=2)
