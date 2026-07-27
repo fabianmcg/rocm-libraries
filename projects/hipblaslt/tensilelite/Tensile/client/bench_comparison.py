@@ -139,60 +139,134 @@ def locateArtifacts(pipelineDir, arch):
 # ---------------------------------------------------------------------------
 
 
-def _findSolutionYamls(pipelineDir):
-    """Return all 00_Final.yaml files from BenchmarkProblems; sorted by path."""
-    matches = glob.glob(
+def _findGroupDirs(pipelineDir):
+    """Return (finalYaml, hsacoPath, libYamlPath) triples from BenchmarkProblems output."""
+    finalYamls = sorted(glob.glob(
         f"{pipelineDir}/1_BenchmarkProblems/**/Data/00_Final.yaml", recursive=True
-    )
-    return sorted(matches)
-
-
-def parsePythonResults(results):
-    """Convert SweepResult list to total (solutions, sizes) counts."""
-    sizes = set()
-    for r in results:
-        sizes.add(tuple(r.problemSize[:4]))
-    return len(results), len(sizes)
-
-
-def _runOnePythonBench(solutionYamls, validateN, nWarmup, nIters, outDir, runIndex):
-    """Compile and benchmark all candidates from 00_Final.yaml files; return (wall, nResults, nSizes)."""
-    from Tensile.client.sweep_runner import SweepRunner
-    t0 = time.perf_counter()
-    totalResults = 0
-    allSizes = set()
-    for yamlPath in solutionYamls:
-        runner = SweepRunner(
-            yamlPath=yamlPath,
-            numElementsToValidate=validateN,
-            nWarmup=nWarmup,
-            nIters=nIters,
-            _finalYaml=True,
+    ))
+    groups = []
+    for yamlPath in finalYamls:
+        groupDir = os.path.dirname(os.path.dirname(yamlPath))
+        hsacos = glob.glob(
+            f"{groupDir}/**/TensileLibrary_gfx950.co", recursive=True
         )
-        results = runner.run()
-        totalResults += len(results)
-        for r in results:
-            allSizes.add(tuple(r.problemSize[:4]))
+        libYamls = glob.glob(
+            f"{groupDir}/**/TensileLibrary.yaml", recursive=True
+        )
+        if hsacos and libYamls:
+            groups.append((yamlPath, hsacos[0], libYamls[0]))
+    return groups
+
+
+def _readKernelNamesFromLibYaml(libYamlPath):
+    """Return list of kernelName strings from a TensileLibrary.yaml."""
+    import yaml as _yaml
+    with open(libYamlPath) as f:
+        data = _yaml.safe_load(f)
+    names = []
+    def _walk(node):
+        if isinstance(node, dict):
+            if "kernelName" in node:
+                names.append(node["kernelName"])
+            for v in node.values():
+                _walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+    _walk(data)
+    return list(dict.fromkeys(names))  # deduplicated, order preserved
+
+
+def _benchmarkGroup(yamlPath, hsacoPath, libYamlPath, nWarmup, nIters):
+    """Benchmark all solutions in one group using the pre-built HSACO; return results list."""
+    import yaml as _yaml
+    from Tensile.client.harness import KernelRunner
+    from Tensile.client.yaml_solution_builder import _injectInternalArgsSupport
+    from Tensile.client.sweep_runner import _buildSweepArgs, _computeNumWg, _deviceCuCount
+    from amdgpu_exec import GpuBuffer, get_chip
+
+    chip = get_chip()
+    with open(yamlPath) as f:
+        data = _yaml.safe_load(f)
+    if not isinstance(data, list) or len(data) < 6:
+        return []
+    rawSizes = data[1].get("ProblemSizes", [])
+    probSizes = []
+    for entry in rawSizes:
+        exact = entry.get("Exact", []) if isinstance(entry, dict) else []
+        if len(exact) >= 4:
+            probSizes.append(tuple(int(x) for x in exact[:4]))
+    solRaws = [item for item in data[5:] if isinstance(item, dict)]
+    if not solRaws or not probSizes:
+        return []
+    kernelNames = _readKernelNamesFromLibYaml(libYamlPath)
+    if len(kernelNames) != len(solRaws):
+        kernelNames = kernelNames[:len(solRaws)]
+    hsacoBytes = open(hsacoPath, "rb").read()
+    cuCount = _deviceCuCount()
+    results = []
+    for solRaw, kernelName in zip(solRaws, kernelNames):
+        solDict = _injectInternalArgsSupport(dict(solRaw), chip)
+        try:
+            runner = KernelRunner.fromHsaco(hsacoBytes, kernelName, nModuleCopies=1)
+        except Exception as exc:
+            print(f"    load failed {kernelName[:50]}: {exc}")
+            continue
+        for M, N, batch, K in probSizes:
+            try:
+                dSize = M * N * batch * 2  # bf16 = 2 bytes
+                aBuf = GpuBuffer(M * K * batch * 2)
+                bBuf = GpuBuffer(N * K * batch * 2)
+                cBuf = GpuBuffer(dSize)
+                dBuf = GpuBuffer(dSize)
+                args = _buildSweepArgs(solDict, M, N, batch, K, dBuf, cBuf, aBuf, bBuf, cuCount)
+                wg = _computeNumWg(solDict, M, N, batch)
+                benchResult = runner.run(
+                    argsFn=lambda _buf: args,
+                    grid=(wg, 1, 1),
+                    block=(solDict.get("NumThreads", 256), 1, 1),
+                    nWarmup=nWarmup,
+                    nIters=nIters,
+                )
+                gflops = 2 * M * N * K * batch / (benchResult.minUs * 1e-6) / 1e9
+                results.append((M, N, batch, K, gflops))
+            except Exception as exc:
+                print(f"    bench failed {kernelName[:30]} {M}x{N}: {exc}")
+    return results
+
+
+def parsePythonResults(rawResults):
+    """Convert raw results list to (nResults, nSizes)."""
+    sizes = set((r[0], r[1], r[2], r[3]) for r in rawResults)
+    return len(rawResults), len(sizes)
+
+
+def _runOnePythonBench(groups, nWarmup, nIters, outDir, runIndex):
+    """Benchmark all candidate groups using pre-built HSACO; return (wall, nResults, nSizes)."""
+    t0 = time.perf_counter()
+    allResults = []
+    for yamlPath, hsacoPath, libYamlPath in groups:
+        groupResults = _benchmarkGroup(yamlPath, hsacoPath, libYamlPath, nWarmup, nIters)
+        allResults.extend(groupResults)
     wall = time.perf_counter() - t0
-    return wall, totalResults, len(allSizes)
+    nResults, nSizes = parsePythonResults(allResults)
+    return wall, nResults, nSizes
 
 
 def runPythonBench(pipelineDir, validateN, nWarmup, nIters, outDir):
-    """Run SweepRunner in compile mode 3 times over all candidate YAMLs."""
+    """Benchmark all candidate groups 3 times using pre-built HSACO files."""
     from Tensile.client.sweep_runner import _cachedIsaInfoMap
-    solutionYamls = _findSolutionYamls(pipelineDir)
-    if not solutionYamls:
-        raise FileNotFoundError(f"No 00_Final.yaml files found under {pipelineDir}")
-    print(f"  Found {len(solutionYamls)} candidate solution YAMLs")
-    # Clear ISA cache so run 0 is genuinely cold.
+    groups = _findGroupDirs(pipelineDir)
+    if not groups:
+        raise FileNotFoundError(
+            f"No (00_Final.yaml, hsaco) pairs found under {pipelineDir}")
+    print(f"  Found {len(groups)} candidate groups with pre-built HSACO")
     _cachedIsaInfoMap.cache_clear()
     dropPageCache()
     runs = []
     for i in range(3):
         print(f"  Python bench run {i} ...")
-        wall, nResults, nSizes = _runOnePythonBench(
-            solutionYamls, validateN, nWarmup, nIters, outDir, i
-        )
+        wall, nResults, nSizes = _runOnePythonBench(groups, nWarmup, nIters, outDir, i)
         runs.append({"wall": wall, "nResults": nResults, "nSizes": nSizes})
         print(f"    wall={wall:.1f}s, results={nResults}, sizes={nSizes}")
     return runs
