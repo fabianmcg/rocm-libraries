@@ -156,30 +156,25 @@ def parsePythonResults(results):
 
 
 def _runOnePythonBench(solutionYamls, validateN, nWarmup, nIters, outDir, runIndex):
-    """Run SweepRunner in compile mode over all candidate YAMLs; return (wall, nResults, nSizes)."""
+    """Compile and benchmark all candidates from 00_Final.yaml files; return (wall, nResults, nSizes)."""
     from Tensile.client.sweep_runner import SweepRunner
-    csvPath = os.path.join(outDir, f"python_run{runIndex}.csv")
     t0 = time.perf_counter()
-    totalResults = []
+    totalResults = 0
+    allSizes = set()
     for yamlPath in solutionYamls:
         runner = SweepRunner(
             yamlPath=yamlPath,
             numElementsToValidate=validateN,
             nWarmup=nWarmup,
             nIters=nIters,
+            _finalYaml=True,
         )
-        totalResults.extend(runner.run())
+        results = runner.run()
+        totalResults += len(results)
+        for r in results:
+            allSizes.add(tuple(r.problemSize[:4]))
     wall = time.perf_counter() - t0
-    nResults, nSizes = parsePythonResults(totalResults)
-    # Write combined CSV for first run only.
-    if runIndex == 0 and totalResults:
-        import csv as _csv
-        with open(csvPath, "w", newline="") as f:
-            w = _csv.writer(f)
-            w.writerow(["problemSize", "gflops", "validation"])
-            for r in totalResults:
-                w.writerow([r.problemSize, r.gflops, r.validation])
-    return wall, nResults, nSizes
+    return wall, totalResults, len(allSizes)
 
 
 def runPythonBench(pipelineDir, validateN, nWarmup, nIters, outDir):

@@ -163,6 +163,44 @@ def _injectInternalArgsSupport(solution: dict, chip: str | None) -> dict:
     return result
 
 
+def solutionsFromFinalYaml(yamlPath: str, assembler, isaInfoMap, debugConfig,
+                           chip: str | None = None):
+    """Parse a 00_Final.yaml (BenchmarkProblems output) into (Solution objects, problem_sizes).
+
+    00_Final.yaml is a flat list:
+      [0]: {MinimumRequiredVersion: ...}
+      [1]: {ProblemSizes: [...]}
+      [2..4]: BiasTypeArgs, ActivationArgs, GateTypeArgs
+      [5+]: fully-resolved solution parameter dicts with ProblemType and ISA
+
+    Returns (solutions, problemSizes) where solutions is a list of (Solution, id) pairs
+    (same format as solutionsFromYaml) and problemSizes is a list of (M, N, batch, K) tuples.
+    """
+    import yaml
+    from Tensile.BenchmarkProblems import _build_and_validate_solution
+
+    with open(yamlPath) as f:
+        data = yaml.safe_load(f)
+    if not isinstance(data, list) or len(data) < 6:
+        return [], []
+    rawSizes = data[1].get("ProblemSizes", [])
+    problemSizes = []
+    for entry in rawSizes:
+        exact = entry.get("Exact", []) if isinstance(entry, dict) else []
+        if len(exact) >= 4:
+            problemSizes.append(tuple(int(x) for x in exact[:4]))
+    solutions = []
+    for item in data[5:]:
+        if not isinstance(item, dict):
+            continue
+        sol = _build_and_validate_solution(
+            dict(item), assembler, debugConfig, isaInfoMap, silent=True
+        )
+        if sol is not None:
+            solutions.append((sol, solutionId(sol)))
+    return solutions, problemSizes
+
+
 def _iterRawSolutions(yamlPath: str) -> list[tuple[int, int, dict]]:
     """Iterate raw solution dicts from a tuning YAML without building Solution objects.
 

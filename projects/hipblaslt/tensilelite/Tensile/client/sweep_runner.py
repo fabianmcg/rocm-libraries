@@ -460,7 +460,8 @@ class SweepRunner:
                  numElementsToValidate: int = 0,
                  saveCoPath: Optional[str] = None,
                  pinClocks: bool = False,
-                 amdSmiPath: Optional[str] = None) -> None:
+                 amdSmiPath: Optional[str] = None,
+                 _finalYaml: bool = False) -> None:
         if yamlPath.endswith('.ini'):
             self._yamlPath = self._resolveYamlFromIni(yamlPath)
         else:
@@ -476,6 +477,7 @@ class SweepRunner:
         self._saveCoPath = saveCoPath
         self._pinClocks = pinClocks
         self._amdSmiPath = amdSmiPath
+        self._finalYaml = _finalYaml
 
     def _compileOneSolution(self, sol, sid, chip: str, assembler,
                             debugConfig) -> Optional[dict]:
@@ -518,16 +520,25 @@ class SweepRunner:
         written to {saveCoPath}/{kernelName}.co for use by the C++ client.
         Solutions that fail to compile or are filtered are skipped with a warning.
         """
-        from Tensile.client.yaml_solution_builder import solutionsFromYaml
+        from Tensile.client.yaml_solution_builder import (
+            solutionsFromYaml, solutionsFromFinalYaml,
+        )
 
         if self._saveCoPath is not None:
             os.makedirs(self._saveCoPath, exist_ok=True)
 
         try:
-            sols = solutionsFromYaml(
-                self._yamlPath, assembler, isaInfoMap, debugConfig,
-                problemIdx=self._problemIdx, groupIdx=self._groupIdx,
-            )
+            if self._finalYaml:
+                sols, problemSizes = solutionsFromFinalYaml(
+                    self._yamlPath, assembler, isaInfoMap, debugConfig, chip)
+                # Store problem sizes for _runCompile to use.
+                self._finalYamlProblemSizes = problemSizes
+            else:
+                self._finalYamlProblemSizes = None
+                sols = solutionsFromYaml(
+                    self._yamlPath, assembler, isaInfoMap, debugConfig,
+                    problemIdx=self._problemIdx, groupIdx=self._groupIdx,
+                )
         except Exception as exc:
             _log.warning("solution enumeration failed: %s", exc)
             return []
@@ -954,9 +965,12 @@ class SweepRunner:
         if not compiled:
             _log.warning("no solutions compiled; sweep returns empty")
             return []
-        probSizes = problemSizesFromYaml(self._yamlPath,
-                                         problemIdx=self._problemIdx,
-                                         groupIdx=self._groupIdx)
+        if self._finalYaml and self._finalYamlProblemSizes:
+            probSizes = self._finalYamlProblemSizes
+        else:
+            probSizes = problemSizesFromYaml(self._yamlPath,
+                                             problemIdx=self._problemIdx,
+                                             groupIdx=self._groupIdx)
         cuCount = _deviceCuCount()
         solNames = [e["sid"] for e in compiled]
         # numSizeDims from actual tuple length — batched GEMM returns 8-dim tuples.
