@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import configparser
 import ctypes
+import functools
 import logging
 import math
 import os
@@ -60,20 +61,26 @@ class SweepResult:
 # ---------------------------------------------------------------------------
 
 
+@functools.lru_cache(maxsize=None)
+def _cachedIsaInfoMap(isa, cxx: str):
+    """Return ISA capability map for one ISA version, cached to avoid repeated amdclang++ invocations."""
+    from Tensile.Common.Capabilities import makeIsaInfoMap
+    return makeIsaInfoMap([isa], cxx)
+
+
 def _setupTensile(chip: str):
     """Initialize Tensile assembler + ISA map for kernel compilation."""
     from pathlib import Path
     from Tensile.Toolchain.Validators import validateToolchain
     from Tensile.Toolchain.Component import Assembler
     from Tensile.Common.Architectures import gfxToIsa
-    from Tensile.Common.Capabilities import makeIsaInfoMap
     from Tensile.Common.GlobalParameters import assignGlobalParameters
     from Tensile.Common.Types import DebugConfig
 
     gfx = chip.split(":")[0]
     cxx = validateToolchain("amdclang++")
     isa = gfxToIsa(gfx)
-    isaInfoMap = makeIsaInfoMap([isa], cxx)
+    isaInfoMap = _cachedIsaInfoMap(isa, cxx)
     assignGlobalParameters({}, isaInfoMap)
     assembler = Assembler(Path(cxx), co_version="6")
     return assembler, isaInfoMap, DebugConfig()
