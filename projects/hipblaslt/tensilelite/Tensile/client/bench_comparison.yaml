@@ -18,7 +18,7 @@ GlobalParameters:
   ForceRedoLibraryClient: True
   EnqueuesPerSync: 1
   SyncsPerBenchmark: 0
-  NumElementsToValidate: -1
+  NumElementsToValidate: 0
   ValidationMaxToPrint: 4
   ValidationPrintValids: False
   KernelTime: True
