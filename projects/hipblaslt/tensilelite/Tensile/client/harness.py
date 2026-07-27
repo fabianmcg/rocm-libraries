@@ -162,22 +162,52 @@ class KernelRunner:
         for _ in range(nWarmup):
             self._runOneIter(argsFn, grid, block, GpuEvent)
 
-    def _runTimedIters(self, argsFn, grid: tuple, block: tuple, GpuEvent,
-                       nIters: int, profilerMod) -> tuple:
-        """Execute timed iterations, optionally collecting ROCprofiler counters.
+    def _runTimedItersBatched(self, argsFn, grid: tuple, block: tuple, GpuEvent,
+                              nIters: int) -> tuple:
+        """Enqueue all nIters launches between a single start/stop event pair.
 
-        Returns (timesNs, counters).
+        Eliminates per-iteration synchronization overhead to match the C++
+        BenchmarkTimer pattern. Returns ([perLaunchNs] * nIters, {}).
+        """
+        if nIters == 0:
+            return [], {}
+        start = GpuEvent()
+        stop = GpuEvent()
+        start.record()
+        for _ in range(nIters):
+            fn = self._functions[self._call_count % len(self._functions)]
+            out_buf = self._outputPool.next() if self._outputPool is not None else None
+            args = argsFn(out_buf)
+            fn.launch(grid, block, args)
+            self._call_count += 1
+        stop.record()
+        stop.synchronize()
+        perLaunchNs = stop.elapsed_ns(start) // nIters
+        return [perLaunchNs] * nIters, {}
+
+    def _runTimedItersProfiled(self, argsFn, grid: tuple, block: tuple, GpuEvent,
+                               nIters: int, profilerMod) -> tuple:
+        """Execute timed iterations with per-iteration ROCprofiler counter collection.
+
+        Falls back to per-iteration synchronization because profilerMod.enable/disable
+        must bracket each kernel launch individually. Returns (timesNs, counters).
         """
         timesNs = []
         counters = {}
         for i in range(nIters):
-            if profilerMod is not None:
-                profilerMod.enable()
+            profilerMod.enable()
             timesNs.append(self._runOneIter(argsFn, grid, block, GpuEvent))
-            if profilerMod is not None:
-                profilerMod.disable()
-                counters[str(i)] = profilerMod.fetch(i)
+            profilerMod.disable()
+            counters[str(i)] = profilerMod.fetch(i)
         return timesNs, counters
+
+    def _runTimedIters(self, argsFn, grid: tuple, block: tuple, GpuEvent,
+                       nIters: int, profilerMod) -> tuple:
+        """Dispatch to batched or per-iteration timing depending on profilerMod."""
+        if profilerMod is not None:
+            return self._runTimedItersProfiled(argsFn, grid, block, GpuEvent,
+                                               nIters, profilerMod)
+        return self._runTimedItersBatched(argsFn, grid, block, GpuEvent, nIters)
 
     def _checkBounds(self) -> None:
         """Check sentinel values on all output pool slots after the run."""

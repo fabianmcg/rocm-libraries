@@ -147,7 +147,8 @@ def test_kernel_runner_run_with_mock_gpu():
         )
 
     assert len(result.timesNs) == 3
-    assert all(t == 1_000_000 for t in result.timesNs)
+    # Batched: elapsed_ns=1_000_000 total / nIters=3 = 333_333 per launch.
+    assert all(t == 1_000_000 // 3 for t in result.timesNs)
     assert len(args_calls) == 4  # 1 warmup + 3 iters
     assert result.warmupN == 1
 
