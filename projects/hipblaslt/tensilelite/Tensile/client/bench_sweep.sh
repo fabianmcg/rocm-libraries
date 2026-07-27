@@ -11,38 +11,46 @@
 # YAML defaults to Tensile/client/tests/yaml/gemm_standard.yaml
 # NUM_ELEMENTS_TO_VALIDATE defaults to -1 (all elements)
 #
-# The Python client runs SweepRunner in compile mode directly against the YAML.
-# The C++ client requires a pre-built library; pass TENSILE_CPP_INI to point
-# at a ClientParameters.ini from a prior pipeline run. If absent, only the
-# Python time is reported.
+# Environment variables:
+#   TENSILE_CPP_INI    path to a ClientParameters.ini (required for C++ run)
+#   TENSILE_LIBRARY    path to a TensileLibrary*.yaml (enables Python library mode)
+#   TENSILE_PYTHON     override Python interpreter path
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TENSILE_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-PYTHON="${TENSILE_CPP_PYTHON:-${TENSILE_ROOT}/.tox/unit/bin/python}"
+PYTHON="${TENSILE_PYTHON:-${TENSILE_ROOT}/.tox/unit/bin/python}"
 CPP_CLIENT="${TENSILE_ROOT}/build_tmp/tensilelite/client/tensilelite-client"
 YAML="${1:-${SCRIPT_DIR}/tests/yaml/gemm_standard.yaml}"
 VALIDATE="${2:--1}"
 CPP_INI="${TENSILE_CPP_INI:-}"
+LIBRARY="${TENSILE_LIBRARY:-}"
 
 export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-/opt/rocm/lib}"
 
 echo "======================================================================"
 echo "bench_sweep.sh"
 echo "  YAML     : ${YAML}"
-echo "  validate : ${VALIDATE} (${VALIDATE} == -1 means all elements)"
+echo "  validate : ${VALIDATE} (-1 = all elements)"
+echo "  library  : ${LIBRARY:-<none, compile mode>}"
 echo "  python   : ${PYTHON}"
 echo "======================================================================"
 
 # --- Python sweep ---
 echo ""
-echo "--- Python SweepRunner ---"
+if [[ -n "${LIBRARY}" ]]; then
+    echo "--- Python SweepRunner (library mode: ${LIBRARY}) ---"
+else
+    echo "--- Python SweepRunner (compile mode) ---"
+fi
 time "${PYTHON}" - <<PYEOF
 import sys
 sys.path.insert(0, '${TENSILE_ROOT}')
 from Tensile.client.sweep_runner import SweepRunner
-runner = SweepRunner('${YAML}', numElementsToValidate=${VALIDATE})
+library = '${LIBRARY}' or None
+runner = SweepRunner('${YAML}', libraryPath=library or None,
+                     numElementsToValidate=${VALIDATE})
 results = runner.run()
 total = len(results)
 passed = sum(1 for r in results if getattr(r, 'validation', 'SKIPPED') == 'PASS')
