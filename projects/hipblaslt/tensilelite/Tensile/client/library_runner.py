@@ -73,3 +73,15 @@ class LibraryRunner:
             if sol.eval_hardware_predicate(self._hw) and sol.eval_task_predicate(self._hw, prob):
                 out.append(sol)
         return out
+
+    def autoParams(self, sol, prob) -> tuple:
+        """Return (wgm, gsu, staggerU) resolved by the C++ runtime for sol on prob.
+
+        Delegates to the ContractionSolution auto-compute methods so that
+        WorkGroupMapping=0 and dynamic StaggerU kernels get the exact values the
+        C++ client would compute, rather than the raw YAML placeholders.
+        """
+        wgm = sol.calculate_auto_wgm(prob, self._hw)
+        gsu = sol.calculate_auto_gsu(prob, self._hw)
+        staggerU = sol.calculate_auto_stagger_u(prob, self._hw, 0, wgm)
+        return wgm, gsu, staggerU

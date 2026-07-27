@@ -370,17 +370,18 @@ def _makeRunner(hsacoBytes: bytes, kernelName: str, icacheCopies) -> KernelRunne
 # ---------------------------------------------------------------------------
 
 
-def _shouldSkip(rawDict: dict, solDict: dict) -> bool:
-    """Return True if this solution should be excluded from the sweep.
+def _shouldSkip(solDict: dict) -> bool:
+    """Return True if this solution must be excluded from a compile-mode sweep.
 
-    Skips solutions where WorkGroupMapping=0 (requires calculateAutoWGM) or
-    where StaggerU=0 with SupportCustomStaggerU=True (requires calculateAutoStaggerU).
-    Both auto-computation methods are not available until M10.
+    Excludes MX block-scaled kernels, whose scale-tensor arguments are not
+    built by _buildSweepArgs, and WorkGroupMapping=0 kernels, whose auto-WGM
+    value can only be resolved from a loaded C++ library (library mode).
+    StaggerU=0 is no longer excluded: for the streamK=0 path the kernel arg
+    packs StaggerU verbatim, so StaggerU=0 already matches the C++ client.
     """
-    if solDict.get("WorkGroupMapping", 0) == 0:
+    if _readMxBlock(solDict, "A") or _readMxBlock(solDict, "B"):
         return True
-    isp = rawDict.get("InternalSupportParams", {}) or {}
-    return solDict.get("StaggerU", 0) == 0 and isp.get("SupportCustomStaggerU", False)
+    return solDict.get("WorkGroupMapping", 0) == 0
 
 
 # DataTypeEnum integer code -> tensilelite_runtime dtype name.
@@ -431,6 +432,11 @@ class SweepRunner:
     saveCoPath:
         Directory to save compiled .co files (one per kernel). When None,
         compiled HSACO bytes are used only for in-process benchmarking.
+    problemSizes:
+        Explicit list of problem-size tuples to sweep, e.g. [(M, N, batch, K), ...].
+        When provided these are used directly instead of parsing the YAML, which
+        is required in library mode for YAMLs that lack a BenchmarkProblems block.
+        When None (default) sizes are parsed from the BenchmarkProblems YAML.
     """
 
     def _resolveYamlFromIni(self, iniPath: str) -> str:
@@ -459,6 +465,7 @@ class SweepRunner:
                  problemIdx: int = 0, groupIdx: int = 0,
                  numElementsToValidate: int = 0,
                  saveCoPath: Optional[str] = None,
+                 problemSizes: Optional[list] = None,
                  pinClocks: bool = False,
                  amdSmiPath: Optional[str] = None,
                  _finalYaml: bool = False) -> None:
@@ -475,6 +482,10 @@ class SweepRunner:
         self._groupIdx = groupIdx
         self._numElementsToValidate = numElementsToValidate
         self._saveCoPath = saveCoPath
+        self._problemSizes = (
+            [tuple(int(x) for x in s) for s in problemSizes]
+            if problemSizes else None
+        )
         self._pinClocks = pinClocks
         self._amdSmiPath = amdSmiPath
         self._finalYaml = _finalYaml
@@ -489,7 +500,7 @@ class SweepRunner:
 
         rawDict = dict(sol)
         solDict = _injectInternalArgsSupport(rawDict, chip)
-        if _shouldSkip(rawDict, solDict):
+        if _shouldSkip(solDict):
             return None
         try:
             asmStr, kernelName = _generateAsm(sol, assembler, debugConfig)
@@ -836,7 +847,15 @@ class SweepRunner:
         if coBytes is None:
             _log.warning("no .co exports %s; skip size=%s", name, probSize)
             return None
-        return {"solDict": meta["solDict"], "rawDict": meta["rawDict"],
+        solDict = dict(meta["solDict"])
+        # GSU is not injected: _buildSweepArgs hardcodes gsu=1 for the standard path.
+        autoWgm, _autoGsu, autoStaggerU = libRunner.autoParams(sol, prob)
+        # Inject the C++-resolved auto values so _computeInternalArg0/1 pack the
+        # same WorkGroupMapping and StaggerU the C++ client would use (handles
+        # WorkGroupMapping=0 kernels correctly).
+        solDict["WorkGroupMapping"] = autoWgm
+        solDict["StaggerU"] = autoStaggerU
+        return {"solDict": solDict, "rawDict": meta["rawDict"],
                 "kernelName": name, "hsaco": coBytes, "sid": meta["sid"],
                 "solution": None, "solutionIdx": meta["index"]}
 
@@ -877,10 +896,28 @@ class SweepRunner:
         if luRep and result and result.gflops > 0:
             luRep.writeRow(list(probSize), result.solutionIdx, result.gflops)
 
+    def _resolveProblemSizes(self):
+        """Return the problem sizes to sweep: explicit override or parsed YAML.
+
+        A problemSizes list passed to __init__ takes precedence (required for
+        non-BenchmarkProblems YAMLs).  Otherwise sizes are parsed from the
+        BenchmarkProblems YAML; an empty parse is logged so the caller knows to
+        pass problemSizes explicitly.
+        """
+        from Tensile.client.yaml_solution_builder import problemSizesFromYaml
+        if self._problemSizes is not None:
+            return self._problemSizes
+        probSizes = problemSizesFromYaml(
+            self._yamlPath, problemIdx=self._problemIdx, groupIdx=self._groupIdx)
+        if not probSizes:
+            _log.error(
+                "no problem sizes parsed from %s; pass problemSizes= to "
+                "SweepRunner for non-BenchmarkProblems YAMLs", self._yamlPath)
+        return probSizes
+
     def _runLibrary(self, resultsCsv, libraryUpdateFile):
         """Library-mode sweep: benchmark the per-size winner from a pre-built library."""
         from Tensile.client.library_runner import LibraryRunner
-        from Tensile.client.yaml_solution_builder import problemSizesFromYaml
         import amdgpu_exec
 
         chip = amdgpu_exec.get_chip()
@@ -892,8 +929,7 @@ class SweepRunner:
             return []
         coPaths = self._discoverCodeObjects()
         libRunner = LibraryRunner(self._libraryPath)
-        probSizes = problemSizesFromYaml(
-            self._yamlPath, problemIdx=self._problemIdx, groupIdx=self._groupIdx)
+        probSizes = self._resolveProblemSizes()
         cuCount = _deviceCuCount()
         numSizeDims = len(probSizes[0]) if probSizes else 4
         csvRep, luRep = self._openReporters(
@@ -965,7 +1001,9 @@ class SweepRunner:
         if not compiled:
             _log.warning("no solutions compiled; sweep returns empty")
             return []
-        if self._finalYaml and self._finalYamlProblemSizes:
+        if self._problemSizes is not None:
+            probSizes = self._problemSizes
+        elif self._finalYaml and self._finalYamlProblemSizes:
             probSizes = self._finalYamlProblemSizes
         else:
             probSizes = problemSizesFromYaml(self._yamlPath,

@@ -429,23 +429,23 @@ def test_fp8_gflops_plausible(fp8ParitySweep, request):
 def test_mx_gflops_plausible(mxParitySweep, request):
     """MX float8 + E8 scale GEMM GFLOPS plausible at sizes (256, 512).
 
-    MX kernels force StaggerU=0 (via UseSubtileImpl=True). SweepRunner's
-    filter skips solutions where StaggerU=0 and SupportCustomStaggerU=True,
-    so MX sweeps return empty results. GPU correctness and performance for
-    MX are validated by test_gemm_mx.py (M4) using a dedicated MX filter
-    that bypasses the StaggerU restriction. This parity test records the
-    reference and skips if no sweep results are available.
+    MX kernels set MXBlockA/MXBlockB != 0. SweepRunner's compile-mode filter
+    skips MX kernels because _buildSweepArgs does not build their scale-tensor
+    arguments, so MX sweeps return empty results. GPU correctness and
+    performance for MX are validated by test_gemm_mx.py (M4) using a dedicated
+    MX filter. This parity test records the reference and skips if no sweep
+    results are available.
     """
     if not mxParitySweep:
         _recordFeature(
             request.config,
             "MX float8+E8 scale block_k=32",
             "REFERENCED",
-            "SweepRunner skips MX (StaggerU=0 filter); validated by test_gemm_mx.py (M4)",
+            "SweepRunner skips MX (MXBlock filter); validated by test_gemm_mx.py (M4)",
         )
         pytest.skip(
-            "SweepRunner excludes MX kernels (StaggerU=0 forced by UseSubtileImpl=True, "
-            "hits SupportCustomStaggerU filter). MX is validated by test_gemm_mx.py (M4)."
+            "SweepRunner excludes MX kernels (MXBlock scale-tensor args not built by "
+            "_buildSweepArgs). MX is validated by test_gemm_mx.py (M4)."
         )
     found = False
     for M, N, batch, K in _mxSizes:

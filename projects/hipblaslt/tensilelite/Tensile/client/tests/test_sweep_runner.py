@@ -568,6 +568,31 @@ class TestLibraryModeUnit:
         with pytest.raises(FileNotFoundError):
             r._discoverCodeObjects()
 
+    def test_problem_sizes_override_stored(self):
+        r = SweepRunner(yamlPath="/x.yaml",
+                        problemSizes=[(256, 256, 4, 256), (512, 512, 1, 512)])
+        assert r._problemSizes == [(256, 256, 4, 256), (512, 512, 1, 512)]
+
+    def test_problem_sizes_default_none(self):
+        r = SweepRunner(yamlPath="/x.yaml")
+        assert r._problemSizes is None
+
+    def test_should_skip_mx_kernel(self):
+        from Tensile.client.sweep_runner import _shouldSkip
+        assert _shouldSkip({"MXBlockA": 32, "WorkGroupMapping": 4})
+        assert _shouldSkip({"MXBlockB": 32, "WorkGroupMapping": 4})
+
+    def test_should_skip_wgm_zero(self):
+        from Tensile.client.sweep_runner import _shouldSkip
+        assert _shouldSkip({"WorkGroupMapping": 0})
+
+    def test_should_not_skip_stagger_zero(self):
+        from Tensile.client.sweep_runner import _shouldSkip
+        # StaggerU=0 with a non-zero WGM and no MX must NOT be skipped anymore.
+        assert not _shouldSkip(
+            {"WorkGroupMapping": 16, "StaggerU": 0,
+             "SupportCustomStaggerU": True})
+
 
 def _findBf16Library():
     """Locate a bf16 BBS TensileLibrary for library-mode GPU tests, or None."""
