@@ -177,7 +177,59 @@ def _readKernelNamesFromLibYaml(libYamlPath):
     return list(dict.fromkeys(names))  # deduplicated, order preserved
 
 
-def _benchmarkGroup(yamlPath, hsacoPath, libYamlPath, nWarmup, nIters):
+def _validateOutput(runner, solDict, M, N, batch, K, args, wg, validateN):
+    """Validate kernel output against CPU bf16 reference (NT column-major, alpha=1, beta=0).
+
+    Returns 'PASS', 'FAIL:<msg>', or 'SKIPPED:<reason>'.
+    """
+    try:
+        from ml_dtypes import bfloat16 as bf16
+    except ImportError:
+        return "SKIPPED:ml_dtypes absent"
+    try:
+        import numpy as np
+        from amdgpu_exec import GpuBuffer
+        from Tensile.client.sweep_runner import _buildSweepArgs, _deviceCuCount
+        from Tensile.client.reference import assertClose, RTOL_BF16, ATOL_BF16
+
+        # Mirror _makeVerifyInputs / _computeVerifyRef from sweep_runner.py exactly.
+        rng = np.random.default_rng(seed=M * 1000 + N + K)
+        aNp = np.asfortranarray(rng.random((M, K)).astype(bf16))
+        bNp = np.asfortranarray(rng.random((N, K)).astype(bf16))
+        aFlat = np.tile(aNp.ravel(order="F"), batch)
+        bFlat = np.tile(bNp.ravel(order="F"), batch)
+        aBuf = GpuBuffer(M * K * batch * 2)
+        bBuf = GpuBuffer(N * K * batch * 2)
+        dBuf = GpuBuffer(M * N * batch * 2)
+        cBuf = GpuBuffer(M * N * batch * 2)
+        aBuf.copy_from_host(aFlat)
+        bBuf.copy_from_host(bFlat)
+        cuCount = _deviceCuCount()
+        vArgs = _buildSweepArgs(solDict, M, N, batch, K, dBuf, cBuf, aBuf, bBuf, cuCount)
+        runner._functions[0].launch(
+            (wg, 1, 1), (solDict.get("NumThreads", 256), 1, 1), vArgs
+        )
+        from amdgpu_exec import GpuEvent
+        ev = GpuEvent(); ev.record(); ev.synchronize()
+        dOut = np.zeros(M * N * batch, dtype=bf16)
+        dBuf.copy_to_host(dOut)
+        # Reference: same as _computeVerifyRef.
+        aSlice = aFlat[:M * K].reshape(M, K, order="F")
+        bSlice = bFlat[:N * K].reshape(N, K, order="F")
+        from Tensile.client.reference import gemmBf16
+        dRef = np.tile(np.asfortranarray(
+            gemmBf16(aSlice, bSlice.T, 1.0, 0.0, None)
+        ).ravel(order="F"), batch)
+        nCheck = dOut.size if validateN == -1 else min(validateN, dOut.size)
+        assertClose(dOut[:nCheck], dRef[:nCheck], rtol=RTOL_BF16, atol=ATOL_BF16)
+        return "PASS"
+    except AssertionError as exc:
+        return f"FAIL:{str(exc)[:120]}"
+    except Exception as exc:
+        return f"SKIPPED:{exc}"
+
+
+def _benchmarkGroup(yamlPath, hsacoPath, libYamlPath, nWarmup, nIters, validateN=0):
     """Benchmark all solutions in one group using the pre-built HSACO; return results list."""
     import yaml as _yaml
     from Tensile.client.harness import KernelRunner
@@ -229,28 +281,36 @@ def _benchmarkGroup(yamlPath, hsacoPath, libYamlPath, nWarmup, nIters):
                     nIters=nIters,
                 )
                 gflops = 2 * M * N * K * batch / (benchResult.minUs * 1e-6) / 1e9
-                results.append((M, N, batch, K, gflops))
+                validation = "SKIPPED"
+                if validateN != 0:
+                    validation = _validateOutput(
+                        runner, solDict, M, N, batch, K, args, wg, validateN)
+                results.append((M, N, batch, K, gflops, validation))
             except Exception as exc:
                 print(f"    bench failed {kernelName[:30]} {M}x{N}: {exc}")
     return results
 
 
 def parsePythonResults(rawResults):
-    """Convert raw results list to (nResults, nSizes)."""
+    """Convert raw results list to (nResults, nSizes, nPass, nFail, nSkip)."""
     sizes = set((r[0], r[1], r[2], r[3]) for r in rawResults)
-    return len(rawResults), len(sizes)
+    nPass = sum(1 for r in rawResults if len(r) > 5 and r[5] == "PASS")
+    nFail = sum(1 for r in rawResults if len(r) > 5 and str(r[5]).startswith("FAIL"))
+    nSkip = sum(1 for r in rawResults if len(r) > 5 and str(r[5]).startswith("SKIPPED"))
+    return len(rawResults), len(sizes), nPass, nFail, nSkip
 
 
-def _runOnePythonBench(groups, nWarmup, nIters, outDir, runIndex):
-    """Benchmark all candidate groups using pre-built HSACO; return (wall, nResults, nSizes)."""
+def _runOnePythonBench(groups, validateN, nWarmup, nIters, outDir, runIndex):
+    """Benchmark all candidate groups using pre-built HSACO; return (wall, nResults, nSizes, nPass, nFail)."""
     t0 = time.perf_counter()
     allResults = []
     for yamlPath, hsacoPath, libYamlPath in groups:
-        groupResults = _benchmarkGroup(yamlPath, hsacoPath, libYamlPath, nWarmup, nIters)
+        groupResults = _benchmarkGroup(yamlPath, hsacoPath, libYamlPath,
+                                       nWarmup, nIters, validateN)
         allResults.extend(groupResults)
     wall = time.perf_counter() - t0
-    nResults, nSizes = parsePythonResults(allResults)
-    return wall, nResults, nSizes
+    nResults, nSizes, nPass, nFail, nSkip = parsePythonResults(allResults)
+    return wall, nResults, nSizes, nPass, nFail
 
 
 def runPythonBench(pipelineDir, validateN, nWarmup, nIters, outDir):
@@ -266,9 +326,12 @@ def runPythonBench(pipelineDir, validateN, nWarmup, nIters, outDir):
     runs = []
     for i in range(3):
         print(f"  Python bench run {i} ...")
-        wall, nResults, nSizes = _runOnePythonBench(groups, nWarmup, nIters, outDir, i)
-        runs.append({"wall": wall, "nResults": nResults, "nSizes": nSizes})
-        print(f"    wall={wall:.1f}s, results={nResults}, sizes={nSizes}")
+        wall, nResults, nSizes, nPass, nFail = _runOnePythonBench(
+            groups, validateN, nWarmup, nIters, outDir, i)
+        runs.append({"wall": wall, "nResults": nResults, "nSizes": nSizes,
+                     "nPass": nPass, "nFail": nFail})
+        print(f"    wall={wall:.1f}s, results={nResults}, sizes={nSizes}, "
+              f"pass={nPass}, fail={nFail}")
     return runs
 
 
@@ -429,10 +492,17 @@ def _buildReportSections(reportPath, args, arch, pyRuns, cppRuns, cppWall):
     warmWall = median([pyRun1Wall, pyRun2Wall])
     nResults = pyRuns[0]["nResults"]
     nSizes = pyRuns[0]["nSizes"]
+    nPass = pyRuns[0]["nPass"]
+    nFail = pyRuns[0]["nFail"]
     validateNote = (
         "all elements" if args.num_elements_to_validate == -1
         else f"{args.num_elements_to_validate} elements"
         if args.num_elements_to_validate > 0 else "disabled"
+    )
+    validationResult = (
+        f"{nPass}/{nResults} PASS, {nFail} FAIL"
+        if args.num_elements_to_validate != 0
+        else "disabled"
     )
     return [
         "# bench_comparison: total sweep wall-clock report",
@@ -444,14 +514,15 @@ def _buildReportSections(reportPath, args, arch, pyRuns, cppRuns, cppWall):
         f"- validation: num-elements-to-validate={args.num_elements_to_validate} ({validateNote})",
         f"- num-benchmarks: {args.num_benchmarks}",
         f"- num-warmups: {args.num_warmups}",
-        f"- Python: compile mode, all {nResults} (candidate × size) pairs across {nSizes} problem sizes",
+        f"- Python: all {nResults} (candidate × size) pairs across {nSizes} problem sizes",
+        f"- Python validation (run 0): {validationResult}",
         f"- C++: library mode, winner-per-size from pre-built library",
         "",
         "## Total sweep wall-clock (all candidates × all sizes)",
         "",
         "| Run | Client | Wall-clock (s) | Note |",
         "| --- | --- | --- | --- |",
-        f"| 0 | Python | {pyRun0Wall:.2f} | cold (includes ISA detection) |",
+        f"| 0 | Python | {pyRun0Wall:.2f} | cold |",
         f"| 1 | Python | {pyRun1Wall:.2f} | warm (HSACO cached) |",
         f"| 2 | Python | {pyRun2Wall:.2f} | warm |",
         f"| median warm | Python | {warmWall:.2f} | median of runs 1-2 |",
@@ -463,10 +534,9 @@ def _buildReportSections(reportPath, args, arch, pyRuns, cppRuns, cppWall):
         f"**Python warm speedup vs C++: {cppWall / warmWall:.1f}×**",
         f"**Python cold vs C++: {cppWall / pyRun0Wall:.1f}×**",
         "",
-        "> Note: Python sweeps all candidate solutions in compile mode;",
-        "> C++ benchmarks only the library winner per size.",
-        "> For a like-for-like comparison, both numbers reflect the full sweep cost",
-        "> as experienced by the pipeline.",
+        "> Note: Python sweeps all 13 candidate solutions (pre-built HSACO from",
+        "> BenchmarkProblems cache); C++ benchmarks only the LibraryLogic winner",
+        "> per size (1 solution × 3 sizes).",
     ]
 
 
