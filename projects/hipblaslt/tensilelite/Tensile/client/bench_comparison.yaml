@@ -16,8 +16,6 @@ GlobalParameters:
   ForceRedoBenchmarkProblems: True
   ForceRedoLibraryLogic: True
   ForceRedoLibraryClient: True
-  EnqueuesPerSync: 1
-  SyncsPerBenchmark: 0
   NumElementsToValidate: 0
   ValidationMaxToPrint: 4
   ValidationPrintValids: False
