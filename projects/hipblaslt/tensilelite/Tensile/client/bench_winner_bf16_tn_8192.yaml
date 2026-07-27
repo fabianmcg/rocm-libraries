@@ -1,0 +1,81 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+#
+# bench_winner_bf16_tn_8192.yaml: winner kernel from bf16/f16 8192^3 sweep on gfx950.
+#
+# Winner: BF16 HPA TN MT416x224x64 — 1,562k GFLOPS at 8192^3
+# Source: Tensile/Tests/common/gemm/gfx950/subtile_bf16.yaml (subtile path)
+# Analysis: Tensile/client/bench_bf16_f16_winner_analysis.md
+#
+# Parameters taken verbatim from the 00_Final.yaml produced by BenchmarkProblems.
+# This YAML benchmarks only the single winning configuration for reproducibility.
+
+GlobalParameters:
+  MinimumRequiredVersion: 5.0.0
+  CMakeBuildType: Release
+  PrintLevel: 1
+  SkipGroupsWithNoSolutions: True
+  ForceRedoBenchmarkProblems: True
+  ForceRedoLibraryLogic: True
+  ForceRedoLibraryClient: True
+  NumElementsToValidate: -1
+  ValidationMaxToPrint: 4
+  ValidationPrintValids: False
+  KernelTime: True
+  SyncsPerBenchmark: 1
+  Device: 0
+  UseEffLike: False
+  PrintWinnersOnly: True
+
+BenchmarkProblems:
+  ########################################
+  # BF16 HPA TN — winner configuration
+  # Kernel: MT416x224x64, MI=[16,16,32,1], WaveTile=[13,7], WaveGroup=[2,2]
+  # UseSubtileImpl=True, DirectToLds=1, ScheduleIterAlg=3
+  ########################################
+  -
+    - # ProblemType: BF16 HPA TN
+      OperationType: GEMM
+      DataType: b
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: True
+      TransposeB: False
+      UseBeta: True
+      Batched: True
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 32, 1, 1, 13, 7, 2, 2]   # MT 416x224 — winner
+        - PrefetchGlobalRead: [0]
+        - PrefetchLocalRead: [0]
+        - DepthU: [64]
+        - ScheduleIterAlg: [3]
+        - DirectToLds: [1]
+        - TransposeLDS: [1]
+        - StreamK: [0]
+        - StaggerU: [0]
+        - UseSubtileImpl: [true]
+        - 1LDSBuffer: [0]
+        - SourceSwap: [false]
+        - WorkGroup: [[32, 8, 1]]
+        - WorkGroupMapping: [8]
+        - WorkGroupMappingXCC: [1]
+        - GlobalReadVectorWidthA: [8]
+        - GlobalReadVectorWidthB: [8]
+        - LdsPadA: [0]
+        - LdsPadB: [0]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [8192, 8192, 1, 8192]
+
+LibraryLogic:
+  ScheduleName: "gfx950"
+  ArchitectureName: "gfx950"
+  DeviceNames: ["Device 75a0"]
+
+LibraryClient:
