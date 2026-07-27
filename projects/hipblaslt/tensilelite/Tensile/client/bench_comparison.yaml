@@ -1,0 +1,66 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+################################################################################
+# bench_comparison.yaml: minimal full-pipeline bf16 HPA NT GEMM used by
+# bench_comparison.py. Drives BenchmarkProblems -> LibraryLogic -> ClientWriter
+# to build a fresh device library, which is then benchmarked by both the Python
+# SweepRunner (library mode) and the C++ tensilelite-client.
+#
+# Single ProblemType group (bf16 HPA, NT), small fork (2 DepthU values) so the
+# whole pipeline completes in well under 10 minutes on gfx950.
+################################################################################
+GlobalParameters:
+  MinimumRequiredVersion: 5.0.0
+  CMakeBuildType: Release
+  PrintLevel: 1
+  ForceRedoBenchmarkProblems: True
+  ForceRedoLibraryLogic: True
+  ForceRedoLibraryClient: True
+  EnqueuesPerSync: 1
+  SyncsPerBenchmark: 0
+  NumElementsToValidate: 0
+  ValidationMaxToPrint: 4
+  ValidationPrintValids: False
+  KernelTime: True
+  Device: 0
+  UseEffLike: False
+  PrintWinnersOnly: True
+
+BenchmarkProblems:
+  -
+    - # ProblemType: bf16 HPA NT (BBS)
+      OperationType: GEMM
+      DataType: b
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: False
+      TransposeB: True
+      UseBeta: True
+      Batched: True
+      UseBias: 0
+    - # BenchmarkProblemSizeGroup
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 16, 1, 1, 2, 2, 2, 2]
+        - DepthU: [16, 32]
+        - GlobalSplitU: [1]
+        - SourceSwap: [True]
+        - PrefetchGlobalRead: [1]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [512, 512, 1, 512]
+          - Exact: [1024, 1024, 1, 1024]
+          - Exact: [2048, 2048, 1, 2048]
+
+# gfx950-specific: targeting another architecture requires editing ScheduleName and ArchitectureName below.
+LibraryLogic:
+  ScheduleName: "gfx950"
+  ArchitectureName: "gfx950"
+  DeviceNames: ["Device 75a0"]
+
+LibraryClient:
