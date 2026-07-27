@@ -44,6 +44,7 @@ class SweepResult:
     problemSize: tuple
     benchmark: BenchmarkResult
     gflops: float
+    validation: str = "SKIPPED"
 
 
 # ---------------------------------------------------------------------------
@@ -110,8 +111,8 @@ def _elemSize(dtField) -> int:
     if dtField is not None and hasattr(dtField, "numBytes"):
         n = dtField.numBytes()
         return n if n > 0 else 4
-    # Numeric fallback: Float=0→4B, Double=1→8B, Half=4→2B, BFloat16=9→2B.
-    _TABLE = {0: 4, 1: 8, 4: 2, 8: 2, 9: 2}
+    # Numeric fallback: Float=0→4B, Double=1→8B, Half=4→2B, BFloat16=7→2B.
+    _TABLE = {0: 4, 1: 8, 4: 2, 7: 2, 8: 2, 9: 2}
     try:
         return _TABLE.get(int(dtField), 4)
     except (TypeError, ValueError):
@@ -126,6 +127,63 @@ def _aElemSize(solDict: dict) -> int:
 def _dElemSize(solDict: dict) -> int:
     """Return element size in bytes for D/C operands."""
     return _elemSize(solDict.get("DestDataType", solDict.get("DataType", None)))
+
+
+def _dtypeValue(dtField) -> int:
+    """Return the integer DataTypeEnum value from a DataType object or int."""
+    if dtField is None:
+        return -1
+    return int(dtField.value) if hasattr(dtField, "value") else int(dtField)
+
+
+def _readDtypeInt(solDict: dict, key: str) -> int:
+    """Read a DataType integer from solDict, checking top-level then ProblemType.
+
+    Compiled Solution dicts store per-type fields inside a nested ProblemType
+    mapping (as DataType enum objects); manually constructed dicts may store
+    integer codes at the top level.  This mirrors the pattern in gemm_args.py.
+    """
+    val = solDict.get(key)
+    if val is not None:
+        return _dtypeValue(val)
+    pt = solDict.get("ProblemType") or {}
+    val = pt.get(key) if pt else None
+    return _dtypeValue(val)
+
+
+def _selectReference(solDict: dict):
+    """Return (npDtype, refFn, rtol, atol) for a supported standard GEMM, or None.
+
+    Verification only covers the same subset _buildSweepArgs emits: standard
+    (StreamK==0) NT GEMM with matching input/output dtype in {fp32, fp16, bf16}.
+    Returns None for anything else so the caller records SKIPPED.
+    """
+    from Tensile.client.reference import (
+        gemm, gemmFp16, gemmBf16,
+        RTOL_FP32, ATOL_FP32, RTOL_FP16, ATOL_FP16, RTOL_BF16, ATOL_BF16,
+    )
+    import numpy as np
+
+    if solDict.get("StreamK", 0) != 0:
+        return None
+    inType = _readDtypeInt(solDict, "DataType")
+    outType = _readDtypeInt(solDict, "DestDataType")
+    # When DestDataType is absent (-1), fall back to the input type.
+    if outType == -1:
+        outType = inType
+    if inType != outType:
+        return None
+    if inType == 0:
+        return np.float32, gemm, RTOL_FP32, ATOL_FP32
+    if inType == 4:
+        return np.float16, gemmFp16, RTOL_FP16, ATOL_FP16
+    if inType == 7:
+        try:
+            import ml_dtypes
+        except ImportError:
+            return None
+        return ml_dtypes.bfloat16, gemmBf16, RTOL_BF16, ATOL_BF16
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +308,9 @@ class SweepRunner:
         Index into BenchmarkProblems[] to select the problem group.
     groupIdx:
         Sub-group index within the selected BenchmarkProblems group.
+    numElementsToValidate:
+        0 disables validation (benchmark-only), -1 validates all output elements,
+        N>0 validates the first N flattened elements.
     saveCoPath:
         Directory to save compiled .co files (one per kernel). When None,
         compiled HSACO bytes are used only for in-process benchmarking.
@@ -279,6 +340,7 @@ class SweepRunner:
                  nWarmup: int = 2, nIters: int = 10,
                  rotatingBuffers: int = 8, icacheCopies="auto",
                  problemIdx: int = 0, groupIdx: int = 0,
+                 numElementsToValidate: int = 0,
                  saveCoPath: Optional[str] = None,
                  pinClocks: bool = False,
                  amdSmiPath: Optional[str] = None) -> None:
@@ -293,6 +355,7 @@ class SweepRunner:
         self._icacheCopies = icacheCopies
         self._problemIdx = problemIdx
         self._groupIdx = groupIdx
+        self._numElementsToValidate = numElementsToValidate
         self._saveCoPath = saveCoPath
         self._pinClocks = pinClocks
         self._amdSmiPath = amdSmiPath
@@ -401,6 +464,81 @@ class SweepRunner:
         finally:
             aBuf.free(); bBuf.free(); cBuf.free(); dPool.freeAll()
 
+    def _makeVerifyInputs(self, npDtype, M, N, batch, K):
+        """Return deterministic host A/B flat buffers matching the NT strided layout."""
+        rng = np.random.default_rng(seed=M * 1000 + N + K)
+        aNp = np.asfortranarray(rng.random((M, K)).astype(npDtype))
+        bNp = np.asfortranarray(rng.random((N, K)).astype(npDtype))
+        aHost = np.tile(aNp.ravel(order="F"), batch)
+        bHost = np.tile(bNp.ravel(order="F"), batch)
+        return aHost, bHost
+
+    def _computeVerifyRef(self, aHost, bHost, refFn, M, N, batch, K):
+        """Compute the flat column-major reference D for the strided-batched GEMM."""
+        aSlice = aHost[:M * K].reshape(M, K, order="F")
+        bSlice = bHost[:N * K].reshape(N, K, order="F")
+        dOne = refFn(aSlice, bSlice.T, 1.0, 0.0, None)
+        return np.tile(np.asfortranarray(dOne).ravel(order="F"), batch)
+
+    def _compareVerify(self, dHost, dRef, rtol, atol, label) -> str:
+        """Compare readback vs reference; return 'PASS' or 'FAIL:<message>'.
+
+        For numElementsToValidate>0 only the first N flattened elements are
+        checked (a deliberate simplification of the C++ NextPrime sampling).
+        """
+        from Tensile.client.reference import assertClose
+        gpuCmp, refCmp = dHost, dRef
+        if self._numElementsToValidate > 0:
+            n = min(self._numElementsToValidate, dHost.size)
+            gpuCmp, refCmp = dHost[:n], dRef[:n]
+        try:
+            assertClose(gpuCmp, refCmp, rtol=rtol, atol=atol, label=label)
+        except AssertionError as exc:
+            return f"FAIL:{exc}"
+        return "PASS"
+
+    def _freeVerifyBuffers(self, buffers) -> None:
+        """Free any allocated verification buffers, ignoring None slots."""
+        for buf in buffers:
+            if buf is not None:
+                buf.free()
+
+    def _verifyOne(self, entry: dict, M: int, N: int, batch: int,
+                   K: int, cuCount: int) -> str:
+        """Validate one (solution, problem) pair; return PASS / FAIL:<msg> / SKIPPED."""
+        solDict = entry["solDict"]
+        selected = _selectReference(solDict)
+        if selected is None:
+            return "SKIPPED"
+        npDtype, refFn, rtol, atol = selected
+        from amdgpu_exec import GpuBuffer, GpuEvent
+        aBuf = bBuf = cBuf = dBuf = None
+        try:
+            aHost, bHost = self._makeVerifyInputs(npDtype, M, N, batch, K)
+            dHost = np.zeros(M * N * batch, dtype=npDtype)
+            aBuf = GpuBuffer(aHost.nbytes); aBuf.copy_from_host(aHost)
+            bBuf = GpuBuffer(bHost.nbytes); bBuf.copy_from_host(bHost)
+            cBuf = GpuBuffer(dHost.nbytes); cBuf.memset(0)
+            dBuf = GpuBuffer(dHost.nbytes); dBuf.memset(0)
+            runner = _makeRunner(entry["hsaco"], entry["kernelName"], self._icacheCopies)
+            def argsFn(_ignored):
+                return _buildSweepArgs(
+                    solDict, M, N, batch, K, dBuf, cBuf, aBuf, bBuf, cuCount)
+            runner.run(argsFn=argsFn,
+                       grid=(_computeNumWg(solDict, M, N, batch), 1, 1),
+                       block=(solDict["NumThreads"], 1, 1),
+                       nWarmup=0, nIters=1)
+            dBuf.copy_to_host(dHost)
+            ev = GpuEvent(); ev.record(); ev.synchronize()
+            dRef = self._computeVerifyRef(aHost, bHost, refFn, M, N, batch, K)
+            return self._compareVerify(dHost, dRef, rtol, atol, entry["sid"])
+        except Exception as exc:
+            # Any failure during setup or run must not abort the sweep.
+            _log.warning("verify failed for %s: %s", entry["sid"], exc)
+            return f"FAIL:{exc}"
+        finally:
+            self._freeVerifyBuffers((aBuf, bBuf, cBuf, dBuf))
+
     def _benchmarkProblem(self, probSize: tuple, compiled: list,
                           cuCount: int) -> list:
         """Benchmark all solutions for one problem size.
@@ -414,14 +552,29 @@ class SweepRunner:
             gflops, br = self._benchmarkOne(entry, M, N, batch, K, cuCount)
             if br is None:
                 br = BenchmarkResult(timesNs=[], warmupN=self._nWarmup)
+            validation = "SKIPPED"
+            if self._numElementsToValidate != 0:
+                validation = self._verifyOne(entry, M, N, batch, K, cuCount)
             results.append(SweepResult(
                 solutionIdx=i,
                 solutionName=entry["sid"],
                 problemSize=probSize,
                 benchmark=br,
                 gflops=gflops,
+                validation=validation,
             ))
         return results
+
+    def _aggregateValidation(self, sizeResults: list) -> str:
+        """Summarize per-solution validation into one row-level status."""
+        if self._numElementsToValidate == 0:
+            return "SKIPPED"
+        fails = [r.validation for r in sizeResults if r.validation.startswith("FAIL")]
+        if fails:
+            return fails[0]
+        if any(r.validation == "PASS" for r in sizeResults):
+            return "PASS"
+        return "SKIPPED"
 
     def _reportProblem(self, probSize, sizeResults, csvRep, luRep):
         """Write CSV and library-update rows for one problem size."""
@@ -436,6 +589,7 @@ class SweepRunner:
                 sizeParams={"sizes": list(probSize), "ldd": ldd, "ldc": ldc,
                             "lda": lda, "ldb": ldb, "totalFlops": 2 * M * N * K * batch},
                 solutionResults=solResults,
+                validation=self._aggregateValidation(sizeResults),
             )
         if luRep:
             valid = [r for r in sizeResults if r.gflops > 0]
@@ -474,7 +628,8 @@ class SweepRunner:
                        numSizeDims: int,
                        libraryUpdateFile: Optional[str]):
         """Open CSV and library-update reporters; write the CSV header."""
-        csvRep = (ResultsCSVReporter(resultsCsv, solNames, numSizeDims=numSizeDims)
+        csvRep = (ResultsCSVReporter(resultsCsv, solNames, numSizeDims=numSizeDims,
+                                      includeValidation=(self._numElementsToValidate != 0))
                   if resultsCsv else None)
         luRep = LibraryUpdateReporter(libraryUpdateFile) if libraryUpdateFile else None
         if csvRep:

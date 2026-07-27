@@ -159,11 +159,10 @@ multi-GPU benchmark request also falls back to the C++ `runClientParallel`.
 
 ### Dropped / not yet ported
 
-- **In-loop validation.** `SweepRunner` performs no correctness check: it
-  allocates uninitialized buffers and never reads back `D`. There is no
-  `--num-elements-to-validate`, no in-sweep bounds-check, and no
-  print/dump-tensor path. (Correctness is a separate NumPy step — see
-  [section 4c](#c-verifying-correctness-numpy-only-separate-from-the-sweep).)
+- **In-loop validation now supported.** `SweepRunner` supports in-sweep GPU
+  output validation via `numElementsToValidate` (`0`=disabled, `-1`=all,
+  `N`=first N elements). No in-sweep bounds-check or dump-tensor path.
+  (See [section 4c](#c-verifying-correctness) for details.)
 - **Grouped GEMM in the sweep.** A grouped-GEMM argument builder exists in
   `gemm_args.py`, but the sweep's `_buildSweepArgs` is NT strided-batched only.
 - **Sparse in the sweep.** `sparse.py` is CPU-only and unit-tested; GPU sparse is
@@ -182,7 +181,7 @@ multi-GPU benchmark request also falls back to the C++ `runClientParallel`.
 ### `sweep_runner.py`
 
 The orchestrator.
-`SweepResult` is a dataclass `(solutionIdx, solutionName, problemSize, benchmark, gflops)`.
+`SweepResult` is a dataclass `(solutionIdx, solutionName, problemSize, benchmark, gflops, validation: str = "SKIPPED")`.
 `SweepRunner(yamlPath, libraryPath=None, nWarmup=2, nIters=10, rotatingBuffers=8,
 icacheCopies="auto", problemIdx=0, groupIdx=0, saveCoPath=None, pinClocks=False,
 amdSmiPath=None)`. If `yamlPath` ends in `.ini`, it is resolved via
@@ -431,87 +430,49 @@ PYTHONPATH=/home/fmoracor/rocm-libraries/projects/hipblaslt/tensilelite \
   .tox/unit/bin/python /tmp/py_single.py
 ```
 
-### (c) Verifying correctness (NumPy only, separate from the sweep)
+### (c) Verifying correctness
 
-This is the single most important behavioral difference to understand.
-**`SweepRunner` is benchmark-only. It never checks results.** It allocates
-uninitialized device buffers and never reads back the output `D`. There is no
-`--num-elements-to-validate`, `--verify-all`, or bounds-check flag in
-`SweepRunner`.
+`SweepRunner` now supports in-sweep correctness validation via the
+`numElementsToValidate` constructor parameter, mirroring the C++ client's
+`--num-elements-to-validate` flag:
 
-Correctness verification is a **separate NumPy step** built on
-`Tensile.client.reference`: compute the reference GEMM on the CPU
-(`gemmBf16` / `gemm`) and compare with `assertClose`. This is exactly what the
-feature tests (`test_gemm_standard.py`, `test_gemm_mx.py`, ...) do, exercised by
-`test_reference.py`.
+- `0` — validation **disabled** (default; benchmark-only, matches C++ default).
+- `-1` — validate **all** output elements.
+- `N > 0` — validate the **first N flattened** output elements.
 
-The `--num-elements-to-validate` concept belongs to the **C++ client**:
+**Intentional divergence from the C++ client:** the C++ client samples using a
+`NextPrime(total/N)` stride pattern; `SweepRunner` validates the first N
+elements of the flat output instead. This is simpler and sufficient for
+detecting silent wrong-answer bugs in GEMM kernels.
 
-- `-1` = validate **all** output elements (stride stays 1).
-- `128` = validate roughly 128 sampled elements (stride = `NextPrime(total/128)`).
-- `0` = validation **disabled** (the C++ default).
+When enabled, each returned `SweepResult` carries a per-solution `.validation`
+field ("PASS", "FAIL:\<message\>", or "SKIPPED"), and the results CSV gains a
+`Validation` column placed immediately after `TotalFlops` and before the
+per-solution GFLOPS columns. The aggregate row-level status follows these rules:
+if any solution fails, the first FAIL message is used; if at least one passes,
+"PASS" is used; otherwise "SKIPPED".
 
-The following NumPy driver (`/tmp/py_verify.py`) demonstrates both the
-"verify all" and "verify 128" modes on the host. It computes the bf16 reference
-and compares it against a stand-in output array, so it isolates the reference +
-comparison cost (it does not launch the GPU kernel):
+Only standard (StreamK==0) NT stridedBatched GEMMs with matching input/output
+dtype in {fp32, fp16, bf16} are verified; other configurations record "SKIPPED".
+
+Example usage:
 
 ```python
-# Copyright Advanced Micro Devices, Inc., or its affiliates.
-# SPDX-License-Identifier: MIT
-"""Time the Python-side numpy correctness verification cost: all vs 128 elements."""
-import time
-import numpy as np
-import ml_dtypes
-from Tensile.client import reference
+from Tensile.client.sweep_runner import SweepRunner
 
-M = N = K = 2048
-rng = np.random.default_rng(0)
-A = rng.standard_normal((M, K)).astype(ml_dtypes.bfloat16)
-B = rng.standard_normal((K, N)).astype(ml_dtypes.bfloat16)  # (K, N)
-C = np.zeros((M, N), dtype=ml_dtypes.bfloat16)
-alpha, beta = 1.0, 0.0
-
-# Stand-in GPU result identical to the reference, so assertClose passes.
-Dref_bootstrap = reference.gemmBf16(A, B, alpha, beta, C)
-gpuOut = np.array(Dref_bootstrap)
-
-# ---- Mode 1: verify ALL elements ----
-t0 = time.perf_counter()
-Dref = reference.gemmBf16(A, B, alpha, beta, C)
-reference.assertClose(gpuOut, Dref, reference.RTOL_BF16, reference.ATOL_BF16, "D")
-t1 = time.perf_counter()
-print(f"VERIFY_ALL_SECONDS={t1 - t0:.4f}  (elements={M*N})")
-
-# ---- Mode 2: verify only 128 sampled output elements ----
-nSample = 128
-flatIdx = np.linspace(0, M * N - 1, nSample, dtype=np.int64)
-rows = flatIdx // N
-cols = flatIdx % N
-t0 = time.perf_counter()
-Af = A.astype(np.float32)
-Bf = B.astype(np.float32)
-refSample = np.empty(nSample, dtype=np.float32)
-for i in range(nSample):
-    refSample[i] = np.dot(Af[rows[i], :], Bf[:, cols[i]])
-refSample = (alpha * refSample).astype(ml_dtypes.bfloat16)
-gpuSample = gpuOut[rows, cols]
-reference.assertClose(gpuSample, refSample, reference.RTOL_BF16, reference.ATOL_BF16, "D128")
-t1 = time.perf_counter()
-print(f"VERIFY_128_SECONDS={t1 - t0:.4f}  (elements={nSample})")
+runner = SweepRunner(
+    yamlPath="/path/to/benchmark.yaml",
+    numElementsToValidate=-1,   # validate all output elements
+)
+results = runner.run(resultsCsv="/path/to/results.csv")
+for r in results:
+    print(r.solutionName, r.gflops, r.validation)
 ```
 
-Run it:
-
-```bash
-LD_LIBRARY_PATH=/opt/rocm/lib \
-PYTHONPATH=/home/fmoracor/rocm-libraries/projects/hipblaslt/tensilelite \
-  .tox/unit/bin/python /tmp/py_verify.py
-```
-
-If you need in-process, in-loop GPU output validation against a reference, that
-capability currently lives only in the C++ client
-(`--num-elements-to-validate`); it has not been ported into `SweepRunner`.
+Correctness verification also remains available as a standalone NumPy step built
+on `Tensile.client.reference` (`gemmBf16` / `gemm` + `assertClose`). This is
+exactly what the feature tests (`test_gemm_standard.py`, `test_gemm_mx.py`, ...)
+do, exercised by `test_reference.py`.
 
 ### (d) Using `.ini` config files (M14 pipeline integration)
 
@@ -627,10 +588,11 @@ that carries `benchmark-yaml=`.
   the C++ binary for a plain (non-grouped) GEMM, `use-user-args=True` throws
   `"Failed to cast problem type"`. Keep it `False`. This is visible in the
   verified INIs (e.g. `/tmp/cpp_ref/BFloat16/client3.ini`).
-- **No in-loop validation in the Python sweep.** If your old flow relied on
-  `num-elements-to-validate`, keep validating with the C++ binary, or verify
-  separately with NumPy (`Tensile.client.reference`); see
-  [section 4c](#c-verifying-correctness-numpy-only-separate-from-the-sweep).
+- **In-loop validation via `numElementsToValidate`.** Pass
+  `numElementsToValidate=-1` (all elements) or `numElementsToValidate=N` (first
+  N elements) to `SweepRunner` to enable in-sweep GPU output validation. The
+  C++ binary's `NextPrime`-strided sampling is intentionally not replicated; see
+  [section 4c](#c-verifying-correctness) for details and the divergence note.
 - **Feature coverage.** Grouped/sparse/MX/fp16-epilogue/multi-GPU are not in the
   Python sweep; use the C++ binary for those.
 

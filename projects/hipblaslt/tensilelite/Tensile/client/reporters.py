@@ -76,11 +76,13 @@ class ResultsCSVReporter:
     """
 
     def __init__(self, path: str, solutionNames: list,
-                 numSizeDims: int = 4, perfMetric: str = "GFlops") -> None:
+                 numSizeDims: int = 4, perfMetric: str = "GFlops",
+                 includeValidation: bool = False) -> None:
         self._path = path
         self._solutionNames = list(solutionNames)
         self._numSizeDims = numSizeDims
         self._perfMetric = perfMetric
+        self._includeValidation = includeValidation
         self._file = None
         self._probIdx = 0
 
@@ -90,21 +92,25 @@ class ResultsCSVReporter:
     def writeHeader(self) -> None:
         """Write the header row to the CSV file."""
         self._file = open(self._path, "w", newline="")
+        validationCol = ["Validation"] if self._includeValidation else []
         headers = (
             [self._perfMetric]
             + self._sizeHeaders()
             + ["LDD", "LDC", "LDA", "LDB", "TotalFlops"]
+            + validationCol
             + self._solutionNames
         )
         self._file.write(", ".join(headers) + "\n")
         self._file.flush()
 
-    def writeRow(self, sizeParams: dict, solutionResults: list) -> None:
+    def writeRow(self, sizeParams: dict, solutionResults: list,
+                 validation: str = "SKIPPED") -> None:
         """Write one benchmark data row.
 
         sizeParams: dict with keys 'sizes' (sequence), 'ldd', 'ldc', 'lda',
                     'ldb', 'totalFlops'.
         solutionResults: list of (solution_name, gflops) pairs in header order.
+        validation: row-level validation status; written only when includeValidation=True.
         """
         sizes = sizeParams["sizes"]
         ldd = sizeParams["ldd"]
@@ -119,10 +125,12 @@ class ResultsCSVReporter:
             for name in self._solutionNames
         ]
 
+        validationCol = [str(validation)] if self._includeValidation else []
         row = (
             [str(self._probIdx)]
             + [str(s) for s in sizes]
             + [str(ldd), str(ldc), str(lda), str(ldb), str(totalFlops)]
+            + validationCol
             + gflopsValues
         )
         self._file.write(", ".join(row) + "\n")
