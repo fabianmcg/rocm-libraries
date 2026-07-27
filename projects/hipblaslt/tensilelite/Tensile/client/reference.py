@@ -14,9 +14,10 @@ from __future__ import annotations
 import numpy as np
 
 # Tolerance constants — rtol/atol pairs per dtype.
-# bf16: machine epsilon ~7.8e-3, headroom for accumulation errors.
-RTOL_BF16: float = 2e-2
-ATOL_BF16: float = 2e-2
+# bf16: machine epsilon ~7.8e-3; C++ client uses AlmostEqualTolerance_BFloat16=0.1
+# applied as absDiff < 0.1*(|a|+|b|+1). RTOL=0.1 approximates that formula.
+RTOL_BF16: float = 0.1
+ATOL_BF16: float = 0.1
 # fp16: machine epsilon ~9.8e-4.
 RTOL_FP16: float = 1e-3
 ATOL_FP16: float = 1e-3
