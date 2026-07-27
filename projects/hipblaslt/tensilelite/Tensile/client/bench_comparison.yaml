@@ -50,7 +50,13 @@ BenchmarkProblems:
         - DepthU: [16, 32, 64]
         - GlobalSplitU: [1]
         - SourceSwap: [True, False]
-        - PrefetchGlobalRead: [1]
+        - PrefetchGlobalRead: [1, 2]
+        - ThreadTile:
+          - [4, 4]
+          - [8, 8]
+        - WorkGroup:
+          - [16, 16, 1]
+          - [32, 8, 1]
       BenchmarkJoinParameters:
       BenchmarkFinalParameters:
         - ProblemSizes:

@@ -411,37 +411,45 @@ def _deltaTable(warmBySize, cppBySize):
 
 
 def _buildReportSections(reportPath, args, arch, pyRuns, coldBySize, warmBySize,
-                         warmWall, cppBySize, cppWall):
+                         warmWall, cppBySize, cppWall, cppRuns):
     """Return the list of Markdown section strings for the report."""
+    pyRun0Wall = pyRuns[0]["wall"]
+    pyRun1Wall = pyRuns[1]["wall"]
+    pyRun2Wall = pyRuns[2]["wall"]
+    nConfigs = sum(len(r["bySize"]) for r in pyRuns[:1])
+    nSizes = len(coldBySize)
+    validationNote = (
+        f"num-elements-to-validate={args.num_elements_to_validate} "
+        f"({'all elements' if args.num_elements_to_validate == -1 else str(args.num_elements_to_validate) + ' elements'})"
+    )
     return [
-        "# bench_comparison report",
+        "# bench_comparison: total sweep wall-clock report",
         "",
         "## Configuration",
         f"- arch: {arch}",
         f"- yaml: {args.yaml}",
         f"- output-dir: {os.path.dirname(reportPath)}",
-        f"- num-elements-to-validate: {args.num_elements_to_validate}",
+        f"- validation: {validationNote}",
         f"- num-benchmarks: {args.num_benchmarks}",
         f"- num-warmups: {args.num_warmups}",
+        f"- configs benchmarked: {nConfigs}",
+        f"- problem sizes: {nSizes}",
         "",
-        "## Python cold run (run 0)",
-        f"Wall-clock: {pyRuns[0]['wall']:.1f}s",
+        "## Total sweep wall-clock (all configs × all sizes)",
         "",
-        _coldTable(coldBySize),
+        "| Run | Client | Wall-clock (s) | Note |",
+        "| --- | --- | --- | --- |",
+        f"| 0 | Python | {pyRun0Wall:.2f} | cold (includes ISA detection) |",
+        f"| 1 | Python | {pyRun1Wall:.2f} | warm |",
+        f"| 2 | Python | {pyRun2Wall:.2f} | warm |",
+        f"| median warm | Python | {warmWall:.2f} | median of runs 1-2 |",
+        f"| 0 | C++ | {cppRuns[0]['wall']:.2f} | cold page cache |",
+        f"| 1 | C++ | {cppRuns[1]['wall']:.2f} | |",
+        f"| 2 | C++ | {cppRuns[2]['wall']:.2f} | |",
+        f"| median | C++ | {cppWall:.2f} | median of 3 runs |",
         "",
-        "## Python warm run (median of runs 1-2)",
-        f"Warm wall-clock (median): {warmWall:.1f}s",
-        "",
-        _warmTable(warmBySize),
-        "",
-        "## C++ client (median of 3 runs)",
-        f"C++ wall-clock (median): {cppWall:.1f}s",
-        "",
-        _cppTable(cppBySize),
-        "",
-        "## Delta: Python warm vs C++ median",
-        "",
-        _deltaTable(warmBySize, cppBySize),
+        f"**Python warm speedup vs C++: {cppWall / warmWall:.1f}×**",
+        f"**Python cold vs C++: {cppWall / pyRun0Wall:.1f}×**",
     ]
 
 
@@ -452,7 +460,7 @@ def writeReport(reportPath, args, arch, pyRuns, cppRuns):
     cppBySize, cppWall = cppMedianBySize(cppRuns)
     sections = _buildReportSections(
         reportPath, args, arch, pyRuns, coldBySize, warmBySize, warmWall,
-        cppBySize, cppWall,
+        cppBySize, cppWall, cppRuns,
     )
     report = "\n".join(sections) + "\n"
     print(report)
