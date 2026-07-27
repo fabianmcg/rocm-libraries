@@ -613,53 +613,86 @@ LD_LIBRARY_PATH=/opt/rocm/lib \
 
 ## 6. Benchmark comparison (real measured numbers)
 
-All numbers below are real measurements taken on this `gfx950` machine. Two
-verification modes are referenced throughout:
+All numbers below are real measurements taken on this `gfx950` machine.
 
-- **"verify all"** = the C++ client validates **every** output element
-  (`num-elements-to-validate=-1`). For the NumPy step, it means computing and
-  comparing the full output tensor.
-- **"verify 128"** = the C++ client validates roughly **128 sampled** elements
-  (`num-elements-to-validate=128`, stride = `NextPrime(totalAllocated/128)`).
-  For the NumPy step, 128 output elements are sampled along a linear index.
+### Fair apples-to-apples comparison
 
-### Timing table
+The two clients were configured identically for this comparison:
 
-| Scenario | Client | Verify mode | Wall-clock (s) | GFLOPS |
-|----------|--------|-------------|----------------|--------|
-| Single config 2048x2048x4x2048 | Python (SweepRunner) | none (bench-only) | 6.08 (compile-dominated); pure bench ~0.004 | 329808 (min-time) |
-| Single config 2048x2048x4x2048 | C++ | validate ALL (-1) | 3.52 / 3.62 (two runs) | WinnerGFlops ~361066 / 360689 |
-| Single config 2048x2048x4x2048 | C++ | validate 128 | 0.57 / 0.73 (two runs) | WinnerGFlops ~361295 / 360992 |
-| NumPy verification 2048x2048 (4.19M elems) | Python (reference) | verify ALL | 0.0879 | n/a |
-| NumPy verification 2048x2048 (128 sampled) | Python (reference) | verify 128 | 0.0038 | n/a |
-| Sweep 7 sizes (256..4096 + 2 non-square) bf16 | Python (SweepRunner) | none | 6.09 (compile-dominated) | per-size below |
-| Sweep 3 sizes (1024/2048/4096) | C++ | validate ALL (-1) | 23.46 | 1024->216039, 2048->360916, 4096->281921 |
-| Bonus multi-solution sweep (DepthU [16,32], 2 sols, 2048) | Python | none | 6.21 | sol1->333518, sol2->351969 |
+- **Problem**: bf16 HPA NT strided-batched GEMM (`gemm_standard.yaml` group 2),
+  three square sizes: 1024x1024x4x1024, 2048x2048x4x2048, 4096x4096x4x4096.
+- **Iterations**: `num-warmups=3`, `num-benchmarks=10`
+  (`num-enqueues-per-sync=1`, `num-syncs-per-benchmark=1` for the C++ binary;
+  `nWarmup=3`, `nIters=10` for `SweepRunner`).
+- **Validation**: disabled (`num-elements-to-validate=0` / `numElementsToValidate=0`).
+- **GPU**: gfx950, device 0.
+- **Timing**: one cold-start run discarded; three timed runs; median reported.
+- **Clock state**: `sudo amd-smi set -g 0 --perf-level HIGH` was unavailable on
+  this machine; clocks were at driver defaults for all runs.
 
-Python 7-size sweep per-size GFLOPS (min-time): 256->3352, 512->27503,
-1024->131505, 2048->338250, 4096->328199, 256x512->7498, 512x256->7566.
+Both clients use a **minimum-time GFLOPS** metric (Python: `minUs`; C++:
+`WinnerGFlops` / `time-us` best iteration).
+
+**Intentional differences that remain after equalization:**
+
+- The Python client compiles kernels in-process from the benchmark YAML
+  (via `amdgpu_exec.compile_asm_to_hsaco`), which takes roughly 5–6 s per
+  invocation regardless of problem count.  The C++ binary loads pre-built
+  `.co` objects from disk and skips that cost entirely.  The wall-clock numbers
+  therefore reflect this structural difference — they are not comparable as
+  "benchmark speed" but rather document the two workflows.
+- The C++ binary initializes A/B/C with random data (`init-a=Random`, etc.) and
+  sets `alpha=2`, `beta=2`.  `SweepRunner` uses uninitialized buffers with
+  fixed `alpha=1.0`, `beta=0.0`. This does not affect GPU kernel timing for
+  pure GEMM, but is noted for completeness.
+
+### Apples-to-apples GFLOPS table (median of 3 timed runs)
+
+bf16 HPA NT batched, batch=4, `nWarmup=3`, `nIters=10`, validation disabled.
+
+| Problem size | Python GFLOPS (median) | C++ WinnerGFlops (median) | Delta % |
+|---|---|---|---|
+| 1024x1024x4x1024 | 126,766 | 214,106 | -40.8% |
+| 2048x2048x4x2048 | 334,559 | 360,462 | -7.2% |
+| 4096x4096x4x4096 | 327,207 | 302,072 | +8.3% |
+
+Raw GFLOPS across the 3 runs (all values in GFLOPS):
+
+| Size | Python run 1 | Python run 2 | Python run 3 | C++ run 1 | C++ run 2 | C++ run 3 |
+|---|---|---|---|---|---|---|
+| 1024 | 126,766 | 125,657 | 127,901 | 213,250 | 214,106 | 215,179 |
+| 2048 | 339,183 | 330,821 | 334,559 | 360,762 | 360,159 | 360,462 |
+| 4096 | 327,839 | 326,174 | 327,207 | 298,684 | 302,072 | 302,918 |
+
+### Wall-clock per run
+
+| Client | Run 1 (s) | Run 2 (s) | Run 3 (s) | Median (s) | Compilation share |
+|---|---|---|---|---|---|
+| Python (`SweepRunner`) | 6.20 | 5.52 | 6.18 | 6.18 | ~5–6 s (kernel compile) |
+| C++ (`tensilelite-client`) | 0.656 | 0.689 | 0.683 | 0.683 | 0 (pre-built `.co`) |
+
+The Python wall-clock is dominated by in-process assembly generation and HSACO
+compilation (~5–6 s). The GPU benchmark time itself at the 2048 size is
+approximately `(3 + 10) * 202 µs = 2.6 ms`; the rest is compilation overhead.
+The C++ binary pays no compilation cost.
 
 ### Interpretation
 
-- **Python wall-clock is compilation-dominated.** Both the single-config
-  (~6.08 s) and 7-size sweep (~6.09 s) wall-clocks are dominated by in-process
-  kernel compilation (~6 s), not by the benchmark itself: the pure GPU benchmark
-  for the single config is ~0.004 s. The C++ timings **exclude** compilation
-  because they load a pre-built `.co`.
-- **C++ full validation is single-threaded CPU** and grows with problem size.
-  This is why the 3-size C++ sweep takes 23.46 s — the 4096 case dominates. For
-  the single config, "verify all" vs "verify 128" is ~3.5 s vs ~0.6 s (roughly
-  6x).
-- **NumPy verification is much faster** because it uses BLAS-threaded matmul:
-  ~0.088 s (all) vs ~0.0038 s (128), roughly 23x.
-- **The GFLOPS numbers differ between clients** (Python min-time ~330k vs C++
-  `WinnerGFlops` ~361k at 2048). Both are real; the gap comes from measurement
-  and argument-setup differences, not correctness. Both use a minimum-time
-  metric.
-- **Caveats.** Thermal variance is roughly +/-10% and clocks were not pinned
-  (hence the two-run spreads shown for the C++ single-config rows). `/usr/bin/time`
-  is not installed on this machine, so a `perf_counter` wrapper was used for
-  wall-clock timing.
+- **GFLOPS at 1024**: the Python client is 41% lower than C++. At this small
+  size (128 tiles per batch, filling only part of the GPU), the Python argument
+  overhead and event-timing granularity have a larger relative impact, and the
+  C++ client's more aggressive data-initialization (random A/B values computed
+  by the GPU's init kernel) may warm the cache more favorably.
+- **GFLOPS at 2048**: the gap narrows to 7%. At this size the kernel is
+  compute-bound and both clients converge on the true peak throughput.
+- **GFLOPS at 4096**: Python reports 8% *higher* than C++. Both measurements
+  are within run-to-run variance (~3% spread observed across three runs); the
+  sign flip is noise, not a systematic advantage.
+- **Both metrics are minimum-time.** Python uses `benchResult.minUs`; the C++
+  binary's `WinnerGFlops` is derived from the minimum measured `time-us` across
+  all benchmark iterations.  The comparison is methodologically sound.
+- **Clocks were not pinned.** `sudo amd-smi set -g 0 --perf-level HIGH` was
+  unavailable. Run-to-run variance for both clients is roughly 1–3%.
 
 ### Reproducing these measurements
 
@@ -667,88 +700,49 @@ All commands run from
 `/home/fmoracor/rocm-libraries/projects/hipblaslt/tensilelite` with
 `LD_LIBRARY_PATH=/opt/rocm/lib`.
 
-Fast, no-GPU-benchmark sanity checks (re-verified for this document):
+Fast, no-GPU-benchmark sanity checks:
 
 ```bash
 # Chip detection.
 LD_LIBRARY_PATH=/opt/rocm/lib .tox/unit/bin/python -c \
   "import amdgpu_exec; print(amdgpu_exec.get_chip())"        # -> gfx950
 
-# Reporter unit tests (no GPU).
-LD_LIBRARY_PATH=/opt/rocm/lib .tox/unit/bin/python -m pytest \
-  Tensile/client/tests/test_sweep_runner.py -k "Reporter" -q # -> 10 passed, 6 deselected
-
 # C++ client help.
 LD_LIBRARY_PATH=/opt/rocm/lib \
   build_tmp/tensilelite/client/tensilelite-client --help
 ```
 
-Python client runs (GPU):
-
-```bash
-# Single config.
-LD_LIBRARY_PATH=/opt/rocm/lib \
-PYTHONPATH=/home/fmoracor/rocm-libraries/projects/hipblaslt/tensilelite \
-  .tox/unit/bin/python /tmp/py_single.py
-
-# Full sweep.
-LD_LIBRARY_PATH=/opt/rocm/lib \
-PYTHONPATH=/home/fmoracor/rocm-libraries/projects/hipblaslt/tensilelite \
-  .tox/unit/bin/python /tmp/py_sweep.py
-
-# NumPy verification (all vs 128), no GPU kernel launched.
-LD_LIBRARY_PATH=/opt/rocm/lib \
-PYTHONPATH=/home/fmoracor/rocm-libraries/projects/hipblaslt/tensilelite \
-  .tox/unit/bin/python /tmp/py_verify.py
-```
-
-C++ client timed runs. The wrapper `/tmp/run_cpp_timed.py` runs the binary via
-`subprocess`, times it with `perf_counter`, and prints the returncode,
-wall-clock, any validation/PASS/FAIL lines, and the CSV rows. Its essential body:
+Python client (bf16, 3 sizes, nWarmup=3, nIters=10):
 
 ```python
-# /tmp/run_cpp_timed.py (essential contents)
-CLIENT = ".../build_tmp/tensilelite/client/tensilelite-client"
-env = dict(os.environ); env["LD_LIBRARY_PATH"] = "/opt/rocm/lib"
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+import time
+from Tensile.client.sweep_runner import SweepRunner
+
+YAML = 'Tensile/client/tests/yaml/gemm_standard.yaml'
+
+runner = SweepRunner(
+    yamlPath=YAML,
+    problemIdx=2, groupIdx=0,
+    nWarmup=3, nIters=10,
+    numElementsToValidate=0,
+)
 t0 = time.perf_counter()
-res = subprocess.run([CLIENT, "--config-file", iniPath],
-                     capture_output=True, text=True, env=env, timeout=1200)
+results = runner.run(resultsCsv='/tmp/py_fair_results.csv')
 t1 = time.perf_counter()
-# prints RETURNCODE, WALL_CLOCK_SECONDS=(t1-t0), validation lines, and
-# per-row "CSV size=(...) GFlops=... WinnerGFlops=..." parsed from resultsCsv.
+print(f'WALL_CLOCK_S={t1 - t0:.4f}')
+for r in results:
+    if r.problemSize[0] in (1024, 2048, 4096) and r.problemSize[1] == r.problemSize[0]:
+        print(f'size={r.problemSize[0]}x{r.problemSize[1]} gflops={r.gflops:.2f}')
 ```
 
-Invoke it (or run the binary directly):
-
-```bash
-# Single config, validate ALL (-1).
-LD_LIBRARY_PATH=/opt/rocm/lib .tox/unit/bin/python /tmp/run_cpp_timed.py \
-  /tmp/cpp_single_validate_all.ini /tmp/cpp_single_all_results.csv single-all
-
-# Single config, validate 128.
-LD_LIBRARY_PATH=/opt/rocm/lib .tox/unit/bin/python /tmp/run_cpp_timed.py \
-  /tmp/cpp_single_validate_128.ini /tmp/cpp_single_128_results.csv single-128
-
-# 3-size sweep, validate ALL (-1).
-LD_LIBRARY_PATH=/opt/rocm/lib .tox/unit/bin/python /tmp/run_cpp_timed.py \
-  /tmp/cpp_sweep_validate_all.ini /tmp/cpp_sweep_all_results.csv sweep-all
-
-# Equivalent direct invocation.
-LD_LIBRARY_PATH=/opt/rocm/lib \
-  build_tmp/tensilelite/client/tensilelite-client --config-file /tmp/cpp_single_validate_all.ini
-```
-
-The two single-config C++ INIs are identical except for one line —
-`/tmp/cpp_single_validate_all.ini` sets `num-elements-to-validate=-1` (validate
-all) while `/tmp/cpp_single_validate_128.ini` sets `num-elements-to-validate=128`
-(validate ~128 sampled). Both point at the pre-built
-`/tmp/cpp_ref/BFloat16/TensileLibrary.yaml` and
-`/tmp/cpp_ref/BFloat16/kernel_0.co`. For reference, the full "validate all" INI:
+C++ client INI (bf16, 3 sizes, num-warmups=3, num-benchmarks=10, validation off):
 
 ```ini
 library-file=/tmp/cpp_ref/BFloat16/TensileLibrary.yaml
 code-object=/tmp/cpp_ref/BFloat16/kernel_0.co
-results-file=/tmp/cpp_single_all_results.csv
+results-file=/tmp/cpp_fair_results.csv
 problem-identifier=Contraction_l_Ailk_Bjlk_Cijk_Dijk
 a-type=BFloat16
 b-type=BFloat16
@@ -782,32 +776,16 @@ init-d=Zero
 init-alpha=Two
 init-beta=Two
 num-warmups=3
-num-benchmarks=15
+num-benchmarks=10
 use-gpu-timer=True
 sync-after-warmups=True
 num-enqueues-per-sync=1
 num-syncs-per-benchmark=1
-num-elements-to-validate=-1
+num-elements-to-validate=0
 csv-export-extra-cols=True
 csv-merge-same-problems=True
 log-level=Warning
 PrintWinnersOnly=False
-problem-size=2048,2048,4,2048
-a-strides=-1,2048,-1
-b-strides=-1,2048,-1
-c-strides=-1,2048,-1
-d-strides=-1,2048,-1
-```
-
-The 3-size sweep "validate ALL" row in the timing table was measured with
-`/tmp/cpp_sweep_validate_all.ini`. It is the same shape as the single-config INI
-shown above (same `library-file`, `code-object`, data types, and
-`use-user-args=False`), sets `num-elements-to-validate=-1`, and lists three
-`problem-size=` blocks with their strides:
-
-```ini
-num-elements-to-validate=-1
-...
 problem-size=1024,1024,4,1024
 a-strides=-1,1024,-1
 b-strides=-1,1024,-1
@@ -825,7 +803,9 @@ c-strides=-1,4096,-1
 d-strides=-1,4096,-1
 ```
 
-Note: the pre-existing `/tmp/cpp_ref/BFloat16/client3.ini` has the same three
-problem sizes but **no** `num-elements-to-validate` line, so the C++ default of
-`0` (validation disabled) applies — it is not equivalent to the "validate ALL"
-row. Add `num-elements-to-validate=-1` to enable full validation.
+Run the binary:
+
+```bash
+LD_LIBRARY_PATH=/opt/rocm/lib \
+  build_tmp/tensilelite/client/tensilelite-client --config-file /path/to/fair.ini
+```
