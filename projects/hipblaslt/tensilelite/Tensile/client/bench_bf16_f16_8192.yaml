@@ -13,7 +13,7 @@
 # Notes:
 #   - StreamK: [0] only — StreamK=3 requires the hipblaslt runtime, not the standalone client.
 #   - SyncsPerBenchmark: 1 to avoid -nan GFLOPS from divide-by-zero.
-#   - NumElementsToValidate: 0 — validation is done separately via bench_sweep.sh.
+#   - NumElementsToValidate: -1 — validation is done separately via bench_sweep.sh.
 
 GlobalParameters:
   MinimumRequiredVersion: 5.0.0
@@ -22,7 +22,7 @@ GlobalParameters:
   ForceRedoBenchmarkProblems: True
   ForceRedoLibraryLogic: True
   ForceRedoLibraryClient: True
-  NumElementsToValidate: 0
+  NumElementsToValidate: -1
   ValidationMaxToPrint: 4
   ValidationPrintValids: False
   KernelTime: True
