@@ -27,6 +27,7 @@ from .conftest import requires_gfx950
 
 _TESTS_DIR = os.path.dirname(__file__)
 _YAML_PATH = os.path.join(_TESTS_DIR, "yaml", "gemm_standard.yaml")
+_INT_XF32_YAML_PATH = os.path.join(_TESTS_DIR, "yaml", "gemm_int_xf32.yaml")
 _TENSILE_ROOT = os.path.abspath(os.path.join(_TESTS_DIR, "..", "..", "..", ".."))
 
 if _TENSILE_ROOT not in sys.path:
@@ -34,7 +35,9 @@ if _TENSILE_ROOT not in sys.path:
 
 from Tensile.client import reference
 from Tensile.client.reporters import ResultsCSVReporter
-from Tensile.client.sweep_runner import SweepResult, SweepRunner, _selectReference
+from Tensile.client.sweep_runner import (
+    SweepResult, SweepRunner, _selectReference, _DTYPE_XF32,
+)
 
 
 # ===========================================================================
@@ -43,15 +46,16 @@ from Tensile.client.sweep_runner import SweepResult, SweepRunner, _selectReferen
 
 
 class TestSelectReference:
-    """Verify _selectReference returns correct (npDtype, refFn, rtol, atol) tuples."""
+    """Verify _selectReference returns correct (npDtype, npOutDtype, refFn, rtol, atol) tuples."""
 
     def test_fp32_returns_float32_and_gemm(self):
         """fp32 input/output (DataType=0) selects numpy float32 and reference.gemm."""
         solDict = {"DataType": 0, "DestDataType": 0, "StreamK": 0}
         result = _selectReference(solDict)
         assert result is not None
-        npDtype, refFn, _rtol, _atol = result
+        npDtype, npOutDtype, refFn, _rtol, _atol = result
         assert npDtype == np.float32
+        assert npOutDtype == np.float32
         assert refFn is reference.gemm
 
     def test_fp16_returns_float16_and_gemmFp16(self):
@@ -59,13 +63,14 @@ class TestSelectReference:
         solDict = {"DataType": 4, "DestDataType": 4, "StreamK": 0}
         result = _selectReference(solDict)
         assert result is not None
-        npDtype, refFn, _rtol, _atol = result
+        npDtype, npOutDtype, refFn, _rtol, _atol = result
         assert npDtype == np.float16
+        assert npOutDtype == np.float16
         assert refFn is reference.gemmFp16
 
-    def test_unsupported_dtype_returns_none(self):
-        """Int8 (DataType=8) is not supported; result is None."""
-        solDict = {"DataType": 8, "DestDataType": 8, "StreamK": 0}
+    def test_double_returns_none(self):
+        """fp64 (DataType=1) has no reference implementation; result is None."""
+        solDict = {"DataType": 1, "DestDataType": 1, "StreamK": 0}
         assert _selectReference(solDict) is None
 
     def test_mismatched_inout_dtype_returns_none(self):
@@ -84,10 +89,124 @@ class TestSelectReference:
         from Tensile.client.reference import gemmBf16, RTOL_BF16, ATOL_BF16
         result = _selectReference({"DataType": 7, "DestDataType": 7, "StreamK": 0})
         assert result is not None
-        npDtype, refFn, rtol, atol = result
+        npDtype, npOutDtype, refFn, rtol, atol = result
         assert npDtype == ml_dtypes.bfloat16
+        assert npOutDtype == ml_dtypes.bfloat16
         assert refFn is gemmBf16
         assert rtol == RTOL_BF16 and atol == ATOL_BF16
+
+    def test_int8_int32_out_returns_correct_tuple(self):
+        """int8 input / int32 output (DataType=8, DestDataType=6) selects gemmInt8."""
+        from Tensile.client.reference import RTOL_INT8, ATOL_INT8
+        solDict = {"DataType": 8, "DestDataType": 6, "StreamK": 0}
+        result = _selectReference(solDict)
+        assert result is not None
+        npDtype, npOutDtype, _refFn, rtol, atol = result
+        assert npDtype == np.int8
+        assert npOutDtype == np.int32
+        assert rtol == RTOL_INT8 and atol == ATOL_INT8
+
+    def test_int8_int8_out_returns_correct_tuple(self):
+        """int8 input / int8 output (DataType=8, DestDataType=8) selects gemmInt8."""
+        solDict = {"DataType": 8, "DestDataType": 8, "StreamK": 0}
+        result = _selectReference(solDict)
+        assert result is not None
+        npDtype, npOutDtype, _refFn, _rtol, _atol = result
+        assert npDtype == np.int8
+        assert npOutDtype == np.int8
+
+    def test_int8_ref_fn_is_callable(self):
+        """The wrapped gemmInt8 refFn accepts (A, B, alpha, beta, C) and returns correct shape."""
+        solDict = {"DataType": 8, "DestDataType": 6, "StreamK": 0}
+        result = _selectReference(solDict)
+        assert result is not None
+        _npDtype, _npOutDtype, refFn, _rtol, _atol = result
+        A = np.array([[1, 2], [3, 4]], dtype=np.int8)
+        B = np.array([[1, 0], [0, 1]], dtype=np.int8)
+        D = refFn(A, B, 1.0, 0.0, None)
+        assert D.dtype == np.int32
+        assert D.shape == (2, 2)
+
+    def test_xf32_returns_float32_and_gemmXf32(self):
+        """XFloat32 (DataType=0, F32XdlMathOp=10) selects gemmXf32 reference."""
+        from Tensile.client.reference import gemmXf32, RTOL_XF32, ATOL_XF32
+        solDict = {"DataType": 0, "DestDataType": 0, "StreamK": 0,
+                   "F32XdlMathOp": _DTYPE_XF32}
+        result = _selectReference(solDict)
+        assert result is not None
+        npDtype, npOutDtype, refFn, rtol, atol = result
+        assert npDtype == np.float32
+        assert npOutDtype == np.float32
+        assert refFn is gemmXf32
+        assert rtol == RTOL_XF32 and atol == ATOL_XF32
+
+    def test_plain_fp32_without_xf32_flag_returns_gemm(self):
+        """Plain fp32 without F32XdlMathOp still selects reference.gemm."""
+        solDict = {"DataType": 0, "DestDataType": 0, "StreamK": 0}
+        result = _selectReference(solDict)
+        assert result is not None
+        _npDtype, _npOutDtype, refFn, _rtol, _atol = result
+        assert refFn is reference.gemm
+
+    def test_fp8_e4m3fnuz_returns_fp8_dtype_and_fp32_out(self):
+        """fp8 E4M3 fnuz (DataType=11) selects fp8 input dtype and fp32 output."""
+        ml_dtypes = pytest.importorskip("ml_dtypes")
+        from Tensile.client.reference import RTOL_FP8, ATOL_FP8
+        solDict = {"DataType": 11, "DestDataType": 0, "StreamK": 0}
+        result = _selectReference(solDict)
+        assert result is not None
+        npDtype, npOutDtype, _refFn, rtol, atol = result
+        assert npDtype == ml_dtypes.float8_e4m3fnuz
+        assert npOutDtype == np.float32
+        assert rtol == RTOL_FP8 and atol == ATOL_FP8
+
+    def test_fp8_e5m2fnuz_returns_fp8_dtype(self):
+        """fp8 E5M2 fnuz (DataType=12) selects the correct ml_dtypes type."""
+        ml_dtypes = pytest.importorskip("ml_dtypes")
+        solDict = {"DataType": 12, "DestDataType": 0, "StreamK": 0}
+        result = _selectReference(solDict)
+        assert result is not None
+        npDtype, npOutDtype, _refFn, _rtol, _atol = result
+        assert npDtype == ml_dtypes.float8_e5m2fnuz
+        assert npOutDtype == np.float32
+
+    def test_fp8_ocp_e4m3_returns_fp8_dtype(self):
+        """fp8 OCP E4M3 (DataType=15) selects the correct ml_dtypes type."""
+        ml_dtypes = pytest.importorskip("ml_dtypes")
+        solDict = {"DataType": 15, "DestDataType": 0, "StreamK": 0}
+        result = _selectReference(solDict)
+        assert result is not None
+        npDtype, npOutDtype, _refFn, _rtol, _atol = result
+        assert npDtype == ml_dtypes.float8_e4m3fn
+        assert npOutDtype == np.float32
+
+    def test_fp8_ocp_e5m2_returns_fp8_dtype(self):
+        """fp8 OCP E5M2 (DataType=16) selects the correct ml_dtypes type."""
+        ml_dtypes = pytest.importorskip("ml_dtypes")
+        solDict = {"DataType": 16, "DestDataType": 0, "StreamK": 0}
+        result = _selectReference(solDict)
+        assert result is not None
+        npDtype, npOutDtype, _refFn, _rtol, _atol = result
+        assert npDtype == ml_dtypes.float8_e5m2
+        assert npOutDtype == np.float32
+
+    def test_fp8_ref_fn_is_callable(self):
+        """The wrapped gemmFp8 refFn accepts (A, B, alpha, beta, C) and returns fp32."""
+        ml_dtypes = pytest.importorskip("ml_dtypes")
+        solDict = {"DataType": 11, "DestDataType": 0, "StreamK": 0}
+        result = _selectReference(solDict)
+        assert result is not None
+        _npDtype, _npOutDtype, refFn, _rtol, _atol = result
+        A = np.array([[0.5, 0.25]], dtype=ml_dtypes.float8_e4m3fnuz)
+        B = np.array([[0.5], [0.25]], dtype=ml_dtypes.float8_e4m3fnuz)
+        D = refFn(A, B, 1.0, 0.0, None)
+        assert D.dtype == np.float32
+        assert D.shape == (1, 1)
+
+    def test_mx_scaled_returns_none(self):
+        """MX block-scaled GEMM (MXBlockA!=0) is skipped; result is None."""
+        solDict = {"DataType": 11, "DestDataType": 0, "StreamK": 0, "MXBlockA": 32}
+        assert _selectReference(solDict) is None
 
 
 # ===========================================================================
@@ -237,6 +356,36 @@ class TestAggregateValidation:
 # ===========================================================================
 # GPU tests — require gfx950
 # ===========================================================================
+
+
+@requires_gfx950
+def test_sweep_validate_int8_int32_pass():
+    """SweepRunner with numElementsToValidate=-1 yields PASS for int8→int32 results."""
+    if not HAVE_DEPS:
+        pytest.skip("amdgpu_exec not installed")
+
+    runner = SweepRunner(
+        yamlPath=_INT_XF32_YAML_PATH,
+        problemIdx=0,
+        groupIdx=0,
+        nWarmup=1,
+        nIters=2,
+        rotatingBuffers=2,
+        numElementsToValidate=-1,
+    )
+    allResults = runner.run()
+
+    if not allResults:
+        pytest.skip("no results compiled")
+
+    successful = [r for r in allResults if r.gflops > 0]
+    if not successful:
+        pytest.skip("no successful benchmark results")
+
+    for r in successful:
+        assert r.validation == "PASS", (
+            f"{r.solutionName} on {r.problemSize}: validation={r.validation}"
+        )
 
 
 @requires_gfx950

@@ -23,6 +23,15 @@ ATOL_FP16: float = 1e-3
 # fp32: machine epsilon ~1.2e-7.
 RTOL_FP32: float = 1e-5
 ATOL_FP32: float = 1e-5
+# int8: integer arithmetic is exact; zero tolerance.
+RTOL_INT8: float = 0.0
+ATOL_INT8: float = 0.0
+# xf32: 10-bit mantissa (lower 13 of 23 bits zeroed); accumulation headroom.
+RTOL_XF32: float = 1e-3
+ATOL_XF32: float = 1e-3
+# fp8/bf8: 3–4 mantissa bits; significant accumulation headroom needed.
+RTOL_FP8: float = 0.1
+ATOL_FP8: float = 0.1
 
 
 def gemm(

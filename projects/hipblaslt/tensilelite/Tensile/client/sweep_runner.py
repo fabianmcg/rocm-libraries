@@ -24,7 +24,7 @@ from typing import Optional
 import numpy as np
 
 from Tensile.client.harness import BenchmarkResult, BufferPool, KernelRunner
-from Tensile.client.gemm_args import _computeInternalArg0, _computeInternalArg1
+from Tensile.client.gemm_args import _computeInternalArg0, _computeInternalArg1, _readMxBlock
 from Tensile.client.reporters import LibraryUpdateReporter, ResultsCSVReporter
 
 _log = logging.getLogger(__name__)
@@ -151,38 +151,124 @@ def _readDtypeInt(solDict: dict, key: str) -> int:
     return _dtypeValue(val)
 
 
-def _selectReference(solDict: dict):
-    """Return (npDtype, refFn, rtol, atol) for a supported standard GEMM, or None.
+# DataTypeEnum.XFloat32 integer code — fp32 storage with truncated-mantissa math.
+_DTYPE_XF32 = 10
 
-    Verification only covers the same subset _buildSweepArgs emits: standard
-    (StreamK==0) NT GEMM with matching input/output dtype in {fp32, fp16, bf16}.
-    Returns None for anything else so the caller records SKIPPED.
+
+def _getFp8MlDtype(typeCode: int):
+    """Return the ml_dtypes numpy type for a fp8/bf8 dtype code, or None.
+
+    Returns None if ml_dtypes is not installed or the code is unrecognised.
     """
+    try:
+        import ml_dtypes
+    except ImportError:
+        return None
+    _fp8Map = {
+        11: ml_dtypes.float8_e4m3fnuz,
+        12: ml_dtypes.float8_e5m2fnuz,
+        15: ml_dtypes.float8_e4m3fn,
+        16: ml_dtypes.float8_e5m2,
+    }
+    return _fp8Map.get(typeCode)
+
+
+def _selectRefStd(inType: int):
+    """Return 5-tuple for fp32 (0), fp16 (4), or bf16 (7) standard GEMM, or None."""
     from Tensile.client.reference import (
         gemm, gemmFp16, gemmBf16,
         RTOL_FP32, ATOL_FP32, RTOL_FP16, ATOL_FP16, RTOL_BF16, ATOL_BF16,
     )
-    import numpy as np
-
-    if solDict.get("StreamK", 0) != 0:
-        return None
-    inType = _readDtypeInt(solDict, "DataType")
-    outType = _readDtypeInt(solDict, "DestDataType")
-    # When DestDataType is absent (-1), fall back to the input type.
-    if outType == -1:
-        outType = inType
-    if inType != outType:
-        return None
     if inType == 0:
-        return np.float32, gemm, RTOL_FP32, ATOL_FP32
+        return np.float32, np.float32, gemm, RTOL_FP32, ATOL_FP32
     if inType == 4:
-        return np.float16, gemmFp16, RTOL_FP16, ATOL_FP16
+        return np.float16, np.float16, gemmFp16, RTOL_FP16, ATOL_FP16
     if inType == 7:
         try:
             import ml_dtypes
         except ImportError:
             return None
-        return ml_dtypes.bfloat16, gemmBf16, RTOL_BF16, ATOL_BF16
+        return ml_dtypes.bfloat16, ml_dtypes.bfloat16, gemmBf16, RTOL_BF16, ATOL_BF16
+    return None
+
+
+def _selectRefXf32():
+    """Return 5-tuple for XFloat32 math GEMM (fp32 storage, 10-bit mantissa compute)."""
+    from Tensile.client.reference import gemmXf32, RTOL_XF32, ATOL_XF32
+    return np.float32, np.float32, gemmXf32, RTOL_XF32, ATOL_XF32
+
+
+def _selectRefInt8(outType: int):
+    """Return 5-tuple for int8 input GEMM (int32 or int8 output), or None.
+
+    Wraps gemmInt8 in a closure so the caller can treat it as a standard
+    (A, B, alpha, beta, C) → D function regardless of the outputInt8 flag.
+    """
+    from Tensile.client.reference import gemmInt8, RTOL_INT8, ATOL_INT8
+    if outType not in (6, 8):
+        return None
+    outputInt8 = (outType == 8)
+    npOutDtype = np.int8 if outputInt8 else np.int32
+
+    def refFn(A, B, alpha, beta, C):
+        return gemmInt8(A, B, alpha, beta, C, outputInt8=outputInt8)
+
+    return np.int8, npOutDtype, refFn, RTOL_INT8, ATOL_INT8
+
+
+def _selectRefFp8(inType: int, outType: int):
+    """Return 5-tuple for fp8/bf8 input GEMM (HPA, fp32 or fp8 output), or None.
+
+    Wraps gemmFp8 in a closure capturing the dtype arguments so the caller
+    can use the standard (A, B, alpha, beta, C) → D signature.
+    """
+    from Tensile.client.reference import gemmFp8, RTOL_FP8, ATOL_FP8
+    mlDtypeIn = _getFp8MlDtype(inType)
+    if mlDtypeIn is None:
+        return None
+    if outType in (0, -1):
+        npOutDtype = np.float32
+        mlDtypeOut = np.float32
+    else:
+        mlDtypeOut = _getFp8MlDtype(outType)
+        if mlDtypeOut is None:
+            return None
+        npOutDtype = mlDtypeOut
+
+    def refFn(A, B, alpha, beta, C):
+        return gemmFp8(A, B, mlDtypeIn, mlDtypeIn, mlDtypeOut, alpha, beta, C)
+
+    return mlDtypeIn, npOutDtype, refFn, RTOL_FP8, ATOL_FP8
+
+
+def _selectReference(solDict: dict):
+    """Return (npDtype, npOutDtype, refFn, rtol, atol) for a supported GEMM, or None.
+
+    npDtype is the numpy dtype for A and B inputs; npOutDtype is the dtype for
+    the D output buffer (may differ, e.g. int8→int32 or fp8→fp32). refFn always
+    has the signature (A, B, alpha, beta, C) → D. Returns None so the caller
+    records SKIPPED for StreamK!=0, MX-scaled kernels, mismatched types, and
+    dtypes without a reference implementation.
+    """
+    if solDict.get("StreamK", 0) != 0:
+        return None
+    # MX block-scaled GEMM requires scale tensors not available in basic verification.
+    if _readMxBlock(solDict, "A") or _readMxBlock(solDict, "B"):
+        return None
+    inType = _readDtypeInt(solDict, "DataType")
+    outType = _readDtypeInt(solDict, "DestDataType")
+    if outType == -1:
+        outType = inType
+    if inType in (0, 4, 7):
+        if inType != outType:
+            return None
+        if inType == 0 and _readDtypeInt(solDict, "F32XdlMathOp") == _DTYPE_XF32:
+            return _selectRefXf32()
+        return _selectRefStd(inType)
+    if inType == 8:
+        return _selectRefInt8(outType)
+    if inType in (11, 12, 15, 16):
+        return _selectRefFp8(inType, outType)
     return None
 
 
@@ -465,10 +551,19 @@ class SweepRunner:
             aBuf.free(); bBuf.free(); cBuf.free(); dPool.freeAll()
 
     def _makeVerifyInputs(self, npDtype, M, N, batch, K):
-        """Return deterministic host A/B flat buffers matching the NT strided layout."""
+        """Return deterministic host A/B flat buffers matching the NT strided layout.
+
+        For int8 inputs, generates integer values in [-50, 50) to avoid
+        accumulation overflow into the int32 range. For all other dtypes,
+        uniform random [0, 1) values are cast to npDtype.
+        """
         rng = np.random.default_rng(seed=M * 1000 + N + K)
-        aNp = np.asfortranarray(rng.random((M, K)).astype(npDtype))
-        bNp = np.asfortranarray(rng.random((N, K)).astype(npDtype))
+        if npDtype == np.int8:
+            aNp = np.asfortranarray(rng.integers(-50, 50, size=(M, K)).astype(npDtype))
+            bNp = np.asfortranarray(rng.integers(-50, 50, size=(N, K)).astype(npDtype))
+        else:
+            aNp = np.asfortranarray(rng.random((M, K)).astype(npDtype))
+            bNp = np.asfortranarray(rng.random((N, K)).astype(npDtype))
         aHost = np.tile(aNp.ravel(order="F"), batch)
         bHost = np.tile(bNp.ravel(order="F"), batch)
         return aHost, bHost
@@ -510,12 +605,12 @@ class SweepRunner:
         selected = _selectReference(solDict)
         if selected is None:
             return "SKIPPED"
-        npDtype, refFn, rtol, atol = selected
+        npDtype, npOutDtype, refFn, rtol, atol = selected
         from amdgpu_exec import GpuBuffer, GpuEvent
         aBuf = bBuf = cBuf = dBuf = None
         try:
             aHost, bHost = self._makeVerifyInputs(npDtype, M, N, batch, K)
-            dHost = np.zeros(M * N * batch, dtype=npDtype)
+            dHost = np.zeros(M * N * batch, dtype=npOutDtype)
             aBuf = GpuBuffer(aHost.nbytes); aBuf.copy_from_host(aHost)
             bBuf = GpuBuffer(bHost.nbytes); bBuf.copy_from_host(bHost)
             cBuf = GpuBuffer(dHost.nbytes); cBuf.memset(0)
