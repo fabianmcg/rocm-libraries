@@ -61,7 +61,7 @@ time "${PYTHON}" "${TENSILE_BIN}" "${YAML}" "${PIPELINE_DIR}" --gpu-targets "${A
 
 # Locate library and INI produced by the pipeline.
 LIBRARY="$(find "${PIPELINE_DIR}/4_LibraryClient" -name "TensileLibrary_${ARCH}.yaml" 2>/dev/null | head -1)"
-CPP_INI="$(find "${PIPELINE_DIR}/4_LibraryClient/source" -name "ClientParameters_*.ini" ! -name "*Granularity*" 2>/dev/null | head -1)"
+CPP_INI="$(find "${PIPELINE_DIR}/4_LibraryClient/source" -name "ClientParameters_*.ini" ! -name "*Granularity*" 2>/dev/null | sort | head -1)"
 
 if [[ -z "${LIBRARY}" ]]; then
     echo "ERROR: TensileLibrary_${ARCH}.yaml not found under ${PIPELINE_DIR}/4_LibraryClient"

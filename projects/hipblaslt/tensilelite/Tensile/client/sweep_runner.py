@@ -778,6 +778,8 @@ class SweepRunner:
         ptFields = None
         globalIdx = 0
         # Enumerate all problem groups so library winners from any group can be found.
+        # ptFields is scoped to self._problemIdx so library queries use the correct
+        # problem type when problemIdx > 0 (e.g. cross-running F16 groups).
         try:
             data = LibraryIO.readYAML(self._yamlPath)
             numProblems = len(data.get("BenchmarkProblems", []))
@@ -805,11 +807,17 @@ class SweepRunner:
                         byName[name] = {"solDict": solDict, "rawDict": dict(sol),
                                         "sid": sid, "index": globalIdx}
                         globalIdx += 1
-                    if ptFields is None:
+                    # Capture ptFields only from the target problemIdx group.
+                    if ptFields is None and pIdx == self._problemIdx:
                         ptFields = self._problemTypeFields(solDict)
                 gIdx += 1
                 if gIdx > 32:
                     break
+        # Fallback: if target problemIdx produced no solutions, use first available.
+        if ptFields is None:
+            for meta in byName.values():
+                ptFields = self._problemTypeFields(meta["solDict"])
+                break
         return byName, ptFields
 
     def _discoverCodeObjects(self) -> list:
