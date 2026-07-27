@@ -139,49 +139,67 @@ def locateArtifacts(pipelineDir, arch):
 # ---------------------------------------------------------------------------
 
 
+def _findSolutionYamls(pipelineDir):
+    """Return all 00_Final.yaml files from BenchmarkProblems; sorted by path."""
+    matches = glob.glob(
+        f"{pipelineDir}/1_BenchmarkProblems/**/Data/00_Final.yaml", recursive=True
+    )
+    return sorted(matches)
+
+
 def parsePythonResults(results):
-    """Convert SweepResult list to {(M,N,batch,K): (gflops, validation)}."""
-    bySize = {}
+    """Convert SweepResult list to total (solutions, sizes) counts."""
+    sizes = set()
     for r in results:
-        size = tuple(r.problemSize[:4])
-        existing = bySize.get(size)
-        if existing is None or r.gflops > existing[0]:
-            bySize[size] = (r.gflops, r.validation)
-    return bySize
+        sizes.add(tuple(r.problemSize[:4]))
+    return len(results), len(sizes)
 
 
-def _runOnePythonBench(companionYaml, libraryYaml, validateN, nWarmup, nIters,
-                       outDir, runIndex):
-    """Run SweepRunner once; return (wall, bySize)."""
+def _runOnePythonBench(solutionYamls, validateN, nWarmup, nIters, outDir, runIndex):
+    """Run SweepRunner in compile mode over all candidate YAMLs; return (wall, nResults, nSizes)."""
     from Tensile.client.sweep_runner import SweepRunner
     csvPath = os.path.join(outDir, f"python_run{runIndex}.csv")
     t0 = time.perf_counter()
-    runner = SweepRunner(
-        yamlPath=companionYaml,
-        libraryPath=libraryYaml,
-        numElementsToValidate=validateN,
-        nWarmup=nWarmup,
-        nIters=nIters,
-    )
-    results = runner.run(resultsCsv=csvPath)
+    totalResults = []
+    for yamlPath in solutionYamls:
+        runner = SweepRunner(
+            yamlPath=yamlPath,
+            numElementsToValidate=validateN,
+            nWarmup=nWarmup,
+            nIters=nIters,
+        )
+        totalResults.extend(runner.run())
     wall = time.perf_counter() - t0
-    return wall, parsePythonResults(results)
+    nResults, nSizes = parsePythonResults(totalResults)
+    # Write combined CSV for first run only.
+    if runIndex == 0 and totalResults:
+        import csv as _csv
+        with open(csvPath, "w", newline="") as f:
+            w = _csv.writer(f)
+            w.writerow(["problemSize", "gflops", "validation"])
+            for r in totalResults:
+                w.writerow([r.problemSize, r.gflops, r.validation])
+    return wall, nResults, nSizes
 
 
-def runPythonBench(companionYaml, libraryYaml, validateN, nWarmup, nIters, outDir):
-    """Run SweepRunner 3 times; run 0 is cold (cleared cache), 1-2 are warm."""
+def runPythonBench(pipelineDir, validateN, nWarmup, nIters, outDir):
+    """Run SweepRunner in compile mode 3 times over all candidate YAMLs."""
     from Tensile.client.sweep_runner import _cachedIsaInfoMap
-    # Clear cache so run 0 is genuinely cold (forces ISA detection).
+    solutionYamls = _findSolutionYamls(pipelineDir)
+    if not solutionYamls:
+        raise FileNotFoundError(f"No 00_Final.yaml files found under {pipelineDir}")
+    print(f"  Found {len(solutionYamls)} candidate solution YAMLs")
+    # Clear ISA cache so run 0 is genuinely cold.
     _cachedIsaInfoMap.cache_clear()
     dropPageCache()
     runs = []
     for i in range(3):
         print(f"  Python bench run {i} ...")
-        wall, bySize = _runOnePythonBench(
-            companionYaml, libraryYaml, validateN, nWarmup, nIters, outDir, i
+        wall, nResults, nSizes = _runOnePythonBench(
+            solutionYamls, validateN, nWarmup, nIters, outDir, i
         )
-        runs.append({"wall": wall, "bySize": bySize})
-        print(f"    wall={wall:.1f}s, sizes={len(bySize)}")
+        runs.append({"wall": wall, "nResults": nResults, "nSizes": nSizes})
+        print(f"    wall={wall:.1f}s, results={nResults}, sizes={nSizes}")
     return runs
 
 
@@ -320,27 +338,6 @@ def median(values):
     return statistics.median(values)
 
 
-def pythonColdBySize(runs):
-    """Return the cold-run (run 0) bySize dict."""
-    return runs[0]["bySize"]
-
-
-def pythonWarmBySize(runs):
-    """Return median GFLOPS per size from warm runs (1 and 2), and median wall."""
-    allSizes = set(runs[1]["bySize"]) | set(runs[2]["bySize"])
-    bySize = {}
-    for size in allSizes:
-        vals = []
-        for run in runs[1:]:
-            entry = run["bySize"].get(size)
-            if entry is not None:
-                vals.append(entry[0])
-        if vals:
-            bySize[size] = median(vals)
-    warmWall = median([runs[1]["wall"], runs[2]["wall"]])
-    return bySize, warmWall
-
-
 def cppMedianBySize(runs):
     """Return median GFLOPS per size across all 3 C++ runs, and median wall."""
     allSizes = set()
@@ -355,72 +352,18 @@ def cppMedianBySize(runs):
     return bySize, cppWall
 
 
-def _fmtSize(size):
-    """Format (M,N,batch,K) tuple as MxNxbatchxK string."""
-    return "x".join(str(x) for x in size)
-
-
-def _fmtDelta(pyGflops, cppGflops):
-    """Format percentage delta (pyGflops - cpp) / cpp * 100 with sign."""
-    if cppGflops == 0 or not math.isfinite(cppGflops) or not math.isfinite(pyGflops):
-        return "N/A"
-    delta = (pyGflops - cppGflops) / cppGflops * 100.0
-    sign = "+" if delta >= 0 else ""
-    return f"{sign}{delta:.1f}%"
-
-
-def _coldTable(coldBySize):
-    """Return Markdown rows for the cold Python run."""
-    lines = ["| Size | GFLOPS | Validation |", "| --- | --- | --- |"]
-    for size in sorted(coldBySize):
-        gflops, validation = coldBySize[size]
-        lines.append(f"| {_fmtSize(size)} | {gflops:.1f} | {validation} |")
-    return "\n".join(lines)
-
-
-def _warmTable(warmBySize):
-    """Return Markdown rows for the warm Python run."""
-    lines = ["| Size | GFLOPS |", "| --- | --- |"]
-    for size in sorted(warmBySize):
-        lines.append(f"| {_fmtSize(size)} | {warmBySize[size]:.1f} |")
-    return "\n".join(lines)
-
-
-def _cppTable(cppBySize):
-    """Return Markdown rows for C++ median results."""
-    lines = ["| Size | GFLOPS | Validation |", "| --- | --- | --- |"]
-    for size in sorted(cppBySize):
-        lines.append(f"| {_fmtSize(size)} | {cppBySize[size]:.1f} | PASS (no DID_NOT_SATISFY_ASSERTS) |")
-    return "\n".join(lines)
-
-
-def _deltaTable(warmBySize, cppBySize):
-    """Return Markdown delta table comparing warm Python vs C++ median."""
-    common = sorted(set(warmBySize) & set(cppBySize))
-    if not common:
-        return "No common sizes to compare."
-    lines = ["| Size | Python warm (GFLOPS) | C++ median (GFLOPS) | Delta |",
-             "| --- | --- | --- | --- |"]
-    for size in common:
-        pyG = warmBySize[size]
-        cppG = cppBySize[size]
-        lines.append(
-            f"| {_fmtSize(size)} | {pyG:.1f} | {cppG:.1f} | {_fmtDelta(pyG, cppG)} |"
-        )
-    return "\n".join(lines)
-
-
-def _buildReportSections(reportPath, args, arch, pyRuns, coldBySize, warmBySize,
-                         warmWall, cppBySize, cppWall, cppRuns):
+def _buildReportSections(reportPath, args, arch, pyRuns, cppRuns, cppWall):
     """Return the list of Markdown section strings for the report."""
     pyRun0Wall = pyRuns[0]["wall"]
     pyRun1Wall = pyRuns[1]["wall"]
     pyRun2Wall = pyRuns[2]["wall"]
-    nConfigs = sum(len(r["bySize"]) for r in pyRuns[:1])
-    nSizes = len(coldBySize)
-    validationNote = (
-        f"num-elements-to-validate={args.num_elements_to_validate} "
-        f"({'all elements' if args.num_elements_to_validate == -1 else str(args.num_elements_to_validate) + ' elements'})"
+    warmWall = median([pyRun1Wall, pyRun2Wall])
+    nResults = pyRuns[0]["nResults"]
+    nSizes = pyRuns[0]["nSizes"]
+    validateNote = (
+        "all elements" if args.num_elements_to_validate == -1
+        else f"{args.num_elements_to_validate} elements"
+        if args.num_elements_to_validate > 0 else "disabled"
     )
     return [
         "# bench_comparison: total sweep wall-clock report",
@@ -429,18 +372,18 @@ def _buildReportSections(reportPath, args, arch, pyRuns, coldBySize, warmBySize,
         f"- arch: {arch}",
         f"- yaml: {args.yaml}",
         f"- output-dir: {os.path.dirname(reportPath)}",
-        f"- validation: {validationNote}",
+        f"- validation: num-elements-to-validate={args.num_elements_to_validate} ({validateNote})",
         f"- num-benchmarks: {args.num_benchmarks}",
         f"- num-warmups: {args.num_warmups}",
-        f"- configs benchmarked: {nConfigs}",
-        f"- problem sizes: {nSizes}",
+        f"- Python: compile mode, all {nResults} (candidate × size) pairs across {nSizes} problem sizes",
+        f"- C++: library mode, winner-per-size from pre-built library",
         "",
-        "## Total sweep wall-clock (all configs × all sizes)",
+        "## Total sweep wall-clock (all candidates × all sizes)",
         "",
         "| Run | Client | Wall-clock (s) | Note |",
         "| --- | --- | --- | --- |",
         f"| 0 | Python | {pyRun0Wall:.2f} | cold (includes ISA detection) |",
-        f"| 1 | Python | {pyRun1Wall:.2f} | warm |",
+        f"| 1 | Python | {pyRun1Wall:.2f} | warm (HSACO cached) |",
         f"| 2 | Python | {pyRun2Wall:.2f} | warm |",
         f"| median warm | Python | {warmWall:.2f} | median of runs 1-2 |",
         f"| 0 | C++ | {cppRuns[0]['wall']:.2f} | cold page cache |",
@@ -450,17 +393,19 @@ def _buildReportSections(reportPath, args, arch, pyRuns, coldBySize, warmBySize,
         "",
         f"**Python warm speedup vs C++: {cppWall / warmWall:.1f}×**",
         f"**Python cold vs C++: {cppWall / pyRun0Wall:.1f}×**",
+        "",
+        "> Note: Python sweeps all candidate solutions in compile mode;",
+        "> C++ benchmarks only the library winner per size.",
+        "> For a like-for-like comparison, both numbers reflect the full sweep cost",
+        "> as experienced by the pipeline.",
     ]
 
 
 def writeReport(reportPath, args, arch, pyRuns, cppRuns):
     """Compose and write the Markdown report; also print to stdout."""
-    coldBySize = pythonColdBySize(pyRuns)
-    warmBySize, warmWall = pythonWarmBySize(pyRuns)
-    cppBySize, cppWall = cppMedianBySize(cppRuns)
+    _cppBySize, cppWall = cppMedianBySize(cppRuns)
     sections = _buildReportSections(
-        reportPath, args, arch, pyRuns, coldBySize, warmBySize, warmWall,
-        cppBySize, cppWall, cppRuns,
+        reportPath, args, arch, pyRuns, cppRuns, cppWall,
     )
     report = "\n".join(sections) + "\n"
     print(report)
@@ -512,9 +457,9 @@ def main():
     print(f"Library YAML : {libraryYaml}")
     print(f"INI path     : {iniPath}")
 
-    print("\nRunning Python benchmark (library mode) ...")
+    print("\nRunning Python benchmark (compile mode, all candidates) ...")
     pyRuns = runPythonBench(
-        args.yaml, libraryYaml,
+        pipelineDir,
         args.num_elements_to_validate, args.num_warmups, args.num_benchmarks,
         outputDir,
     )
