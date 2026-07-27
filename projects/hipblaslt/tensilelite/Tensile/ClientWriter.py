@@ -23,6 +23,7 @@
 ################################################################################
 
 import inspect
+import logging
 import os
 import subprocess
 import shlex
@@ -49,6 +50,8 @@ from .TensileCreateLibrary import copyStaticFiles, libraryDir
 from .ParallelExecution import detectAvailableGpus, runClientParallel
 from .Contractions import FreeIndex, BatchIndex
 from .Contractions import ProblemType as ContractionsProblemType
+
+_log = logging.getLogger(__name__)
 
 class DataInitName(Enum):
   Zero = 0
@@ -117,8 +120,11 @@ def main(config, assembler: Assembler, cCompiler: str, isaInfoMap, outputPath: P
     env["PYTHONPATH"] = module_path
 
   targetGfx = isaToGfx(list(isaInfoMap.keys())[0])
+  import sys
   createLibraryScript = getBuildClientLibraryScript(clientLibraryPath, libraryLogicPath, str(assembler.path), targetGfx)
-  subprocess.run(shlex.split(createLibraryScript), env=env, cwd=clientLibraryPath)
+  # Use the current Python interpreter so tox venv packages (joblib, Tensile, etc.) are available.
+  scriptArgs = shlex.split(createLibraryScript)
+  subprocess.run([sys.executable] + scriptArgs, env=env, cwd=clientLibraryPath)
   archs = [isaToGfx(isa) for isa in isaInfoMap.keys()]
   # Kernels fan out into one per-base subdir per arch; union the globs across them.
   coList = []
@@ -231,30 +237,65 @@ def runNewClient(scriptPath, clientParametersPath, cxxCompiler: str, cCompiler: 
     printWarning("clientWriter benchmark process exited with error: {}".format(e))
 
 
+def _resolveIniResults(iniPath):
+  """Return results-file path from a ClientParameters .ini, or None if absent."""
+  import configparser
+  iniStr = str(iniPath)
+  if not iniStr.endswith('.ini') or not os.path.exists(iniStr):
+    return None
+  config = configparser.RawConfigParser(strict=False)
+  with open(iniStr) as f:
+    config.read_string('[default]\n' + f.read())
+  return config['default'].get('results-file') or None
+
+
+def _resolveConfigYaml(fallback):
+  """Return the original BenchmarkProblems YAML from globalParameters, or fallback."""
+  configPath = globalParameters.get("ConfigPath", fallback)
+  if isinstance(configPath, (list, tuple)):
+    configPath = configPath[0] if configPath else fallback
+  return str(configPath)
+
+
 def _runWithPythonHarness(configPaths, buildPath):
   """Run the benchmark sweep using SweepRunner (Python harness, single-GPU path).
 
-  Returns 0 on success, 1 on failure. Lazy-imports SweepRunner to avoid
-  circular imports at module load time.
+  Returns 0 on success, 1 on failure. Uses the original BenchmarkProblems YAML
+  (from globalParameters) for compile-mode solution enumeration, and writes the
+  results CSV to the INI's results-file path so BenchmarkProblems.py can find it.
   """
-  # SweepRunner requires a BenchmarkProblems YAML (not a .ini file).
-  # Production callers pass .ini paths; this function is only reachable when
-  # use_python_client=True is explicitly set by the caller.
   from Tensile.client.sweep_runner import SweepRunner
+  iniPath = configPaths[0]
+  # Write to results-file from INI so BenchmarkProblems.py can copy it afterward.
+  resultsCsv = _resolveIniResults(iniPath) or str(buildPath / "results.csv")
+  if resultsCsv != str(buildPath / "results.csv"):
+    os.makedirs(os.path.dirname(resultsCsv), exist_ok=True)
+  # Use benchmark-yaml from the INI (the pre-enumerated solutions YAML written by
+  # BenchmarkProblems) so SweepRunner can compile and benchmark those solutions.
+  # Fall back to the original config YAML only when the INI key is absent.
+  import configparser as _cp
+  _cfg = _cp.RawConfigParser(strict=False)
+  try:
+    with open(str(iniPath)) as _f:
+      _cfg.read_string('[default]\n' + _f.read())
+    _benchYaml = _cfg['default'].get('benchmark-yaml') or ''
+  except Exception:
+    _benchYaml = ''
+  yamlPath = _benchYaml if _benchYaml and os.path.exists(_benchYaml) else _resolveConfigYaml(fallback=str(iniPath))
   runner = SweepRunner(
-      yamlPath=configPaths[0],
+      yamlPath=yamlPath,
       pinClocks=globalParameters["PinClocks"],
       amdSmiPath=globalParameters.get("AMDSMIPath"),
   )
   try:
-    runner.run(resultsCsv=str(buildPath / "results.csv"))
+    runner.run(resultsCsv=resultsCsv)
     return 0
   except Exception as exc:
     printWarning("python client sweep failed: %s" % exc)
     return 1
 
 
-def runClient(libraryLogicPath, forBenchmark, enableTileSelection, cxxCompiler: str, cCompiler: str, outputPath, configPaths=None, use_python_client: bool = False):
+def runClient(libraryLogicPath, forBenchmark, enableTileSelection, cxxCompiler: str, cCompiler: str, outputPath, configPaths=None, use_python_client: bool = True):
   buildPath = ensurePath(outputPath / "build")
   timingEnabled = globalParameters.get("TimingInstrumentation", False)
   parallelGpus = globalParameters.get("ParallelGpuExecution", 1)
@@ -294,7 +335,8 @@ def runClient(libraryLogicPath, forBenchmark, enableTileSelection, cxxCompiler: 
     if use_python_client:
       return _runWithPythonHarness(configPaths, buildPath)
 
-    # Legacy C++ subprocess path.
+    # Legacy C++ subprocess path; caller explicitly opted out of the Python harness.
+    _log.debug("use_python_client=False: falling back to C++ client subprocess")
     runScriptName = writeRunScript(buildPath, forBenchmark, enableTileSelection, cxxCompiler, cCompiler, buildPath, configPaths)
 
     with ClientExecutionLock(globalParameters["ClientExecutionLockPath"]):
@@ -620,7 +662,7 @@ def pruneModeName(mode):
     if mode == 5: return 'Prune0X0X'
     if mode == 6: return 'Prune00XX'
 
-def writeClientConfigIni(forBenchmark, problemSizes, biasTypeArgs, factorDimArgs, activationArgs, icacheFlushArgs, problemType, sourceDir, codeObjectFiles, resultsFileName, parametersFilePath, deviceId: int, gfxName: str, libraryFile, gateTypeArgs="", probSolMap={}):
+def writeClientConfigIni(forBenchmark, problemSizes, biasTypeArgs, factorDimArgs, activationArgs, icacheFlushArgs, problemType, sourceDir, codeObjectFiles, resultsFileName, parametersFilePath, deviceId: int, gfxName: str, libraryFile, gateTypeArgs="", probSolMap={}, benchmarkYaml: str = ""):
 
     assert os.path.exists(sourceDir), f"sourceDir={sourceDir} does not exist"
     # libraryFile must point at the per-base TensileLibrary{,.yaml,.dat}; the
@@ -633,6 +675,9 @@ def writeClientConfigIni(forBenchmark, problemSizes, biasTypeArgs, factorDimArgs
             f.write("{}={}\n".format(key, value))
 
         param("library-file", libraryFile)
+
+        if benchmarkYaml:
+            param("benchmark-yaml", benchmarkYaml)
 
         for coFile in codeObjectFiles:
             if 'gfx' not in coFile or gfxName in coFile:
@@ -836,8 +881,10 @@ def writeClientConfig(
     else:
       resultsFileName = os.path.join(stepBaseDir, "../Data", stepName+".csv")
 
+    # Solutions YAML is always stepName.yaml regardless of tileAwareSelection.
+    solutionsYaml = os.path.normpath(os.path.join(stepBaseDir, "../Data", stepName + ".yaml"))
     newSolution = next(iter(newLibrary.solutions.values()))
-    writeClientConfigIni(forBenchmark, problemSizes, biasTypeArgs, factorDimArgs, activationArgs, icacheFlushArgs, newSolution.problemType, sourceDir, codeObjectFiles, resultsFileName, filename, deviceId, gfxName, libraryFile, gateTypeArgs, probSolMap)
+    writeClientConfigIni(forBenchmark, problemSizes, biasTypeArgs, factorDimArgs, activationArgs, icacheFlushArgs, newSolution.problemType, sourceDir, codeObjectFiles, resultsFileName, filename, deviceId, gfxName, libraryFile, gateTypeArgs, probSolMap, benchmarkYaml=solutionsYaml)
 
     return filename
 
