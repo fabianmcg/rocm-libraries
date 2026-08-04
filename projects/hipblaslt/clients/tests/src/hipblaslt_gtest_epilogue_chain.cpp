@@ -31,6 +31,7 @@
 //    output against the CPU reference on a real GEMM (skipped when no HIP device is present).
 
 #include <cmath>
+#include <cstdint>
 #include <gtest/gtest.h>
 #include <hip/hip_runtime.h>
 #include <hipblaslt/hipblaslt.h>
@@ -257,6 +258,27 @@ namespace
     inline float refRndBf(float f)
     {
         return static_cast<float>(hip_bfloat16(f));
+    }
+
+    // UE8M0 exponent-only scale reference, matching the shim: value = 2^(e - 127), exponent
+    // rounded up (ceil of log2) so the decoded scale never underestimates x.
+    inline uint8_t encodeUe8m0Ref(float x)
+    {
+        if(!std::isfinite(x) || !(x > 0.0f))
+            return 0;
+        int         exponent = 0;
+        const float m        = std::frexp(x, &exponent);
+        const int   biased   = (m == 0.5f ? exponent - 1 : exponent) + 127;
+        if(biased < 0)
+            return 0;
+        if(biased > 254)
+            return 254;
+        return static_cast<uint8_t>(biased);
+    }
+
+    inline float decodeUe8m0Ref(uint8_t e)
+    {
+        return std::ldexp(1.0f, static_cast<int>(e) - 127);
     }
 
     // CPU GEMM over column-major inputs, returning rndBf(A @ B) as column-major [rows, cols]
@@ -1536,6 +1558,283 @@ TEST(FusedEpilogueEndToEnd, quantizedDecomposedResidualRmsnormFlowMatchesReferen
         {
             const int64_t idx = jj * M1 + i;
             EXPECT_NEAR(toF(hD2[idx]), refRndBf(gemm2[idx] * rhoref[i]), 3e-2f)
+                << "consumer mismatch at flat index " << idx;
+        }
+
+    hipblasLtFusedEpilogueDestroy(prod);
+    hipblasLtFusedEpilogueDestroy(cons);
+    hipblasLtFusedEpilogueRMSNormDescriptorDestroy(stats);
+    hipblasLtDestroy(handle);
+    static_cast<void>(hipFree(dX));
+    static_cast<void>(hipFree(dW0));
+    static_cast<void>(hipFree(dC1));
+    static_cast<void>(hipFree(dQH2));
+    static_cast<void>(hipFree(dResidual));
+    static_cast<void>(hipFree(dGamma));
+    static_cast<void>(hipFree(dScale));
+    static_cast<void>(hipFree(dAmax));
+    static_cast<void>(hipFree(dW1));
+    static_cast<void>(hipFree(dC2));
+    static_cast<void>(hipFree(dD2));
+    static_cast<void>(hipFree(dWorkspace));
+}
+
+// ---- End-to-end correctness of the CPU shim (MX block-quantized decomposed producer) ----
+//
+// MX block producer emits per-block UE8M0 scales + block-quantized FP8 codes; the CPU-shim
+// consumer approximates the eventual GPU MXGEMM with a regular fp8 GEMM and applies the
+// per-row rstd handoff scale.
+//
+// Pipeline:
+//   GEMM1 producer: residual add + partial RMSNorm stats + per-block MX FP8 requant.
+//                   Writes block-quantized FP8 to D and UE8M0 scales to the scale pointer.
+//                   The handoff host_scale carries the per-row rstd for the consumer.
+//   GEMM2 consumer: regular fp8 GEMM on the raw FP8 codes, then multiply each row by rstd.
+
+TEST(FusedEpilogueEndToEnd, mxBlockQuantizedDecomposedProducerMatchesReference)
+{
+    int deviceCount = 0;
+    if(hipGetDeviceCount(&deviceCount) != hipSuccess || deviceCount == 0)
+        GTEST_SKIP() << "no HIP device available";
+
+    using bf16 = hip_bfloat16;
+    using fp8  = hipblaslt_f8;
+    auto toF   = [](bf16 v) { return static_cast<float>(v); };
+    auto toBf  = [](float f) { return bf16(f); };
+    auto toF8  = [](float f) { return fp8(f); };
+    auto f8ToF = [](fp8 v) { return static_cast<float>(static_cast<_Float16>(v)); };
+
+    // GEMM1 (producer): x[M0,K0] @ W0[K0,N0] -> FP8 q(h2)[M0,N0].
+    // GEMM2 (consumer): q(h2)[M1,K1] @ W1[K1,N1] -> BF16 [M1,N1], with M1 == M0
+    // and K1 == N0.
+    const int64_t M0 = 32, N0 = 24, K0 = 16;
+    const int64_t M1 = M0, K1 = N0, N1 = 20;
+    const float   eps      = 1e-5f;
+    const float   fp8Max   = 448.0f; // OCP E4M3 maximum finite magnitude.
+
+    const int32_t blockSize = 8;
+    const int64_t nBlocks   = (N0 + blockSize - 1) / blockSize; // == 3
+
+    std::vector<fp8>  hX(M0 * K0), hW0(K0 * N0);
+    std::vector<bf16> hResidual(M0 * N0), hGamma(N0);
+    std::vector<bf16> hC1(M0 * N0, toBf(0.0f)), hC2(M1 * N1, toBf(0.0f));
+    std::vector<fp8>  hW1(K1 * N1);
+    for(int64_t i = 0; i < M0 * K0; ++i)
+        hX[i] = toF8(static_cast<float>((i % 13) - 6) * 0.05f);
+    for(int64_t i = 0; i < K0 * N0; ++i)
+        hW0[i] = toF8(static_cast<float>((i % 11) - 5) * 0.04f);
+    for(int64_t i = 0; i < M0 * N0; ++i)
+        hResidual[i] = toBf(static_cast<float>((i % 7) - 3) * 0.3f);
+    for(int64_t j = 0; j < N0; ++j)
+        hGamma[j] = toBf(0.5f + static_cast<float>(j % 5) * 0.1f);
+    for(int64_t i = 0; i < K1 * N1; ++i)
+        hW1[i] = toF8(static_cast<float>((i % 9) - 4) * 0.05f);
+
+    void *dX = nullptr, *dW0 = nullptr, *dC1 = nullptr, *dQH2 = nullptr, *dResidual = nullptr,
+         *dGamma = nullptr, *dScale = nullptr, *dAmax = nullptr, *dW1 = nullptr, *dC2 = nullptr,
+         *dD2 = nullptr, *dWorkspace = nullptr;
+    const size_t maxWorkspace = 32 * 1024 * 1024;
+    ASSERT_EQ(hipMalloc(&dX, hX.size() * sizeof(fp8)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&dW0, hW0.size() * sizeof(fp8)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&dC1, hC1.size() * sizeof(bf16)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&dQH2, hC1.size() * sizeof(fp8)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&dResidual, hResidual.size() * sizeof(bf16)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&dGamma, hGamma.size() * sizeof(bf16)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&dScale, M0 * nBlocks * sizeof(uint8_t)), hipSuccess);
+    // MX amax side output is per-row [M] f32 (row-level max), independent of the per-block scales.
+    ASSERT_EQ(hipMalloc(&dAmax, M0 * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&dW1, hW1.size() * sizeof(fp8)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&dC2, hC2.size() * sizeof(bf16)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&dD2, hC2.size() * sizeof(bf16)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&dWorkspace, maxWorkspace), hipSuccess);
+    ASSERT_EQ(hipMemcpy(dX, hX.data(), hX.size() * sizeof(fp8), hipMemcpyHostToDevice),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpy(dW0, hW0.data(), hW0.size() * sizeof(fp8), hipMemcpyHostToDevice),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpy(dC1, hC1.data(), hC1.size() * sizeof(bf16), hipMemcpyHostToDevice),
+              hipSuccess);
+    ASSERT_EQ(
+        hipMemcpy(dResidual, hResidual.data(), hResidual.size() * sizeof(bf16), hipMemcpyHostToDevice),
+        hipSuccess);
+    ASSERT_EQ(hipMemcpy(dGamma, hGamma.data(), hGamma.size() * sizeof(bf16), hipMemcpyHostToDevice),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpy(dW1, hW1.data(), hW1.size() * sizeof(fp8), hipMemcpyHostToDevice),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpy(dC2, hC2.data(), hC2.size() * sizeof(bf16), hipMemcpyHostToDevice),
+              hipSuccess);
+
+    hipblasLtHandle_t handle = nullptr;
+    ASSERT_EQ(hipblasLtCreate(&handle), HIPBLAS_STATUS_SUCCESS);
+
+    hipblasLtFusedEpilogueRMSNormDescriptor_t stats = nullptr;
+    ASSERT_EQ(hipblasLtFusedEpilogueRMSNormDescriptorCreate(&stats), HIPBLAS_STATUS_SUCCESS);
+
+    // Producer chain: residual add + partial RMSNorm stats + MX block dynamic requant.
+    hipblasLtFusedEpilogueDescriptor_t prod = nullptr;
+    ASSERT_EQ(hipblasLtFusedEpilogueCreate(&prod), HIPBLAS_STATUS_SUCCESS);
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(prod, HIPBLASLT_FUSEABLE_EPILOGUE_RESIDUAL_ADD),
+              HIPBLAS_STATUS_SUCCESS);
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(prod, HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS),
+              HIPBLAS_STATUS_SUCCESS);
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(prod, HIPBLASLT_FUSEABLE_EPILOGUE_REQUANT),
+              HIPBLAS_STATUS_SUCCESS);
+    ASSERT_EQ(hipblasLtFusedEpilogueSetAttribute(
+                  prod, HIPBLASLT_FUSED_EPILOGUE_RESIDUAL_POINTER, &dResidual, sizeof(dResidual)),
+              HIPBLAS_STATUS_SUCCESS);
+    ASSERT_EQ(hipblasLtFusedEpilogueSetAttribute(
+                  prod, HIPBLASLT_FUSED_EPILOGUE_RMSNORM_GAMMA, &dGamma, sizeof(dGamma)),
+              HIPBLAS_STATUS_SUCCESS);
+    ASSERT_EQ(hipblasLtFusedEpilogueSetAttribute(
+                  prod, HIPBLASLT_FUSED_EPILOGUE_RMSNORM_EPS, &eps, sizeof(eps)),
+              HIPBLAS_STATUS_SUCCESS);
+    ASSERT_EQ(hipblasLtFusedEpilogueSetAttribute(
+                  prod, HIPBLASLT_FUSED_EPILOGUE_RMSNORM_STATS, &stats, sizeof(stats)),
+              HIPBLAS_STATUS_SUCCESS);
+    ASSERT_EQ(hipblasLtFusedEpilogueSetAttribute(
+                  prod, HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_POINTER, &dScale, sizeof(dScale)),
+              HIPBLAS_STATUS_SUCCESS);
+    ASSERT_EQ(hipblasLtFusedEpilogueSetAttribute(
+                  prod, HIPBLASLT_FUSED_EPILOGUE_REQUANT_AMAX_POINTER, &dAmax, sizeof(dAmax)),
+              HIPBLAS_STATUS_SUCCESS);
+    hipblasLtRequantScaleComputeMode_t mode = HIPBLASLT_REQUANT_SCALE_DYNAMIC_FROM_AMAX;
+    ASSERT_EQ(hipblasLtFusedEpilogueSetAttribute(
+                  prod, HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_COMPUTE_MODE, &mode, sizeof(mode)),
+              HIPBLAS_STATUS_SUCCESS);
+    hipblasLtRequantScaleGranularity_t granularity = HIPBLASLT_REQUANT_SCALE_MX_BLOCK;
+    ASSERT_EQ(hipblasLtFusedEpilogueSetAttribute(prod,
+                                                 HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_GRANULARITY,
+                                                 &granularity,
+                                                 sizeof(granularity)),
+              HIPBLAS_STATUS_SUCCESS);
+    int32_t blockSizeAttr = static_cast<int32_t>(blockSize);
+    ASSERT_EQ(hipblasLtFusedEpilogueSetAttribute(prod,
+                                                 HIPBLASLT_FUSED_EPILOGUE_REQUANT_BLOCK_SIZE,
+                                                 &blockSizeAttr,
+                                                 sizeof(blockSizeAttr)),
+              HIPBLAS_STATUS_SUCCESS);
+
+    const hipblasStatus_t s1 = runFp8GemmWithFusedEpilogue(
+        handle, M0, N0, K0, dX, dW0, dC1, dQH2, prod, dWorkspace, maxWorkspace);
+    if(s1 == HIPBLAS_STATUS_NOT_SUPPORTED)
+        GTEST_SKIP() << "no GEMM1 solution found for the MX block-quantized producer shape";
+    ASSERT_EQ(s1, HIPBLAS_STATUS_SUCCESS);
+
+    std::vector<fp8>     hQH2(M0 * N0);
+    std::vector<uint8_t> hScale(M0 * nBlocks);
+    std::vector<float>   hAmax(M0);
+    ASSERT_EQ(hipMemcpy(hQH2.data(), dQH2, hQH2.size() * sizeof(fp8), hipMemcpyDeviceToHost),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpy(hScale.data(), dScale, hScale.size() * sizeof(uint8_t), hipMemcpyDeviceToHost),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpy(hAmax.data(), dAmax, hAmax.size() * sizeof(float), hipMemcpyDeviceToHost),
+              hipSuccess);
+
+    // CPU reference: dequantize FP8 A/B to their exact numeric values, then BF16-rounded GEMM.
+    std::vector<float> hXDequant(hX.size()), hW0Dequant(hW0.size());
+    for(size_t i = 0; i < hX.size(); ++i)
+        hXDequant[i] = f8ToF(hX[i]);
+    for(size_t i = 0; i < hW0.size(); ++i)
+        hW0Dequant[i] = f8ToF(hW0[i]);
+    const std::vector<float> gemm1 = cpuGemmBf16(hXDequant, hW0Dequant, M0, N0, K0);
+    std::vector<float>       h2ref, rstd;
+    cpuResidualRmsnormRef(gemm1, hResidual, hGamma, M0, N0, eps, /*apply_scale=*/false, h2ref, rstd);
+
+    // Build the block-quant reference matching the shim logic.
+    std::vector<fp8>     qref(M0 * N0);
+    std::vector<uint8_t> scaleref(M0 * nBlocks, 0);
+    std::vector<float>   amaxref(M0, 0.0f);
+    for(int64_t i = 0; i < M0; ++i)
+    {
+        float amaxRow = 0.0f;
+        for(int64_t bl = 0; bl < nBlocks; ++bl)
+        {
+            const int64_t j0 = bl * blockSize;
+            const int64_t j1 = std::min<int64_t>(j0 + blockSize, N0);
+            float amaxBlk = 0.0f;
+            for(int64_t j = j0; j < j1; ++j)
+                amaxBlk = std::max(amaxBlk, std::fabs(h2ref[j * M0 + i]));
+            const uint8_t sB = encodeUe8m0Ref(amaxBlk / fp8Max);
+            scaleref[i * nBlocks + bl] = sB;
+            const float dec = decodeUe8m0Ref(sB);
+            for(int64_t j = j0; j < j1; ++j)
+                qref[j * M0 + i] = fp8(h2ref[j * M0 + i] / dec);
+            amaxRow = std::max(amaxRow, amaxBlk);
+        }
+        amaxref[i] = rstd[i] * amaxRow;
+    }
+
+    // Producer assertions: FP8 codes exact, MX scales exact, amax near.
+    for(int64_t idx = 0; idx < M0 * N0; ++idx)
+        EXPECT_EQ(hQH2[idx].__x, qref[idx].__x) << "producer FP8 mismatch at flat index " << idx;
+    for(int64_t i = 0; i < M0; ++i)
+        for(int64_t bl = 0; bl < nBlocks; ++bl)
+            EXPECT_EQ(hScale[i * nBlocks + bl], scaleref[i * nBlocks + bl])
+                << "MX scale mismatch at row " << i << " block " << bl;
+    for(int64_t i = 0; i < M0; ++i)
+        EXPECT_NEAR(hAmax[i], amaxref[i], 1e-6f) << "amax mismatch at row " << i;
+
+    // Independent producer round-trip: does not call encode_ue8m0/encodeUe8m0Ref. The ceil-rounded
+    // block scale guarantees the ideal pre-quantization value stays at or below the FP8 max, so no
+    // element overflows; each dequantized FP8 code must then reproduce its h2 value within one FP8
+    // E4M3 ulp scaled by the block scale. The fp8 ulp is 2^(floor(log2|q|)-3), clamped to the E4M3
+    // subnormal step 2^-9, where q is the ideal pre-quantization value h2/dec.
+    for(int64_t i = 0; i < M0; ++i)
+        for(int64_t bl = 0; bl < nBlocks; ++bl)
+        {
+            const float   dec = std::ldexp(1.0f, static_cast<int>(hScale[i * nBlocks + bl]) - 127);
+            const int64_t j0  = bl * blockSize;
+            const int64_t j1  = std::min<int64_t>(j0 + blockSize, N0);
+            for(int64_t j = j0; j < j1; ++j)
+            {
+                const int64_t idx = j * M0 + i;
+                // ceil-rounded scale guarantees the ideal pre-quantization value is at or below
+                // fp8Max; values that round to the fp8 max code in E4M3 are not overflow.
+                const float q = std::fabs(h2ref[idx] / dec);
+                EXPECT_LE(q, fp8Max)
+                    << "pre-quantization magnitude exceeded fp8 max at row " << i << " col " << j;
+                const float dequant = f8ToF(hQH2[idx]) * dec;
+                int         qe      = 0;
+                if(q > 0.0f)
+                    static_cast<void>(std::frexp(q, &qe));
+                const float ulp = std::ldexp(1.0f, std::max<int>(qe - 4, -9));
+                EXPECT_LE(std::fabs(dequant - h2ref[idx]), dec * ulp)
+                    << "block-quant round-trip exceeded one fp8 ulp at row " << i << " col " << j;
+            }
+        }
+
+    // Consumer chain: apply the per-row rstd from the handoff descriptor to GEMM2's BF16 output.
+    hipblasLtFusedEpilogueDescriptor_t cons = nullptr;
+    ASSERT_EQ(hipblasLtFusedEpilogueCreate(&cons), HIPBLAS_STATUS_SUCCESS);
+    ASSERT_EQ(hipblasLtFusedEpilogueAdd(cons, HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM_SCALE_APPLY),
+              HIPBLAS_STATUS_SUCCESS);
+    ASSERT_EQ(hipblasLtFusedEpilogueSetAttribute(
+                  cons, HIPBLASLT_FUSED_EPILOGUE_RMSNORM_STATS, &stats, sizeof(stats)),
+              HIPBLAS_STATUS_SUCCESS);
+
+    int                   algoCount = 0;
+    const hipblasStatus_t s2        = runFp8ToBf16GemmWithFusedEpilogue(
+        handle, M1, N1, K1, dQH2, dW1, dC2, dD2, cons, dWorkspace, maxWorkspace, &algoCount);
+    if(algoCount == 0)
+        GTEST_SKIP() << "no GEMM2 FP8 consumer solution found for the test shape";
+    ASSERT_EQ(s2, HIPBLAS_STATUS_SUCCESS);
+
+    std::vector<bf16> hD2(M1 * N1, toBf(0.0f));
+    ASSERT_EQ(hipMemcpy(hD2.data(), dD2, hD2.size() * sizeof(bf16), hipMemcpyDeviceToHost),
+              hipSuccess);
+
+    // Consumer reference: regular fp8 GEMM on raw codes then multiply each row by rstd.
+    // The handoff host_scale for MX mode carries rstd (not the composed rho from PER_ROW mode).
+    std::vector<float> hQH2f(hQH2.size()), hW1f(hW1.size());
+    for(size_t i = 0; i < hQH2.size(); ++i)
+        hQH2f[i] = f8ToF(hQH2[i]);
+    for(size_t i = 0; i < hW1.size(); ++i)
+        hW1f[i] = f8ToF(hW1[i]);
+    const std::vector<float> gemm2 = cpuGemmBf16(hQH2f, hW1f, M1, N1, K1);
+    for(int64_t i = 0; i < M1; ++i)
+        for(int64_t jj = 0; jj < N1; ++jj)
+        {
+            const int64_t idx = jj * M1 + i;
+            EXPECT_NEAR(toF(hD2[idx]), refRndBf(gemm2[idx] * rstd[i]), 3e-2f)
                 << "consumer mismatch at flat index " << idx;
         }
 

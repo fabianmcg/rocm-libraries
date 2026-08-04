@@ -497,10 +497,11 @@ preference workspace and is consumed by the reduction inside the producer call.
 
 | Attribute                                             | Type                                    | Meaning                                                                                                                            |
 |-------------------------------------------------------|-----------------------------------------|------------------------------------------------------------------------------------------------------------------------------------|
-| `HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_POINTER`      | `void*` (f32)                           | Device pointer to the dequant scale; read-only input in static mode, written in dynamic mode. Element count follows the granularity |
+| `HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_POINTER`      | `void*` (f32, or `uint8_t` UE8M0 for MX_BLOCK) | Device pointer to the dequant scale; read-only input in static mode, written in dynamic mode. Element count follows the granularity. For MX_BLOCK granularity the pointer targets a `[M, ceil(N/blockSize)]` row-major array of `uint8_t` UE8M0 scales rather than f32 |
 | `HIPBLASLT_FUSED_EPILOGUE_REQUANT_AMAX_POINTER`       | `void*` (f32)                           | Optional device pointer receiving the result amax side output, same granularity as the scale (`NULL`/unset = no amax written)      |
 | `HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_COMPUTE_MODE` | `hipblasLtRequantScaleComputeMode_t`    | Static caller-provided scale vs dynamic-from-amax (default: static)                                                                |
 | `HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_GRANULARITY`  | `hipblasLtRequantScaleGranularity_t`    | Scale/amax shape: per-tensor, per-row, or block (default: per-tensor)                                                              |
+| `HIPBLASLT_FUSED_EPILOGUE_REQUANT_BLOCK_SIZE`         | `int32_t`                               | Elements per MX block along N for `MX_BLOCK` granularity; power-of-two >= 1 (default 32)                                          |
 
 ##### Requant policy
 
@@ -617,6 +618,43 @@ scale `S`, the required FP8 code is `round_fp8((rstd * h2) / S)`, so the produce
 apply `rstd` before quantization or use a row-dependent quant multiplier `1 / (S / rstd)`. That
 is not the cancellation in section 3.3 and should be modeled as a full materializing path or a
 separate future mode.
+
+##### CODA MX block-quantized producer mode
+
+When a producer chain contains both `HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS` and
+`HIPBLASLT_FUSEABLE_EPILOGUE_REQUANT` with `SCALE_GRANULARITY = HIPBLASLT_REQUANT_SCALE_MX_BLOCK`,
+the requant stage uses per-block UE8M0 exponent-only scales. The three-kernel pipeline is:
+
+```text
+Kernel 1: h1 = (x@W0) + z; h2 = h1 * gamma; r_hat = partialRMS(h1)
+          for each MX block b along N: s_b = encode_UE8M0(amax(|h2_b|)/mxfp8_max); q_b = quant_fp8(h2_b / decode_UE8M0(s_b))
+          write q(h2) [FP8], s_b [UE8M0], r_hat
+Kernel 2: r = rsqrt(reduce(r_hat)/d + eps)
+Kernel 3: u = sum_b MXGEMM(q_b, s_b, W1_b); y = r * u
+```
+
+**Block layout:** one UE8M0 scale per block per row, row-major `[M, ceil(N/blockSize)]`. Blocks
+partition the output N dimension (which equals K1 of GEMM2, the contraction dimension). The block
+size is parametric via `HIPBLASLT_FUSED_EPILOGUE_REQUANT_BLOCK_SIZE` (power-of-two >= 1, default
+32). Quantized output is OCP E4M3 FP8 with `mxfp8_max = 448.0`.
+
+**API attributes:**
+
+- `SCALE_GRANULARITY = HIPBLASLT_REQUANT_SCALE_MX_BLOCK` selects MX block mode.
+- `SCALE_COMPUTE_MODE = DYNAMIC_FROM_AMAX` is required; static scales are not supported for this
+  mode.
+- `SCALE_POINTER` points to the `uint8_t` UE8M0 scale array of shape `[M, ceil(N/blockSize)]`,
+  row-major.
+- `HIPBLASLT_FUSED_EPILOGUE_REQUANT_BLOCK_SIZE` sets the block size and must be set explicitly
+  when using this granularity.
+
+The handoff descriptor carries the finalized per-row `r` (rstd) for the consumer scale-apply,
+plus the per-block MX scales for the GPU MXGEMM (in `host_mx_scales`).
+
+**CPU shim approximation:** the current CPU shim consumer approximates the GPU MXGEMM with a
+regular fp8 GEMM and applies only the per-row `r` handoff scale; the per-block UE8M0 scales are
+surfaced in `host_mx_scales` for the eventual native MX kernel and are validated on the producer
+side.
 
 ##### Relationship to the existing matmul-descriptor scale/amax attributes
 

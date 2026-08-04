@@ -387,13 +387,18 @@ struct hipblasLtFusedEpilogueRMSNormDescriptor
     // FP32 rstd, tightly packed [M * batch]. M and batch are implicit in the consumer GEMM2
     // problem, which must match the producer for the decomposed flow.
     void* per_row_scale = nullptr;
-    // Set after the producer reduction has populated per_row_scale.
+    // Set true once a requant-path producer (per-row or MX block) has populated the handoff
+    // scales; the plain reduce path leaves per_row_scale null and only fills host_scale.
     bool populated = false;
 
     // CPU-shim storage for the finalized per-row scale (rstd), laid out as
     // [batch * rows + row], FP32. The producer (partial RMSNorm stats) fills this; the
     // consumer (RMSNorm scale-apply) reads it. Not part of the eventual on-device layout.
     std::vector<float> host_scale;
+    // CPU-shim storage for the per-block UE8M0 MX scales, laid out row-major as
+    // [(batch * rows + row) * blocks + block], uint8_t. Populated by the MX-block producer and
+    // surfaced for the eventual GPU MXGEMM consumer; the CPU-shim consumer does not read it.
+    std::vector<uint8_t> host_mx_scales;
     uint64_t           rows  = 0;
     int32_t            batch = 1;
 };
@@ -423,6 +428,9 @@ struct hipblasLtFusedEpilogueDescriptor
     void*                              requant_amax         = nullptr;
     hipblasLtRequantScaleComputeMode_t requant_compute_mode = HIPBLASLT_REQUANT_SCALE_STATIC;
     hipblasLtRequantScaleGranularity_t requant_granularity  = HIPBLASLT_REQUANT_SCALE_PER_TENSOR;
+    // MX-block requant: elements per block along N. Power-of-two >= 1; default 32.
+    int32_t requant_block_size     = 32;
+    bool    requant_block_size_set = false;
 };
 
 namespace
@@ -490,7 +498,8 @@ namespace
     bool requant_granularity_valid(hipblasLtRequantScaleGranularity_t granularity)
     {
         return granularity == HIPBLASLT_REQUANT_SCALE_PER_TENSOR
-               || granularity == HIPBLASLT_REQUANT_SCALE_PER_ROW;
+               || granularity == HIPBLASLT_REQUANT_SCALE_PER_ROW
+               || granularity == HIPBLASLT_REQUANT_SCALE_MX_BLOCK;
     }
 
     bool fused_epilogue_has_requant(const hipblasLtFusedEpilogueDescriptor* d)
@@ -627,6 +636,18 @@ try
         if(!requant_granularity_valid(desc->requant_granularity))
             return HIPBLAS_STATUS_INVALID_VALUE;
         break;
+    case HIPBLASLT_FUSED_EPILOGUE_REQUANT_BLOCK_SIZE:
+    {
+        if(sizeInBytes < sizeof(int32_t))
+            return HIPBLAS_STATUS_INVALID_VALUE;
+        int32_t block_size = 0;
+        memcpy(&block_size, value, sizeof(int32_t));
+        if(block_size <= 0 || (block_size & (block_size - 1)) != 0)
+            return HIPBLAS_STATUS_INVALID_VALUE;
+        desc->requant_block_size     = block_size;
+        desc->requant_block_size_set = true;
+        break;
+    }
     default:
         return HIPBLAS_STATUS_INVALID_VALUE;
     }
@@ -733,12 +754,19 @@ try
                 rocblaslt::Debug::Instance().markerStop();
                 return HIPBLAS_STATUS_INVALID_VALUE;
             }
-            if(fused_epilogue_has_stage(fused, HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS)
-               && (fused->requant_compute_mode != HIPBLASLT_REQUANT_SCALE_DYNAMIC_FROM_AMAX
-                   || fused->requant_granularity != HIPBLASLT_REQUANT_SCALE_PER_ROW))
+            if(fused_epilogue_has_stage(fused, HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS))
             {
-                rocblaslt::Debug::Instance().markerStop();
-                return HIPBLAS_STATUS_INVALID_VALUE;
+                const bool per_row
+                    = fused->requant_granularity == HIPBLASLT_REQUANT_SCALE_PER_ROW;
+                const bool mx_block
+                    = fused->requant_granularity == HIPBLASLT_REQUANT_SCALE_MX_BLOCK;
+                if(fused->requant_compute_mode != HIPBLASLT_REQUANT_SCALE_DYNAMIC_FROM_AMAX
+                   || (!per_row && !mx_block)
+                   || (mx_block && !fused->requant_block_size_set))
+                {
+                    rocblaslt::Debug::Instance().markerStop();
+                    return HIPBLAS_STATUS_INVALID_VALUE;
+                }
             }
         }
     }
@@ -923,7 +951,8 @@ namespace
                        && d->requant_granularity == HIPBLASLT_REQUANT_SCALE_PER_TENSOR;
             if(fused_epilogue_has_stage(d, HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS))
                 return d->requant_compute_mode == HIPBLASLT_REQUANT_SCALE_DYNAMIC_FROM_AMAX
-                       && d->requant_granularity == HIPBLASLT_REQUANT_SCALE_PER_ROW;
+                       && (d->requant_granularity == HIPBLASLT_REQUANT_SCALE_PER_ROW
+                           || d->requant_granularity == HIPBLASLT_REQUANT_SCALE_MX_BLOCK);
             return false;
         }
         return true;
@@ -966,6 +995,29 @@ namespace
     {
         // OCP E4M3 maximum finite magnitude.
         return 448.0f;
+    }
+
+    // UE8M0 is an exponent-only 8-bit scale: value = 2^(e - 127). Encoding rounds the exponent up
+    // (ceil of log2) so the decoded scale never underestimates x; this keeps block-quantized values
+    // at or below the FP8 max and avoids saturation. Zero, negative, non-finite (inf/NaN) inputs map to 0.
+    inline uint8_t encode_ue8m0(float x)
+    {
+        if(!std::isfinite(x) || !(x > 0.0f))
+            return 0;
+        int         exponent = 0;
+        const float m        = std::frexp(x, &exponent); // x = m * 2^exponent, m in [0.5, 1).
+        // ceil(log2(x)) + 127: exact powers of two (m == 0.5) round to themselves, others up.
+        const int biased = (m == 0.5f ? exponent - 1 : exponent) + 127;
+        if(biased < 0)
+            return 0;
+        if(biased > 254)
+            return 254;
+        return static_cast<uint8_t>(biased);
+    }
+
+    inline float decode_ue8m0(uint8_t e)
+    {
+        return std::ldexp(1.0f, static_cast<int>(e) - 127); // 2^(e - 127).
     }
 
     // Reduce path over each row of a column-major [M,N] tensor (leading dimension ld), using
@@ -1317,6 +1369,189 @@ namespace
         return HIPBLAS_STATUS_SUCCESS;
     }
 
+    // Quantize one row into per-block FP8 codes and emit each block's UE8M0 scale. Returns the
+    // row amax (max over block amaxes) for the optional per-row amax side output.
+    template <typename QuantT, typename WorkT>
+    float mxquant_row(const std::vector<WorkT>& h_work,
+                      std::vector<QuantT>&      h_quant,
+                      std::vector<uint8_t>&     mx_scales,
+                      int64_t                   row,
+                      int64_t                   i,
+                      int64_t                   base,
+                      int64_t                   n,
+                      int64_t                   ld,
+                      int64_t                   n_blocks,
+                      int32_t                   block_size,
+                      float                     qmax)
+    {
+        float amax_row = 0.0f;
+        for(int64_t bl = 0; bl < n_blocks; ++bl)
+        {
+            const int64_t j0 = bl * block_size;
+            const int64_t j1 = std::min<int64_t>(j0 + block_size, n);
+            float amax_blk = 0.0f;
+            for(int64_t j = j0; j < j1; ++j)
+            {
+                const int64_t e = base + j * ld + i;
+                amax_blk        = std::max(amax_blk, std::fabs(shim_load(h_work[e])));
+            }
+            const uint8_t s_b = encode_ue8m0(amax_blk / qmax);
+            mx_scales[static_cast<size_t>(row * n_blocks + bl)] = s_b;
+            const float dec = decode_ue8m0(s_b);
+            for(int64_t j = j0; j < j1; ++j)
+            {
+                const int64_t e = base + j * ld + i;
+                h_quant[e]      = QuantT(shim_load(h_work[e]) / dec);
+            }
+            amax_row = std::max(amax_row, amax_blk);
+        }
+        return amax_row;
+    }
+
+    // Decomposed producer with MX (dynamic block) quantization: residual add + gamma + partial
+    // RMSNorm stats, then per-row per-block FP8 quantization with a UE8M0 block scale. The
+    // consumer stays a regular fp8 GEMM plus the existing per-row scale-apply, so the handoff
+    // carries the per-row rstd in host_scale; the per-block UE8M0 scales go to the requant scale
+    // pointer and host_mx_scales for the eventual GPU MXGEMM path.
+    template <typename QuantT, typename WorkT>
+    hipblasStatus_t fused_epilogue_cpu_shim_mxquant_typed(
+        const hipblasLtFusedEpilogueDescriptor* fused,
+        void*                                   work_device,
+        void*                                   d_device,
+        uint64_t                                m,
+        uint64_t                                n,
+        int64_t                                 ld,
+        int32_t                                 batch_count,
+        int64_t                                 batch_stride,
+        hipStream_t                             stream)
+    {
+        if(batch_count < 1)
+            batch_count = 1;
+
+        // MX block quantization is only defined for the decomposed producer chain.
+        if(!fused_epilogue_has_stage(fused, HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS))
+            return HIPBLAS_STATUS_NOT_SUPPORTED;
+
+        const int32_t block_size = fused->requant_block_size;
+        if(block_size <= 0 || (block_size & (block_size - 1)) != 0)
+            return HIPBLAS_STATUS_INVALID_VALUE;
+
+        const float qmax = shim_quant_max<QuantT>();
+        if(qmax == 0.0f)
+            return HIPBLAS_STATUS_NOT_SUPPORTED;
+
+        const bool has_residual
+            = fused_epilogue_has_stage(fused, HIPBLASLT_FUSEABLE_EPILOGUE_RESIDUAL_ADD);
+        const int64_t n_blocks = (static_cast<int64_t>(n) + block_size - 1) / block_size;
+        const size_t  span
+            = static_cast<size_t>(batch_count - 1) * static_cast<size_t>(batch_stride)
+              + static_cast<size_t>(n - 1) * static_cast<size_t>(ld) + static_cast<size_t>(m);
+
+        if(hipStreamSynchronize(stream) != hipSuccess)
+            return HIPBLAS_STATUS_INTERNAL_ERROR;
+
+        std::vector<WorkT> h_work(span);
+        std::vector<WorkT> h_res, h_res_out, h_gamma;
+        if(hipMemcpy(h_work.data(), work_device, span * sizeof(WorkT), hipMemcpyDeviceToHost)
+           != hipSuccess)
+            return HIPBLAS_STATUS_INTERNAL_ERROR;
+
+        if(has_residual)
+        {
+            h_res.resize(span);
+            if(hipMemcpy(h_res.data(), fused->residual, span * sizeof(WorkT), hipMemcpyDeviceToHost)
+               != hipSuccess)
+                return HIPBLAS_STATUS_INTERNAL_ERROR;
+            h_res_out = h_res;
+        }
+
+        h_gamma.resize(n);
+        if(hipMemcpy(h_gamma.data(), fused->rmsnorm_gamma, n * sizeof(WorkT), hipMemcpyDeviceToHost)
+           != hipSuccess)
+            return HIPBLAS_STATUS_INTERNAL_ERROR;
+
+        std::vector<float> rstd(static_cast<size_t>(batch_count) * m);
+        fused_epilogue_reduce_host<WorkT>(h_work.data(),
+                                          has_residual ? h_res.data() : nullptr,
+                                          has_residual ? h_res_out.data() : nullptr,
+                                          h_gamma.data(),
+                                          m,
+                                          n,
+                                          ld,
+                                          batch_count,
+                                          batch_stride,
+                                          fused->rmsnorm_eps,
+                                          has_residual,
+                                          /*do_norm=*/true,
+                                          /*apply_scale=*/false,
+                                          rstd.data());
+
+        if(has_residual)
+        {
+            void* res_out = fused->residual_output ? fused->residual_output : fused->residual;
+            if(hipMemcpy(res_out, h_res_out.data(), span * sizeof(WorkT), hipMemcpyHostToDevice)
+               != hipSuccess)
+                return HIPBLAS_STATUS_INTERNAL_ERROR;
+        }
+
+        std::vector<QuantT>  h_quant(span);
+        std::vector<uint8_t> mx_scales(
+            static_cast<size_t>(batch_count) * m * static_cast<size_t>(n_blocks), 0);
+        std::vector<float> rho(static_cast<size_t>(batch_count) * m, 0.0f);
+        std::vector<float> amax(static_cast<size_t>(batch_count) * m, 0.0f);
+
+        for(int32_t b = 0; b < batch_count; ++b)
+        {
+            const int64_t base = static_cast<int64_t>(b) * batch_stride;
+            for(uint64_t i = 0; i < m; ++i)
+            {
+                const size_t row      = static_cast<size_t>(b) * m + i;
+                const float  amax_row = mxquant_row<QuantT, WorkT>(h_work,
+                                                                    h_quant,
+                                                                    mx_scales,
+                                                                    static_cast<int64_t>(row),
+                                                                    static_cast<int64_t>(i),
+                                                                    base,
+                                                                    static_cast<int64_t>(n),
+                                                                    ld,
+                                                                    n_blocks,
+                                                                    block_size,
+                                                                    qmax);
+                // Consumer applies the per-row rstd only; block dequant is carried by mx_scales.
+                rho[row]  = rstd[row];
+                amax[row] = rstd[row] * amax_row;
+            }
+        }
+
+        if(hipMemcpy(fused->requant_scale,
+                     mx_scales.data(),
+                     mx_scales.size() * sizeof(uint8_t),
+                     hipMemcpyHostToDevice)
+           != hipSuccess)
+            return HIPBLAS_STATUS_INTERNAL_ERROR;
+        if(fused->requant_amax != nullptr
+           && hipMemcpy(fused->requant_amax,
+                        amax.data(),
+                        amax.size() * sizeof(float),
+                        hipMemcpyHostToDevice)
+                  != hipSuccess)
+            return HIPBLAS_STATUS_INTERNAL_ERROR;
+        if(hipMemcpy(d_device, h_quant.data(), span * sizeof(QuantT), hipMemcpyHostToDevice)
+           != hipSuccess)
+            return HIPBLAS_STATUS_INTERNAL_ERROR;
+
+        hipblasLtFusedEpilogueRMSNormDescriptor* stats = fused->rmsnorm_stats;
+        stats->host_scale     = std::move(rho);
+        stats->host_mx_scales = std::move(mx_scales);
+        stats->rows           = m;
+        stats->batch          = batch_count;
+        stats->populated      = true;
+        // per_row_scale is the f32 rstd handoff pointer; MX carries block scales via the requant
+        // scale pointer and host_mx_scales, so leave it null for this mode.
+        stats->per_row_scale  = nullptr;
+        return HIPBLAS_STATUS_SUCCESS;
+    }
+
     // Decomposed consumer (RMSNorm scale-apply): multiply GEMM2's output by the deferred per-row
     // scale carried in the handoff descriptor.
     template <typename T>
@@ -1550,17 +1785,32 @@ try
                                      workspaceSizeInBytes,
                                      stream));
                 if(return_status == HIPBLAS_STATUS_SUCCESS)
-                    return_status = fused_epilogue_cpu_shim_requant_typed<hipblaslt_f8,
-                                                                          hip_bfloat16>(
-                        fused,
-                        tmpD,
-                        D,
-                        layoutD->m,
-                        layoutD->n,
-                        layoutD->ld,
-                        batch_count,
-                        batch_stride,
-                        stream);
+                {
+                    if(fused->requant_granularity == HIPBLASLT_REQUANT_SCALE_MX_BLOCK)
+                        return_status
+                            = fused_epilogue_cpu_shim_mxquant_typed<hipblaslt_f8, hip_bfloat16>(
+                                fused,
+                                tmpD,
+                                D,
+                                layoutD->m,
+                                layoutD->n,
+                                layoutD->ld,
+                                batch_count,
+                                batch_stride,
+                                stream);
+                    else
+                        return_status
+                            = fused_epilogue_cpu_shim_requant_typed<hipblaslt_f8, hip_bfloat16>(
+                                fused,
+                                tmpD,
+                                D,
+                                layoutD->m,
+                                layoutD->n,
+                                layoutD->ld,
+                                batch_count,
+                                batch_stride,
+                                stream);
+                }
                 cleanup();
                 rocblaslt::Debug::Instance().markerStop();
                 return return_status;
