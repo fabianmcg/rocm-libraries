@@ -146,12 +146,13 @@ typedef enum {
  *
  *  \details
  *  Determines how many scale/amax values are shared across the ``[M,N]`` result. Per-tensor uses a
- *  single value; per-row uses one value per output row (``[M]``). Block granularities can be added
- *  later when there is a concrete model and kernel requirement.
+ *  single value; per-row uses one value per output row (``[M]``); MX_BLOCK uses one UE8M0 scale per
+ *  2D tile of shape ``[tile_rows, tile_cols]``, covering a rectangular region of the result.
  */
 typedef enum {
   HIPBLASLT_REQUANT_SCALE_PER_TENSOR    = 0, /**<One scalar scale for the whole result tensor. Scale/amax shape ``[1]``.*/
   HIPBLASLT_REQUANT_SCALE_PER_ROW       = 1, /**<One scale per output row/token. Scale/amax shape ``[M]``.*/
+  HIPBLASLT_REQUANT_SCALE_MX_BLOCK      = 2, /**<One UE8M0 (8-bit exponent-only) scale per 2D MX tile of shape ``[tile_rows, tile_cols]``. Scale shape ``[ceil(M/tile_rows), ceil(N/tile_cols)]`` of ``uint8_t``, row-major over the tile grid. tile_cols is set via HIPBLASLT_FUSED_EPILOGUE_REQUANT_BLOCK_SIZE and tile_rows via HIPBLASLT_FUSED_EPILOGUE_REQUANT_TILE_ROWS (default 1 = per-row blocks).*/
 } hipblasLtRequantScaleGranularity_t;
 
 /*! \ingroup types_module
@@ -163,10 +164,12 @@ typedef enum {
   HIPBLASLT_FUSED_EPILOGUE_RESIDUAL_POINTER = 2, /**<Non-null device pointer to the residual input tensor. The tensor has the same logical shape, layout, and data type as D. Data type: ``void*``.*/
   HIPBLASLT_FUSED_EPILOGUE_RESIDUAL_OUTPUT_POINTER = 3, /**<Optional device pointer that receives the updated residual stream after the residual add. If NULL or unset, the residual input tensor is updated in place. Data type: ``void*``.*/
   HIPBLASLT_FUSED_EPILOGUE_RMSNORM_STATS = 4, /**<Opaque RMSNorm handoff descriptor linking the decomposed producer (partial RMSNorm stats) and consumer (RMSNorm scale-apply) matmul calls. The same object must be set on both handles. The carried consumer scale is rstd for the ordinary decomposed flow, or the composed RMSNorm-output dequant scale for the dynamic-quantized decomposed producer. Data type: ``hipblasLtFusedEpilogueRMSNormDescriptor_t``.*/
-  HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_POINTER = 5, /**<Device pointer to the requant dequant scale. In static mode it is read-only input; in dynamic mode it receives the derived scale. For the dynamic-quantized decomposed producer, this receives the logical RMSNorm-output dequant scale consumed by GEMM2. Its element count follows the scale granularity. Data type: ``void*`` (f32 elements).*/
-  HIPBLASLT_FUSED_EPILOGUE_REQUANT_AMAX_POINTER = 6, /**<Optional device pointer that receives the result amax side output, with the same granularity as the scale. If unset in dynamic mode, amax is computed internally only to derive the scale. Data type: ``void*`` (f32 elements).*/
+  HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_POINTER = 5, /**<Device pointer to the requant dequant scale. In static mode it is read-only input; in dynamic mode it receives the derived scale. For the dynamic-quantized decomposed producer, this receives the logical RMSNorm-output dequant scale consumed by GEMM2. Its element count follows the scale granularity. For MX_BLOCK granularity the pointer targets a ``[ceil(M/tile_rows), ceil(N/tile_cols)]`` row-major array of ``uint8_t`` UE8M0 scales rather than f32. Data type: ``void*`` (f32 elements, or ``uint8_t`` UE8M0 for MX_BLOCK).*/
+  HIPBLASLT_FUSED_EPILOGUE_REQUANT_AMAX_POINTER = 6, /**<Optional device pointer that receives the result amax side output. For per-tensor and per-row granularity it matches the scale granularity (``[1]`` or ``[M]``). This side output does not apply to MX_BLOCK granularity, where the pointer is ignored and per-block information is carried by the UE8M0 block scales. If unset in dynamic mode, amax is computed internally only to derive the scale. Data type: ``void*`` (f32 elements).*/
   HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_COMPUTE_MODE = 7, /**<How the output scale is obtained (static vs dynamic-from-amax). Defaults to static. Data type: ``hipblasLtRequantScaleComputeMode_t``.*/
-  HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_GRANULARITY = 8, /**<Shape shared by the scale and amax outputs (per-tensor or per-row). Defaults to per-tensor. Data type: ``hipblasLtRequantScaleGranularity_t``.*/
+  HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_GRANULARITY = 8, /**<Granularity of the scale output (per-tensor, per-row, or MX per-block). The amax side output shares this shape for per-tensor and per-row, and is not produced for MX_BLOCK. Defaults to per-tensor. Data type: ``hipblasLtRequantScaleGranularity_t``.*/
+  HIPBLASLT_FUSED_EPILOGUE_REQUANT_BLOCK_SIZE = 9, /**<MX tile column extent (tile_cols, elements per tile along N) for HIPBLASLT_REQUANT_SCALE_MX_BLOCK granularity. Must be a power of two >= 1. Data type: ``int32_t``. Defaults to 32.*/
+  HIPBLASLT_FUSED_EPILOGUE_REQUANT_TILE_ROWS = 10, /**<Number of rows in each MX quantization tile for HIPBLASLT_REQUANT_SCALE_MX_BLOCK granularity. Must be a power of two >= 1. Defaults to 1 (per-row blocks). Data type: ``int32_t``.*/
 } hipblasLtFusedEpilogueAttribute_t;
 
 /*! \ingroup types_module
