@@ -187,6 +187,12 @@ namespace TensileLite
             if(args.count("output-amaxD"))
                 m_outputAmaxD = args["output-amaxD"].as<bool>();
 
+            if(args.count("use-tile-quant"))
+                m_useTileQuant = args["use-tile-quant"].as<bool>();
+            if(args.count("tile-quant-q0"))
+                m_tileQuantQ0Override = static_cast<int>(args["tile-quant-q0"].as<size_t>());
+            if(args.count("tile-quant-q1"))
+                m_tileQuantQ1Override = static_cast<int>(args["tile-quant-q1"].as<size_t>());
             if(args.count("use-partial-rms"))
                 m_usePartialRMS = args["use-partial-rms"].as<bool>();
             if(args.count("partial-rms-residual-add"))
@@ -409,6 +415,7 @@ namespace TensileLite
                                 rv.back().setUseGateResidual(m_useGateResidual);
                                 rv.back().setUseE(m_useE);
                                 rv.back().setOutputAmaxD(m_outputAmaxD);
+                                rv.back().setUseTileQuant(m_useTileQuant);
                                 rv.back().setUsePartialRMS(m_usePartialRMS);
                                 rv.back().setPartialRMSResidualAdd(m_partialRMSResidualAdd);
                                 rv.back().setUseRstdScale(m_useRstdScale);
@@ -508,6 +515,16 @@ namespace TensileLite
                                     size_t M       = rv.back().d().sizes()[0];
                                     size_t mPadded = ((M + 255) / 256) * 256;
                                     rv.back().setRstdBuf(mPadded);
+                                }
+                                if(m_useTileQuant)
+                                {
+                                    size_t M  = rv.back().d().sizes()[0];
+                                    size_t N  = rv.back().d().sizes()[1];
+                                    int    q0 = m_tileQuantQ0Override > 0 ? m_tileQuantQ0Override : static_cast<int>(M);
+                                    int    q1 = m_tileQuantQ1Override > 0 ? m_tileQuantQ1Override : static_cast<int>(N);
+                                    rv.back().setTileQuantQ0(q0);
+                                    rv.back().setTileQuantQ1(q1);
+                                    rv.back().setQuantScale((M + q0 - 1) / q0, (N + q1 - 1) / q1);
                                 }
                                 if(j < m_activationEnumArg.size())
                                 {

@@ -83,6 +83,9 @@ namespace TensileLite
             bool        m_useGradient     = false;
             bool        m_useGateResidual = false;
             bool        m_outputAmaxD;
+            bool        m_useTileQuant            = false;
+            int         m_tileQuantQ0Override     = 0;
+            int         m_tileQuantQ1Override     = 0;
             bool        m_usePartialRMS         = false;
             bool        m_partialRMSResidualAdd  = false;
             bool        m_partialRMSQuant        = false;

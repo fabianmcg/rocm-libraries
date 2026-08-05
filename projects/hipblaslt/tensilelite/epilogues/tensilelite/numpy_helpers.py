@@ -45,6 +45,35 @@ def rmsDenom(rowSumSq, invD, eps):
     return np.sqrt(np.asarray(rowSumSq, dtype=np.float32) * invD + eps).astype(np.float32)
 
 
+def tileQuantReference(dEff_f32, q0, q1, fp8Max=448.0):
+    """Compute per-tile dynamic fp8 quantization reference outputs.
+
+    Returns (quantScale, dFp8) where quantScale has shape [ceil(M/q0), ceil(N/q1)]
+    float32 and dFp8 has the same shape as dEff_f32 in OCP e4m3.
+    dEff_f32 is the f32 effective D before quantization (alpha already applied);
+    the caller is responsible for passing alpha * (A @ B).
+    """
+    import math
+    import numpy as np
+    import ml_dtypes
+
+    M, N = dEff_f32.shape
+    mT = math.ceil(M / q0)
+    nT = math.ceil(N / q1)
+    scale = np.zeros((mT, nT), dtype=np.float32)
+    out   = np.zeros((M, N),   dtype=np.float32)
+    for ti in range(mT):
+        for tj in range(nT):
+            mStart, mEnd = ti * q0, min((ti + 1) * q0, M)
+            nStart, nEnd = tj * q1, min((tj + 1) * q1, N)
+            blk  = dEff_f32[mStart:mEnd, nStart:nEnd]
+            amax = float(np.max(np.abs(blk))) if blk.size else 0.0
+            scale[ti, tj] = amax / fp8Max
+            if amax > 0:
+                out[mStart:mEnd, nStart:nEnd] = blk * (fp8Max / amax)
+    return scale, out.astype(ml_dtypes.float8_e4m3fn)
+
+
 def rmsNormReference(aRow, bRow, gammaBf16, invD, eps):
     """End-to-end RMSNorm reference: bf16(A@B * gamma) / rms(A@B), float32 (M, nHidden).
 

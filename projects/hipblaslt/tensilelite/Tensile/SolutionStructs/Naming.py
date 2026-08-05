@@ -225,6 +225,11 @@ def _getName(state, requiredParameters: frozenset, splitGSU: bool, ignoreInterna
   if state.get("LDSSegmentInterleave") == 1:
     requiredParametersTemp.add("LDSSegmentInterleave")
 
+  # TileQuantShape is only meaningful when TileQuant is active; exclude it from
+  # non-quant kernel names to avoid a spurious [-1,-1] tag on every other kernel.
+  if not state.get("TileQuant", False):
+    requiredParametersTemp.discard("TileQuantShape")
+
   for key in sorted(requiredParametersTemp):
     if key not in state or key == "CustomKernelName":
       continue

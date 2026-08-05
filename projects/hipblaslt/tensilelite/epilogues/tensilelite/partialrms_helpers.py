@@ -178,7 +178,8 @@ def compileSolution(solution):
 
 
 def buildSubtileArgs(free0, free1, bound, numWG, dOut, cIn, aOperand, bOperand,
-                     skArgs, ki0, ki1, epilogueArgs):
+                     skArgs, ki0, ki1, epilogueArgs, alpha=np.float32(1.0),
+                     hasBeta=True):
     """Build the StreamK=3/ForceDPOnly subtile kernel argument list.
 
     All subtile kernels use StreamKForceDPOnly=1, which drops AddressWS and
@@ -186,7 +187,10 @@ def buildSubtileArgs(free0, free1, bound, numWG, dOut, cIn, aOperand, bOperand,
     Four zero u64 batchOffset{D,C,A,B} args are appended at the tail for
     non-grouped-GEMM kernels (batch=1, so offsets are all zero).
 
-    Slot layout (0-indexed):
+    Pass hasBeta=False for kernels with UseBeta=False (e.g. TileQuant), which
+    do not load a beta SGPR; epilogue args then start one slot earlier.
+
+    Slot layout (0-indexed) with hasBeta=True:
       0        : kernel_info_flags (uint32, always 1)
       1, 2     : ki0, ki1
       3        : numWG
@@ -200,6 +204,8 @@ def buildSubtileArgs(free0, free1, bound, numWG, dOut, cIn, aOperand, bOperand,
       22–27    : SK decomposition args
       28+      : epilogue-specific args
       tail     : batchOffsetD, batchOffsetC, batchOffsetA, batchOffsetB (u64, all 0)
+
+    With hasBeta=False slot 21 (beta) is absent; epilogue args start at slot 27.
     """
     args = [
         np.uint32(1), ki0, ki1, np.uint32(numWG),
@@ -209,11 +215,15 @@ def buildSubtileArgs(free0, free1, bound, numWG, dOut, cIn, aOperand, bOperand,
         np.uint32(free0), np.uint32(0),
         np.uint32(bound), np.uint32(0),
         np.uint32(bound), np.uint32(0),
-        np.float32(1.0), np.float32(0.0),
+        np.float32(alpha),
+    ]
+    if hasBeta:
+        args.append(np.float32(0.0))
+    args.extend([
         skArgs["iters_per_tile"], skArgs["magic_iters_per_tile"],
         skArgs["shift_iters_per_tile"], skArgs["sk_iters_per_wg"],
         skArgs["sk_grid"], skArgs["sk_tiles"],
-    ]
+    ])
     args.extend(epilogueArgs)
     # batchOffset{D,C,A,B}: zero for batch=1 (no pointer-array offset needed).
     args.extend([np.uint64(0), np.uint64(0), np.uint64(0), np.uint64(0)])

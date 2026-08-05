@@ -73,7 +73,8 @@ class ProblemType:
                  'useGradient', 'activationType', 'activationArgLength', 'activationComputeDataType', 'activationNoGuard',
                  'sparse', 'f32XdlMathOp', 'supportDeviceUserArguments', 'outputAmaxD', 'swizzleTensorA', 'swizzleTensorB', 'metadataLayout',
                  'mxBlockA', 'mxBlockB', 'mxTypeA', 'mxTypeB', 'mxScaleFormat',
-                 'usePartialRMS', 'partialRMSResidualAdd', 'partialRMSQuant', 'useRstdScale']
+                 'usePartialRMS', 'partialRMSResidualAdd', 'partialRMSQuant', 'useRstdScale',
+                 'useTileQuant']
     @classmethod
     def FromOriginalState(cls, d):
         indices = [None]*d['TotalIndices']
@@ -263,6 +264,7 @@ class ProblemType:
         rv.partialRMSResidualAdd = bool(d.get('PartialRMSResidualAdd', False))
         rv.partialRMSQuant = bool(d.get('PartialRMSQuant', False))
         rv.useRstdScale = bool(d.get('RstdScale', False))
+        rv.useTileQuant = bool(d.get('TileQuant', False))
 
         rv.useScaleAB = ""
         if 'UseScaleAB' in d:
@@ -441,6 +443,7 @@ class ProblemType:
             predicates.append(ProblemPredicate("UseRstdScale", value=self.useRstdScale))
             predicates.append(ProblemPredicate("UsePartialRMSResidualAdd", value=self.partialRMSResidualAdd))
             predicates.append(ProblemPredicate("UsePartialRMSQuant", value=self.partialRMSQuant))
+            predicates.append(ProblemPredicate("UseTileQuant", value=self.useTileQuant))
         return predicates
 
 def extractDimPredicate(cls, key, value, predicateName):
@@ -611,6 +614,10 @@ class ProblemPredicate(Properties.Predicate):
         if state['ProblemType']['SwizzleTensorB']:
             rv += [cls('SwizzleTensorB', value=state['ProblemType']['SwizzleTensorB'])]
 
+        if state.get('TileQuant', False):
+            rv += [cls('TileQuantQ0', value=state['_TileQuantQ0'])]
+            rv += [cls('TileQuantQ1', value=state['_TileQuantQ1'])]
+
         return rv
 
     @classmethod
@@ -668,6 +675,9 @@ class SizeMapping:
                  'PartialRMS',
                  'PartialRMSResidualAdd',
                  'RstdScale',
+                 'TileQuant',
+                 'tileQuantQ0',
+                 'tileQuantQ1',
                  'NonTemporalD',
                  'WaveSeparateGlobalReadA',
                  'WaveSeparateGlobalReadB',
@@ -766,6 +776,9 @@ class SizeMapping:
                    PartialRMS               = bool(d.get('PartialRMS', False)),
                    PartialRMSResidualAdd    = bool(d.get('PartialRMSResidualAdd', False)),
                    RstdScale                = bool(d.get('RstdScale', False)),
+                   TileQuant                = bool(d.get('TileQuant', False)),
+                   tileQuantQ0              = int(d.get('_TileQuantQ0', 0)),
+                   tileQuantQ1              = int(d.get('_TileQuantQ1', 0)),
                    NonTemporalD             = d['NonTemporalD'],
                    WaveSeparateGlobalReadA  = d['WaveSeparateGlobalReadA'],
                    WaveSeparateGlobalReadB  = d['WaveSeparateGlobalReadB'],

@@ -429,6 +429,7 @@ _defaultProblemType = {
     "PartialRMSResidualAdd": False,
     "PartialRMSQuant":       False,
     "RstdScale":             False,
+    "TileQuant":             False,
     "Gradient": False,  # =True set globalWriteElements to gradient mode
     "UseBias": 0,  # =1 support bias vector on M direction, =2 support bias vector on N direction, =3 support bias vector on both M,N direction
     "UseGateResidual": False,  # =True apply gate residual: D = gate * spmm_result + gate
@@ -531,6 +532,7 @@ _validGEMMTypes = [
     ("B", "B", "B", "S"),
     ("B", "B", "S", "S"),
     ("B", "B", "H", "S"),
+    ("B", "B", "F8", "S"),   # bf16 in, OCP fp8 e4m3 out, f32 compute
     ("I8", "I8", "I", "I"),
     ("4xi8", "4xi8", "I", "I"),
     ("I8", "I8", "I8", "I"),
@@ -634,6 +636,7 @@ _HPATypes = [
     ("B", "B", "B", "S"),
     ("B", "B", "S", "S"),
     ("B", "B", "H", "S"),
+    ("B", "B", "F8", "S"),   # bf16 in, OCP fp8 e4m3 out, f32 compute (TileQuant)
     ("I8", "I8", "I", "I"),
     ("4xi8", "4xi8", "I", "I"),
     ("I8", "I8", "I", "S"),

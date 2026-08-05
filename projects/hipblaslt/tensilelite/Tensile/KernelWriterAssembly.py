@@ -14607,7 +14607,14 @@ class KernelWriterAssembly(KernelWriter):
     # print("len(elements)= ", len(elements_1))
     noGSUBranch = (kernel["GlobalSplitU"] == 0 and (not self.states.streamK.requiresWorkspaceReductionStorePath or kernel["StreamKForceDPOnly"]))
     module = Module("notLocalSplitUGlobalWrite")
-    storeModule, deferredGSU0 = self.globalWriteElements(kernel, tPA, tPB, fullVws, fullVws_1, elements, elements_1, noGSUBranch=noGSUBranch)
+    # TileQuant applies alpha and handles beta=0 in its epilogue; suppress both here.
+    applyAlpha = not kernel.get("TileQuant", False)
+    betas = [False] if kernel.get("TileQuant", False) else None
+    storeModule, deferredGSU0 = self.globalWriteElements(
+        kernel, tPA, tPB, fullVws, fullVws_1, elements, elements_1,
+        noGSUBranch=noGSUBranch,
+        applyAlpha=applyAlpha,
+        **({"betas": betas} if betas is not None else {}))
     module.add(storeModule)
 
     self.cleanupGlobalWrite(kernel)

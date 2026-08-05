@@ -506,6 +506,8 @@ defaultBenchmarkCommonParameters = [
     {"PartialRMSQuant": [False]},
     {"PartialRMSResidualAdd": [False]},
     {"RstdScale": [False]},
+    {"TileQuant": [False]},
+    {"TileQuantShape": [[-1, -1]]},
     {"UseSubtileImpl": [False]},
     {"UseSgprForGRO": [-1]},
     {"UseInstOffsetForGRO": [0]},

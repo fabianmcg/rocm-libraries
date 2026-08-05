@@ -1266,6 +1266,8 @@ namespace TensileLite
         }
         if(sizeMapping.rstdScale)
             args.template append<void const*>("RstdBuf", inputs.rstdBuf);
+        if(sizeMapping.tileQuant)
+            args.template append<void*>("QuantScale", inputs.quantScale);
     }
 
     inline uint32_t getNumWorkGroups(const KernelInvocation& rv)

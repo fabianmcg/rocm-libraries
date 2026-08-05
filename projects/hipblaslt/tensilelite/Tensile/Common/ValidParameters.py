@@ -158,6 +158,7 @@ def makeValidWorkGroups():
                     validWorkGroups.append(workGroup)
     return validWorkGroups
 
+
 def makeValidWMMA():
     return [[16, 16, 4, 1], [16, 16, 8, 1], [16, 16, 16, 1], [16, 16, 32, 1], [16, 16, 64, 1], [16, 16, 128, 1], [32, 16, 128, 1]]
 
@@ -536,6 +537,8 @@ validParameters = { # we need to make sure this matches develop
     "PartialRMSQuant": [False, True],
     "PartialRMSResidualAdd": [False, True],
     "RstdScale": [False, True],
+    "TileQuant": [False, True],
+    "TileQuantShape": -1,  # Any two-element list; real validation is in _resolveTileQuantShape.
     "UseSubtileImpl": [False, True],
     # Load options:
     # (GRO = Global Read Offset)

@@ -412,6 +412,10 @@ namespace TensileLite
                 ("rotating-buffer-size",      po::value<int32_t>()->default_value(0), "Size of rotating buffer in the unit of MB.")
                 ("rotating-buffer-mode",      po::value<int32_t>()->default_value(0), "Rotating mode.")
                 ("output-amaxD",              po::value<bool>()->default_value(false), "Output AmaxD.")
+                ("use-tile-quant",             po::value<bool>()->default_value(false),             "Enable dynamic tile-quant fp8 epilogue.")
+                ("tile-quant-q0",             po::value<size_t>()->default_value(0),               "Quant tile M extent (0 = whole MacroTile0).")
+                ("tile-quant-q1",             po::value<size_t>()->default_value(0),               "Quant tile N extent (0 = whole MacroTile1).")
+                ("init-quantScale",           po::value<InitMode>()->default_value(InitMode::Zero), "Init mode for quantScale output.")
                 ("use-partial-rms",           po::value<bool>()->default_value(false), "Enable PartialRMS fused epilogue.")
                 ("partial-rms-residual-add",  po::value<bool>()->default_value(false), "PartialRMS: add residual before reduction.")
                 ("partial-rms-quant",         po::value<bool>()->default_value(false), "PartialRMS: also compute amax(|D|)/448 into partialBuf second half.")
@@ -565,6 +569,10 @@ namespace TensileLite
             DUMP_OPT("init-scaleC", InitMode);
             DUMP_OPT("init-scaleD", InitMode);
             DUMP_OPT("init-scaleAlphaVec", InitMode);
+            DUMP_OPT("use-tile-quant", bool);
+            DUMP_OPT("tile-quant-q0", size_t);
+            DUMP_OPT("tile-quant-q1", size_t);
+            DUMP_OPT("init-quantScale", InitMode);
             DUMP_OPT("use-partial-rms", bool);
             DUMP_OPT("partial-rms-residual-add", bool);
             DUMP_OPT("partial-rms-quant", bool);

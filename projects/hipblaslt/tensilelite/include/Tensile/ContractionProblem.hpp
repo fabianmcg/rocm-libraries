@@ -353,6 +353,7 @@ namespace TensileLite
             PARTIALBUF    = 19, // f32 output: partial Σx² [M_tokens_padded x n_d] row-major, n_d = ceil(N_hidden/MT0).
             RESIDUAL      = 20, // bf16 input: residual tensor [M_tokens x N_hidden] row-major (optional).
             RSTDBUF       = 21, // f32 input: reciprocal std-dev buffer [M] for RstdScale epilogue.
+            QUANTSCALE    = 22, // f32 output: per-tile amax/448 scale [ceil(M/Q0) x ceil(N/Q1)] row-major.
             TENSOR_COUNT
         };
 
@@ -779,6 +780,23 @@ namespace TensileLite
 
         void setUseRstdScale(bool v) { m_useRstdScale = v; }
         bool useRstdScale() const    { return m_useRstdScale; }
+
+        void setUseTileQuant(bool v)  { m_useTileQuant = v; }
+        bool useTileQuant() const     { return m_useTileQuant; }
+        void setTileQuantQ0(int v)    { m_tileQuantQ0 = v; }
+        int  tileQuantQ0() const      { return m_tileQuantQ0; }
+        void setTileQuantQ1(int v)    { m_tileQuantQ1 = v; }
+        int  tileQuantQ1() const      { return m_tileQuantQ1; }
+
+        void setQuantScale(size_t mTiles, size_t nTiles)
+        {
+            if(m_useTileQuant)
+            {
+                m_tensors[TENSOR::QUANTSCALE]
+                    = {"quantScale", rocisa::DataType::Float, {mTiles, nTiles}, {nTiles, 1}};
+                m_tensors[TENSOR::QUANTSCALE].setAsOutput(true);
+            }
+        }
 
         void setUseBias(int useBias)
         {
@@ -1534,6 +1552,9 @@ namespace TensileLite
         int              m_partialRMSMT0            = 0;
         int              m_partialRMSMT1            = 0;
         bool             m_useRstdScale            = false;
+        bool             m_useTileQuant            = false;
+        int              m_tileQuantQ0             = 0;
+        int              m_tileQuantQ1             = 0;
         bool             m_swizzleTensorA          = false;
         bool             m_swizzleTensorB          = false;
         int              m_useBias                 = 0;
@@ -1673,10 +1694,11 @@ namespace TensileLite
         void*       e     = nullptr;
         void*       amaxD = nullptr;
 
-        void*       partialBuf = nullptr;
-        void const* rmsGamma   = nullptr;
-        void const* residual   = nullptr;
-        void const* rstdBuf    = nullptr;
+        void*       partialBuf  = nullptr;
+        void const* rmsGamma    = nullptr;
+        void const* residual    = nullptr;
+        void const* rstdBuf     = nullptr;
+        void*       quantScale  = nullptr;
 
         void const* const* batchA    = nullptr;
         void const* const* batchB    = nullptr;

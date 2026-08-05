@@ -169,4 +169,6 @@ def getRequiredParametersMin() -> set:
         'PartialRMSQuant',
         'PartialRMSResidualAdd',
         'RstdScale',
+        'TileQuant',
+        'TileQuantShape',
     })

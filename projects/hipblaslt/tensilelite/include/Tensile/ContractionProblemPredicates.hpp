@@ -2120,6 +2120,108 @@ namespace TensileLite
                 }
             };
 
+            struct UseTileQuantEqual
+                : public Predicate_CRTP<UseTileQuantEqual, ContractionProblemGemm>
+            {
+                enum
+                {
+                    HasIndex = false,
+                    HasValue = true
+                };
+                bool value;
+
+                UseTileQuantEqual() = default;
+                UseTileQuantEqual(bool value)
+                    : value(value)
+                {
+                }
+
+                static std::string Type()
+                {
+                    return "UseTileQuant";
+                }
+
+                virtual bool operator()(ContractionProblemGemm const& problem) const override
+                {
+                    return problem.useTileQuant() == value;
+                }
+
+                virtual bool debugEval(ContractionProblemGemm const& problem,
+                                       std::ostream&                 stream) const override
+                {
+                    return debugEvalCmp(
+                        problem, stream, "prob", problem.useTileQuant(), "==", "sol", value);
+                }
+            };
+
+            struct TileQuantQ0Equal
+                : public Predicate_CRTP<TileQuantQ0Equal, ContractionProblemGemm>
+            {
+                enum
+                {
+                    HasIndex = false,
+                    HasValue = true
+                };
+                int value;
+
+                TileQuantQ0Equal() = default;
+                TileQuantQ0Equal(int value)
+                    : value(value)
+                {
+                }
+
+                static std::string Type()
+                {
+                    return "TileQuantQ0";
+                }
+
+                virtual bool operator()(ContractionProblemGemm const& problem) const override
+                {
+                    return problem.tileQuantQ0() == value;
+                }
+
+                virtual bool debugEval(ContractionProblemGemm const& problem,
+                                       std::ostream&                 stream) const override
+                {
+                    return debugEvalCmp(
+                        problem, stream, "prob", problem.tileQuantQ0(), "==", "sol", value);
+                }
+            };
+
+            struct TileQuantQ1Equal
+                : public Predicate_CRTP<TileQuantQ1Equal, ContractionProblemGemm>
+            {
+                enum
+                {
+                    HasIndex = false,
+                    HasValue = true
+                };
+                int value;
+
+                TileQuantQ1Equal() = default;
+                TileQuantQ1Equal(int value)
+                    : value(value)
+                {
+                }
+
+                static std::string Type()
+                {
+                    return "TileQuantQ1";
+                }
+
+                virtual bool operator()(ContractionProblemGemm const& problem) const override
+                {
+                    return problem.tileQuantQ1() == value;
+                }
+
+                virtual bool debugEval(ContractionProblemGemm const& problem,
+                                       std::ostream&                 stream) const override
+                {
+                    return debugEvalCmp(
+                        problem, stream, "prob", problem.tileQuantQ1(), "==", "sol", value);
+                }
+            };
+
             struct UseRstdScaleEqual
                 : public Predicate_CRTP<UseRstdScaleEqual, ContractionProblemGemm>
             {

@@ -395,6 +395,101 @@ def _validateRstdScale(state, printRejectionReason):
     return
 
 
+def _resolveTileQuantShape(state, printRejectionReason):
+  """Resolve and validate TileQuantShape; set _TileQuantQ0/Q1 in state.
+
+  Returns True on success, False if the state was rejected.
+  Checks power-of-two, even divisibility, and Phase-1 wave-span bounds.
+  """
+  mt0, mt1 = state["MacroTile0"], state["MacroTile1"]
+  q = list(state.get("TileQuantShape", [-1, -1]))
+  q0 = mt0 if q[0] in (-1, 0) else q[0]
+  q1 = mt1 if q[1] in (-1, 0) else q[1]
+  state["_TileQuantQ0"], state["_TileQuantQ1"] = q0, q1
+  for name, qd, mtd in (("Q0", q0, mt0), ("Q1", q1, mt1)):
+    if qd <= 0 or (qd & (qd - 1)) != 0:
+      reject(state, printRejectionReason, f"TileQuant {name} must be a power of two")
+      return False
+    if mtd % qd != 0:
+      reject(state, printRejectionReason, f"TileQuant {name} must divide MacroTile evenly")
+      return False
+  mfmaM = state["MatrixInstM"]
+  if q0 < mfmaM:
+    rowsPerLane = (mfmaM * state["MatrixInstN"]) // state["WavefrontSize"]
+    if q0 > rowsPerLane or (rowsPerLane % q0) != 0:
+      reject(state, printRejectionReason,
+             f"TileQuant Q0={q0} < MatrixInstM={mfmaM} is only supported when "
+             f"Q0 <= rowsPerLane={rowsPerLane} and Q0 divides rowsPerLane")
+      return False
+  mfmaN = state["MatrixInstN"]
+  if q1 < mfmaN:
+    reject(state, printRejectionReason,
+           f"TileQuant Q1={q1} must be >= MatrixInstN={mfmaN} (sub-mfma column quantization not supported)")
+    return False
+  wg = state["MIWaveGroup"]
+  if q0 > (mt0 // wg[0]) or q1 > (mt1 // wg[1]):
+    reject(state, printRejectionReason,
+           "TileQuant Phase 1 requires QuantTileShape within a single wave sub-tile")
+    return False
+  return True
+
+
+def _validateTileQuant(state, printRejectionReason):
+  """Validate TileQuant fused epilogue constraints (feature flags, type, shape)."""
+  if not state.get("TileQuant", False):
+    return
+  if state.get("PartialRMS", False) or state.get("RstdScale", False):
+    reject(state, printRejectionReason, "TileQuant is mutually exclusive with PartialRMS/RstdScale")
+    return
+  if not _validateSubtileEpiloguePrereqs(state, printRejectionReason, "TileQuant"):
+    return
+  # D is the fp8 output; require OCP e4m3 DestDataType.
+  if not state["ProblemType"]["DestDataType"].isFloat8():
+    reject(state, printRejectionReason,
+           "TileQuant requires DestDataType=F8 (OCP e4m3); D is the fp8 output")
+    return
+  if not state["ProblemType"]["HighPrecisionAccumulate"]:
+    reject(state, printRejectionReason, "TileQuant requires HighPrecisionAccumulate=True")
+    return
+  # TileQuant computes amax over A*B only; beta!=0 adds C after scaling
+  # and corrupts both the fp8 D values and QuantScale.
+  if state["ProblemType"].get("UseBeta", True):
+    reject(state, printRejectionReason, "TileQuant requires UseBeta=False (beta must be 0)")
+    return
+  # No competing per-tensor scale; TileQuant owns scaling via QuantScale.
+  if state["ProblemType"].get("UseScaleCD", False):
+    reject(state, printRejectionReason,
+           "TileQuant is incompatible with UseScaleCD (per-tile scale only)")
+    return
+  if state["ProblemType"].get("UseBias", 0) != 0:
+    reject(state, printRejectionReason, "TileQuant does not support UseBias")
+    return
+  if state["ProblemType"].get("UseE", False):
+    reject(state, printRejectionReason, "TileQuant does not support UseE")
+    return
+  if state["ProblemType"].get("UseGateResidual", False):
+    reject(state, printRejectionReason, "TileQuant does not support UseGateResidual")
+    return
+  if state["ProblemType"].get("UseScaleAlphaVec", 0) != 0:
+    reject(state, printRejectionReason, "TileQuant does not support UseScaleAlphaVec")
+    return
+  if state.get("PrefetchAcrossPersistent", 0):
+    reject(state, printRejectionReason, "TileQuant is not supported with PrefetchAcrossPersistent")
+    return
+  if state["ProblemType"]["OutputAmaxD"]:
+    reject(state, printRejectionReason, "TileQuant does not support OutputAmaxD")
+    return
+  if (state.get("_GlobalAccumulation") == "MultipleBufferSingleKernel"
+      or state.get("AdaptiveGemmGSUA") == 1):
+    reject(state, printRejectionReason, "TileQuant does not support MBSK/AdaptiveGemmGSUA")
+    return
+  if state["ProblemType"].get("GroupedGemm", False):
+    reject(state, printRejectionReason, "TileQuant does not support GroupedGemm")
+    return
+  if not _resolveTileQuantShape(state, printRejectionReason):
+    return
+
+
 def _validateStreamKForceDPOnly(state, printRejectionReason):
   if state["StreamKForceDPOnly"]:
     if state["StreamK"] != 3:
@@ -1256,6 +1351,10 @@ class Solution(collections.abc.Mapping):
       return
 
     _validateRstdScale(state, printRejectionReason)
+    if not state["Valid"]:
+      return
+
+    _validateTileQuant(state, printRejectionReason)
     if not state["Valid"]:
       return
 

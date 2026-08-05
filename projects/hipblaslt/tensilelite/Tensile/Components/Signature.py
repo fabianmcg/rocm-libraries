@@ -372,7 +372,30 @@ class SignatureDefault(Signature):
             # RstdScale (K3) epilogue appends in this order:
             #   RstdBuf: fp32 global buffer pointer (8 bytes) — pre-computed per-row rstd.
             signature.addArg("RstdBuf", SVK.SIG_GLOBALBUFFER, "f32", "generic")
-            userArgumentsInfo.rmsNormSize = 8  # 8B rstdBuf ptr
+            userArgumentsInfo.rmsNormSize += 8  # 8B rstdBuf ptr
+
+        if kernel["TileQuant"]:
+            # TileQuant epilogue appends QuantScale: fp32 global buffer pointer (8 bytes).
+            # The emitter writes per-tile amax/448 values; the standard fp8 store handles D.
+            # Mirror the KernelWriter padding: insert a u32 pad word when the accumulated
+            # named-SGPR count before this point is odd (64-bit pointer needs 2-SGPR alignment).
+            # For valid TileQuant kernels (UseScaleCD/Bias/E/Gate/ScaleAlphaVec all rejected),
+            # the pre-TileQuant SGPRs are: UseScaleAB (0 or 4) + activation args.
+            preTqSgprs  = 0
+            preTqSgprs += 2 + 2 if kernel["ProblemType"].get("UseScaleAB", False) else 0
+            runActivation = (kernel["ProblemType"]["ActivationType"] != 'none'
+                             and kernel["ActivationFused"])
+            if runActivation:
+                numActArgSize = writer.states.numActivationArgSize
+                preTqSgprs += (len(kernel["ProblemType"]["ActivationType"].getAdditionalArgStringList())
+                               * numActArgSize)
+                if kernel["ProblemType"]["ActivationType"] in ['all', 'hipblaslt_all']:
+                    preTqSgprs += 1  # ActivationType u32
+            if preTqSgprs % 2:
+                signature.addArg("TileQuantPad", SVK.SIG_VALUE, "u32")
+                userArgumentsInfo.rmsNormSize += 4
+            signature.addArg("QuantScale", SVK.SIG_GLOBALBUFFER, "f32", "generic")
+            userArgumentsInfo.rmsNormSize += 8  # 8B quantScale ptr
 
         # Calculate total size
         userArgumentsInfo.totalSize = userArgumentsInfo.gemmArgumentSize + \

@@ -148,6 +148,8 @@ namespace TensileLite
                 // partialBuf column stride.  The CPU reference must use the same MT0
                 // as the kernel being validated; otherwise the tile layout doesn't
                 // match and validation fails for kernels with MT0 > minMT0.
+                // TODO: for TileQuant, add a re-run path analogous to the PartialRMS
+                // per-solution MT0 re-run below, for mixed-tile benchmark groups (Phase 2).
                 if(gemm->usePartialRMS())
                 {
                     int actualMT0 = static_cast<int>(solution->sizeMapping.macroTile.x);
@@ -544,6 +546,12 @@ namespace TensileLite
                 {
                     refPtr = reference.partialBuf;
                     resPtr = result.partialBuf;
+                }
+                break;
+                case ContractionProblemGemm::TENSOR::QUANTSCALE:
+                {
+                    refPtr = reference.quantScale;
+                    resPtr = result.quantScale;
                 }
                 break;
                 default:

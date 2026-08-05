@@ -2305,7 +2305,9 @@ namespace TensileLite
                                     * static_cast<float>(cPtr[cIndex]);
                         dPtr[dIndex] = SaturateCast<typename Inputs::DType>(dVal);
                     }
-                    else
+                    // TileQuant owns D: the second-pass block below writes every element,
+                    // so skip the standard per-element store here to avoid dead writes.
+                    else if(!problem.useTileQuant())
                     {
                         dPtr[dIndex] = SaturateCast<typename Inputs::DType>(resultD);
                     }
@@ -2433,6 +2435,103 @@ namespace TensileLite
                             pb[pbIdx] = tileAmax / kFp8E4M3Max;
                         else
                             pb[pbIdx] = tileSum;
+                    }
+                }
+            }
+
+            // Compute TileQuant reference: per-tile amax-based fp8 quantization.
+            // Arbitrary alpha is applied before amax; beta=0 is required (Tier 1).
+            if constexpr(notCmplxAmaxD)
+            {
+                if(problem.useTileQuant() && inputs.quantScale != nullptr
+                   && inputs.d != nullptr)
+                {
+                    float alphaF = static_cast<float>(constVariantCast<Accumulator>(inputs.alpha));
+
+                    int q0 = problem.tileQuantQ0() > 0 ? problem.tileQuantQ0() : static_cast<int>(d.sizes()[0]);
+                    int q1 = problem.tileQuantQ1() > 0 ? problem.tileQuantQ1() : static_cast<int>(d.sizes()[1]);
+
+                    float* qsPtr = static_cast<float*>(inputs.quantScale);
+
+                    size_t M = static_cast<size_t>(d.sizes()[0]);
+                    size_t N = static_cast<size_t>(d.sizes()[1]);
+                    size_t mTiles = (M + static_cast<size_t>(q0) - 1) / static_cast<size_t>(q0);
+                    size_t nTiles = (N + static_cast<size_t>(q1) - 1) / static_cast<size_t>(q1);
+
+                    // D index for the M dimension (free0) and N dimension (free1).
+                    size_t dDimM = freeIndicesA[0].d;
+                    size_t dDimN = freeIndicesB[0].d;
+                    // A/B tensor dimension indices for the free and bound dimensions.
+                    size_t aDimM = freeIndicesA[0].i;
+                    size_t bDimN = freeIndicesB[0].i;
+                    size_t aDimK = boundIndices[0].a;
+                    size_t bDimK = boundIndices[0].b;
+
+                    constexpr float kFp8Max = 448.0f;
+
+                    omp_set_num_threads(MAX_OMP_THREADS);
+#pragma omp parallel for schedule(dynamic) collapse(2)
+                    for(size_t ti = 0; ti < mTiles; ++ti)
+                    {
+                        for(size_t tj = 0; tj < nTiles; ++tj)
+                        {
+                            size_t mLo = ti * static_cast<size_t>(q0);
+                            size_t mHi = std::min(mLo + static_cast<size_t>(q0), M);
+                            size_t nLo = tj * static_cast<size_t>(q1);
+                            size_t nHi = std::min(nLo + static_cast<size_t>(q1), N);
+
+                            size_t tileRows = mHi - mLo;
+                            size_t tileCols = nHi - nLo;
+                            // Cache alpha*dot per element so the second pass reuses the same
+                            // f32 accumulation used for amax (GPU accumulates only once).
+                            std::vector<float> effTile(tileRows * tileCols, 0.0f);
+
+                            // First pass: compute f32 GEMM dot products and find amax.
+                            float amax = 0.0f;
+                            for(size_t m = mLo; m < mHi; ++m)
+                            {
+                                for(size_t n = nLo; n < nHi; ++n)
+                                {
+                                    std::vector<int64_t> ac(a.dimensions(), 0);
+                                    std::vector<int64_t> bc(b.dimensions(), 0);
+                                    ac[aDimM] = static_cast<int64_t>(m);
+                                    bc[bDimN] = static_cast<int64_t>(n);
+                                    float dot = 0.0f;
+                                    for(size_t k = 0; k < boundSize[0]; ++k)
+                                    {
+                                        ac[aDimK] = static_cast<int64_t>(k);
+                                        bc[bDimK] = static_cast<int64_t>(k);
+                                        dot += GetValue<float>(a.dataType(), inputs.a,
+                                                               static_cast<int>(a.index(ac)), false)
+                                               * GetValue<float>(b.dataType(), inputs.b,
+                                                                 static_cast<int>(b.index(bc)), false);
+                                    }
+                                    float eff    = alphaF * dot;
+                                    effTile[(m - mLo) * tileCols + (n - nLo)] = eff;
+                                    float absVal = eff < 0.0f ? -eff : eff;
+                                    if(absVal > amax)
+                                        amax = absVal;
+                                }
+                            }
+
+                            // Write quantScale = amax / fp8Max.
+                            qsPtr[ti * nTiles + tj] = amax / kFp8Max;
+
+                            // Second pass: reuse cached eff values; no second dot-product.
+                            float quantMult = (amax > 0.0f) ? (kFp8Max / amax) : 0.0f;
+                            for(size_t m = mLo; m < mHi; ++m)
+                            {
+                                for(size_t n = nLo; n < nHi; ++n)
+                                {
+                                    std::vector<int64_t> dc(d.dimensions(), 0);
+                                    dc[dDimM] = static_cast<int64_t>(m);
+                                    dc[dDimN] = static_cast<int64_t>(n);
+                                    float eff = effTile[(m - mLo) * tileCols + (n - nLo)];
+                                    dPtr[d.index(dc)]
+                                        = SaturateCast<typename Inputs::DType>(eff * quantMult);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -2713,6 +2812,11 @@ namespace TensileLite
             case TypedGemm_F8_F8_S::TypeId():
             {
                 return ReferenceSolution<TypedGemm_F8_F8_S, float>::SolveCPU(
+                    problem, inputs, elementsToValidate);
+            }
+            case TypedGemm_B_B_F8_S::TypeId():
+            {
+                return ReferenceSolution<TypedGemm_B_B_F8_S, float>::SolveCPU(
                     problem, inputs, elementsToValidate);
             }
             case TypedGemm_F8_B8_S::TypeId():
