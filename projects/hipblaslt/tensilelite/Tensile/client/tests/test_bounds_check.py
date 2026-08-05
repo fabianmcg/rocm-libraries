@@ -188,6 +188,9 @@ def _buildArgs(sol_dict: dict, M: int, N: int, batch: int, K: int,
         np.uint32(ldb), np.uint32(stride_b),
     ])
     args.extend([np.float32(alpha), np.float32(beta)])
+    # Batch offset args added by feat(hipblaslt): 64-bit offset support (#7585).
+    # Placed at the tail of non-grouped kernarg buffers (Signature.py, line 338).
+    args.extend([np.int64(0), np.int64(0), np.int64(0), np.int64(0)])
     return args, num_wg
 
 

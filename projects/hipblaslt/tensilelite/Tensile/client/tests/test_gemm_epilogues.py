@@ -833,6 +833,9 @@ def _buildBiasTypedArgs(sol_dict, M, N, batch, K,
     # Epilogue: bias pointer, bias_type (float32=0), strideBias=0 (non-batched col bias).
     args.append(bias_arr)
     args.extend([np.uint32(0), np.uint32(0)])
+    # Batch offset args added by feat(hipblaslt): 64-bit offset support (#7585).
+    # Placed at the tail of non-grouped kernarg buffers (Signature.py, line 338).
+    args.extend([np.int64(0), np.int64(0), np.int64(0), np.int64(0)])
     return args
 
 
@@ -914,6 +917,9 @@ def _buildReluTypedArgs(sol_dict, M, N, batch, K,
 
     args.extend([np.float32(alpha), np.float32(beta)])
     # relu: activationArgLength=0, not 'all' type → no extra args.
+    # Batch offset args added by feat(hipblaslt): 64-bit offset support (#7585).
+    # Placed at the tail of non-grouped kernarg buffers (Signature.py, line 338).
+    args.extend([np.int64(0), np.int64(0), np.int64(0), np.int64(0)])
     return args
 
 
@@ -1216,6 +1222,9 @@ def _buildScaleCdTypedArgs(sol_dict, M, N, batch, K,
     # ScaleCD epilogue: scaleC pointer then scaleD pointer.
     args.append(scaleC_arr)
     args.append(scaleD_arr)
+    # Batch offset args added by feat(hipblaslt): 64-bit offset support (#7585).
+    # Placed at the tail of non-grouped kernarg buffers (Signature.py, line 338).
+    args.extend([np.int64(0), np.int64(0), np.int64(0), np.int64(0)])
     return args
 
 

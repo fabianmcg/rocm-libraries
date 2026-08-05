@@ -653,6 +653,9 @@ def _buildNtTypedArgs(sol_dict: dict, M: int, N: int, batch: int, K: int,
     ])
 
     args.extend([np.float32(alpha), np.float32(beta)])
+    # Batch offset args added by feat(hipblaslt): 64-bit offset support (#7585).
+    # Placed at the tail of non-grouped kernarg buffers (Signature.py, line 338).
+    args.extend([np.int64(0), np.int64(0), np.int64(0), np.int64(0)])
     return args
 
 
@@ -986,6 +989,9 @@ def _buildPtrBatchArgList(sol_dict: dict, M: int, N: int, batch: int, K: int,
         np.uint32(lda), np.uint32(0), np.uint32(ldb), np.uint32(0),
     ])
     args.extend([np.float32(1.0), np.float32(0.0)])
+    # Batch offset args added by feat(hipblaslt): 64-bit offset support (#7585).
+    # Placed at the tail of non-grouped kernarg buffers (Signature.py, line 338).
+    args.extend([np.int64(0), np.int64(0), np.int64(0), np.int64(0)])
     return args
 
 

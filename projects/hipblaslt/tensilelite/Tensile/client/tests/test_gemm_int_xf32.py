@@ -572,6 +572,9 @@ def _buildNtTypedArgs(sol_dict: dict, M: int, N: int, batch: int, K: int,
         np.uint32(ldb), np.uint32(stride_b),
     ])
     args.extend([np.float32(alpha), np.float32(beta)])
+    # Batch offset args added by feat(hipblaslt): 64-bit offset support (#7585).
+    # Placed at the tail of non-grouped kernarg buffers (Signature.py, line 338).
+    args.extend([np.int64(0), np.int64(0), np.int64(0), np.int64(0)])
     return args
 
 
@@ -688,9 +691,10 @@ def _corruptStrideA1(argList: list, M: int) -> list:
     strideA[1] is the stride between batches of A, located immediately after lda.
     Corrupting the batch stride causes the kernel to read A data from the wrong
     batch offset, producing wildly different outputs detectable at any tolerance.
-    Infers header_n from total arg count: total = header_n + 18.
+    Infers header_n from total arg count: total = header_n + 22
+    (4 sizes + 4 ptrs + 8 strides + 2 scalars + 4 batch-offset int64s added by #7585).
     """
-    header_n = len(argList) - 18  # header + 4 sizes + 4 ptrs + 8 strides + 2 scalars
+    header_n = len(argList) - 22  # header + 4 sizes + 4 ptrs + 8 strides + 2 scalars + 4 offsets
     ldaIdx = header_n + 4 + 4 + 4  # after header/sizes/ptrs/D-strides/C-strides
     strideA1Idx = ldaIdx + 1       # stride_a is immediately after lda
     original = argList[strideA1Idx]

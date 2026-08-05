@@ -476,6 +476,9 @@ def _buildSkLaunchArgs(solDict: dict, M: int, N: int, batch: int, K: int,
     ]
     for i in range(6):
         args.append(np.uint32(struct.unpack_from("<I", skBlock, i * 4)[0]))
+    # Batch offset args added by feat(hipblaslt): 64-bit offset support (#7585).
+    # Placed at the tail of non-grouped kernarg buffers (Signature.py, line 338).
+    args.extend([np.int64(0), np.int64(0), np.int64(0), np.int64(0)])
     return args
 
 
