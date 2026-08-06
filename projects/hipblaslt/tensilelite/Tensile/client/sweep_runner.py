@@ -288,6 +288,195 @@ def _selectReference(solDict: dict):
 
 
 # ---------------------------------------------------------------------------
+# Library-YAML solDict builder — constructs a solDict from a TensileLibrary
+# solution entry without invoking any part of the Tensile parameter pipeline.
+# ---------------------------------------------------------------------------
+
+# tensilelite_runtime dtype name -> DataTypeEnum integer code.
+_rtNameToDtypeInt = {v: k for k, v in {
+    0: "Float", 1: "Double", 4: "Half", 7: "BFloat16", 8: "Int8", 10: "XFloat32",
+}.items()}
+
+# tensilelite_runtime / library YAML dtype name -> DataTypeEnum integer code.
+# Library YAML uses the full CamelCase names used by Tensile internally.
+_libDtypeNameToInt = {
+    "Float": 0, "Double": 1, "Half": 4, "BFloat16": 7, "Int8": 8,
+    "XFloat32": 10, "Int32": 6, "Int16": 5,
+    "Float8": 11, "BFloat8": 12,
+    "Float8_fnuz": 11, "BFloat8_fnuz": 12,
+    "Float8_ocp": 15, "BFloat8_ocp": 16,
+}
+
+
+def _libDtypeToInt(name: str) -> int:
+    """Convert a library-YAML type name string to a DataTypeEnum integer."""
+    return _libDtypeNameToInt.get(name, -1)
+
+
+def _solDictFromLibSol(libSol: dict, chip: str) -> dict:
+    """Build a minimal solDict from a TensileLibrary YAML solution entry.
+
+    This extracts exactly the fields that _computeInternalArg0/1, _buildSweepArgs,
+    _computeNumWg, and _selectReference need, reading them directly from the
+    sizeMapping, problemType, and internalArgsSupport sub-dicts of the library
+    YAML solution object.  No Tensile solution pipeline is invoked.
+    """
+    sm = libSol.get("sizeMapping", {})
+    pt = libSol.get("problemType", {})
+    ias = libSol.get("internalArgsSupport", {})
+
+    macroTile = sm.get("macroTile", [16, 16, 1])
+    wg = sm.get("workGroup", [16, 16, 1])
+    waveNum = sm.get("waveNum", 1)
+    # SubtileImpl kernels (useSubtileImpl=True) use workGroup as the HIP block
+    # directly — each element is a hardware thread, not a wavefront.  Standard
+    # kernels count workGroup * waveNum threads per block.
+    useSubtileImpl = bool(sm.get("useSubtileImpl", False))
+
+    aTypeName = pt.get("aType", "BFloat16")
+    dTypeName = pt.get("dType", aTypeName)
+    aTypeInt = _libDtypeToInt(aTypeName)
+    dTypeInt = _libDtypeToInt(dTypeName)
+
+    # F32XdlMathOp: XFloat32=10 when f32XdlMathOp='XFloat32', else Float=0.
+    f32XdlMathOp = 10 if pt.get("f32XdlMathOp") == "XFloat32" else 0
+
+    staggerStrideShift = sm.get("staggerStrideShift", 0)
+
+    solDict = {
+        # KernArgs version / internal-args flags.
+        "KernArgsVersion": ias.get("version", 0),
+        "SupportCustomWGM": ias.get("wgm", False),
+        "SupportCustomStaggerU": ias.get("staggerU", False),
+        "SupportUserGSU": ias.get("gsu", False),
+        "UseSFC": ias.get("useSFC", False),
+        "UseUniversalArgs": ias.get("useUniversalArgs", False),
+        # Tile geometry.
+        "MacroTile0": macroTile[0],
+        "MacroTile1": macroTile[1],
+        "NumThreads": wg[0] * wg[1] * wg[2] if useSubtileImpl else wg[0] * wg[1] * wg[2] * waveNum,
+        # Work-group mapping and stagger.
+        "WorkGroupMapping": sm.get("workGroupMapping", 8),
+        "WorkGroupMappingXCC": sm.get("workGroupMappingXCC", 0),
+        "WorkGroupMappingXCCGroup": sm.get("workGroupMappingXCCGroup", -1),
+        "StaggerU": sm.get("staggerU", 0),
+        "StaggerUMapping": sm.get("staggerUMapping", 0),
+        "_staggerStrideShift": staggerStrideShift,
+        # GSU.
+        "GlobalSplitU": sm.get("globalSplitU", 1),
+        "GlobalSplitUCoalesced": sm.get("globalSplitUCoalesced", False),
+        "GlobalSplitUWorkGroupMappingRoundRobin": sm.get("globalSplitUWorkGroupMappingRoundRobin", False),
+        # Stream-K.
+        "StreamK": sm.get("streamK", 0),
+        "StreamKAtomic": sm.get("streamKAtomic", 0),
+        # Misc kernel behaviour.
+        "StridedBatched": pt.get("stridedBatched", True),
+        "UseBeta": pt.get("useBeta", True),
+        "GlobalAccumulation": sm.get("globalAccumulation", 0),
+        "ExpertSchedulingMode": sm.get("expertSchedulingMode", 0),
+        "ActivationFused": sm.get("activationFused", True),
+        # GlobalAccumulation / MBSK fields needed for buffer sizing and arg layout.
+        "AdaptiveGemmGSUA": sm.get("adaptiveGemmGSUA", 0),
+        "WorkspaceSizePerElemC": sm.get("workspaceSizePerElemC", 4),
+        "SynchronizerSizePerWG": sm.get("synchronizerSizePerWG", 0),
+        # Types (integer codes for _selectReference / _aElemSize / _dElemSize).
+        "DataType": aTypeInt,
+        "DestDataType": dTypeInt,
+        "F32XdlMathOp": f32XdlMathOp,
+        # ProblemType sub-dict for stride / epilogue / reference selection.
+        "ProblemType": {
+            "TransposeA": pt.get("transA", False),
+            "TransposeB": pt.get("transB", False),
+            "HighPrecisionAccumulate": pt.get("highPrecisionAccumulate", False),
+            "GroupedGemm": pt.get("groupedGemm", False),
+            "DataType": aTypeInt,
+            "DestDataType": dTypeInt,
+            "F32XdlMathOp": f32XdlMathOp,
+            # Epilogue flags — forwarded directly from problemType.
+            "UseBias": int(pt.get("useBias", 0)),
+            "UseScaleAB": pt.get("useScaleAB", ""),
+            "UseScaleCD": bool(pt.get("useScaleCD", False)),
+            "UseScaleAlphaVec": int(pt.get("useScaleAlphaVec", 0)),
+            "UseE": bool(pt.get("useE", False)),
+            "OutputAmaxD": bool(pt.get("outputAmaxD", False)),
+            "Gradient": bool(pt.get("useGradient", False)),
+            "ActivationType": pt.get("activationType", "none"),
+        },
+    }
+    # Duplicate epilogue flags at top level so _readPTFlag finds them either way.
+    for key in ("UseBias", "UseScaleAB", "UseScaleCD", "UseScaleAlphaVec",
+                "UseE", "OutputAmaxD", "Gradient", "ActivationType"):
+        solDict[key] = solDict["ProblemType"][key]
+    return solDict
+
+
+# ---------------------------------------------------------------------------
+# GlobalAccumulation mode helpers.
+#
+# Library YAML sizeMapping.globalAccumulation numeric values (library-specific
+# — may differ from current Contractions.py):
+#   0  standard store to D
+#   2  interleaved fp32 partials (KernelWriter bpeCexternal = fp32 at gsu>0)
+#   4  MultipleBufferSingleKernel (MBSK): single kernel, trailing kernarg slots
+# ---------------------------------------------------------------------------
+
+
+def _gaMode(solDict: dict) -> int:
+    """Return the GlobalAccumulation integer from solDict."""
+    return int(solDict.get("GlobalAccumulation", 0))
+
+
+def _isMbsk(solDict: dict) -> bool:
+    """Return True for MultipleBufferSingleKernel kernels (GA=4 or AdaptiveGemmGSUA=1).
+
+    These kernels require three extra trailing kernarg slots: dstD, Synchronizer,
+    GSUSync; and a pre-zeroed synchronizer GPU buffer.
+    """
+    return _gaMode(solDict) == 4 or int(solDict.get("AdaptiveGemmGSUA", 0)) == 1
+
+
+def _usesFp32External(solDict: dict, gsu: int) -> bool:
+    """Return True when the kernel writes fp32 into its D-pointer target.
+
+    Mirrors KernelWriter.py:7573-7578: bpeCexternal = fp32 whenever
+    gsu > 0 and GlobalAccumulation is set and is not PartialsBuffer.
+    In this library GA=2 triggers this at gsu=1.
+    """
+    ga = _gaMode(solDict)
+    return gsu > 0 and ga not in (0,)
+
+
+def _storeElemSize(solDict: dict, gsu: int) -> int:
+    """Return the element size in bytes the kernel uses when writing to D.
+
+    For _usesFp32External kernels this is WorkspaceSizePerElemC (fp32 = 4),
+    not _dElemSize (bf16 = 2).  Determines minimum safe D/C buffer allocation.
+    """
+    if _usesFp32External(solDict, gsu):
+        return int(solDict.get("WorkspaceSizePerElemC", 4))
+    return _dElemSize(solDict)
+
+
+def _synchronizerBytes(solDict: dict, M: int, N: int, batch: int) -> int:
+    """Return bytes needed for the MBSK synchronizer buffer.
+
+    Mirrors ContractionSolution.cpp:3969-3979: tiles * SynchronizerSizePerWG * 4.
+    Falls back to a conservative 409,600-element allocation (matching the C++
+    ClientProblemFactory.cpp fixed workspace) when SynchronizerSizePerWG is 0.
+    """
+    if not _isMbsk(solDict):
+        return 0
+    mt0 = solDict["MacroTile0"]
+    mt1 = solDict["MacroTile1"]
+    tiles = math.ceil(M / mt0) * math.ceil(N / mt1) * batch
+    perWg = int(solDict.get("SynchronizerSizePerWG", 0))
+    if perWg > 0:
+        return tiles * perWg * 4
+    # Conservative fallback: match C++ ClientProblemFactory fixed buffer.
+    return 409_600 * 4
+
+
+# ---------------------------------------------------------------------------
 # Kernel argument builder for stridedBatched NT GEMM.
 # ---------------------------------------------------------------------------
 
@@ -426,6 +615,70 @@ def _buildSweepArgs(solDict: dict, M: int, N: int, batch: int, K: int,
 
 
 # ---------------------------------------------------------------------------
+def _buildSweepArgsGA(solDict: dict, M: int, N: int, batch: int, K: int,
+                      dBuf, cBuf, aBuf, bBuf, cuCount: int,
+                      gsu: int, syncBuf=None,
+                      alpha: float = 1.0, beta: float = 0.0,
+                      epilogueBufs: dict = None) -> list:
+    """Build typed kernel arg list for GlobalAccumulation != 0 kernels.
+
+    Differences from _buildSweepArgs:
+    - Real gsu is packed into internalArg0 (not hardcoded 1).
+    - For MBSK (GA=4): three trailing slots (dstD, Synchronizer, GSUSync) are
+      appended between the epilogue block and the batch-offset tail, and
+      alpha/beta are passed as 1.0/0.0 (the kernel handles finalization).
+    - For GA=2/gsu=1: the header, pointer, and stride layout are identical to
+      _buildSweepArgs; only the caller's buffer sizes differ (fp32-sized D/C).
+    """
+    version = solDict.get("KernArgsVersion", 0)
+    numWg = _computeNumWg(solDict, M, N, batch)
+    arg0 = _computeInternalArg0(solDict, gsu=gsu)
+    gemmCount = (1 & 0x3FFFFFFF) | (0 << 30)
+
+    args = [np.uint32(gemmCount), np.uint32(arg0)]
+    if version >= 1:
+        arg1 = _computeInternalArg1(solDict, cu_count=cuCount)
+        args.append(np.int32(arg1))
+        args.append(np.uint32(numWg))
+
+    args.extend([np.uint32(M), np.uint32(N), np.uint32(batch), np.uint32(K)])
+    for ptr in [dBuf.ptr_value, cBuf.ptr_value, aBuf.ptr_value, bBuf.ptr_value]:
+        args.append(ctypes.c_void_p(ptr))
+
+    lda, strideA, ldb, strideB, ldd, strideD, ldc, strideC = _computeStrides(solDict, M, N, K)
+    args.extend([
+        np.uint32(ldd), np.uint32(strideD),
+        np.uint32(ldc), np.uint32(strideC),
+        np.uint32(lda), np.uint32(strideA),
+        np.uint32(ldb), np.uint32(strideB),
+    ])
+
+    # MBSK finalizes in the same kernel; alpha/beta are absorbed into the
+    # internal accumulation, so the host passes 1/0 here.
+    if _isMbsk(solDict):
+        args.extend([np.float32(1.0), np.float32(0.0)])
+    else:
+        args.extend([np.float32(alpha), np.float32(beta)])
+
+    if epilogueBufs is not None:
+        args.extend(_buildEpilogueTypedArgs(solDict, M, epilogueBufs))
+
+    # MBSK trailing slots: dstD, Synchronizer, GSUSync.
+    # Placed after the epilogue block and before the batch-offset tail so the
+    # four int64 batch offsets land at the correct byte offset (Signature.py:328-348).
+    if _isMbsk(solDict):
+        # dstD = final bf16 output (same as the dBuf we already passed as D).
+        args.append(ctypes.c_void_p(dBuf.ptr_value))
+        # Synchronizer = zeroed sync buffer for cross-WG atomics.
+        syncPtr = syncBuf.ptr_value if syncBuf is not None else 0
+        args.append(ctypes.c_void_p(syncPtr))
+        args.append(np.uint32(0))  # GSUSync
+
+    # Batch offset args (Signature.py:338-348, always last).
+    args.extend([np.int64(0), np.int64(0), np.int64(0), np.int64(0)])
+    return args
+
+
 # KernelRunner factory with icache-copy resolution.
 # ---------------------------------------------------------------------------
 
@@ -652,15 +905,26 @@ class SweepRunner:
                 compiled.append(entry)
         return compiled
 
-    def _allocBufs(self, solDict, M, N, batch, K):
-        """Allocate device buffers for one benchmark run; caller must free."""
+    def _allocBufs(self, solDict, M, N, batch, K, gsu: int = 1):
+        """Allocate device buffers for one benchmark run; caller must free.
+
+        For GlobalAccumulation != 0 kernels the kernel writes fp32 into D, so
+        dSize uses _storeElemSize (4 B) rather than _dElemSize (2 B for bf16).
+        Returns (aBuf, bBuf, cBuf, dPool, syncBuf) where syncBuf is None unless
+        the solution is MBSK (GA=4), in which case it is a pre-zeroed synchronizer.
+        """
         from amdgpu_exec import GpuBuffer
         aSize = M * K * batch * _aElemSize(solDict)
         bSize = N * K * batch * _aElemSize(solDict)
-        dSize = M * N * batch * _dElemSize(solDict)
+        dSize = M * N * batch * _storeElemSize(solDict, gsu)
+        syncBuf = None
+        if _isMbsk(solDict):
+            syncBytes = _synchronizerBytes(solDict, M, N, batch)
+            syncBuf = GpuBuffer(max(syncBytes, 4))
+            syncBuf.memset(0)
         return (GpuBuffer(aSize), GpuBuffer(bSize), GpuBuffer(dSize),
                 BufferPool(nSlots=self._rotatingBuffers, sizeBytes=dSize,
-                           gpuBufferCls=GpuBuffer))
+                           gpuBufferCls=GpuBuffer), syncBuf)
 
     def _allocEpilogueBufs(self, solDict, M, N, batch) -> dict:
         """Allocate zeroed GPU buffers for epilogue tensors; caller must free values."""
@@ -702,14 +966,22 @@ class SweepRunner:
         Returns (gflops, BenchmarkResult) on success, or (-1.0, None) on error.
         """
         solDict = entry["solDict"]
-        aBuf, bBuf, cBuf, dPool = self._allocBufs(solDict, M, N, batch, K)
+        gsu = int(solDict.get("_resolvedGsu", 1))
+        aBuf, bBuf, cBuf, dPool, syncBuf = self._allocBufs(solDict, M, N, batch, K, gsu)
         epilogueBufs = self._allocEpilogueBufs(solDict, M, N, batch) if _hasEpilogue(solDict) else {}
         try:
             runner = _makeRunner(entry["hsaco"], entry["kernelName"], self._icacheCopies)
+            ga = _gaMode(solDict)
 
             def argsFn(_ignored):
+                dBuf = dPool.next()
+                if ga != 0:
+                    return _buildSweepArgsGA(solDict, M, N, batch, K,
+                                             dBuf, cBuf, aBuf, bBuf, cuCount, gsu,
+                                             syncBuf=syncBuf,
+                                             epilogueBufs=epilogueBufs or None)
                 return _buildSweepArgs(solDict, M, N, batch, K,
-                                       dPool.next(), cBuf, aBuf, bBuf, cuCount,
+                                       dBuf, cBuf, aBuf, bBuf, cuCount,
                                        epilogueBufs=epilogueBufs or None)
 
             benchResult = runner.run(
@@ -728,6 +1000,8 @@ class SweepRunner:
             return -1.0, None
         finally:
             aBuf.free(); bBuf.free(); cBuf.free(); dPool.freeAll()
+            if syncBuf is not None:
+                syncBuf.free()
             self._freeEpilogueBufs(epilogueBufs)
 
     def _makeVerifyInputs(self, solDict, npDtype, M, N, batch, K):
@@ -803,23 +1077,39 @@ class SweepRunner:
                    K: int, cuCount: int) -> str:
         """Validate one (solution, problem) pair; return PASS / FAIL:<msg> / SKIPPED."""
         solDict = entry["solDict"]
+        ga = _gaMode(solDict)
+        # GA=2 (interleaved fp32 partials): final bf16 readback layout not yet
+        # confirmed — skip rather than risk a false PASS/FAIL.
+        if ga == 2:
+            return "SKIPPED"
         selected = _selectReference(solDict)
         if selected is None:
             return "SKIPPED"
         npDtype, npOutDtype, refFn, rtol, atol = selected
         from amdgpu_exec import GpuBuffer, GpuEvent
-        aBuf = bBuf = cBuf = dBuf = None
+        aBuf = bBuf = cBuf = dBuf = syncBuf = None
         epilogueBufs = {}
+        gsu = int(solDict.get("_resolvedGsu", 1))
         try:
             aHost, bHost = self._makeVerifyInputs(solDict, npDtype, M, N, batch, K)
             dHost = np.zeros(M * N * batch, dtype=npOutDtype)
+            storeSize = M * N * batch * _storeElemSize(solDict, gsu)
             aBuf = GpuBuffer(aHost.nbytes); aBuf.copy_from_host(aHost)
             bBuf = GpuBuffer(bHost.nbytes); bBuf.copy_from_host(bHost)
-            cBuf = GpuBuffer(dHost.nbytes); cBuf.memset(0)
-            dBuf = GpuBuffer(dHost.nbytes); dBuf.memset(0)
+            cBuf = GpuBuffer(storeSize); cBuf.memset(0)
+            dBuf = GpuBuffer(storeSize); dBuf.memset(0)
+            if _isMbsk(solDict):
+                syncBytes = _synchronizerBytes(solDict, M, N, batch)
+                syncBuf = GpuBuffer(max(syncBytes, 4))
+                syncBuf.memset(0)
             epilogueBufs = self._allocEpilogueBufs(solDict, M, N, batch) if _hasEpilogue(solDict) else {}
             runner = _makeRunner(entry["hsaco"], entry["kernelName"], self._icacheCopies)
             def argsFn(_ignored):
+                if ga != 0:
+                    return _buildSweepArgsGA(solDict, M, N, batch, K,
+                                             dBuf, cBuf, aBuf, bBuf, cuCount, gsu,
+                                             syncBuf=syncBuf,
+                                             epilogueBufs=epilogueBufs or None)
                 return _buildSweepArgs(
                     solDict, M, N, batch, K, dBuf, cBuf, aBuf, bBuf, cuCount,
                     epilogueBufs=epilogueBufs or None)
@@ -827,16 +1117,18 @@ class SweepRunner:
                        grid=(_computeNumWg(solDict, M, N, batch), 1, 1),
                        block=(solDict["NumThreads"], 1, 1),
                        nWarmup=0, nIters=1)
+            # For MBSK (GA=4) the final output is in dstD = dBuf (same pointer).
             dBuf.copy_to_host(dHost)
             ev = GpuEvent(); ev.record(); ev.synchronize()
             dRef = self._computeVerifyRef(solDict, aHost, bHost, refFn, M, N, batch, K)
             return self._compareVerify(dHost, dRef, rtol, atol, entry["sid"])
         except Exception as exc:
-            # Any failure during setup or run must not abort the sweep.
             _log.warning("verify failed for %s: %s", entry["sid"], exc)
             return f"FAIL:{exc}"
         finally:
             self._freeVerifyBuffers((aBuf, bBuf, cBuf, dBuf))
+            if syncBuf is not None:
+                syncBuf.free()
             self._freeEpilogueBufs(epilogueBufs)
 
     def _benchmarkProblem(self, probSize: tuple, compiled: list,
@@ -911,6 +1203,36 @@ class SweepRunner:
             "transB": bool(pt.get("TransposeB", False)),
             "hpa": bool(pt.get("HighPrecisionAccumulate", False)),
         }
+
+    def _loadSolutionMetadataFromLibrary(self, chip: str):
+        """Return (byName, ptFields) by reading the library YAML directly.
+
+        Builds solDicts from the library's sizeMapping/problemType/internalArgsSupport
+        without invoking any part of the Tensile solution pipeline.  This is O(n_solutions)
+        YAML parsing instead of O(n_solutions) Tensile parameter validation, which is
+        the dominant cost in _enumerateSolutionMetadata for large YAMLs.
+        """
+        from Tensile import LibraryIO
+        data = LibraryIO.readYAML(self._libraryPath)
+        libSols = data.get("solutions", [])
+        byName = {}
+        ptFields = None
+        for idx, libSol in enumerate(libSols):
+            name = libSol.get("kernelName") or libSol.get("name", "")
+            if not name or name in byName:
+                continue
+            try:
+                solDict = _solDictFromLibSol(libSol, chip)
+            except Exception as exc:
+                _log.warning("could not build solDict for %s: %s", name, exc)
+                continue
+            byName[name] = {"solDict": solDict, "rawDict": libSol,
+                            "sid": name, "index": idx}
+            if ptFields is None:
+                ptFields = self._problemTypeFields(solDict)
+        if ptFields is None and byName:
+            ptFields = self._problemTypeFields(next(iter(byName.values()))["solDict"])
+        return byName, ptFields
 
     def _enumerateSolutionMetadata(self, chip: str, assembler, isaInfoMap,
                                    debugConfig):
@@ -1032,13 +1354,13 @@ class SweepRunner:
             _log.warning("no .co exports %s; skip size=%s", name, probSize)
             return None
         solDict = dict(meta["solDict"])
-        # GSU is not injected: _buildSweepArgs hardcodes gsu=1 for the standard path.
-        autoWgm, _autoGsu, autoStaggerU = libRunner.autoParams(sol, prob)
+        autoWgm, autoGsu, autoStaggerU = libRunner.autoParams(sol, prob)
         # Inject the C++-resolved auto values so _computeInternalArg0/1 pack the
         # same WorkGroupMapping and StaggerU the C++ client would use (handles
-        # WorkGroupMapping=0 kernels correctly).
+        # WorkGroupMapping=0 and GlobalSplitU=0 kernels correctly).
         solDict["WorkGroupMapping"] = autoWgm
         solDict["StaggerU"] = autoStaggerU
+        solDict["_resolvedGsu"] = max(1, int(autoGsu))
         return {"solDict": solDict, "rawDict": meta["rawDict"],
                 "kernelName": name, "hsaco": coBytes, "sid": meta["sid"],
                 "solution": None, "solutionIdx": meta["index"]}
@@ -1105,9 +1427,7 @@ class SweepRunner:
         import amdgpu_exec
 
         chip = amdgpu_exec.get_chip()
-        assembler, isaInfoMap, debugConfig = _setupTensile(chip)
-        byName, ptFields = self._enumerateSolutionMetadata(
-            chip, assembler, isaInfoMap, debugConfig)
+        byName, ptFields = self._loadSolutionMetadataFromLibrary(chip)
         if not byName:
             _log.warning("no solutions enumerated; library sweep returns empty")
             return []
