@@ -293,19 +293,106 @@ def _selectReference(solDict: dict):
 
 
 def _computeNumWg(solDict: dict, M: int, N: int, batch: int) -> int:
-    """Compute work-group count for NT stridedBatched GEMM."""
+    """Compute work-group count for stridedBatched GEMM."""
     mt0 = solDict["MacroTile0"]
     mt1 = solDict["MacroTile1"]
     return math.ceil(M / mt0) * math.ceil(N / mt1) * batch
 
 
+def _computeStrides(solDict: dict, M: int, N: int, K: int):
+    """Return (lda, strideA, ldb, strideB, ldd, strideD, ldc, strideC).
+
+    Strides depend on transpose flags stored in ProblemType:
+      TN (TransposeA=True,  TransposeB=False): lda=K, ldb=K
+      NT (TransposeA=False, TransposeB=True):  lda=M, ldb=N
+    Column-major layout: leading dim is the number of rows in the stored matrix.
+    """
+    pt = solDict.get("ProblemType") or {}
+    transA = bool(pt.get("TransposeA", False))
+    transB = bool(pt.get("TransposeB", False))
+    lda = K if transA else M
+    ldb = N if transB else K
+    ldd = ldc = M
+    strideA = lda * (M if transA else K)
+    strideB = ldb * (K if transB else N)
+    strideD = strideC = M * N
+    return lda, strideA, ldb, strideB, ldd, strideD, ldc, strideC
+
+
+def _hasEpilogue(solDict: dict) -> bool:
+    """Return True when the solution requires epilogue kernel args beyond alpha/beta."""
+    from Tensile.client.gemm_args import _readPTFlag
+    return bool(
+        _readPTFlag(solDict, "UseScaleAB", "")
+        or _readPTFlag(solDict, "UseScaleCD", False)
+        or _readPTFlag(solDict, "UseScaleAlphaVec", 0)
+        or _readPTFlag(solDict, "UseBias", 0)
+        or _readPTFlag(solDict, "UseE", False)
+        or _readPTFlag(solDict, "OutputAmaxD", False)
+        or _readPTFlag(solDict, "ActivationType", "none") not in ("none", "0", None, 0)
+    )
+
+
+def _buildEpilogueTypedArgs(solDict: dict, M: int, epilogueBufs: dict) -> list:
+    """Return typed arg list items for epilogue slots (mirrors _buildEpilogueArgs byte layout).
+
+    epilogueBufs maps tensor name -> GpuBuffer (zeroed). Missing names default to
+    null pointer (0). Callers must keep the buffers alive until after kernel launch.
+    """
+    from Tensile.client.gemm_args import _readPTFlag
+    pt = solDict.get("ProblemType") or {}
+
+    useScaleAB = _readPTFlag(solDict, "UseScaleAB", "")
+    useScaleCD = bool(_readPTFlag(solDict, "UseScaleCD", False))
+    useScaleAlphaVec = int(_readPTFlag(solDict, "UseScaleAlphaVec", 0))
+    useBias = int(_readPTFlag(solDict, "UseBias", 0))
+    useE = bool(_readPTFlag(solDict, "UseE", False))
+    outputAmaxD = bool(_readPTFlag(solDict, "OutputAmaxD", False))
+    activationType = _readPTFlag(solDict, "ActivationType", "none")
+    activationFused = bool(solDict.get("ActivationFused", True))
+    actStr = str(activationType).lower() if activationType else "none"
+    runActivation = actStr not in ("none", "0") and activationFused
+
+    def _ptr(name):
+        buf = epilogueBufs.get(name)
+        return ctypes.c_void_p(buf.ptr_value if buf is not None else 0)
+
+    args = []
+    if useScaleAB:
+        args.extend([_ptr("scaleA"), _ptr("scaleB")])
+    if useScaleCD:
+        args.extend([_ptr("scaleC"), _ptr("scaleD")])
+    if useScaleAlphaVec:
+        args.append(_ptr("scaleAlphaVec"))
+    if useBias:
+        args.append(_ptr("bias"))
+        args.extend([np.uint32(0), np.uint32(0)])  # biasType=0, strideBias=0
+    if useScaleAlphaVec == 3 or useBias == 3:
+        args.append(np.uint32(0))  # factorDim
+    if useE:
+        args.append(_ptr("e"))
+        args.extend([np.uint32(M), np.uint32(M * M)])  # lde, stride_e (placeholder)
+    if runActivation:
+        from Tensile.client.reference import _ACT_ARG_COUNT
+        argCount = int(solDict.get("ActivationArgLength", _ACT_ARG_COUNT.get(actStr, 0)))
+        for _ in range(argCount):
+            args.append(np.float32(0.0))
+        if actStr in ("all", "hipblaslt_all"):
+            args.append(np.uint32(0))  # activationEnum
+    if outputAmaxD:
+        args.extend([_ptr("amaxD"), _ptr("amaxWS"), _ptr("amaxSync")])
+    return args
+
+
 def _buildSweepArgs(solDict: dict, M: int, N: int, batch: int, K: int,
                     dBuf, cBuf, aBuf, bBuf, cuCount: int = 0,
-                    alpha: float = 1.0, beta: float = 0.0) -> list:
-    """Build typed kernel arg list for stridedBatched NT GEMM.
+                    alpha: float = 1.0, beta: float = 0.0,
+                    epilogueBufs: dict = None) -> list:
+    """Build typed kernel arg list for stridedBatched GEMM.
 
     Uses argType=0 (stridedBatched=True) in gemm_count bits 30-31.
-    NT column-major strides: lda=M, ldb=N, ldd=ldc=M.
+    Strides are computed from TransposeA/TransposeB in ProblemType.
+    epilogueBufs maps epilogue tensor name -> GpuBuffer for kernels that need them.
     """
     version = solDict.get("KernArgsVersion", 0)
     numWg = _computeNumWg(solDict, M, N, batch)
@@ -322,8 +409,7 @@ def _buildSweepArgs(solDict: dict, M: int, N: int, batch: int, K: int,
     for ptr in [dBuf.ptr_value, cBuf.ptr_value, aBuf.ptr_value, bBuf.ptr_value]:
         args.append(ctypes.c_void_p(ptr))
 
-    lda, ldb, ldd, ldc = M, N, M, M
-    strideA, strideB, strideD, strideC = M * K, N * K, M * N, M * N
+    lda, strideA, ldb, strideB, ldd, strideD, ldc, strideC = _computeStrides(solDict, M, N, K)
     args.extend([
         np.uint32(ldd), np.uint32(strideD),
         np.uint32(ldc), np.uint32(strideC),
@@ -331,6 +417,8 @@ def _buildSweepArgs(solDict: dict, M: int, N: int, batch: int, K: int,
         np.uint32(ldb), np.uint32(strideB),
         np.float32(alpha), np.float32(beta),
     ])
+    if epilogueBufs is not None:
+        args.extend(_buildEpilogueTypedArgs(solDict, M, epilogueBufs))
     # Batch offset args added by feat(hipblaslt): 64-bit offset support (#7585).
     # Placed at the tail of non-grouped kernarg buffers (Signature.py, line 338).
     args.extend([np.int64(0), np.int64(0), np.int64(0), np.int64(0)])
@@ -574,6 +662,39 @@ class SweepRunner:
                 BufferPool(nSlots=self._rotatingBuffers, sizeBytes=dSize,
                            gpuBufferCls=GpuBuffer))
 
+    def _allocEpilogueBufs(self, solDict, M, N, batch) -> dict:
+        """Allocate zeroed GPU buffers for epilogue tensors; caller must free values."""
+        from amdgpu_exec import GpuBuffer
+        from Tensile.client.gemm_args import _readPTFlag
+        bufs = {}
+        scalar = 4  # 4-byte scalar epilogue tensors
+        if _readPTFlag(solDict, "UseScaleAB", ""):
+            bufs["scaleA"] = GpuBuffer(scalar)
+            bufs["scaleB"] = GpuBuffer(scalar)
+        if _readPTFlag(solDict, "UseScaleCD", False):
+            bufs["scaleC"] = GpuBuffer(scalar)
+            bufs["scaleD"] = GpuBuffer(scalar)
+        if _readPTFlag(solDict, "UseScaleAlphaVec", 0):
+            bufs["scaleAlphaVec"] = GpuBuffer(M * scalar)
+        if _readPTFlag(solDict, "UseBias", 0):
+            bufs["bias"] = GpuBuffer(M * scalar)
+        if _readPTFlag(solDict, "UseE", False):
+            dSize = M * N * batch * _dElemSize(solDict)
+            bufs["e"] = GpuBuffer(dSize)
+        if _readPTFlag(solDict, "OutputAmaxD", False):
+            bufs["amaxD"] = GpuBuffer(scalar)
+            bufs["amaxWS"] = GpuBuffer(scalar)
+            bufs["amaxSync"] = GpuBuffer(scalar)
+        for buf in bufs.values():
+            buf.memset(0)
+        return bufs
+
+    @staticmethod
+    def _freeEpilogueBufs(epilogueBufs: dict) -> None:
+        """Free all GPU buffers in an epilogue buffer dict."""
+        for buf in epilogueBufs.values():
+            buf.free()
+
     def _benchmarkOne(self, entry: dict, M: int, N: int, batch: int,
                       K: int, cuCount: int):
         """Benchmark one (solution, problem) pair.
@@ -582,12 +703,14 @@ class SweepRunner:
         """
         solDict = entry["solDict"]
         aBuf, bBuf, cBuf, dPool = self._allocBufs(solDict, M, N, batch, K)
+        epilogueBufs = self._allocEpilogueBufs(solDict, M, N, batch) if _hasEpilogue(solDict) else {}
         try:
             runner = _makeRunner(entry["hsaco"], entry["kernelName"], self._icacheCopies)
 
             def argsFn(_ignored):
                 return _buildSweepArgs(solDict, M, N, batch, K,
-                                       dPool.next(), cBuf, aBuf, bBuf, cuCount)
+                                       dPool.next(), cBuf, aBuf, bBuf, cuCount,
+                                       epilogueBufs=epilogueBufs or None)
 
             benchResult = runner.run(
                 argsFn=argsFn,
@@ -605,30 +728,52 @@ class SweepRunner:
             return -1.0, None
         finally:
             aBuf.free(); bBuf.free(); cBuf.free(); dPool.freeAll()
+            self._freeEpilogueBufs(epilogueBufs)
 
-    def _makeVerifyInputs(self, npDtype, M, N, batch, K):
-        """Return deterministic host A/B flat buffers matching the NT strided layout.
+    def _makeVerifyInputs(self, solDict, npDtype, M, N, batch, K):
+        """Return deterministic host A/B flat buffers in the kernel's strided layout.
 
-        For int8 inputs, generates integer values in [-50, 50) to avoid
-        accumulation overflow into the int32 range. For all other dtypes,
-        uniform random [0, 1) values are cast to npDtype.
+        Layout depends on TransposeA/TransposeB from ProblemType:
+          TN: A stored as K×M (lda=K), B stored as K×N (ldb=K)
+          NT: A stored as M×K (lda=M), B stored as N×K (ldb=N)
+        Buffers are column-major (Fortran order).
         """
+        pt = solDict.get("ProblemType") or {}
+        transA = bool(pt.get("TransposeA", False))
+        transB = bool(pt.get("TransposeB", False))
         rng = np.random.default_rng(seed=M * 1000 + N + K)
         if npDtype == np.int8:
-            aNp = np.asfortranarray(rng.integers(-50, 50, size=(M, K)).astype(npDtype))
-            bNp = np.asfortranarray(rng.integers(-50, 50, size=(N, K)).astype(npDtype))
+            aShape = (K, M) if transA else (M, K)
+            bShape = (K, N) if not transB else (N, K)
+            aNp = np.asfortranarray(rng.integers(-50, 50, size=aShape).astype(npDtype))
+            bNp = np.asfortranarray(rng.integers(-50, 50, size=bShape).astype(npDtype))
         else:
-            aNp = np.asfortranarray(rng.random((M, K)).astype(npDtype))
-            bNp = np.asfortranarray(rng.random((N, K)).astype(npDtype))
+            aShape = (K, M) if transA else (M, K)
+            bShape = (K, N) if not transB else (N, K)
+            aNp = np.asfortranarray(rng.random(aShape).astype(npDtype))
+            bNp = np.asfortranarray(rng.random(bShape).astype(npDtype))
         aHost = np.tile(aNp.ravel(order="F"), batch)
         bHost = np.tile(bNp.ravel(order="F"), batch)
         return aHost, bHost
 
-    def _computeVerifyRef(self, aHost, bHost, refFn, M, N, batch, K):
+    def _computeVerifyRef(self, solDict, aHost, bHost, refFn, M, N, batch, K):
         """Compute the flat column-major reference D for the strided-batched GEMM."""
-        aSlice = aHost[:M * K].reshape(M, K, order="F")
-        bSlice = bHost[:N * K].reshape(N, K, order="F")
-        dOne = refFn(aSlice, bSlice.T, 1.0, 0.0, None)
+        pt = solDict.get("ProblemType") or {}
+        transA = bool(pt.get("TransposeA", False))
+        transB = bool(pt.get("TransposeB", False))
+        # Reconstruct the 2-D slice from the flat buffer using the stored shape.
+        if transA:
+            aSlice = aHost[:K * M].reshape(K, M, order="F")  # K×M stored, op(A)=A^T=M×K
+        else:
+            aSlice = aHost[:M * K].reshape(M, K, order="F")  # M×K stored, op(A)=A
+        if transB:
+            bSlice = bHost[:N * K].reshape(N, K, order="F")  # N×K stored, op(B)=B^T=K×N
+        else:
+            bSlice = bHost[:K * N].reshape(K, N, order="F")  # K×N stored, op(B)=B
+        # refFn expects (A_mxk, B_kxn, alpha, beta, C) where A_mxk = op(A_stored).
+        opA = aSlice.T if transA else aSlice        # M×K
+        opB = bSlice.T if not transB else bSlice    # K×N
+        dOne = refFn(opA, opB, 1.0, 0.0, None)
         return np.tile(np.asfortranarray(dOne).ravel(order="F"), batch)
 
     def _compareVerify(self, dHost, dRef, rtol, atol, label) -> str:
@@ -664,24 +809,27 @@ class SweepRunner:
         npDtype, npOutDtype, refFn, rtol, atol = selected
         from amdgpu_exec import GpuBuffer, GpuEvent
         aBuf = bBuf = cBuf = dBuf = None
+        epilogueBufs = {}
         try:
-            aHost, bHost = self._makeVerifyInputs(npDtype, M, N, batch, K)
+            aHost, bHost = self._makeVerifyInputs(solDict, npDtype, M, N, batch, K)
             dHost = np.zeros(M * N * batch, dtype=npOutDtype)
             aBuf = GpuBuffer(aHost.nbytes); aBuf.copy_from_host(aHost)
             bBuf = GpuBuffer(bHost.nbytes); bBuf.copy_from_host(bHost)
             cBuf = GpuBuffer(dHost.nbytes); cBuf.memset(0)
             dBuf = GpuBuffer(dHost.nbytes); dBuf.memset(0)
+            epilogueBufs = self._allocEpilogueBufs(solDict, M, N, batch) if _hasEpilogue(solDict) else {}
             runner = _makeRunner(entry["hsaco"], entry["kernelName"], self._icacheCopies)
             def argsFn(_ignored):
                 return _buildSweepArgs(
-                    solDict, M, N, batch, K, dBuf, cBuf, aBuf, bBuf, cuCount)
+                    solDict, M, N, batch, K, dBuf, cBuf, aBuf, bBuf, cuCount,
+                    epilogueBufs=epilogueBufs or None)
             runner.run(argsFn=argsFn,
                        grid=(_computeNumWg(solDict, M, N, batch), 1, 1),
                        block=(solDict["NumThreads"], 1, 1),
                        nWarmup=0, nIters=1)
             dBuf.copy_to_host(dHost)
             ev = GpuEvent(); ev.record(); ev.synchronize()
-            dRef = self._computeVerifyRef(aHost, bHost, refFn, M, N, batch, K)
+            dRef = self._computeVerifyRef(solDict, aHost, bHost, refFn, M, N, batch, K)
             return self._compareVerify(dHost, dRef, rtol, atol, entry["sid"])
         except Exception as exc:
             # Any failure during setup or run must not abort the sweep.
@@ -689,6 +837,7 @@ class SweepRunner:
             return f"FAIL:{exc}"
         finally:
             self._freeVerifyBuffers((aBuf, bBuf, cBuf, dBuf))
+            self._freeEpilogueBufs(epilogueBufs)
 
     def _benchmarkProblem(self, probSize: tuple, compiled: list,
                           cuCount: int) -> list:
