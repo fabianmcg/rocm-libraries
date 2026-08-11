@@ -187,6 +187,8 @@ namespace TensileLite
         bool tileQuant             = false;
         int  tileQuantQ0           = 0;
         int  tileQuantQ1           = 0;
+        bool deepseekScaleA        = false;
+        bool deepseekScaleB        = false;
 
         int NonTemporalD = 0;
         int WaveSeparateGlobalReadA = 0;
@@ -664,6 +666,8 @@ namespace TensileLite
             bool partialRMSQuant       = false;
             bool useRstdScale          = false;
             bool useTileQuant          = false;
+            bool useDeepseekScaleA     = false;
+            bool useDeepseekScaleB     = false;
         };
 
         struct LinearModel

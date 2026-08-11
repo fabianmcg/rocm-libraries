@@ -490,6 +490,84 @@ def _validateTileQuant(state, printRejectionReason):
     return
 
 
+def _validateDeepseekScaleMultiK(state, printRejectionReason):
+  """Validate additional constraints for the Deepseek multi-K mainloop path.
+
+  This path is active when PrefetchGlobalRead == 0 and DepthU == DeepseekScaleBlockK.
+  The mainloop loads one scaleA/scaleB value per K-block iteration; several
+  microarchitectural limits apply only in this mode.
+  """
+  pgr = state.get("PrefetchGlobalRead", 1)
+  # Guard 3: multi-K mainloop requires PrefetchGlobalRead == 0.
+  if pgr != 0:
+    reject(state, printRejectionReason,
+           f"useDeepseekScaleA/B multi-K path: PrefetchGlobalRead must be 0 (got {pgr})")
+    return
+
+  depthU = state.get("DepthU", 0)
+  # Guard 1: enforce K is always a multiple of DepthU (no tail loop).
+  # Raise AssertSummationElementMultiple so the kernel is only dispatched for
+  # K values that are multiples of blockK, preventing stale scale reads in the
+  # tail loop iteration.
+  asem = state.get("AssertSummationElementMultiple", 1)
+  if asem % depthU != 0:
+    state["AssertSummationElementMultiple"] = max(asem, depthU)
+
+  # Guard 2: scaleB mainloop path loads one E8M0 byte per K-block (one N-block).
+  # MacroTile1 > 128 spans two N-blocks but only the first block's scale is loaded.
+  use_b = state.get("UseDeepseekScaleB", False)
+  mt1 = state.get("MacroTile1", 0)
+  if use_b and mt1 > 128:
+    reject(state, printRejectionReason,
+           f"useDeepseekScaleB multi-K path: MacroTile1 must be <= 128 (MacroTile1={mt1})")
+    return
+
+
+def _validateDeepseekScale(state, printRejectionReason):
+  """Validate UseDeepseekScaleA / UseDeepseekScaleB fused epilogue constraints.
+
+  Both scale flags share the same structural requirements: UseSubtileImpl,
+  HighPrecisionAccumulate, DepthU == DeepseekScaleBlockK (one scale block per
+  DepthU iteration), and mutual exclusion with TileQuant/RstdScale/PartialRMS.
+  Either or both may be True.
+  """
+  use_a = state.get("UseDeepseekScaleA", False)
+  use_b = state.get("UseDeepseekScaleB", False)
+  if not use_a and not use_b:
+    return
+  if not state.get("UseSubtileImpl", False):
+    reject(state, printRejectionReason, "useDeepseekScale requires UseSubtileImpl")
+    return
+  if not state["ProblemType"].get("HighPrecisionAccumulate", False):
+    reject(state, printRejectionReason, "useDeepseekScale requires HighPrecisionAccumulate")
+    return
+  # fp8 MFMA instruction spans 128 K-elements (instK=128): DepthU must be a
+  # non-zero multiple of 128 so the subtile geometry has a valid K-grid.
+  abPairA = state.get("_ABTilePairA", "")
+  if abPairA == "AB_B8":
+    depthU = state.get("DepthU", 0)
+    if depthU <= 0 or depthU % 128 != 0:
+      reject(state, printRejectionReason,
+             f"useDeepseekScale with fp8 A requires DepthU to be a positive multiple "
+             f"of 128 (got DepthU={depthU})")
+      return
+  blockK = state.get("DeepseekScaleBlockK", 128)
+  depthU = state.get("DepthU", 0)
+  if depthU != blockK:
+    reject(state, printRejectionReason,
+           f"useDeepseekScaleA/B requires DepthU == DeepseekScaleBlockK "
+           f"(got DepthU={depthU}, blockK={blockK})")
+    return
+  for flag in ("TileQuant", "RstdScale", "PartialRMS"):
+    if state.get(flag, False):
+      reject(state, printRejectionReason,
+             f"useDeepseekScale is mutually exclusive with {flag}")
+      return
+  # Apply multi-K guards when PrefetchGlobalRead == 0 (mainloop handles scaling).
+  if state.get("PrefetchGlobalRead", 1) == 0:
+    _validateDeepseekScaleMultiK(state, printRejectionReason)
+
+
 def _validateStreamKForceDPOnly(state, printRejectionReason):
   if state["StreamKForceDPOnly"]:
     if state["StreamK"] != 3:
@@ -1357,6 +1435,11 @@ class Solution(collections.abc.Mapping):
     _validateTileQuant(state, printRejectionReason)
     if not state["Valid"]:
       return
+
+    if state.get("UseDeepseekScaleA", False) or state.get("UseDeepseekScaleB", False):
+      _validateDeepseekScale(state, printRejectionReason)
+      if not state["Valid"]:
+        return
 
     # TODO: Support other LdsBlockSizePerPadMXSA/B for gfx1250.
     if state["ISA"] == (12, 5, 0):

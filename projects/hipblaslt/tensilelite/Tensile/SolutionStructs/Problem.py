@@ -430,6 +430,8 @@ _defaultProblemType = {
     "PartialRMSQuant":       False,
     "RstdScale":             False,
     "TileQuant":             False,
+    "UseDeepseekScaleA":     False,
+    "UseDeepseekScaleB":     False,
     "Gradient": False,  # =True set globalWriteElements to gradient mode
     "UseBias": 0,  # =1 support bias vector on M direction, =2 support bias vector on N direction, =3 support bias vector on both M,N direction
     "UseGateResidual": False,  # =True apply gate residual: D = gate * spmm_result + gate

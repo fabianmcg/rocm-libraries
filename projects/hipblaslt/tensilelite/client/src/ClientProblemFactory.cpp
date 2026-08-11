@@ -206,6 +206,14 @@ namespace TensileLite
             if(args.count("use-rstd-scale"))
                 m_useRstdScale = args["use-rstd-scale"].as<bool>();
 
+            if(args.count("use-deepseek-scale-a"))
+                m_useDeepseekScaleA = args["use-deepseek-scale-a"].as<bool>();
+            if(args.count("use-deepseek-scale-b"))
+                m_useDeepseekScaleB = args["use-deepseek-scale-b"].as<bool>();
+            if(args.count("deepseek-scale-block-k"))
+                m_deepseekScaleBlockK
+                    = static_cast<int>(args["deepseek-scale-block-k"].as<size_t>());
+
             if(args.count("bias-type-args"))
                 m_biasTypeArgs = args["bias-type-args"].as<std::vector<rocisa::DataType>>();
             if(args.count("factor-dim-args"))
@@ -416,6 +424,8 @@ namespace TensileLite
                                 rv.back().setUseE(m_useE);
                                 rv.back().setOutputAmaxD(m_outputAmaxD);
                                 rv.back().setUseTileQuant(m_useTileQuant);
+                                rv.back().setUseDeepseekScaleA(m_useDeepseekScaleA);
+                                rv.back().setUseDeepseekScaleB(m_useDeepseekScaleB);
                                 rv.back().setUsePartialRMS(m_usePartialRMS);
                                 rv.back().setPartialRMSResidualAdd(m_partialRMSResidualAdd);
                                 rv.back().setUseRstdScale(m_useRstdScale);
@@ -525,6 +535,18 @@ namespace TensileLite
                                     rv.back().setTileQuantQ0(q0);
                                     rv.back().setTileQuantQ1(q1);
                                     rv.back().setQuantScale((M + q0 - 1) / q0, (N + q1 - 1) / q1);
+                                }
+                                if(m_useDeepseekScaleA)
+                                {
+                                    size_t M = rv.back().d().sizes()[0];
+                                    rv.back().setScaleADeepseek(M);
+                                }
+                                if(m_useDeepseekScaleB)
+                                {
+                                    size_t N       = rv.back().d().sizes()[1];
+                                    int    blockK  = m_deepseekScaleBlockK > 0 ? m_deepseekScaleBlockK : 128;
+                                    size_t nBlocks = (N + blockK - 1) / blockK;
+                                    rv.back().setScaleBDeepseek(nBlocks);
                                 }
                                 if(j < m_activationEnumArg.size())
                                 {

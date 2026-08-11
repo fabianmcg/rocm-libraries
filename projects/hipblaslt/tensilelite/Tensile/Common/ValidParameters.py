@@ -539,6 +539,9 @@ validParameters = { # we need to make sure this matches develop
     "RstdScale": [False, True],
     "TileQuant": [False, True],
     "TileQuantShape": -1,  # Any two-element list; real validation is in _resolveTileQuantShape.
+    "UseDeepseekScaleA": [False, True],
+    "UseDeepseekScaleB": [False, True],
+    "DeepseekScaleBlockK": [128],
     "UseSubtileImpl": [False, True],
     # Load options:
     # (GRO = Global Read Offset)

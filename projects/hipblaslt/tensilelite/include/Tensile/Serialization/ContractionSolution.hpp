@@ -142,6 +142,8 @@ namespace TensileLite
                 iot::mapOptional(io, "TileQuant",             s.tileQuant);
                 iot::mapOptional(io, "tileQuantQ0",           s.tileQuantQ0);
                 iot::mapOptional(io, "tileQuantQ1",           s.tileQuantQ1);
+                iot::mapOptional(io, "useDeepseekScaleA",     s.deepseekScaleA);
+                iot::mapOptional(io, "useDeepseekScaleB",     s.deepseekScaleB);
                 iot::mapRequired(io, "NonTemporalD", s.NonTemporalD);
                 iot::mapRequired(io, "WaveSeparateGlobalReadA", s.WaveSeparateGlobalReadA);
                 iot::mapRequired(io, "WaveSeparateGlobalReadB", s.WaveSeparateGlobalReadB);
@@ -237,6 +239,8 @@ namespace TensileLite
                 iot::mapOptional(io, "partialRMSQuant", s.partialRMSQuant);
                 iot::mapOptional(io, "useRstdScale", s.useRstdScale);
                 iot::mapOptional(io, "useTileQuant", s.useTileQuant);
+                iot::mapOptional(io, "useDeepseekScaleA", s.useDeepseekScaleA);
+                iot::mapOptional(io, "useDeepseekScaleB", s.useDeepseekScaleB);
             }
 
             const static bool flow = false;

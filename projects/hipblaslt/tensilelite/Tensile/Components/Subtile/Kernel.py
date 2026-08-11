@@ -1064,7 +1064,7 @@ def _selectF8F6F4InstType(kernel):
 # Given RegisterTileInfo inputs for A,B,C,D operands
 # emit corresponding mfma instruction
 #
-def emitMfmaInstruction(writer, kernel, vgprTileA, vgprTileB, vgprTileC, vgprTileD, scaleAVgpr=-1, scaleBVgpr=-1, scaleAsel=-1, scaleBsel=-1, comment = ""):
+def emitMfmaInstruction(writer, kernel, vgprTileA, vgprTileB, vgprTileC, vgprTileD, scaleAVgpr=-1, scaleBVgpr=-1, scaleAsel=-1, scaleBsel=-1, fp32Scale=False, comment = ""):
   module = Module()
 
   vgprAStart = vgprTileA.regList.indices[0]
@@ -1093,7 +1093,7 @@ def emitMfmaInstruction(writer, kernel, vgprTileA, vgprTileB, vgprTileC, vgprTil
     # MX FP4: 16x16x128
     mxInstType = _selectF8F6F4InstType(kernel)
     if scaleAVgpr >= 0 and scaleBVgpr >= 0:
-      # Use actual loaded scale VGPRs
+      # MX E8M0 path: byte-select via VOP3P modifier.
       module.add(MXMFMAInstruction(instType=mxInstType, accType=InstType.INST_F32, variant=[16,16,miK,1], \
                                    acc=dAccAlias(vgprDStart,opDSize), \
                                    a=aOperand, \
@@ -1184,7 +1184,20 @@ def emitMfmaCode(writer, kernel):
         btiles = tiB.vgprTiles[btileId]
         dtiles = dtileInfo.vgprTiles[mma0 + mma1 * dtileInfo.localMMATileGrid[0]]
 
-        if hasScaleA:
+        dml = kernel.get("_deepseekML")
+        fp32Scale = False
+        if dml is not None:
+          # Deepseek multi-K mainloop path: E8M0 byte loaded per K-block by emitDeepseekScaleGR.
+          # scaleAVgprs[mma0] holds the E8M0 byte (in bits [7:0]) for the current iteration.
+          # scaleBVgpr holds the E8M0 byte for the current K-block's N-block.
+          # unitE8m0 (byte 0x7f = 1.0 in E8M0) is used when one side is inactive.
+          # Both use byte 0 (scaleAsel=0, scaleBsel=0) via the standard MX E8M0 MFMA path.
+          use_dsa = kernel.get("UseDeepseekScaleA", False)
+          use_dsb = kernel.get("UseDeepseekScaleB", False)
+          scaleAVgpr = (dml["scaleAVgprs"] + mma0) if use_dsa else dml["unitE8m0"]
+          scaleBVgpr = dml["scaleBVgpr"] if use_dsb else dml["unitE8m0"]
+          sAsel = sBsel = 0
+        elif hasScaleA:
           # Scale group index: one VGPR per lrSubtileShape[0] M-tiles x lrSubtileShape[1] K-tiles
           scaleMShapeA = tiMXSA.lrSubtileShape[0]
           scaleMShapeB = tiMXSB.lrSubtileShape[0]
@@ -1208,6 +1221,7 @@ def emitMfmaCode(writer, kernel):
 
         module.add(emitMfmaInstruction(writer, kernel, atiles, btiles, dtiles, dtiles,
                                        scaleAVgpr=scaleAVgpr, scaleBVgpr=scaleBVgpr, scaleAsel=sAsel, scaleBsel=sBsel,
+                                       fp32Scale=fp32Scale,
                                        comment="Emit MMFA code for MMA tiles C[%u, %u] += A[%u, %u] * B[%u, %u] sA = %u, sB = %u"%(mma0, mma1, mma0, mmak, mmak, mma1, sAsel, sBsel)))
 
   return module
@@ -1408,6 +1422,13 @@ def mainLoop(writer, kernel):
       module.add(VMovB32(dst=vgpr(unitScaleVgpr), src=hex(0x7f7f7f7f),
                          comment="unit scale=1.0 (E8M0) for plain FP8 MFMA"))
       kernel["_subtileUnitScaleVgpr"] = unitScaleVgpr
+  # Deepseek fp32 mainloop scale (PGR=0 only): alloc VGPRs/SGPRs, precompute vaddrs.
+  # The mainloop WMMA instruction will apply per-lane fp32 scaleA and uniform scaleB.
+  useDeepseekScale = kernel.get("UseDeepseekScaleA", False) or kernel.get("UseDeepseekScaleB", False)
+  if useDeepseekScale and pgr == 0:
+      from .SubtileDeepseekScaleEmit import setupDeepseekMainloopScale
+      mma_m = tiA.localMMATileGrid[0]
+      setupDeepseekMainloopScale(module, writer, kernel, mma_m)
   scheduler.populate_instructions(
       writer, kernel,
       tileInfoA=tiA, tileInfoB=tiB, dtileInfo=dtileInfo,
@@ -1486,5 +1507,25 @@ def mainLoop(writer, kernel):
 
   if unitScaleVgpr >= 0:
       writer.vgprPool.checkIn(unitScaleVgpr)
+
+  dml = kernel.get("_deepseekML")
+  if dml is not None:
+      writer.vgprPool.checkIn(dml["unitE8m0"])
+      if "scaleAVaddrs" in dml:
+          writer.vgprPool.checkIn(dml["scaleAVaddrs"])
+      if "scaleAVgprs" in dml:
+          writer.vgprPool.checkIn(dml["scaleAVgprs"])
+      if "kbOffset" in dml:
+          writer.sgprPool.checkIn(dml["kbOffset"])
+      if "scaleBVaddr" in dml:
+          writer.vgprPool.checkIn(dml["scaleBVaddr"])
+      if "scaleBVgpr" in dml:
+          writer.vgprPool.checkIn(dml["scaleBVgpr"])
+      if "kbBOffset" in dml:
+          writer.vgprPool.checkIn(dml["kbBOffset"])
+      if "nNBlocksStride" in dml:
+          writer.vgprPool.checkIn(dml["nNBlocksStride"])
+      if "sharedBufPtrSgpr" in dml:
+          writer.sgprPool.checkIn(dml["sharedBufPtrSgpr"])
 
   return module

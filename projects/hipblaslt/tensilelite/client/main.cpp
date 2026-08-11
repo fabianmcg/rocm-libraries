@@ -416,6 +416,11 @@ namespace TensileLite
                 ("tile-quant-q0",             po::value<size_t>()->default_value(0),               "Quant tile M extent (0 = whole MacroTile0).")
                 ("tile-quant-q1",             po::value<size_t>()->default_value(0),               "Quant tile N extent (0 = whole MacroTile1).")
                 ("init-quantScale",           po::value<InitMode>()->default_value(InitMode::Zero), "Init mode for quantScale output.")
+                ("use-deepseek-scale-a",      po::value<bool>()->default_value(false), "Enable Deepseek per-row A dequantization scale epilogue.")
+                ("use-deepseek-scale-b",      po::value<bool>()->default_value(false), "Enable Deepseek per-128col B dequantization scale epilogue.")
+                ("deepseek-scale-block-k",    po::value<size_t>()->default_value(128), "Column-block width for Deepseek B scale (default 128).")
+                ("init-scaleADeepseek",       po::value<InitMode>()->default_value(InitMode::TrigAbsSin), "Init mode for Deepseek A scale buffer.")
+                ("init-scaleBDeepseek",       po::value<InitMode>()->default_value(InitMode::TrigAbsSin), "Init mode for Deepseek B scale buffer.")
                 ("use-partial-rms",           po::value<bool>()->default_value(false), "Enable PartialRMS fused epilogue.")
                 ("partial-rms-residual-add",  po::value<bool>()->default_value(false), "PartialRMS: add residual before reduction.")
                 ("partial-rms-quant",         po::value<bool>()->default_value(false), "PartialRMS: also compute amax(|D|)/448 into partialBuf second half.")
@@ -573,6 +578,11 @@ namespace TensileLite
             DUMP_OPT("tile-quant-q0", size_t);
             DUMP_OPT("tile-quant-q1", size_t);
             DUMP_OPT("init-quantScale", InitMode);
+            DUMP_OPT("use-deepseek-scale-a", bool);
+            DUMP_OPT("use-deepseek-scale-b", bool);
+            DUMP_OPT("deepseek-scale-block-k", size_t);
+            DUMP_OPT("init-scaleADeepseek", InitMode);
+            DUMP_OPT("init-scaleBDeepseek", InitMode);
             DUMP_OPT("use-partial-rms", bool);
             DUMP_OPT("partial-rms-residual-add", bool);
             DUMP_OPT("partial-rms-quant", bool);

@@ -2145,6 +2145,24 @@ namespace TensileLite
                     value *= static_cast<Accumulator>(rstdVal);
                 }
 
+                // Deepseek per-row A scale: D[m,n] = alpha * scaleA[m] * scaleB[n/blockK] * acc.
+                if(problem.useDeepseekScaleA() && inputs.scaleADeepseek != nullptr)
+                {
+                    size_t mCoord   = dCoord[0];
+                    float  scaleVal = GetValue<float>(rocisa::DataType::Float,
+                                                      inputs.scaleADeepseek, (int)mCoord, aConjugate);
+                    value *= static_cast<Accumulator>(scaleVal);
+                }
+                if(problem.useDeepseekScaleB() && inputs.scaleBDeepseek != nullptr)
+                {
+                    size_t nCoord   = dCoord[1];
+                    // Tied to DeepseekScaleBlockK=128; a future change must read blockK from the problem instead.
+                    size_t blockK   = 128;
+                    float  scaleVal = GetValue<float>(rocisa::DataType::Float,
+                                                      inputs.scaleBDeepseek, (int)(nCoord / blockK), aConjugate);
+                    value *= static_cast<Accumulator>(scaleVal);
+                }
+
                 auto resultD = multiply<Accumulator>(alpha, value);
 
                 if(problem.useScaleAlphaVec())

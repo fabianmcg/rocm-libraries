@@ -2958,7 +2958,9 @@ namespace TensileLite
             inputs->rmsGamma      = (void*)ptrs[ContractionProblemGemm::TENSOR::RMSGAMMA];
             inputs->residual      = (void*)ptrs[ContractionProblemGemm::TENSOR::RESIDUAL];
             inputs->rstdBuf       = (void*)ptrs[ContractionProblemGemm::TENSOR::RSTDBUF];
-            inputs->quantScale    = (void*)ptrs[ContractionProblemGemm::TENSOR::QUANTSCALE];
+            inputs->quantScale      = (void*)ptrs[ContractionProblemGemm::TENSOR::QUANTSCALE];
+            inputs->scaleADeepseek = (void*)ptrs[ContractionProblemGemm::TENSOR::SCALEA_DS];
+            inputs->scaleBDeepseek = (void*)ptrs[ContractionProblemGemm::TENSOR::SCALEB_DS];
 
             inputs->batchA    = (void**)batchPtrs[ContractionProblemGemm::TENSOR::A];
             inputs->batchB    = (void**)batchPtrs[ContractionProblemGemm::TENSOR::B];
@@ -3204,6 +3206,16 @@ namespace TensileLite
                 rotatingSize += problem.tensors()[ContractionProblemGemm::TENSOR::QUANTSCALE]
                                     .totalAllocatedBytes();
             }
+            if(inputs.scaleADeepseek != nullptr)
+            {
+                rotatingSize += problem.tensors()[ContractionProblemGemm::TENSOR::SCALEA_DS]
+                                    .totalAllocatedBytes();
+            }
+            if(inputs.scaleBDeepseek != nullptr)
+            {
+                rotatingSize += problem.tensors()[ContractionProblemGemm::TENSOR::SCALEB_DS]
+                                    .totalAllocatedBytes();
+            }
             return rotatingSize;
         }
 
@@ -3266,6 +3278,18 @@ namespace TensileLite
                 newInputs.quantScale,
                 rotatingPtr,
                 problem.tensors()[ContractionProblemGemm::TENSOR::QUANTSCALE].totalAllocatedBytes(),
+                offset,
+                stream);
+            newInputs.scaleADeepseek = copyRotatingInput(
+                newInputs.scaleADeepseek,
+                rotatingPtr,
+                problem.tensors()[ContractionProblemGemm::TENSOR::SCALEA_DS].totalAllocatedBytes(),
+                offset,
+                stream);
+            newInputs.scaleBDeepseek = copyRotatingInput(
+                newInputs.scaleBDeepseek,
+                rotatingPtr,
+                problem.tensors()[ContractionProblemGemm::TENSOR::SCALEB_DS].totalAllocatedBytes(),
                 offset,
                 stream);
             newInputs.scaleA = copyRotatingInput(

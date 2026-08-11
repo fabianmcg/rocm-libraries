@@ -114,6 +114,8 @@ namespace TensileLite
                      Base::template Pair<Predicates::Contraction::UseTileQuantEqual>(),
                      Base::template Pair<Predicates::Contraction::TileQuantQ0Equal>(),
                      Base::template Pair<Predicates::Contraction::TileQuantQ1Equal>(),
+                     Base::template Pair<Predicates::Contraction::UseDeepseekScaleAEqual>(),
+                     Base::template Pair<Predicates::Contraction::UseDeepseekScaleBEqual>(),
                      Base::template Pair<Predicates::Contraction::UsePartialRMSResidualAddEqual>(),
                      Base::template Pair<Predicates::Contraction::UsePartialRMSQuantEqual>(),
                      Base::template Pair<Predicates::Contraction::UseGradientEqual>(),
@@ -480,6 +482,18 @@ namespace TensileLite
         template <typename IO>
         struct MappingTraits<Predicates::Contraction::TileQuantQ1Equal, IO>
             : public AutoMappingTraits<Predicates::Contraction::TileQuantQ1Equal, IO>
+        {
+        };
+
+        template <typename IO>
+        struct MappingTraits<Predicates::Contraction::UseDeepseekScaleAEqual, IO>
+            : public AutoMappingTraits<Predicates::Contraction::UseDeepseekScaleAEqual, IO>
+        {
+        };
+
+        template <typename IO>
+        struct MappingTraits<Predicates::Contraction::UseDeepseekScaleBEqual, IO>
+            : public AutoMappingTraits<Predicates::Contraction::UseDeepseekScaleBEqual, IO>
         {
         };
 

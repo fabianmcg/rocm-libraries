@@ -74,7 +74,7 @@ class ProblemType:
                  'sparse', 'f32XdlMathOp', 'supportDeviceUserArguments', 'outputAmaxD', 'swizzleTensorA', 'swizzleTensorB', 'metadataLayout',
                  'mxBlockA', 'mxBlockB', 'mxTypeA', 'mxTypeB', 'mxScaleFormat',
                  'usePartialRMS', 'partialRMSResidualAdd', 'partialRMSQuant', 'useRstdScale',
-                 'useTileQuant']
+                 'useTileQuant', 'useDeepseekScaleA', 'useDeepseekScaleB']
     @classmethod
     def FromOriginalState(cls, d):
         indices = [None]*d['TotalIndices']
@@ -265,6 +265,8 @@ class ProblemType:
         rv.partialRMSQuant = bool(d.get('PartialRMSQuant', False))
         rv.useRstdScale = bool(d.get('RstdScale', False))
         rv.useTileQuant = bool(d.get('TileQuant', False))
+        rv.useDeepseekScaleA = bool(d.get('UseDeepseekScaleA', False))
+        rv.useDeepseekScaleB = bool(d.get('UseDeepseekScaleB', False))
 
         rv.useScaleAB = ""
         if 'UseScaleAB' in d:
@@ -444,6 +446,8 @@ class ProblemType:
             predicates.append(ProblemPredicate("UsePartialRMSResidualAdd", value=self.partialRMSResidualAdd))
             predicates.append(ProblemPredicate("UsePartialRMSQuant", value=self.partialRMSQuant))
             predicates.append(ProblemPredicate("UseTileQuant", value=self.useTileQuant))
+            predicates.append(ProblemPredicate("UseDeepseekScaleA", value=self.useDeepseekScaleA))
+            predicates.append(ProblemPredicate("UseDeepseekScaleB", value=self.useDeepseekScaleB))
         return predicates
 
 def extractDimPredicate(cls, key, value, predicateName):
@@ -678,6 +682,8 @@ class SizeMapping:
                  'TileQuant',
                  'tileQuantQ0',
                  'tileQuantQ1',
+                 'useDeepseekScaleA',
+                 'useDeepseekScaleB',
                  'NonTemporalD',
                  'WaveSeparateGlobalReadA',
                  'WaveSeparateGlobalReadB',
@@ -779,6 +785,8 @@ class SizeMapping:
                    TileQuant                = bool(d.get('TileQuant', False)),
                    tileQuantQ0              = int(d.get('_TileQuantQ0', 0)),
                    tileQuantQ1              = int(d.get('_TileQuantQ1', 0)),
+                   useDeepseekScaleA        = bool(d.get('UseDeepseekScaleA', False)),
+                   useDeepseekScaleB        = bool(d.get('UseDeepseekScaleB', False)),
                    NonTemporalD             = d['NonTemporalD'],
                    WaveSeparateGlobalReadA  = d['WaveSeparateGlobalReadA'],
                    WaveSeparateGlobalReadB  = d['WaveSeparateGlobalReadB'],

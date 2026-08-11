@@ -5241,6 +5241,12 @@ class KernelWriter(metaclass=abc.ABCMeta):
         tqEmitter = SubtileTileQuantEmitter(self, kernel)
         module.add(tqEmitter.emit(dtileInfo.vgprTiles))
 
+      if kernel.get("UseDeepseekScaleA", False) or kernel.get("UseDeepseekScaleB", False):
+        from .Components.Subtile.SubtileDeepseekScaleEmit import SubtileDeepseekScaleEmitter
+        module.addComment1("DeepseekScale: fp8 dequantization scale epilogue.")
+        dsEmitter = SubtileDeepseekScaleEmitter(self, kernel)
+        module.add(dsEmitter.emit(dtileInfo.vgprTiles))
+
       # global write indices
       module.addComment1("not-LocalSplitU: global write indices")
       module.add(self.notLocalSplitUGlobalWriteIndices(kernel))
@@ -10198,6 +10204,24 @@ class KernelWriter(metaclass=abc.ABCMeta):
         self.states.numStoreSgprNameSizes.append(1)
         storeSgprLoad += 1
       self.states.numStoreSgprNames.append("QuantScale")
+      self.states.numStoreSgprNameSizes.append(self.states.rpga)  # 2 SGPRs (64-bit ptr)
+      storeSgprLoad += self.states.rpga
+    if kernel.get("UseDeepseekScaleA", False):
+      # ScaleABuf: 64-bit pointer (2 SGPRs) for per-row fp32 A-dequantization scales.
+      if sum(self.states.numStoreSgprNameSizes) % 2:
+        self.states.numStoreSgprNames.append("DeepseekScaleAPad")
+        self.states.numStoreSgprNameSizes.append(1)
+        storeSgprLoad += 1
+      self.states.numStoreSgprNames.append("ScaleABuf")
+      self.states.numStoreSgprNameSizes.append(self.states.rpga)  # 2 SGPRs (64-bit ptr)
+      storeSgprLoad += self.states.rpga
+    if kernel.get("UseDeepseekScaleB", False):
+      # ScaleBBuf: 64-bit pointer (2 SGPRs) for per-128col-block fp32 B-dequantization scales.
+      if sum(self.states.numStoreSgprNameSizes) % 2:
+        self.states.numStoreSgprNames.append("DeepseekScaleBPad")
+        self.states.numStoreSgprNameSizes.append(1)
+        storeSgprLoad += 1
+      self.states.numStoreSgprNames.append("ScaleBBuf")
       self.states.numStoreSgprNameSizes.append(self.states.rpga)  # 2 SGPRs (64-bit ptr)
       storeSgprLoad += self.states.rpga
     self.states.numStoreSgprToLoad = storeSgprLoad

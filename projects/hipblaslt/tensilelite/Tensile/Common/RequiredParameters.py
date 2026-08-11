@@ -171,4 +171,7 @@ def getRequiredParametersMin() -> set:
         'RstdScale',
         'TileQuant',
         'TileQuantShape',
+        'UseDeepseekScaleA',
+        'UseDeepseekScaleB',
+        'DeepseekScaleBlockK',
     })

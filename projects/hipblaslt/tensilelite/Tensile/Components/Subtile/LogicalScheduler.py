@@ -3664,6 +3664,10 @@ class LogicalScheduler:
 
         exitLabels = [Label(f"ExitC{ui}", "") for ui in range(uf - 1)]
         module.add(loopBegin)
+        # Deepseek mainloop scale (PGR=0): load per-K-block fp32 scales at each iteration.
+        if kernel.get("_deepseekML") and kernel.get("PrefetchGlobalRead") == 0:
+            from .SubtileDeepseekScaleEmit import emitDeepseekScaleGR
+            module.add(emitDeepseekScaleGR(writer, kernel))
         # Debug: emit `s_mov_b32 m0, LoopCounterL; s_ttracedata` at the start of
         # every mainloop iteration so SQTT / trace decoders can identify iterations
         # (adds 2 instructions per iter). Gated by the EmitMainloopTraceMarker global.

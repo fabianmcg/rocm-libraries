@@ -2324,6 +2324,74 @@ namespace TensileLite
                 }
             };
 
+            struct UseDeepseekScaleAEqual
+                : public Predicate_CRTP<UseDeepseekScaleAEqual, ContractionProblemGemm>
+            {
+                enum
+                {
+                    HasIndex = false,
+                    HasValue = true
+                };
+                bool value;
+
+                UseDeepseekScaleAEqual() = default;
+                UseDeepseekScaleAEqual(bool value)
+                    : value(value)
+                {
+                }
+
+                static std::string Type()
+                {
+                    return "UseDeepseekScaleA";
+                }
+
+                virtual bool operator()(ContractionProblemGemm const& problem) const override
+                {
+                    return problem.useDeepseekScaleA() == value;
+                }
+
+                virtual bool debugEval(ContractionProblemGemm const& problem,
+                                       std::ostream&                 stream) const override
+                {
+                    return debugEvalCmp(
+                        problem, stream, "prob", problem.useDeepseekScaleA(), "==", "sol", value);
+                }
+            };
+
+            struct UseDeepseekScaleBEqual
+                : public Predicate_CRTP<UseDeepseekScaleBEqual, ContractionProblemGemm>
+            {
+                enum
+                {
+                    HasIndex = false,
+                    HasValue = true
+                };
+                bool value;
+
+                UseDeepseekScaleBEqual() = default;
+                UseDeepseekScaleBEqual(bool value)
+                    : value(value)
+                {
+                }
+
+                static std::string Type()
+                {
+                    return "UseDeepseekScaleB";
+                }
+
+                virtual bool operator()(ContractionProblemGemm const& problem) const override
+                {
+                    return problem.useDeepseekScaleB() == value;
+                }
+
+                virtual bool debugEval(ContractionProblemGemm const& problem,
+                                       std::ostream&                 stream) const override
+                {
+                    return debugEvalCmp(
+                        problem, stream, "prob", problem.useDeepseekScaleB(), "==", "sol", value);
+                }
+            };
+
             // Activation
             struct ActivationCheck : public Predicate_CRTP<ActivationCheck, ContractionProblemGemm>
             {

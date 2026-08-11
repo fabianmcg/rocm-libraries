@@ -230,6 +230,16 @@ def _getName(state, requiredParameters: frozenset, splitGSU: bool, ignoreInterna
   if not state.get("TileQuant", False):
     requiredParametersTemp.discard("TileQuantShape")
 
+  # DeepseekScale parameters are only meaningful when at least one scale flag is active.
+  use_scale_a = state.get("UseDeepseekScaleA", False)
+  use_scale_b = state.get("UseDeepseekScaleB", False)
+  if not use_scale_a:
+    requiredParametersTemp.discard("UseDeepseekScaleA")
+  if not use_scale_b:
+    requiredParametersTemp.discard("UseDeepseekScaleB")
+  if not use_scale_a and not use_scale_b:
+    requiredParametersTemp.discard("DeepseekScaleBlockK")
+
   for key in sorted(requiredParametersTemp):
     if key not in state or key == "CustomKernelName":
       continue

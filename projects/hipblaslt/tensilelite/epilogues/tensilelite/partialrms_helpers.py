@@ -179,7 +179,7 @@ def compileSolution(solution):
 
 def buildSubtileArgs(free0, free1, bound, numWG, dOut, cIn, aOperand, bOperand,
                      skArgs, ki0, ki1, epilogueArgs, alpha=np.float32(1.0),
-                     hasBeta=True):
+                     hasBeta=True, beta=np.float32(0.0)):
     """Build the StreamK=3/ForceDPOnly subtile kernel argument list.
 
     All subtile kernels use StreamKForceDPOnly=1, which drops AddressWS and
@@ -218,7 +218,7 @@ def buildSubtileArgs(free0, free1, bound, numWG, dOut, cIn, aOperand, bOperand,
         np.float32(alpha),
     ]
     if hasBeta:
-        args.append(np.float32(0.0))
+        args.append(np.float32(beta))
     args.extend([
         skArgs["iters_per_tile"], skArgs["magic_iters_per_tile"],
         skArgs["shift_iters_per_tile"], skArgs["sk_iters_per_wg"],
