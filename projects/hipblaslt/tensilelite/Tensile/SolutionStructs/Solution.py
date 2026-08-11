@@ -497,13 +497,6 @@ def _validateDeepseekScaleMultiK(state, printRejectionReason):
   The mainloop loads one scaleA/scaleB value per K-block iteration; several
   microarchitectural limits apply only in this mode.
   """
-  pgr = state.get("PrefetchGlobalRead", 1)
-  # Guard 3: multi-K mainloop requires PrefetchGlobalRead == 0.
-  if pgr != 0:
-    reject(state, printRejectionReason,
-           f"useDeepseekScaleA/B multi-K path: PrefetchGlobalRead must be 0 (got {pgr})")
-    return
-
   depthU = state.get("DepthU", 0)
   # Guard 1: enforce K is always a multiple of DepthU (no tail loop).
   # Raise AssertSummationElementMultiple so the kernel is only dispatched for

@@ -1,13 +1,8 @@
 # Copyright Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier: MIT
 
-import math
 from abc import ABC, abstractmethod
-from contextlib import contextmanager
-from copy import deepcopy
-from dataclasses import dataclass, field
 from functools import singledispatch
-from typing import Dict, List, NamedTuple, Optional, Tuple, Type
 from Tensile.Components.Subtile.LogicalScheduler import (
       LogicalScheduler, SchedulerConfig as MFMASchedulerConfig,
       ReadGranularity, GRPlacementStrategy)
@@ -1191,10 +1186,10 @@ def emitMfmaCode(writer, kernel):
           # scaleBVgpr holds the E8M0 byte for the current K-block's N-block.
           # unitE8m0 (byte 0x7f = 1.0 in E8M0) is used when one side is inactive.
           # Both use byte 0 (scaleAsel=0, scaleBsel=0) via the standard MX E8M0 MFMA path.
-          use_dsa = kernel.get("UseDeepseekScaleA", False)
-          use_dsb = kernel.get("UseDeepseekScaleB", False)
-          scaleAVgpr = (dml["scaleAVgprs"] + mma0) if use_dsa else dml["unitE8m0"]
-          scaleBVgpr = dml["scaleBVgpr"] if use_dsb else dml["unitE8m0"]
+          useDsa = kernel.get("UseDeepseekScaleA", False)
+          useDsb = kernel.get("UseDeepseekScaleB", False)
+          scaleAVgpr = (dml["scaleAVgprs"] + mma0) if useDsa else dml["unitE8m0"]
+          scaleBVgpr = dml["scaleBVgpr"] if useDsb else dml["unitE8m0"]
           sAsel = sBsel = 0
         elif hasScaleA:
           # Scale group index: one VGPR per lrSubtileShape[0] M-tiles x lrSubtileShape[1] K-tiles
@@ -1420,8 +1415,9 @@ def mainLoop(writer, kernel):
       module.add(VMovB32(dst=vgpr(unitScaleVgpr), src=hex(0x7f7f7f7f),
                          comment="unit scale=1.0 (E8M0) for plain FP8 MFMA"))
       kernel["_subtileUnitScaleVgpr"] = unitScaleVgpr
-  # Deepseek fp32 mainloop scale (PGR=0 only): alloc VGPRs/SGPRs, precompute vaddrs.
-  # The mainloop WMMA instruction will apply per-lane fp32 scaleA and uniform scaleB.
+  # Deepseek mainloop scale (PGR=0 only): alloc VGPRs/SGPRs, precompute vaddrs.
+  # The v_mfma_scale_f32_16x16x128_f8f6f4 instruction applies per-lane E8M0 scaleA
+  # and uniform scaleB inline during each MFMA, one K-block at a time.
   useDeepseekScale = kernel.get("UseDeepseekScaleA", False) or kernel.get("UseDeepseekScaleB", False)
   if useDeepseekScale and pgr == 0:
       from .SubtileDeepseekScaleEmit import setupDeepseekMainloopScale

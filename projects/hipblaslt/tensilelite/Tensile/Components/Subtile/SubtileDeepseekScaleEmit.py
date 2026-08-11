@@ -2,19 +2,27 @@
 # SPDX-License-Identifier: MIT
 """DeepseekScale fused epilogue emitter for the Subtile kernel (gfx950, fp8 in / f32 out).
 
-Applies per-row fp32 scaleA from scaleA[M, 1] and/or per-128col-block fp32
-scaleB from scaleB[1, ceil(N/128)] to the fp32 GEMM accumulator (AGPRs).
-This implements the Deepseek V3 dequantization pattern restricted to a single
-K-block (DepthU <= DeepseekScaleBlockK).
+Applies per-row E8M0 scaleA and/or per-128col-block E8M0 scaleB to the fp32
+GEMM accumulator (AGPRs). Scale buffers hold one UE8M0 byte per element; the
+kernel decodes each byte to fp32 via left-shift by 23 (same as the hardware
+v_mfma_scale operand path). This implements the Deepseek V3 dequantization
+pattern.
 
 Full formula:
-  D[m,n] = alpha * scaleA[m] * scaleB[n//128] * (A_fp8 @ B_fp8)[m,n] + beta*C
+  D[m,n] = alpha * decode(scaleA[m]) * decode(scaleB[n//128]) * acc[m,n] + beta*C
 
-If only scaleA: scaleB factor is omitted.
-If only scaleB: scaleA factor is omitted.
+If only scaleA: scaleB factor is omitted (unit scale applied via 0x7f byte).
+If only scaleB: scaleA factor is omitted (unit scale applied via 0x7f byte).
 
-scaleA layout: one fp32 per output row, indexed by global row m.
-scaleB layout: one fp32 per 128-column N-block, indexed by global block n//128.
+Scale buffer layouts (E8M0, 1 byte per element):
+  scaleA: shape [M, nKBlocks] for multi-K (PGR=0) or [M, 1] for epilogue (PGR=1).
+  scaleB: shape [nKBlocks, ceil(N/128)].
+
+Two application modes:
+  PGR=0 (mainloop): scaleA and scaleB are passed as mxsa/mxsb operands to
+    v_mfma_scale_f32_16x16x128_f8f6f4, applied inline per K-block iteration.
+  PGR=1 (epilogue): accumulated fp32 result is multiplied by decoded scale
+    values after the MFMA loop, before the alpha/beta store.
 
 MFMA output accumulator layout (gfx950, waveSize=64, 16x16 MFMA):
   lane % mfma_n = N-column within MMA tile.
@@ -319,6 +327,10 @@ def emitDeepseekScaleGR(writer, kernel):
                       dml["scaleBVaddr"], vgpr(dml["kbBOffset"]), dml["scaleBVgpr"],
                       "scaleB[kb, WG1_block].")
 
+    # vlcnt=0 drains only the scale flat_loads issued above. This is a no-op at
+    # PGR=0 because no data buffer_loads are in flight yet. Do not reorder data
+    # GRs to precede this block — that would drain them here too, serialising
+    # scale and data loads and eliminating load-MFMA overlap.
     module.add(SWaitCnt(vlcnt=0, comment="wait for Deepseek scale flat_loads."))
 
     # Broadcast the loaded E8M0 byte to all 4 byte positions of each scale VGPR.
@@ -407,7 +419,7 @@ class SubtileDeepseekScaleEmitter:
             return
         module.add(VAccvgprWriteB32(accvgpr(reg), vgpr(src), comment=comment))
 
-    def _partial_idx(self, m: int, k: int) -> int:
+    def _partialIdx(self, m: int, k: int) -> int:
         """Index into scale_a_vgprs for M-tile m, row-offset k."""
         return m * self.rows_per_lane + k
 
@@ -527,7 +539,7 @@ class SubtileDeepseekScaleEmitter:
 
         for m in range(self.mma_m):
             for k in range(self.rows_per_lane):
-                i = self._partial_idx(m, k)
+                i = self._partialIdx(m, k)
                 self._computeScaleAAddrBytes(module, global_addr, offset_tmp,
                                               row_base_vgpr, row_group_byte, m, k)
                 module.add(BufferLoadU8(
@@ -544,7 +556,7 @@ class SubtileDeepseekScaleEmitter:
         # Decode E8M0 to fp32: fp32 = byte << 23 (byte becomes the exponent field).
         for m in range(self.mma_m):
             for k in range(self.rows_per_lane):
-                i = self._partial_idx(m, k)
+                i = self._partialIdx(m, k)
                 module.add(VLShiftLeftB32(
                     dst=vgpr(scale_vgprs + i), shiftHex=hex(23), src=vgpr(scale_vgprs + i),
                     comment=f"decode E8M0 to fp32 for scaleA[m={m},k={k}].",
@@ -564,7 +576,7 @@ class SubtileDeepseekScaleEmitter:
         for m in range(self.mma_m):
             for n in range(self.mma_n):
                 for k in range(self.rows_per_lane):
-                    ridx = scale_a_vgprs + self._partial_idx(m, k)
+                    ridx = scale_a_vgprs + self._partialIdx(m, k)
                     self._readAccInto(module, acc_tmp, vgprTiles, m, n, k,
                                       f"read acc[m={m},n={n},k={k}].")
                     module.add(VMulF32(dst=vgpr(acc_tmp), src0=vgpr(acc_tmp),
@@ -687,7 +699,7 @@ class SubtileDeepseekScaleEmitter:
 
         for m in range(self.mma_m):
             for k in range(self.rows_per_lane):
-                a_ridx = scale_a_vgprs + self._partial_idx(m, k)
+                a_ridx = scale_a_vgprs + self._partialIdx(m, k)
                 for b_idx, block_off in enumerate(distinct):
                     ns = [n for n in range(self.mma_n) if self._computeNBlock(n) == block_off]
                     # Precompute combined scale = scaleA[m,k] * scaleB[block].

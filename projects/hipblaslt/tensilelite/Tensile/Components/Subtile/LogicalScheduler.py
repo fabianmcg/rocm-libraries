@@ -3664,8 +3664,12 @@ class LogicalScheduler:
 
         exitLabels = [Label(f"ExitC{ui}", "") for ui in range(uf - 1)]
         module.add(loopBegin)
-        # Deepseek mainloop scale (PGR=0): load per-K-block fp32 scales at each iteration.
+        # Deepseek mainloop scale (PGR=0): load per-K-block E8M0 scales once per
+        # outer-loop iteration, before the inner uf=1 unroll. PGR=0 forces uf=1
+        # so the load is consumed exactly once per iteration; if that invariant
+        # ever changes this assert will catch it before stale scales are applied.
         if kernel.get("_deepseekML") and kernel.get("PrefetchGlobalRead") == 0:
+            assert uf == 1, "deepseek mainloop scale assumes uf==1 (PGR=0 invariant violated)"
             from .SubtileDeepseekScaleEmit import emitDeepseekScaleGR
             module.add(emitDeepseekScaleGR(writer, kernel))
         # Debug: emit `s_mov_b32 m0, LoopCounterL; s_ttracedata` at the start of

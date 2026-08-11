@@ -2167,8 +2167,10 @@ namespace TensileLite
                 if(problem.useDeepseekScaleB() && inputs.scaleBDeepseek != nullptr)
                 {
                     size_t  nCoord   = dCoord[1];
-                    // Tied to DeepseekScaleBlockK=128; a future change must read blockK from the problem instead.
-                    size_t  blockK   = 128;
+                    // DeepseekScaleBlockK is fixed at 128 (the only value in ValidParameters).
+                    // If the valid set is extended, add a blockK field to ContractionProblemGemm
+                    // and read it here instead of this constant.
+                    constexpr size_t blockK = 128;
                     uint8_t e8m0     = static_cast<const uint8_t*>(inputs.scaleBDeepseek)[nCoord / blockK];
                     value *= static_cast<Accumulator>(decodeE8M0(e8m0));
                 }

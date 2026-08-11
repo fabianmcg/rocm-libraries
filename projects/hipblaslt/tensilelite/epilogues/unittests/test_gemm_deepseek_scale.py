@@ -34,15 +34,19 @@ from epilogues.tensilelite.partialrms_helpers import (
     compute_sk3_dp_args, _pack_kernel_info, compileSolution, buildSubtileArgs,
 )
 
-_DSA_YAML       = yamlPath("gemm_deepseek_scale_a_k1.yaml")
-_DSB_YAML       = yamlPath("gemm_deepseek_scale_b_k1.yaml")
-_DSAB_YAML      = yamlPath("gemm_deepseek_scale_ab_k1.yaml")
-_DSAB_MULTIK_YAML = yamlPath("gemm_deepseek_scale_ab_multik.yaml")
+_DSA_YAML          = yamlPath("gemm_deepseek_scale_a_k1.yaml")
+_DSB_YAML          = yamlPath("gemm_deepseek_scale_b_k1.yaml")
+_DSAB_YAML         = yamlPath("gemm_deepseek_scale_ab_k1.yaml")
+_DSAB_MULTIK_YAML  = yamlPath("gemm_deepseek_scale_ab_multik.yaml")
+_DSA_MULTIK_YAML   = yamlPath("gemm_deepseek_scale_a_multik.yaml")
+_DSB_MULTIK_YAML   = yamlPath("gemm_deepseek_scale_b_multik.yaml")
 
-_DSA_SOLUTIONS       = enumerateSolutions("gemm_deepseek_scale_a_k1.yaml")
-_DSB_SOLUTIONS       = enumerateSolutions("gemm_deepseek_scale_b_k1.yaml")
-_DSAB_SOLUTIONS      = enumerateSolutions("gemm_deepseek_scale_ab_k1.yaml")
+_DSA_SOLUTIONS         = enumerateSolutions("gemm_deepseek_scale_a_k1.yaml")
+_DSB_SOLUTIONS         = enumerateSolutions("gemm_deepseek_scale_b_k1.yaml")
+_DSAB_SOLUTIONS        = enumerateSolutions("gemm_deepseek_scale_ab_k1.yaml")
 _DSAB_MULTIK_SOLUTIONS = enumerateSolutions("gemm_deepseek_scale_ab_multik.yaml")
+_DSA_MULTIK_SOLUTIONS  = enumerateSolutions("gemm_deepseek_scale_a_multik.yaml")
+_DSB_MULTIK_SOLUTIONS  = enumerateSolutions("gemm_deepseek_scale_b_multik.yaml")
 
 # A-only test shapes: M x N x K.
 # Covers M=1 (partial block), M=7 (odd), M=128 (aligned), M=129 (crosses boundary).
@@ -114,6 +118,30 @@ def dsab_kernel(request):
 )
 def dsab_multik_kernel(request):
     """Assemble and compile one multi-K DeepseekScaleAB solution (PGR=0)."""
+    solution = request.param
+    kernelName, hsaco, chip = compileSolution(solution)
+    return solution, kernelName, hsaco, chip
+
+
+@pytest.fixture(
+    scope="session",
+    params=[sol for sol, _id in _DSA_MULTIK_SOLUTIONS],
+    ids=[sid for _sol, sid in _DSA_MULTIK_SOLUTIONS],
+)
+def dsa_multik_kernel(request):
+    """Assemble and compile one multi-K DeepseekScaleA-only solution (PGR=0)."""
+    solution = request.param
+    kernelName, hsaco, chip = compileSolution(solution)
+    return solution, kernelName, hsaco, chip
+
+
+@pytest.fixture(
+    scope="session",
+    params=[sol for sol, _id in _DSB_MULTIK_SOLUTIONS],
+    ids=[sid for _sol, sid in _DSB_MULTIK_SOLUTIONS],
+)
+def dsb_multik_kernel(request):
+    """Assemble and compile one multi-K DeepseekScaleB-only solution (PGR=0)."""
     solution = request.param
     kernelName, hsaco, chip = compileSolution(solution)
     return solution, kernelName, hsaco, chip
@@ -419,6 +447,36 @@ def test_deepseek_scale_ab_shape(dsab_kernel, M, N, K):
     _TEST_SHAPES_NONUNIT_ALPHA,
     ids=[f"M{m}-N{n}-K{k}" for m, n, k in _TEST_SHAPES_NONUNIT_ALPHA],
 )
+def test_deepseek_scale_a_nonunit_alpha(dsa_kernel, M, N, K):
+    """Verify DeepseekScaleA output with alpha=2.0 (non-unit alpha scaling)."""
+    solution, kernelName, hsaco, chip = dsa_kernel
+    dGpu, dRef = _run_shape_a(solution, kernelName, hsaco, chip, M, N, K, alpha=2.0)
+    label = (f"MT{solution['MacroTile0']}x{solution['MacroTile1']} "
+             f"A-only alpha=2.0 M={M} N={N} K={K}")
+    assertClose(dGpu[:M, :N], dRef[:M, :N], label, rtol=2e-2, atol=2e-2, kind="D_f32")
+
+
+@requires_gfx950
+@pytest.mark.parametrize(
+    "M,N,K",
+    _TEST_SHAPES_NONUNIT_ALPHA,
+    ids=[f"M{m}-N{n}-K{k}" for m, n, k in _TEST_SHAPES_NONUNIT_ALPHA],
+)
+def test_deepseek_scale_b_nonunit_alpha(dsb_kernel, M, N, K):
+    """Verify DeepseekScaleB output with alpha=2.0 (non-unit alpha scaling)."""
+    solution, kernelName, hsaco, chip = dsb_kernel
+    dGpu, dRef = _run_shape_b(solution, kernelName, hsaco, chip, M, N, K, alpha=2.0)
+    label = (f"MT{solution['MacroTile0']}x{solution['MacroTile1']} "
+             f"B-only alpha=2.0 M={M} N={N} K={K}")
+    assertClose(dGpu[:M, :N], dRef[:M, :N], label, rtol=2e-2, atol=2e-2, kind="D_f32")
+
+
+@requires_gfx950
+@pytest.mark.parametrize(
+    "M,N,K",
+    _TEST_SHAPES_NONUNIT_ALPHA,
+    ids=[f"M{m}-N{n}-K{k}" for m, n, k in _TEST_SHAPES_NONUNIT_ALPHA],
+)
 def test_deepseek_scale_ab_nonunit_alpha(dsab_kernel, M, N, K):
     """Verify DeepseekScaleAB output with alpha=2.0 (non-unit alpha scaling)."""
     solution, kernelName, hsaco, chip = dsab_kernel
@@ -502,7 +560,7 @@ def _make_inputs_ab_multik(M, N, K, mPadded):
 
 
 def _run_shape_ab_multik(solution, kernelName, hsaco, chip, M, N, K,
-                         alpha=1.0, beta=0.0):
+                         alpha=1.0, beta=0.0, cMatrix=None):
     """Run multi-K DeepseekScaleAB kernel for one (M, N, K) shape."""
     MT0     = solution["MacroTile0"]
     mPadded = math.ceil(M / MT0) * MT0
@@ -512,15 +570,84 @@ def _run_shape_ab_multik(solution, kernelName, hsaco, chip, M, N, K,
      scaleAPadded, scaleBBytes, scaleBRef, aKM, bKN, scaleARef) = \
         _make_inputs_ab_multik(M, N, K, mPadded)
 
+    if cMatrix is not None:
+        cFortran = np.asfortranarray(cMatrix.astype(np.float32))
+
+    c_ref = cMatrix if cMatrix is not None else np.zeros((M, N), dtype=np.float32)
     aMK  = np.asarray(aKM).T
     dRef = numpy_ref_multiblock(aMK, np.asarray(bKN), scaleARef, scaleBRef,
-                                alpha, beta,
-                                np.zeros((M, N), dtype=np.float32))
+                                alpha, beta, c_ref)
 
     # scaleA buffer: flat row-major [mPadded * nKBlocks] E8M0 uint8 array.
     # scaleB buffer: flat row-major [nKBlocks * nNBlocks] E8M0 uint8 array.
     epilogueArgs = [amdgpu_exec.InputArray(scaleAPadded.ravel()),
                     amdgpu_exec.InputArray(scaleBBytes.ravel())]
+    dGpu = _execute_and_compare(solution, kernelName, hsaco, M, N, K, numWG,
+                                aFortran, bFortran, cFortran, dFortran,
+                                epilogueArgs, alpha, beta=beta)
+    return dGpu, dRef.astype(np.float32)
+
+
+def _run_shape_a_multik(solution, kernelName, hsaco, chip, M, N, K,
+                        alpha=1.0, beta=0.0, cMatrix=None):
+    """Run multi-K DeepseekScaleA-only kernel for one (M, N, K) shape.
+
+    scaleB side uses a unit scale inside the mainloop (0x7f = 1.0 in E8M0).
+    The reference uses scaleA only, with scaleB effectively 1.0.
+    """
+    MT0     = solution["MacroTile0"]
+    mPadded = math.ceil(M / MT0) * MT0
+    numWG   = math.ceil(M / MT0) * math.ceil(N / solution["MacroTile1"])
+
+    (aFortran, bFortran, cFortran, dFortran,
+     scaleAPadded, _scaleBBytes, _scaleBRef, aKM, bKN, scaleARef) = \
+        _make_inputs_ab_multik(M, N, K, mPadded)
+
+    if cMatrix is not None:
+        cFortran = np.asfortranarray(cMatrix.astype(np.float32))
+
+    c_ref = cMatrix if cMatrix is not None else np.zeros((M, N), dtype=np.float32)
+    # Unit scaleB (all 1.0): scaleB[kb, nb] = 1.0 for all blocks.
+    nNBlocks = math.ceil(N / 128)
+    nKBlocks = K // 128
+    unitScaleBRef = np.ones((nKBlocks, nNBlocks), dtype=np.float32)
+    aMK  = np.asarray(aKM).T
+    dRef = numpy_ref_multiblock(aMK, np.asarray(bKN), scaleARef, unitScaleBRef,
+                                alpha, beta, c_ref)
+
+    epilogueArgs = [amdgpu_exec.InputArray(scaleAPadded.ravel())]
+    dGpu = _execute_and_compare(solution, kernelName, hsaco, M, N, K, numWG,
+                                aFortran, bFortran, cFortran, dFortran,
+                                epilogueArgs, alpha, beta=beta)
+    return dGpu, dRef.astype(np.float32)
+
+
+def _run_shape_b_multik(solution, kernelName, hsaco, chip, M, N, K,
+                        alpha=1.0, beta=0.0, cMatrix=None):
+    """Run multi-K DeepseekScaleB-only kernel for one (M, N, K) shape.
+
+    scaleA side uses a unit scale inside the mainloop (0x7f = 1.0 in E8M0).
+    The reference uses scaleB only, with scaleA effectively 1.0.
+    """
+    MT0     = solution["MacroTile0"]
+    mPadded = math.ceil(M / MT0) * MT0
+    numWG   = math.ceil(M / MT0) * math.ceil(N / solution["MacroTile1"])
+
+    (aFortran, bFortran, cFortran, dFortran,
+     _scaleAPadded, scaleBBytes, scaleBRef, aKM, bKN, _scaleARef) = \
+        _make_inputs_ab_multik(M, N, K, mPadded)
+
+    if cMatrix is not None:
+        cFortran = np.asfortranarray(cMatrix.astype(np.float32))
+
+    c_ref = cMatrix if cMatrix is not None else np.zeros((M, N), dtype=np.float32)
+    # Unit scaleA (all 1.0): scaleA[m, kb] = 1.0 for all rows and K-blocks.
+    unitScaleARef = np.ones((M, K // 128), dtype=np.float32)
+    aMK  = np.asarray(aKM).T
+    dRef = numpy_ref_multiblock(aMK, np.asarray(bKN), unitScaleARef, scaleBRef,
+                                alpha, beta, c_ref)
+
+    epilogueArgs = [amdgpu_exec.InputArray(scaleBBytes.ravel())]
     dGpu = _execute_and_compare(solution, kernelName, hsaco, M, N, K, numWG,
                                 aFortran, bFortran, cFortran, dFortran,
                                 epilogueArgs, alpha, beta=beta)
@@ -534,11 +661,54 @@ def _run_shape_ab_multik(solution, kernelName, hsaco, chip, M, N, K,
     ids=[f"M{m}-N{n}-K{k}" for m, n, k in _TEST_SHAPES_MULTIK],
 )
 def test_deepseek_scale_ab_multik_shape(dsab_multik_kernel, M, N, K):
-    """Verify multi-K DeepseekScaleAB output: per-K-block fp32 scale via WMMA operand."""
+    """Verify multi-K DeepseekScaleAB output: per-K-block E8M0 scale via MFMA operand."""
     solution, kernelName, hsaco, chip = dsab_multik_kernel
     dGpu, dRef = _run_shape_ab_multik(solution, kernelName, hsaco, chip, M, N, K)
     label = (f"MT{solution['MacroTile0']}x{solution['MacroTile1']} "
              f"M={M} N={N} K={K}")
+    assertClose(dGpu[:M, :N], dRef[:M, :N], label, rtol=2e-2, atol=2e-2, kind="D_f32")
+
+
+@requires_gfx950
+@pytest.mark.parametrize(
+    "M,N,K",
+    _TEST_SHAPES_MULTIK,
+    ids=[f"M{m}-N{n}-K{k}" for m, n, k in _TEST_SHAPES_MULTIK],
+)
+def test_deepseek_scale_a_multik_shape(dsa_multik_kernel, M, N, K):
+    """Verify multi-K DeepseekScaleA-only: unit scaleB fallback path in MFMA operand."""
+    solution, kernelName, hsaco, chip = dsa_multik_kernel
+    dGpu, dRef = _run_shape_a_multik(solution, kernelName, hsaco, chip, M, N, K)
+    label = (f"MT{solution['MacroTile0']}x{solution['MacroTile1']} "
+             f"A-only multik M={M} N={N} K={K}")
+    assertClose(dGpu[:M, :N], dRef[:M, :N], label, rtol=2e-2, atol=2e-2, kind="D_f32")
+
+
+@requires_gfx950
+@pytest.mark.parametrize(
+    "M,N,K",
+    _TEST_SHAPES_MULTIK,
+    ids=[f"M{m}-N{n}-K{k}" for m, n, k in _TEST_SHAPES_MULTIK],
+)
+def test_deepseek_scale_b_multik_shape(dsb_multik_kernel, M, N, K):
+    """Verify multi-K DeepseekScaleB-only: unit scaleA fallback path in MFMA operand."""
+    solution, kernelName, hsaco, chip = dsb_multik_kernel
+    dGpu, dRef = _run_shape_b_multik(solution, kernelName, hsaco, chip, M, N, K)
+    label = (f"MT{solution['MacroTile0']}x{solution['MacroTile1']} "
+             f"B-only multik M={M} N={N} K={K}")
+    assertClose(dGpu[:M, :N], dRef[:M, :N], label, rtol=2e-2, atol=2e-2, kind="D_f32")
+
+
+@requires_gfx950
+def test_deepseek_scale_ab_multik_nonzero_beta(dsab_multik_kernel):
+    """Verify multi-K A+B: beta=0.5, non-zero C to exercise the beta*C addition."""
+    solution, kernelName, hsaco, chip = dsab_multik_kernel
+    M, N, K = 128, 128, 256
+    cMatrix = _make_nonzero_c(M, N, seed=55)
+    dGpu, dRef = _run_shape_ab_multik(solution, kernelName, hsaco, chip, M, N, K,
+                                      alpha=1.0, beta=0.5, cMatrix=cMatrix)
+    label = (f"MT{solution['MacroTile0']}x{solution['MacroTile1']} "
+             f"A+B multik beta=0.5 M={M} N={N} K={K}")
     assertClose(dGpu[:M, :N], dRef[:M, :N], label, rtol=2e-2, atol=2e-2, kind="D_f32")
 
 
