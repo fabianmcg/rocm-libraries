@@ -516,6 +516,54 @@ def _validateDeepseekScaleMultiK(state, printRejectionReason):
     return
 
 
+def _validateDeepseekScaleEpilogueModifiers(state, printRejectionReason):
+  """Reject epilogue modifiers incompatible with the DeepseekScale path.
+
+  The per-K-block scale is applied in the mainloop MFMA operand, so the
+  accumulator reaching the standard notLocalSplitUGlobalWrite epilogue is
+  already scaled. Purely-downstream modifiers (UseScaleAB, UseScaleAlphaVec,
+  UseScaleCD, UseScaleD, D-side UseBias, Activation, UseE) run on that
+  accumulator and are permitted. The modifiers below restructure the kernel
+  or the kernarg layout and are rejected. Returns True when a reject fired.
+  """
+  pt = state["ProblemType"]
+  if pt.get("Gradient", False):
+    reject(state, printRejectionReason,
+           "useDeepseekScale does not support Gradient (fused backward path "
+           "restructures the epilogue and bypasses the mainloop scale)")
+    return True
+  if pt.get("OutputAmaxD", False):
+    reject(state, printRejectionReason,
+           "useDeepseekScale does not support OutputAmaxD (kernarg layout conflict)")
+    return True
+  if pt.get("UseBias", 0) != 0 and pt.get("BiasSrc", "D") != "D":
+    reject(state, printRejectionReason,
+           "useDeepseekScale supports only D-side bias (BiasSrc=D); A/B-side "
+           "bias reduction requires the gradient path")
+    return True
+  return False
+
+
+def _validateDeepseekScaleDepthU(state, printRejectionReason):
+  """Reject DepthU/DeepseekScaleBlockK geometry mismatches. Returns True on reject."""
+  # fp8 MFMA instruction spans 128 K-elements (instK=128): DepthU must be a
+  # non-zero multiple of 128 so the subtile geometry has a valid K-grid.
+  abPairA = state.get("_ABTilePairA", "")
+  depthU = state.get("DepthU", 0)
+  if abPairA == "AB_B8" and (depthU <= 0 or depthU % 128 != 0):
+    reject(state, printRejectionReason,
+           f"useDeepseekScale with fp8 A requires DepthU to be a positive multiple "
+           f"of 128 (got DepthU={depthU})")
+    return True
+  blockK = state.get("DeepseekScaleBlockK", 128)
+  if depthU != blockK:
+    reject(state, printRejectionReason,
+           f"useDeepseekScaleA/B requires DepthU == DeepseekScaleBlockK "
+           f"(got DepthU={depthU}, blockK={blockK})")
+    return True
+  return False
+
+
 def _validateDeepseekScale(state, printRejectionReason):
   """Validate UseDeepseekScaleA / UseDeepseekScaleB mainloop scale constraints.
 
@@ -550,28 +598,15 @@ def _validateDeepseekScale(state, printRejectionReason):
     reject(state, printRejectionReason,
            "useDeepseekScale requires StreamKForceDPOnly=1 (complete tiles, no K-split fixup)")
     return
-  # fp8 MFMA instruction spans 128 K-elements (instK=128): DepthU must be a
-  # non-zero multiple of 128 so the subtile geometry has a valid K-grid.
-  abPairA = state.get("_ABTilePairA", "")
-  if abPairA == "AB_B8":
-    depthU = state.get("DepthU", 0)
-    if depthU <= 0 or depthU % 128 != 0:
-      reject(state, printRejectionReason,
-             f"useDeepseekScale with fp8 A requires DepthU to be a positive multiple "
-             f"of 128 (got DepthU={depthU})")
-      return
-  blockK = state.get("DeepseekScaleBlockK", 128)
-  depthU = state.get("DepthU", 0)
-  if depthU != blockK:
-    reject(state, printRejectionReason,
-           f"useDeepseekScaleA/B requires DepthU == DeepseekScaleBlockK "
-           f"(got DepthU={depthU}, blockK={blockK})")
+  if _validateDeepseekScaleDepthU(state, printRejectionReason):
     return
   for flag in ("TileQuant", "RstdScale", "PartialRMS"):
     if state.get(flag, False):
       reject(state, printRejectionReason,
              f"useDeepseekScale is mutually exclusive with {flag}")
       return
+  if _validateDeepseekScaleEpilogueModifiers(state, printRejectionReason):
+    return
   # Only the mainloop path (PGR=0) is supported; the epilogue path was removed.
   if state.get("PrefetchGlobalRead", 1) != 0:
     reject(state, printRejectionReason,
