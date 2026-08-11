@@ -1415,11 +1415,11 @@ def mainLoop(writer, kernel):
       module.add(VMovB32(dst=vgpr(unitScaleVgpr), src=hex(0x7f7f7f7f),
                          comment="unit scale=1.0 (E8M0) for plain FP8 MFMA"))
       kernel["_subtileUnitScaleVgpr"] = unitScaleVgpr
-  # Deepseek mainloop scale (PGR=0 only): alloc VGPRs/SGPRs, precompute vaddrs.
+  # Deepseek mainloop scale (PGR=0 and PGR=1): alloc VGPRs/SGPRs, precompute vaddrs.
   # The v_mfma_scale_f32_16x16x128_f8f6f4 instruction applies per-lane E8M0 scaleA
   # and uniform scaleB inline during each MFMA, one K-block at a time.
   useDeepseekScale = kernel.get("UseDeepseekScaleA", False) or kernel.get("UseDeepseekScaleB", False)
-  if useDeepseekScale and pgr == 0:
+  if useDeepseekScale and pgr in (0, 1):
       from .SubtileDeepseekScaleEmit import setupDeepseekMainloopScale
       mma_m = tiA.localMMATileGrid[0]
       setupDeepseekMainloopScale(module, writer, kernel, mma_m)

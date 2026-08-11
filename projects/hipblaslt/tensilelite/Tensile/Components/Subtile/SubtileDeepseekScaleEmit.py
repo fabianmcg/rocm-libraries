@@ -18,7 +18,7 @@ Scale buffer layouts (E8M0, 1 byte per element):
   scaleA: shape [M, nKBlocks].
   scaleB: shape [nKBlocks, ceil(N/128)].
 
-Application (mainloop, PGR=0): scaleA and scaleB are passed as mxsa/mxsb
+Application (mainloop, PGR=0 and PGR=1): scaleA and scaleB are passed as mxsa/mxsb
   operands to v_mfma_scale_f32_16x16x128_f8f6f4, applied inline per K-block
   iteration.
 
@@ -100,7 +100,8 @@ def _computeScaleAVaddrs(module, writer, kernel, dml, mma_m, mfma_m, wg_m, macro
     Scale is E8M0: 1 byte per (row, K-block) entry, so the byte offset is
     row * nKBlocks + kbOffset (kbOffset advances by 1 each iteration).
     """
-    # nKBlocks = LoopCounterL (PGR=0: LoopCounterL == nKBlocks initially).
+    # nKBlocks = LoopCounterL at setup time (holds for PGR=0 and PGR=1: the
+    # counter starts at nKBlocks before the loop counts it down).
     nkb_vgpr = writer.vgprPool.checkOut(1, tag="dml_nkb")
     module.add(VMovB32(dst=vgpr(nkb_vgpr), src=sgpr("LoopCounterL"),
                        comment="nKBlocks = LoopCounterL (E8M0: 1 byte per K-block)."))
@@ -154,7 +155,7 @@ def setupDeepseekMainloopScale(module, writer, kernel, mma_m):
     Uses flat_load (no buffer SRD) to avoid SGPR pressure in StreamK kernels.
     Emits preloop setup code into module and stores VGPR/SGPR indices in
     kernel["_deepseekML"] for use by emitDeepseekScaleGR and emit_mfma.
-    Called from mainLoop() only when PrefetchGlobalRead == 0.
+    Called from mainLoop() when PrefetchGlobalRead is 0 or 1.
 
     kbBOffset and nNBlocksStride are VGPRs (not SGPRs) to keep SGPR pressure low.
     A single shared 2-SGPR pair (sharedBufPtrSgpr) is loaded each iteration with
@@ -271,7 +272,8 @@ def emitDeepseekScaleGR(writer, kernel):
 
     Loads one E8M0 byte per scaleA row and one E8M0 byte per scaleB N-block.
     Uses flat_load to avoid requiring 4-aligned SGPR SRDs (which are scarce in
-    StreamK kernels). Called once per main loop iteration for PGR=0 Deepseek kernels.
+    StreamK kernels). Called once per consuming K-block iteration (each mainloop
+    unroll copy, and the NLL for PGR=1).
 
     The post-loop store-SGPR symbols (sgprScaleABuf, sgprScaleBBuf) are only defined
     in the post-loop section and cannot be referenced in the mainloop. Instead, a
@@ -313,10 +315,13 @@ def emitDeepseekScaleGR(writer, kernel):
                       dml["scaleBVaddr"], vgpr(dml["kbBOffset"]), dml["scaleBVgpr"],
                       "scaleB[kb, WG1_block].")
 
-    # vlcnt=0 drains only the scale flat_loads issued above. This is a no-op at
-    # PGR=0 because no data buffer_loads are in flight yet. Do not reorder data
-    # GRs to precede this block — that would drain them here too, serialising
-    # scale and data loads and eliminating load-MFMA overlap.
+    # vlcnt=0 drains the scale flat_loads plus the current K-block's in-flight
+    # data prefetch. At PGR=0 no data loads are in flight, so it only waits for
+    # the scale. At PGR=1 the lookahead is 1 K-block deep, so it waits for this
+    # iteration's own data (needed before its MFMAs anyway) while the NEXT
+    # K-block's prefetch, issued after this block, still overlaps the MFMAs. Do
+    # not reorder later data GRs before this block — that would drain them here
+    # too and serialise the pipeline.
     module.add(SWaitCnt(vlcnt=0, comment="wait for Deepseek scale flat_loads."))
 
     # Broadcast the loaded E8M0 byte to all 4 byte positions of each scale VGPR.

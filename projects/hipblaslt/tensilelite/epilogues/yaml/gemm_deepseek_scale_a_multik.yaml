@@ -47,7 +47,7 @@ BenchmarkProblems:
         - StreamKAtomic: [0]
         - GlobalSplitU: [1]
         - ScheduleIterAlg: [3]
-        - PrefetchGlobalRead: [0]
+        - PrefetchGlobalRead: [0, 1]
         - PrefetchAcrossPersistent: [0]
         - DirectToLds: [1]
         - UseSubtileImpl: [True]

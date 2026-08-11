@@ -493,7 +493,7 @@ def _validateTileQuant(state, printRejectionReason):
 def _validateDeepseekScaleMultiK(state, printRejectionReason):
   """Validate additional constraints for the Deepseek multi-K mainloop path.
 
-  This path is active when PrefetchGlobalRead == 0 and DepthU == DeepseekScaleBlockK.
+  This path is active when PrefetchGlobalRead in (0, 1) and DepthU == DeepseekScaleBlockK.
   The mainloop loads one scaleA/scaleB value per K-block iteration; several
   microarchitectural limits apply only in this mode.
   """
@@ -607,10 +607,13 @@ def _validateDeepseekScale(state, printRejectionReason):
       return
   if _validateDeepseekScaleEpilogueModifiers(state, printRejectionReason):
     return
-  # Only the mainloop path (PGR=0) is supported; the epilogue path was removed.
-  if state.get("PrefetchGlobalRead", 1) != 0:
+  # Mainloop scale path supports PGR=0 (no prefetch) and PGR=1 (1-deep data
+  # prefetch; scale is loaded per K-block in each unroll copy and the NLL).
+  # PGR>=2 is unsupported: it adds NGLL consuming loops and 2-deep lookahead
+  # that the per-iteration scale drain does not handle.
+  if state.get("PrefetchGlobalRead", 1) not in (0, 1):
     reject(state, printRejectionReason,
-           "useDeepseekScale requires PrefetchGlobalRead=0 (mainloop scale path)")
+           "useDeepseekScale supports only PrefetchGlobalRead=0 or 1 (mainloop scale path)")
     return
   _validateDeepseekScaleMultiK(state, printRejectionReason)
 
