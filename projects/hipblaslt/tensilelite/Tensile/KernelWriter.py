@@ -5241,12 +5241,6 @@ class KernelWriter(metaclass=abc.ABCMeta):
         tqEmitter = SubtileTileQuantEmitter(self, kernel)
         module.add(tqEmitter.emit(dtileInfo.vgprTiles))
 
-      if kernel.get("UseDeepseekScaleA", False) or kernel.get("UseDeepseekScaleB", False):
-        from .Components.Subtile.SubtileDeepseekScaleEmit import SubtileDeepseekScaleEmitter
-        module.addComment1("DeepseekScale: fp8 dequantization scale epilogue.")
-        dsEmitter = SubtileDeepseekScaleEmitter(self, kernel)
-        module.add(dsEmitter.emit(dtileInfo.vgprTiles))
-
       # global write indices
       module.addComment1("not-LocalSplitU: global write indices")
       module.add(self.notLocalSplitUGlobalWriteIndices(kernel))

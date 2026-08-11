@@ -1,7 +1,7 @@
 # Copyright Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier: MIT
 #
-# Client integration-test YAML covering all three Deepseek-scale epilogue modes:
+# Client integration-test YAML covering the three Deepseek-scale multi-K mainloop (PGR=0) modes:
 #   A-only: D = alpha * scaleA[m] * acc[m,n] + beta*C
 #   B-only: D = alpha * scaleB[n//128] * acc[m,n] + beta*C
 #   A+B:    D = alpha * scaleA[m] * scaleB[n//128] * acc[m,n] + beta*C
@@ -17,168 +17,7 @@ GlobalParameters:
 
 BenchmarkProblems:
   # --------------------------------------------------------------------------
-  # Mode 0 — DeepseekScaleA only.
-  # --------------------------------------------------------------------------
-  -
-    - # ProblemType
-      OperationType: GEMM
-      DataType: F8
-      DestDataType: S
-      ComputeDataType: s
-      HighPrecisionAccumulate: True
-      TransposeA: True
-      TransposeB: False
-      UseBeta: True
-      Batched: True
-      StridedBatched: True
-      GroupedGemm: False
-      UseBias: 0
-      UseScaleAB: ""
-      UseScaleCD: False
-      UseScaleAlphaVec: 0
-      UseScaleD: False
-      Sparse: 0
-      UseDeepseekScaleA: True
-
-    - BenchmarkCommonParameters:
-        - KernelLanguage: ["Assembly"]
-      ForkParameters:
-        - MatrixInstruction:
-            - [16, 16, 128, 1, 1, 4, 8, 1, 1]   # MT0=64  MT1=128  wg0=1 wg1=1
-        - UseDeepseekScaleA: [True]
-        - DeepseekScaleBlockK: [128]
-        - StreamK: [3]
-        - StreamKForceDPOnly: [1]
-        - StreamKAtomic: [0]
-        - GlobalSplitU: [1]
-        - ScheduleIterAlg: [3]
-        - PrefetchGlobalRead: [1]
-        - PrefetchAcrossPersistent: [0]
-        - DirectToLds: [1]
-        - UseSubtileImpl: [True]
-        - StaggerU: [0]
-        - DepthU: [128]
-        - LdsPadA: [-1]
-        - LdsPadB: [-1]
-        - StoreVectorWidth: [-1]
-        - GlobalReadVectorWidthA: [-1]
-        - GlobalReadVectorWidthB: [-1]
-        - PreloadKernArgs: [False]
-        - 1LDSBuffer: [0]
-      BenchmarkFinalParameters:
-        - ProblemSizes:
-            - Exact: [128, 128, 1, 128]
-
-  # --------------------------------------------------------------------------
-  # Mode 1 — DeepseekScaleB only.
-  # --------------------------------------------------------------------------
-  -
-    - # ProblemType
-      OperationType: GEMM
-      DataType: F8
-      DestDataType: S
-      ComputeDataType: s
-      HighPrecisionAccumulate: True
-      TransposeA: True
-      TransposeB: False
-      UseBeta: True
-      Batched: True
-      StridedBatched: True
-      GroupedGemm: False
-      UseBias: 0
-      UseScaleAB: ""
-      UseScaleCD: False
-      UseScaleAlphaVec: 0
-      UseScaleD: False
-      Sparse: 0
-      UseDeepseekScaleB: True
-
-    - BenchmarkCommonParameters:
-        - KernelLanguage: ["Assembly"]
-      ForkParameters:
-        - MatrixInstruction:
-            - [16, 16, 128, 1, 1, 4, 8, 1, 1]   # MT0=64  MT1=128  wg0=1 wg1=1
-        - UseDeepseekScaleB: [True]
-        - DeepseekScaleBlockK: [128]
-        - StreamK: [3]
-        - StreamKForceDPOnly: [1]
-        - StreamKAtomic: [0]
-        - GlobalSplitU: [1]
-        - ScheduleIterAlg: [3]
-        - PrefetchGlobalRead: [1]
-        - PrefetchAcrossPersistent: [0]
-        - DirectToLds: [1]
-        - UseSubtileImpl: [True]
-        - StaggerU: [0]
-        - DepthU: [128]
-        - LdsPadA: [-1]
-        - LdsPadB: [-1]
-        - StoreVectorWidth: [-1]
-        - GlobalReadVectorWidthA: [-1]
-        - GlobalReadVectorWidthB: [-1]
-        - PreloadKernArgs: [False]
-        - 1LDSBuffer: [0]
-      BenchmarkFinalParameters:
-        - ProblemSizes:
-            - Exact: [128, 128, 1, 128]
-
-  # --------------------------------------------------------------------------
-  # Mode 2 — DeepseekScaleA + DeepseekScaleB combined.
-  # --------------------------------------------------------------------------
-  -
-    - # ProblemType
-      OperationType: GEMM
-      DataType: F8
-      DestDataType: S
-      ComputeDataType: s
-      HighPrecisionAccumulate: True
-      TransposeA: True
-      TransposeB: False
-      UseBeta: True
-      Batched: True
-      StridedBatched: True
-      GroupedGemm: False
-      UseBias: 0
-      UseScaleAB: ""
-      UseScaleCD: False
-      UseScaleAlphaVec: 0
-      UseScaleD: False
-      Sparse: 0
-      UseDeepseekScaleA: True
-      UseDeepseekScaleB: True
-
-    - BenchmarkCommonParameters:
-        - KernelLanguage: ["Assembly"]
-      ForkParameters:
-        - MatrixInstruction:
-            - [16, 16, 128, 1, 1, 4, 8, 1, 1]   # MT0=64  MT1=128  wg0=1 wg1=1
-        - UseDeepseekScaleA: [True]
-        - UseDeepseekScaleB: [True]
-        - DeepseekScaleBlockK: [128]
-        - StreamK: [3]
-        - StreamKForceDPOnly: [1]
-        - StreamKAtomic: [0]
-        - GlobalSplitU: [1]
-        - ScheduleIterAlg: [3]
-        - PrefetchGlobalRead: [1]
-        - PrefetchAcrossPersistent: [0]
-        - DirectToLds: [1]
-        - UseSubtileImpl: [True]
-        - StaggerU: [0]
-        - DepthU: [128]
-        - LdsPadA: [-1]
-        - LdsPadB: [-1]
-        - StoreVectorWidth: [-1]
-        - GlobalReadVectorWidthA: [-1]
-        - GlobalReadVectorWidthB: [-1]
-        - PreloadKernArgs: [False]
-        - 1LDSBuffer: [0]
-      BenchmarkFinalParameters:
-        - ProblemSizes:
-            - Exact: [128, 128, 1, 128]
-
-  # --------------------------------------------------------------------------
-  # Mode 3 — DeepseekScaleA only, multi-K mainloop (PGR=0).
+  # Mode 0 — DeepseekScaleA only, multi-K mainloop (PGR=0).
   # --------------------------------------------------------------------------
   -
     - # ProblemType
@@ -233,7 +72,7 @@ BenchmarkProblems:
             - Exact: [128, 128, 1, 256]
 
   # --------------------------------------------------------------------------
-  # Mode 4 — DeepseekScaleB only, multi-K mainloop (PGR=0).
+  # Mode 1 — DeepseekScaleB only, multi-K mainloop (PGR=0).
   # --------------------------------------------------------------------------
   -
     - # ProblemType
@@ -288,7 +127,7 @@ BenchmarkProblems:
             - Exact: [128, 128, 1, 256]
 
   # --------------------------------------------------------------------------
-  # Mode 5 — DeepseekScaleA + DeepseekScaleB combined, multi-K mainloop (PGR=0).
+  # Mode 2 — DeepseekScaleA + DeepseekScaleB combined, multi-K mainloop (PGR=0).
   # --------------------------------------------------------------------------
   -
     - # ProblemType

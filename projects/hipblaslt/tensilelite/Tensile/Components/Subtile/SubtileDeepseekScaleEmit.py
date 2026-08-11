@@ -1,6 +1,6 @@
 # Copyright Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier: MIT
-"""DeepseekScale fused epilogue emitter for the Subtile kernel (gfx950, fp8 in / f32 out).
+"""DeepseekScale mainloop scale emitter for the Subtile kernel (gfx950, fp8 in / f32 out).
 
 Applies per-row E8M0 scaleA and/or per-128col-block E8M0 scaleB to the fp32
 GEMM accumulator (AGPRs). Scale buffers hold one UE8M0 byte per element; the
@@ -15,14 +15,12 @@ If only scaleA: scaleB factor is omitted (unit scale applied via 0x7f byte).
 If only scaleB: scaleA factor is omitted (unit scale applied via 0x7f byte).
 
 Scale buffer layouts (E8M0, 1 byte per element):
-  scaleA: shape [M, nKBlocks] for multi-K (PGR=0) or [M, 1] for epilogue (PGR=1).
+  scaleA: shape [M, nKBlocks].
   scaleB: shape [nKBlocks, ceil(N/128)].
 
-Two application modes:
-  PGR=0 (mainloop): scaleA and scaleB are passed as mxsa/mxsb operands to
-    v_mfma_scale_f32_16x16x128_f8f6f4, applied inline per K-block iteration.
-  PGR=1 (epilogue): accumulated fp32 result is multiplied by decoded scale
-    values after the MFMA loop, before the alpha/beta store.
+Application (mainloop, PGR=0): scaleA and scaleB are passed as mxsa/mxsb
+  operands to v_mfma_scale_f32_16x16x128_f8f6f4, applied inline per K-block
+  iteration.
 
 MFMA output accumulator layout (gfx950, waveSize=64, 16x16 MFMA):
   lane % mfma_n = N-column within MMA tile.
@@ -36,8 +34,6 @@ MFMA A-input lane distribution (strided M, standard AMD ISA):
   A-input row for lane l = l % mfma_m.
   All mfma_m groups of (wave_size / mfma_m) lanes share K-segment (l // mfma_m).
   For v_mfma_scale: scale_a[l] must equal scaleA[l % mfma_m, kb].
-  The single-K epilogue uses the accumulator row_group (l // mfma_n) instead,
-  because it applies scale post-MFMA to the output accumulator elements.
 
 N-block assignment (compile-time): each accumulator tile position n maps to
   local_n_block = (n * mfma_n) // 128.
@@ -49,34 +45,24 @@ import math as _math
 
 from rocisa.code import Module
 from rocisa.container import (
-    ContinuousRegister,
-    MUBUFModifiers,
     VCC,
-    accvgpr,
     sgpr,
     vgpr,
 )
-from rocisa.functions import vectorStaticDivide
 from rocisa.instruction import (
-    BufferLoadU8,
     FlatLoadD16U8,
     SAddU32,
     SLShiftRightB32,
     SLoadB64,
     SMulI32,
     SMovB32,
-    SMovB64,
     SWaitCnt,
-    VAccvgprReadB32,
-    VAccvgprWriteB32,
     VAddCCOU32,
     VAddCOU32,
     VAddU32,
     VAndB32,
-    VLShiftLeftB32,
     VLShiftRightB32,
     VMovB32,
-    VMulF32,
     VMulLOU32,
     VReadfirstlaneB32,
 )
@@ -367,424 +353,3 @@ def emitDeepseekScaleGR(writer, kernel):
                            comment="kbBOffset += nNBlocksStride (next K-block scaleB offset)."))
     return module
 
-
-class SubtileDeepseekScaleEmitter:
-    """Emit the DeepseekScale epilogue for the Subtile gfx950 fp8 kernel.
-
-    Supports UseDeepseekScaleA only, UseDeepseekScaleB only, or both.
-    """
-
-    def __init__(self, writer, kernel):
-        self.writer   = writer
-        self.kernel   = kernel
-
-        self.use_a = kernel.get("UseDeepseekScaleA", False)
-        self.use_b = kernel.get("UseDeepseekScaleB", False)
-
-        self.mfma_m        = kernel["MatrixInstM"]
-        self.mfma_n        = kernel["MatrixInstN"]
-        self.wave_size     = kernel["WavefrontSize"]
-        self.rows_per_lane = (self.mfma_m * self.mfma_n) // self.wave_size
-
-        wg = kernel["MIWaveGroup"]
-        self.wg_m, self.wg_n = wg[0], wg[1]
-
-        self.mma_m       = (kernel["MacroTile0"] // self.mfma_m) // self.wg_m
-        self.mma_n       = (kernel["MacroTile1"] // self.mfma_n) // self.wg_n
-        self.macro_tile0 = kernel["MacroTile0"]
-        self.macro_tile1 = kernel["MacroTile1"]
-        self.num_rows    = self.mma_m * self.rows_per_lane
-
-    # ------------------------------------------------------------------ #
-    # Accumulator read/write helpers.                                      #
-    # ------------------------------------------------------------------ #
-
-    def _readAccInto(self, module, dst: int, vgprTiles, m: int, n: int, k: int,
-                     comment: str) -> None:
-        """Copy accumulator element (m, n, k) into VGPR dst."""
-        tile = vgprTiles[n * self.mma_m + m]
-        reg  = tile.regList.indices[k]
-        if tile.regList.pool == self.writer.vgprPool:
-            module.add(VMovB32(dst=vgpr(dst), src=vgpr(reg), comment=comment))
-            return
-        module.add(VAccvgprReadB32(vgpr(dst), accvgpr(reg), comment=comment))
-
-    def _writeAccFrom(self, module, src: int, vgprTiles, m: int, n: int, k: int,
-                      comment: str) -> None:
-        """Write VGPR src back into accumulator element (m, n, k)."""
-        tile = vgprTiles[n * self.mma_m + m]
-        reg  = tile.regList.indices[k]
-        if tile.regList.pool == self.writer.vgprPool:
-            module.add(VMovB32(dst=vgpr(reg), src=vgpr(src), comment=comment))
-            return
-        module.add(VAccvgprWriteB32(accvgpr(reg), vgpr(src), comment=comment))
-
-    def _partialIdx(self, m: int, k: int) -> int:
-        """Index into scale_a_vgprs for M-tile m, row-offset k."""
-        return m * self.rows_per_lane + k
-
-    # ------------------------------------------------------------------ #
-    # ScaleA helpers (per-row).                                            #
-    # ------------------------------------------------------------------ #
-
-    def _computeWaveM(self, module, dst: int) -> None:
-        """Compute waveM = waveId % wg_m into VGPR dst."""
-        waveId  = self.writer.vgprPool.checkOut(1, tag="dsa_waveId")
-        tmpVgpr = self.writer.vgprPool.checkOutAligned(2, 2, tag="dsa_waveMDiv")
-        tmpRes  = ContinuousRegister(tmpVgpr, 2)
-        module.add(vectorStaticDivide(waveId, "Serial", self.wave_size, tmpRes,
-                                      comment="waveId = Serial / WavefrontSize."))
-        # wg_m is always a power of 2 (format9 constraint), so AND with wg_m-1 gives the modulo.
-        module.add(VAndB32(dst=vgpr(dst), src0=vgpr(waveId), src1=self.wg_m - 1,
-                           comment=f"waveM = waveId % {self.wg_m}."))
-        self.writer.vgprPool.checkIn(tmpVgpr)
-        self.writer.vgprPool.checkIn(waveId)
-
-    def _buildScaleASrd(self, module, srd: int) -> None:
-        """Load a 128-bit buffer descriptor for ScaleABuf into SGPRs [srd, srd+3]."""
-        module.add(SMovB64(dst=sgpr(srd, 2), src=sgpr("ScaleABuf", 2),
-                           comment="scaleABuf SRD base."))
-        module.add(SMovB32(dst=sgpr(srd + 2), src="BufferOOB",
-                           comment="scaleABuf SRD limit."))
-        module.add(SMovB32(dst=sgpr(srd + 3), src="Srd127_96",
-                           comment="scaleABuf SRD flags."))
-
-    def _computeRowBase(self, module, dst: int) -> None:
-        """Compute row_base = WorkGroup0*MT0 + waveM*mma_m*mfma_m into VGPR dst.
-
-        The wave M offset is added when wg_m > 1 so each wave addresses its own
-        row region in scaleA.
-        """
-        mt0V = self.writer.vgprPool.checkOut(1, tag="dsa_rbMT0")
-        module.add(VMovB32(dst=vgpr(mt0V), src=self.macro_tile0,
-                           comment=f"MT0={self.macro_tile0}."))
-        module.add(VMulLOU32(dst=vgpr(dst), src0=vgpr(mt0V), src1=sgpr("WorkGroup0"),
-                             comment="rowBase = WorkGroup0 * MT0."))
-        self.writer.vgprPool.checkIn(mt0V)
-        if self.wg_m == 1:
-            return
-        waveM    = self.writer.vgprPool.checkOut(1, tag="dsa_rbWaveM")
-        strideV  = self.writer.vgprPool.checkOut(1, tag="dsa_rbStride")
-        self._computeWaveM(module, waveM)
-        waveStride = self.mma_m * self.mfma_m
-        module.add(VMovB32(dst=vgpr(strideV), src=waveStride,
-                           comment=f"waveStride = mma_m * mfma_m = {waveStride}."))
-        module.add(VMulLOU32(dst=vgpr(waveM), src0=vgpr(strideV), src1=vgpr(waveM),
-                             comment="waveMOff = waveM * waveStride."))
-        module.add(VAddU32(vgpr(dst), vgpr(dst), vgpr(waveM),
-                           comment="rowBase += waveMOff."))
-        self.writer.vgprPool.checkIn(strideV)
-        self.writer.vgprPool.checkIn(waveM)
-
-    def _setupScaleA(self, scale_srd: int, row_base_vgpr: int, lane_id: int,
-                     row_group: int, row_group_byte: int) -> Module:
-        """Build ScaleABuf SRD, compute row_base, derive lane_id and row_group."""
-        module = Module("DeepseekScaleA setup")
-        self._buildScaleASrd(module, scale_srd)
-        self._computeRowBase(module, row_base_vgpr)
-
-        # lane_id = Serial & (wave_size - 1).
-        module.add(VAndB32(dst=vgpr(lane_id), src0=vgpr("Serial"), src1=self.wave_size - 1,
-                           comment="lane_id = Serial & (wave_size-1)."))
-
-        # row_group = lane_id >> log2(mfma_n).
-        log2_mfma_n = int(_math.log2(self.mfma_n))
-        module.add(VLShiftRightB32(
-            dst=vgpr(row_group),
-            shiftHex=hex(log2_mfma_n),
-            src=vgpr(lane_id),
-            comment=f"row_group = lane_id >> {log2_mfma_n} (= lane_id // {self.mfma_n}).",
-        ))
-
-        # row_group_byte = row_group * rows_per_lane (E8M0: 1 byte per row).
-        module.add(VMulLOU32(
-            dst=vgpr(row_group_byte),
-            src0=self.rows_per_lane,
-            src1=vgpr(row_group),
-            comment=f"row_group_byte = row_group * {self.rows_per_lane} (E8M0 byte stride).",
-        ))
-
-        return module
-
-    def _computeScaleAAddrBytes(self, module, global_addr: int, offset_tmp: int,
-                                 row_base_vgpr: int, row_group_byte: int,
-                                 m: int, k: int) -> None:
-        """Compute the byte address for E8M0 scaleA element (m, k) into global_addr.
-
-        Byte address = row_base + m*mfma_m + k + row_group * rows_per_lane.
-        E8M0 has 1 byte per row, so no shift is needed.
-        """
-        m_k_offset = m * self.mfma_m + k
-        module.add(VMovB32(dst=vgpr(global_addr), src=vgpr(row_base_vgpr),
-                           comment=f"global_addr = row_base for scaleA[m={m},k={k}]."))
-        if m_k_offset > 64:
-            module.add(VMovB32(dst=vgpr(offset_tmp), src=m_k_offset,
-                               comment=f"offset_tmp = {m_k_offset}."))
-            module.add(VAddU32(vgpr(global_addr), vgpr(global_addr), vgpr(offset_tmp),
-                               comment=f"global_addr += {m_k_offset} (m*mfmaM + k)."))
-        elif m_k_offset > 0:
-            module.add(VAddU32(vgpr(global_addr), vgpr(global_addr), m_k_offset,
-                               comment=f"global_addr += {m_k_offset} (m*mfmaM + k)."))
-        module.add(VAddU32(vgpr(global_addr), vgpr(global_addr), vgpr(row_group_byte),
-                           comment="global_addr += row_group * rows_per_lane (E8M0 byte offset)."))
-
-    def _loadScaleA(self, scale_srd: int, row_base_vgpr: int,
-                    row_group_byte: int, scale_vgprs: int) -> Module:
-        """Load E8M0 scaleA bytes from ScaleABuf and decode to fp32 in scale_vgprs."""
-        module = Module("DeepseekScaleA loadScaleA")
-        module.addComment1("DeepseekScaleA: load E8M0 scaleA bytes from ScaleABuf.")
-
-        global_addr = self.writer.vgprPool.checkOut(1, tag="dsa_globalAddr")
-        offset_tmp  = self.writer.vgprPool.checkOut(1, tag="dsa_offsetTmp")
-
-        for m in range(self.mma_m):
-            for k in range(self.rows_per_lane):
-                i = self._partialIdx(m, k)
-                self._computeScaleAAddrBytes(module, global_addr, offset_tmp,
-                                              row_base_vgpr, row_group_byte, m, k)
-                module.add(BufferLoadU8(
-                    dst=vgpr(scale_vgprs + i),
-                    vaddr=vgpr(global_addr),
-                    saddr=sgpr(scale_srd, 4),
-                    soffset=0,
-                    mubuf=MUBUFModifiers(offen=True),
-                    comment=f"scaleA[m={m},k={k}]: load E8M0 byte from ScaleABuf.",
-                ))
-
-        module.add(SWaitCnt(vlcnt=0, comment="wait for all scaleA byte loads."))
-
-        # Decode E8M0 to fp32: fp32 = byte << 23 (byte becomes the exponent field).
-        for m in range(self.mma_m):
-            for k in range(self.rows_per_lane):
-                i = self._partialIdx(m, k)
-                module.add(VLShiftLeftB32(
-                    dst=vgpr(scale_vgprs + i), shiftHex=hex(23), src=vgpr(scale_vgprs + i),
-                    comment=f"decode E8M0 to fp32 for scaleA[m={m},k={k}].",
-                ))
-
-        self.writer.vgprPool.checkIn(offset_tmp)
-        self.writer.vgprPool.checkIn(global_addr)
-        return module
-
-    def _applyScaleA(self, vgprTiles, scale_a_vgprs: int) -> Module:
-        """Multiply every accumulator element by the corresponding scaleA[row]."""
-        module = Module("DeepseekScaleA applyScaleA")
-        module.addComment1("DeepseekScaleA: multiply each acc element by scaleA[row].")
-
-        acc_tmp = self.writer.vgprPool.checkOut(1, tag="dsa_accTmp")
-
-        for m in range(self.mma_m):
-            for n in range(self.mma_n):
-                for k in range(self.rows_per_lane):
-                    ridx = scale_a_vgprs + self._partialIdx(m, k)
-                    self._readAccInto(module, acc_tmp, vgprTiles, m, n, k,
-                                      f"read acc[m={m},n={n},k={k}].")
-                    module.add(VMulF32(dst=vgpr(acc_tmp), src0=vgpr(acc_tmp),
-                                       src1=vgpr(ridx),
-                                       comment=f"acc *= scaleA[m={m},k={k}]."))
-                    self._writeAccFrom(module, acc_tmp, vgprTiles, m, n, k,
-                                       f"write acc[m={m},n={n},k={k}].")
-
-        self.writer.vgprPool.checkIn(acc_tmp)
-        return module
-
-    # ------------------------------------------------------------------ #
-    # ScaleB helpers (per-128col N-block).                                 #
-    # ------------------------------------------------------------------ #
-
-    def _computeNBlock(self, n: int) -> int:
-        """Return the compile-time local N-block index for accumulator tile position n.
-
-        For configs where the wave's N-span fits within 128 columns, this is
-        always 0. The caller adds the runtime WG1 base block to get the global index.
-        """
-        return (n * self.mfma_n) // 128
-
-    def _distinctNBlocks(self) -> list:
-        """Sorted list of distinct compile-time local N-block offsets in this wave."""
-        return sorted({self._computeNBlock(n) for n in range(self.mma_n)})
-
-    def _buildScaleBSrd(self, module, srd: int) -> None:
-        """Load a 128-bit buffer descriptor for ScaleBBuf into SGPRs [srd, srd+3]."""
-        module.add(SMovB64(dst=sgpr(srd, 2), src=sgpr("ScaleBBuf", 2),
-                           comment="scaleBBuf SRD base."))
-        module.add(SMovB32(dst=sgpr(srd + 2), src="BufferOOB",
-                           comment="scaleBBuf SRD limit."))
-        module.add(SMovB32(dst=sgpr(srd + 3), src="Srd127_96",
-                           comment="scaleBBuf SRD flags."))
-
-    def _loadScaleB(self, scale_b_srd: int, scaleB_vgprs: int) -> Module:
-        """Load E8M0 scaleB bytes from ScaleBBuf and decode to fp32 in scaleB_vgprs.
-
-        Each distinct local N-block offset maps to one VGPR slot. For all
-        existing configs (MT1=128, wave span <= 128), only slot 0 is populated
-        and the byte address is simply WorkGroup1 (E8M0: 1 byte per N-block).
-        """
-        module = Module("DeepseekScaleB loadScaleB")
-        module.addComment1("DeepseekScaleB: load E8M0 scaleB bytes from ScaleBBuf.")
-        self._buildScaleBSrd(module, scale_b_srd)
-
-        # mt1_blocks: number of 128-column scaleB blocks per WG tile (compile-time).
-        mt1_blocks = self.macro_tile1 // 128
-        distinct   = self._distinctNBlocks()
-        addr       = self.writer.vgprPool.checkOut(1, tag="dsb_addr")
-
-        for i, block_off in enumerate(distinct):
-            # Byte offset = WG1 * mt1_blocks + block_off (E8M0: 1 byte per N-block).
-            module.add(VMovB32(dst=vgpr(addr), src=sgpr("WorkGroup1"),
-                               comment=f"addr = WorkGroup1 (scaleB block off={block_off})."))
-            if mt1_blocks != 1:
-                module.add(VMulLOU32(dst=vgpr(addr), src0=vgpr(addr), src1=mt1_blocks,
-                                     comment=f"addr *= {mt1_blocks} (N-block index)."))
-            if block_off > 0:
-                module.add(VAddU32(vgpr(addr), vgpr(addr), block_off,
-                                   comment=f"addr += block_off={block_off}."))
-            module.add(BufferLoadU8(
-                dst=vgpr(scaleB_vgprs + i),
-                vaddr=vgpr(addr),
-                saddr=sgpr(scale_b_srd, 4),
-                soffset=0,
-                mubuf=MUBUFModifiers(offen=True),
-                comment=f"scaleB[WG1*{mt1_blocks}+{block_off}]: load E8M0 byte from ScaleBBuf.",
-            ))
-
-        module.add(SWaitCnt(vlcnt=0, comment="wait for all scaleB byte loads."))
-
-        # Decode E8M0 to fp32: fp32 = byte << 23 (byte becomes the exponent field).
-        for i in range(len(distinct)):
-            module.add(VLShiftLeftB32(
-                dst=vgpr(scaleB_vgprs + i), shiftHex=hex(23), src=vgpr(scaleB_vgprs + i),
-                comment=f"decode E8M0 to fp32 for scaleB[{i}].",
-            ))
-
-        self.writer.vgprPool.checkIn(addr)
-        return module
-
-    def _applyScaleB(self, vgprTiles, scaleB_vgprs: int) -> Module:
-        """Multiply every accumulator element by scaleB[n-block]."""
-        module = Module("DeepseekScaleB applyScaleB")
-        module.addComment1("DeepseekScaleB: multiply each acc element by scaleB[n-block].")
-
-        distinct = self._distinctNBlocks()
-        acc_tmp  = self.writer.vgprPool.checkOut(1, tag="dsb_accTmp")
-
-        for m in range(self.mma_m):
-            for b_idx, block_off in enumerate(distinct):
-                ns = [n for n in range(self.mma_n) if self._computeNBlock(n) == block_off]
-                for n in ns:
-                    for k in range(self.rows_per_lane):
-                        self._readAccInto(module, acc_tmp, vgprTiles, m, n, k,
-                                          f"read acc[m={m},n={n},k={k}].")
-                        module.add(VMulF32(dst=vgpr(acc_tmp), src0=vgpr(acc_tmp),
-                                           src1=vgpr(scaleB_vgprs + b_idx),
-                                           comment=f"acc *= scaleB[block={block_off}]."))
-                        self._writeAccFrom(module, acc_tmp, vgprTiles, m, n, k,
-                                           f"write acc[m={m},n={n},k={k}].")
-
-        self.writer.vgprPool.checkIn(acc_tmp)
-        return module
-
-    def _applyScaleAB(self, vgprTiles, scale_a_vgprs: int, scaleB_vgprs: int) -> Module:
-        """Multiply every acc element by scaleA[row] * scaleB[n-block].
-
-        The product is precomputed per (m, k, block) triple and reused across
-        all n tile positions mapping to the same block.
-        """
-        module = Module("DeepseekScaleAB applyScaleAB")
-        module.addComment1("DeepseekScaleAB: acc *= scaleA[row] * scaleB[n-block].")
-
-        distinct = self._distinctNBlocks()
-        acc_tmp  = self.writer.vgprPool.checkOut(1, tag="dsab_accTmp")
-        combined = self.writer.vgprPool.checkOut(1, tag="dsab_combined")
-
-        for m in range(self.mma_m):
-            for k in range(self.rows_per_lane):
-                a_ridx = scale_a_vgprs + self._partialIdx(m, k)
-                for b_idx, block_off in enumerate(distinct):
-                    ns = [n for n in range(self.mma_n) if self._computeNBlock(n) == block_off]
-                    # Precompute combined scale = scaleA[m,k] * scaleB[block].
-                    module.add(VMulF32(dst=vgpr(combined), src0=vgpr(a_ridx),
-                                       src1=vgpr(scaleB_vgprs + b_idx),
-                                       comment=f"combined = scaleA[m={m},k={k}]*scaleB[{block_off}]."))
-                    for n in ns:
-                        self._readAccInto(module, acc_tmp, vgprTiles, m, n, k,
-                                          f"read acc[m={m},n={n},k={k}].")
-                        module.add(VMulF32(dst=vgpr(acc_tmp), src0=vgpr(acc_tmp),
-                                           src1=vgpr(combined),
-                                           comment=f"acc *= combined scale."))
-                        self._writeAccFrom(module, acc_tmp, vgprTiles, m, n, k,
-                                           f"write acc[m={m},n={n},k={k}].")
-
-        self.writer.vgprPool.checkIn(combined)
-        self.writer.vgprPool.checkIn(acc_tmp)
-        return module
-
-    # ------------------------------------------------------------------ #
-    # Main emit entry point.                                               #
-    # ------------------------------------------------------------------ #
-
-    def _loadScales(self) -> tuple:
-        """Load scaleA and/or scaleB from global memory into VGPRs.
-
-        SRDs and address-computation temporaries are freed immediately after
-        the loads complete to minimise register pressure during apply.
-        Returns (module, scale_a_vgprs_or_None, scale_b_vgprs_or_None).
-        """
-        module = Module("DeepseekScale load scales")
-        scale_a_vgprs = None
-        if self.use_a:
-            scale_a_vgprs  = self.writer.vgprPool.checkOut(self.num_rows, tag="dsa_scaleVgprs")
-            lane_id        = self.writer.vgprPool.checkOut(1,             tag="dsa_laneId")
-            row_group      = self.writer.vgprPool.checkOut(1,             tag="dsa_rowGroup")
-            row_group_byte = self.writer.vgprPool.checkOut(1,             tag="dsa_rowGroupByte")
-            row_base_vgpr  = self.writer.vgprPool.checkOut(1,             tag="dsa_rowBase")
-            srd_a = self.writer.sgprPool.checkOutAligned(4, 4, tag="dsa_scaleASrd")
-            module.add(self._setupScaleA(srd_a, row_base_vgpr, lane_id,
-                                         row_group, row_group_byte))
-            module.add(self._loadScaleA(srd_a, row_base_vgpr, row_group_byte, scale_a_vgprs))
-            self.writer.sgprPool.checkIn(srd_a)
-            self.writer.vgprPool.checkIn(row_base_vgpr)
-            self.writer.vgprPool.checkIn(row_group_byte)
-            self.writer.vgprPool.checkIn(row_group)
-            self.writer.vgprPool.checkIn(lane_id)
-        scale_b_vgprs = None
-        if self.use_b:
-            num_b = len(self._distinctNBlocks())
-            scale_b_vgprs = self.writer.vgprPool.checkOut(num_b, tag="dsb_scaleVgprs")
-            srd_b = self.writer.sgprPool.checkOutAligned(4, 4, tag="dsb_scaleBSrd")
-            module.add(self._loadScaleB(srd_b, scale_b_vgprs))
-            self.writer.sgprPool.checkIn(srd_b)
-        return module, scale_a_vgprs, scale_b_vgprs
-
-    def _applyAndFree(self, vgprTiles, scale_a_vgprs, scale_b_vgprs) -> Module:
-        """Dispatch to the correct scale-apply path then release all scale VGPRs."""
-        module = Module("DeepseekScale apply and free")
-        if self.use_a and self.use_b:
-            module.add(self._applyScaleAB(vgprTiles, scale_a_vgprs, scale_b_vgprs))
-        elif self.use_a:
-            module.add(self._applyScaleA(vgprTiles, scale_a_vgprs))
-        else:
-            module.add(self._applyScaleB(vgprTiles, scale_b_vgprs))
-        if self.use_b:
-            self.writer.vgprPool.checkIn(scale_b_vgprs)
-        if self.use_a:
-            self.writer.vgprPool.checkIn(scale_a_vgprs)
-        return module
-
-    def emit(self, vgprTiles) -> Module:
-        """Return the full DeepseekScale epilogue module.
-
-        Handles UseDeepseekScaleA only, UseDeepseekScaleB only, and A+B.
-        vgprTiles: dtileInfo.vgprTiles, the per-tile allocator records for D.
-        When the mainloop handles scaling (PGR=0 path, kernel has _deepseekML),
-        the epilogue is a no-op — the WMMA instruction already applied the scales.
-        """
-        if self.kernel.get("_deepseekML"):
-            return Module("DeepseekScale epilogue (skipped: mainloop path active)")
-        module = Module("DeepseekScale epilogue")
-        module.addComment1("DeepseekScale: fp8 dequantization scale epilogue.")
-        module.add(SWaitCnt(waitAll=True, comment="flush MFMA pipeline before DeepseekScale."))
-        load_module, scale_a_vgprs, scale_b_vgprs = self._loadScales()
-        module.add(load_module)
-        module.add(self._applyAndFree(vgprTiles, scale_a_vgprs, scale_b_vgprs))
-        return module

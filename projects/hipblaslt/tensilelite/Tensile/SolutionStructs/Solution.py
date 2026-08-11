@@ -517,7 +517,7 @@ def _validateDeepseekScaleMultiK(state, printRejectionReason):
 
 
 def _validateDeepseekScale(state, printRejectionReason):
-  """Validate UseDeepseekScaleA / UseDeepseekScaleB fused epilogue constraints.
+  """Validate UseDeepseekScaleA / UseDeepseekScaleB mainloop scale constraints.
 
   Both scale flags share the same structural requirements: UseSubtileImpl,
   HighPrecisionAccumulate, DepthU == DeepseekScaleBlockK (one scale block per
@@ -572,9 +572,12 @@ def _validateDeepseekScale(state, printRejectionReason):
       reject(state, printRejectionReason,
              f"useDeepseekScale is mutually exclusive with {flag}")
       return
-  # Apply multi-K guards when PrefetchGlobalRead == 0 (mainloop handles scaling).
-  if state.get("PrefetchGlobalRead", 1) == 0:
-    _validateDeepseekScaleMultiK(state, printRejectionReason)
+  # Only the mainloop path (PGR=0) is supported; the epilogue path was removed.
+  if state.get("PrefetchGlobalRead", 1) != 0:
+    reject(state, printRejectionReason,
+           "useDeepseekScale requires PrefetchGlobalRead=0 (mainloop scale path)")
+    return
+  _validateDeepseekScaleMultiK(state, printRejectionReason)
 
 
 def _validateStreamKForceDPOnly(state, printRejectionReason):

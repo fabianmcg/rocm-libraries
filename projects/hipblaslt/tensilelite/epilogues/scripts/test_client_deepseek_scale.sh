@@ -2,7 +2,7 @@
 # Copyright Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier: MIT
 #
-# Integration test for the tensilelite-client Deepseek-scale epilogue paths.
+# Integration test for the tensilelite-client Deepseek-scale mainloop (PGR=0) paths.
 #
 # Tests all three modes:
 #   A-only: --use-deepseek-scale-a
