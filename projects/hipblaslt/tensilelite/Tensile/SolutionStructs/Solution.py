@@ -541,6 +541,22 @@ def _validateDeepseekScale(state, printRejectionReason):
   if not state["ProblemType"].get("HighPrecisionAccumulate", False):
     reject(state, printRejectionReason, "useDeepseekScale requires HighPrecisionAccumulate")
     return
+  if tuple(state["ISA"]) != (9, 5, 0):
+    reject(state, printRejectionReason, "useDeepseekScale is only implemented on gfx950")
+    return
+  if state["MIArchVgpr"]:
+    reject(state, printRejectionReason,
+           "useDeepseekScale requires MIArchVgpr=False (emitter uses AGPR read/write instructions)")
+    return
+  if state["ProblemType"].get("GroupedGemm", False):
+    reject(state, printRejectionReason, "useDeepseekScale does not support GroupedGemm")
+    return
+  # StreamK-completeness: when StreamK is active require full data-parallel tiles
+  # (no K-split fixup); per-WG scaling would corrupt the cross-WG reduction otherwise.
+  if state["StreamK"] and not state["StreamKForceDPOnly"]:
+    reject(state, printRejectionReason,
+           "useDeepseekScale requires StreamKForceDPOnly=1 (complete tiles, no K-split fixup)")
+    return
   # fp8 MFMA instruction spans 128 K-elements (instK=128): DepthU must be a
   # non-zero multiple of 128 so the subtile geometry has a valid K-grid.
   abPairA = state.get("_ABTilePairA", "")

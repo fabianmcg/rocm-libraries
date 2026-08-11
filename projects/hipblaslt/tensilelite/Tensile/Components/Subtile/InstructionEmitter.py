@@ -183,7 +183,6 @@ class InstructionEmitter:
                 scaleAVgpr = dml["scaleAVgprs"] + a if "scaleAVgprs" in dml else unit_e8m0
                 scaleBVgpr = dml.get("scaleBVgpr", unit_e8m0)
                 sAsel = sBsel = 0
-                fp32Scale = False
             elif self.hasScale:
                 scaleGroupA = (a // self.config.lrSA.mn) * self.config.lrSA.mn
                 scaleGroupB = (b // self.config.lrSB.mn) * self.config.lrSB.mn
@@ -197,17 +196,14 @@ class InstructionEmitter:
                 kShapeB = self.tileInfoMap['SB'].lrSubtileShape[1]
                 sAsel = (a % mShapeA) + mShapeA * (subIterK % kShapeA)
                 sBsel = (b % mShapeB) + mShapeB * (subIterK % kShapeB)
-                fp32Scale = False
             else:
                 scaleAVgpr = scaleBVgpr = -1
                 sAsel = sBsel = 0
-                fp32Scale = False
 
             module.add(emitMfmaInstruction(
                 self.writer, self.kernel, aTile, bTile, dTile, dTile,
                 scaleAVgpr=scaleAVgpr, scaleBVgpr=scaleBVgpr,
                 scaleAsel=sAsel, scaleBsel=sBsel,
-                fp32Scale=fp32Scale,
                 comment=f"MFMA C[{a},{b}] += A[{a},K={subIterK}] * B[{b},K={subIterK}]"))
         return list(module.flatitems())
 

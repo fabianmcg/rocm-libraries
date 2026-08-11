@@ -33,6 +33,7 @@
 
 #include <cmath>
 #include <cstddef>
+#include <cstring>
 #include <iostream>
 #include <omp.h>
 #include <type_traits>
@@ -49,6 +50,16 @@ namespace TensileLite
 
     namespace
     {
+
+        // Decode an E8M0 scale byte to fp32 exactly as the GPU does (bits = byte << 23).
+        // Byte 0x00 yields 0.0f and 0xFF yields +inf, matching the kernel's decode.
+        inline float decodeE8M0(uint8_t e8m0)
+        {
+            uint32_t bits = static_cast<uint32_t>(e8m0) << 23;
+            float    f;
+            std::memcpy(&f, &bits, sizeof(f));
+            return f;
+        }
 
         // Helper to load data from various source types into an AccumT buffer.
         // Sub-float types go through float first since they lack operator AccumT().
@@ -2146,21 +2157,20 @@ namespace TensileLite
                 }
 
                 // Deepseek per-row A scale: D[m,n] = alpha * scaleA[m] * scaleB[n/blockK] * acc.
+                // Scale buffers hold one E8M0 byte per element; decode as the GPU does.
                 if(problem.useDeepseekScaleA() && inputs.scaleADeepseek != nullptr)
                 {
-                    size_t mCoord   = dCoord[0];
-                    float  scaleVal = GetValue<float>(rocisa::DataType::Float,
-                                                      inputs.scaleADeepseek, (int)mCoord, aConjugate);
-                    value *= static_cast<Accumulator>(scaleVal);
+                    size_t  mCoord   = dCoord[0];
+                    uint8_t e8m0     = static_cast<const uint8_t*>(inputs.scaleADeepseek)[mCoord];
+                    value *= static_cast<Accumulator>(decodeE8M0(e8m0));
                 }
                 if(problem.useDeepseekScaleB() && inputs.scaleBDeepseek != nullptr)
                 {
-                    size_t nCoord   = dCoord[1];
+                    size_t  nCoord   = dCoord[1];
                     // Tied to DeepseekScaleBlockK=128; a future change must read blockK from the problem instead.
-                    size_t blockK   = 128;
-                    float  scaleVal = GetValue<float>(rocisa::DataType::Float,
-                                                      inputs.scaleBDeepseek, (int)(nCoord / blockK), aConjugate);
-                    value *= static_cast<Accumulator>(scaleVal);
+                    size_t  blockK   = 128;
+                    uint8_t e8m0     = static_cast<const uint8_t*>(inputs.scaleBDeepseek)[nCoord / blockK];
+                    value *= static_cast<Accumulator>(decodeE8M0(e8m0));
                 }
 
                 auto resultD = multiply<Accumulator>(alpha, value);

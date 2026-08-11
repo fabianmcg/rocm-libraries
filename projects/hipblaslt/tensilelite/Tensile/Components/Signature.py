@@ -376,22 +376,9 @@ class SignatureDefault(Signature):
 
         if kernel["TileQuant"]:
             # TileQuant epilogue appends QuantScale: fp32 global buffer pointer (8 bytes).
-            # The emitter writes per-tile amax/448 values; the standard fp8 store handles D.
-            # Mirror the KernelWriter padding: insert a u32 pad word when the accumulated
-            # named-SGPR count before this point is odd (64-bit pointer needs 2-SGPR alignment).
-            # For valid TileQuant kernels (UseScaleCD/Bias/E/Gate/ScaleAlphaVec all rejected),
-            # the pre-TileQuant SGPRs are: UseScaleAB (0 or 4) + activation args.
-            preTqSgprs  = 0
-            preTqSgprs += 2 + 2 if kernel["ProblemType"].get("UseScaleAB", False) else 0
-            runActivation = (kernel["ProblemType"]["ActivationType"] != 'none'
-                             and kernel["ActivationFused"])
-            if runActivation:
-                numActArgSize = writer.states.numActivationArgSize
-                preTqSgprs += (len(kernel["ProblemType"]["ActivationType"].getAdditionalArgStringList())
-                               * numActArgSize)
-                if kernel["ProblemType"]["ActivationType"] in ['all', 'hipblaslt_all']:
-                    preTqSgprs += 1  # ActivationType u32
-            if preTqSgprs % 2:
+            # KernelWriter._initKernel is the source of truth for the 64-bit alignment pad;
+            # mirror it exactly by checking whether it inserted the pad entry.
+            if "TileQuantPad" in writer.states.numStoreSgprNames:
                 signature.addArg("TileQuantPad", SVK.SIG_VALUE, "u32")
                 userArgumentsInfo.rmsNormSize += 4
             signature.addArg("QuantScale", SVK.SIG_GLOBALBUFFER, "f32", "generic")
@@ -399,47 +386,23 @@ class SignatureDefault(Signature):
 
         if kernel.get("UseDeepseekScaleA", False):
             # DeepseekScaleA epilogue appends ScaleABuf: fp32 global buffer pointer (8 bytes).
-            # Mirror the TileQuant padding: insert a u32 pad word when the accumulated
-            # named-SGPR count before this point is odd (64-bit pointer needs 2-SGPR alignment).
-            preScaleASgprs  = 0
-            preScaleASgprs += 2 + 2 if kernel["ProblemType"].get("UseScaleAB", False) else 0
-            runActivation = (kernel["ProblemType"]["ActivationType"] != 'none'
-                             and kernel["ActivationFused"])
-            if runActivation:
-                numActArgSize = writer.states.numActivationArgSize
-                preScaleASgprs += (len(kernel["ProblemType"]["ActivationType"].getAdditionalArgStringList())
-                                   * numActArgSize)
-                if kernel["ProblemType"]["ActivationType"] in ['all', 'hipblaslt_all']:
-                    preScaleASgprs += 1
-            if preScaleASgprs % 2:
+            # KernelWriter._initKernel is the source of truth for the 64-bit alignment pad;
+            # mirror it exactly by checking whether it inserted the pad entry.
+            if "DeepseekScaleAPad" in writer.states.numStoreSgprNames:
                 signature.addArg("DeepseekScaleAPad", SVK.SIG_VALUE, "u32")
                 userArgumentsInfo.rmsNormSize += 4
             signature.addArg("ScaleABuf", SVK.SIG_GLOBALBUFFER, "f32", "generic")
-            userArgumentsInfo.rmsNormSize += 8  # 8B scaleA ptr
+            userArgumentsInfo.rmsNormSize += 8  # 8B scaleA ptr.
 
         if kernel.get("UseDeepseekScaleB", False):
             # DeepseekScaleB epilogue appends ScaleBBuf: fp32 global buffer pointer (8 bytes).
-            # Insert a u32 pad word when the accumulated named-SGPR count is odd so the
-            # 64-bit pointer lands on an even SGPR boundary.
-            preScaleBSgprs = 0
-            preScaleBSgprs += 2 + 2 if kernel["ProblemType"].get("UseScaleAB", False) else 0
-            runActivation = (kernel["ProblemType"]["ActivationType"] != 'none'
-                             and kernel["ActivationFused"])
-            if runActivation:
-                numActArgSize = writer.states.numActivationArgSize
-                preScaleBSgprs += (len(kernel["ProblemType"]["ActivationType"].getAdditionalArgStringList())
-                                   * numActArgSize)
-                if kernel["ProblemType"]["ActivationType"] in ['all', 'hipblaslt_all']:
-                    preScaleBSgprs += 1
-            if kernel.get("UseDeepseekScaleA", False):
-                # Pad to even SGPR count before the 64-bit ScaleABuf pointer, then
-                # add 2 for the pointer itself.
-                preScaleBSgprs += (1 if preScaleBSgprs % 2 else 0) + 2
-            if preScaleBSgprs % 2:
+            # KernelWriter._initKernel is the source of truth for the 64-bit alignment pad;
+            # mirror it exactly by checking whether it inserted the pad entry.
+            if "DeepseekScaleBPad" in writer.states.numStoreSgprNames:
                 signature.addArg("DeepseekScaleBPad", SVK.SIG_VALUE, "u32")
                 userArgumentsInfo.rmsNormSize += 4
             signature.addArg("ScaleBBuf", SVK.SIG_GLOBALBUFFER, "f32", "generic")
-            userArgumentsInfo.rmsNormSize += 8  # 8B scaleB ptr
+            userArgumentsInfo.rmsNormSize += 8  # 8B scaleB ptr.
 
         # Calculate total size
         userArgumentsInfo.totalSize = userArgumentsInfo.gemmArgumentSize + \

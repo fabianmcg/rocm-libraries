@@ -53,6 +53,7 @@ from rocisa.instruction import (
     BufferLoadU8,
     FlatLoadD16U8,
     SAddU32,
+    SLShiftRightB32,
     SLoadB64,
     SMulI32,
     SMovB32,
@@ -207,10 +208,14 @@ def setupDeepseekMainloopScale(module, writer, kernel, mma_m):
         module.add(VMovB32(dst=vgpr(kb_b_off), src=0, comment="kbBOffset = 0."))
         dml["kbBOffset"] = kb_b_off
         nn_stride = writer.vgprPool.checkOut(1)
-        module.add(VMovB32(dst=vgpr(nn_stride), src=sgpr("SizesFree+1"),
-                           comment="nNBlocksStride = N."))
-        module.add(VLShiftRightB32(dst=vgpr(nn_stride), shiftHex=hex(7), src=vgpr(nn_stride),
-                                   comment="nNBlocksStride = N >> 7 (= N/128, 1 byte per N-block)."))
+        tmp_sgpr = writer.sgprPool.checkOut(1)
+        module.add(SAddU32(dst=sgpr(tmp_sgpr), src0=sgpr("SizesFree+1"), src1=127,
+                           comment="tmp = N + 127."))
+        module.add(SLShiftRightB32(dst=sgpr(tmp_sgpr), shiftHex=hex(7), src=sgpr(tmp_sgpr),
+                                   comment="tmp = ceil(N/128) (1 byte per N-block)."))
+        module.add(VMovB32(dst=vgpr(nn_stride), src=sgpr(tmp_sgpr),
+                           comment="nNBlocksStride = ceil(N/128)."))
+        writer.sgprPool.checkIn(tmp_sgpr)
         dml["nNBlocksStride"] = nn_stride
         # scaleBVaddr_base: byte offset for WG1 * mt1_blocks (E8M0: 1 byte per N-block).
         mt1_blocks = mt1 // 128

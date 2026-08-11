@@ -1064,7 +1064,7 @@ def _selectF8F6F4InstType(kernel):
 # Given RegisterTileInfo inputs for A,B,C,D operands
 # emit corresponding mfma instruction
 #
-def emitMfmaInstruction(writer, kernel, vgprTileA, vgprTileB, vgprTileC, vgprTileD, scaleAVgpr=-1, scaleBVgpr=-1, scaleAsel=-1, scaleBsel=-1, fp32Scale=False, comment = ""):
+def emitMfmaInstruction(writer, kernel, vgprTileA, vgprTileB, vgprTileC, vgprTileD, scaleAVgpr=-1, scaleBVgpr=-1, scaleAsel=-1, scaleBsel=-1, comment = ""):
   module = Module()
 
   vgprAStart = vgprTileA.regList.indices[0]
@@ -1185,7 +1185,6 @@ def emitMfmaCode(writer, kernel):
         dtiles = dtileInfo.vgprTiles[mma0 + mma1 * dtileInfo.localMMATileGrid[0]]
 
         dml = kernel.get("_deepseekML")
-        fp32Scale = False
         if dml is not None:
           # Deepseek multi-K mainloop path: E8M0 byte loaded per K-block by emitDeepseekScaleGR.
           # scaleAVgprs[mma0] holds the E8M0 byte (in bits [7:0]) for the current iteration.
@@ -1221,7 +1220,6 @@ def emitMfmaCode(writer, kernel):
 
         module.add(emitMfmaInstruction(writer, kernel, atiles, btiles, dtiles, dtiles,
                                        scaleAVgpr=scaleAVgpr, scaleBVgpr=scaleBVgpr, scaleAsel=sAsel, scaleBsel=sBsel,
-                                       fp32Scale=fp32Scale,
                                        comment="Emit MMFA code for MMA tiles C[%u, %u] += A[%u, %u] * B[%u, %u] sA = %u, sB = %u"%(mma0, mma1, mma0, mmak, mmak, mma1, sAsel, sBsel)))
 
   return module

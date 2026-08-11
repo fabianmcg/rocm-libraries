@@ -354,8 +354,8 @@ namespace TensileLite
             RESIDUAL      = 20, // bf16 input: residual tensor [M_tokens x N_hidden] row-major (optional).
             RSTDBUF       = 21, // f32 input: reciprocal std-dev buffer [M] for RstdScale epilogue.
             QUANTSCALE    = 22, // f32 output: per-tile amax/448 scale [ceil(M/Q0) x ceil(N/Q1)] row-major.
-            SCALEA_DS     = 23, // f32 input: per-row A dequantization scale [M rows].
-            SCALEB_DS     = 24, // f32 input: per-128col-block B dequantization scale [ceil(N/128)].
+            SCALEA_DS     = 23, // E8M0 byte input: per-row A dequantization scale [M rows].
+            SCALEB_DS     = 24, // E8M0 byte input: per-128col-block B dequantization scale [ceil(N/128)].
             TENSOR_COUNT
         };
 
@@ -810,14 +810,14 @@ namespace TensileLite
         {
             if(m_useDeepseekScaleA)
                 m_tensors[TENSOR::SCALEA_DS]
-                    = {"scaleADeepseek", rocisa::DataType::Float, {mRows}, {1}};
+                    = {"scaleADeepseek", rocisa::DataType::Int8, {mRows}, {1}};
         }
 
         void setScaleBDeepseek(size_t nBlocks)
         {
             if(m_useDeepseekScaleB)
                 m_tensors[TENSOR::SCALEB_DS]
-                    = {"scaleBDeepseek", rocisa::DataType::Float, {nBlocks}, {1}};
+                    = {"scaleBDeepseek", rocisa::DataType::Int8, {nBlocks}, {1}};
         }
 
         void setUseBias(int useBias)

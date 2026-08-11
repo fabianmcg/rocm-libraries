@@ -947,6 +947,15 @@ namespace TensileLite
             return 1.5;
         }
 
+        // Fill a buffer with valid E8M0 scale bytes near 1.0 (exponents 124..127 ->
+        // 2^-3..2^0) so the kernel and reference decode identical, non-degenerate scales.
+        static void initE8M0Array(void* array, size_t elements)
+        {
+            uint8_t* bytes = static_cast<uint8_t*>(array);
+            for(size_t i = 0; i < elements; ++i)
+                bytes[i] = static_cast<uint8_t>(0x7c + (i & 0x3));
+        }
+
         DataInitialization::DataInitialization(po::variables_map const&    args,
                                                ClientProblemFactory const& problemFactory)
             : m_maxBatch(0)
@@ -1405,7 +1414,10 @@ namespace TensileLite
                     if(!m_problemDependentData)
                     {
 
-                        initArray(p.first, it.init, pUnit.cpuInput.valid.get(), pUnit.maxElements);
+                        if(it.name == "scaleADeepseek" || it.name == "scaleBDeepseek")
+                            initE8M0Array(pUnit.cpuInput.valid.get(), pUnit.maxElements);
+                        else
+                            initArray(p.first, it.init, pUnit.cpuInput.valid.get(), pUnit.maxElements);
                         HIP_CHECK_EXC(
                             hipMemcpy(pUnit.gpuInput.valid.get(),
                                       pUnit.cpuInput.valid.get(),

@@ -470,7 +470,7 @@ def test_deepseek_scale_ab_nonzero_beta(dsab_kernel):
 _TEST_SHAPES_MULTIK = [
     (m, n, k)
     for m in [7, 128]
-    for n in [128, 256]
+    for n in [128, 256, 320]
     for k in [256, 512]
 ]
 
