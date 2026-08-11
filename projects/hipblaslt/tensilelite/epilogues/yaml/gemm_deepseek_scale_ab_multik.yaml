@@ -12,8 +12,8 @@ BenchmarkProblems:
   # applied via the hardware WMMA fp32 scale operand during the mainloop.
   # D = alpha * sum_kb(scaleA[m,kb] * scaleB[kb,nb] * partial[m,n,kb]) + beta*C
   # K must be a multiple of DeepseekScaleBlockK (128).
-  # Covers PrefetchGlobalRead=0 (no prefetch) and PGR=1 (1-deep data prefetch;
-  # scale is loaded per K-block in each unroll copy and the NLL).
+  # Covers PrefetchGlobalRead=0 (no prefetch), PGR=1 (1-deep data prefetch;
+  # scale is loaded per K-block in each unroll copy and the NLL), and PGR=2.
   # free0=M, free1=N.
   # --------------------------------------------------------------------------
   -
@@ -53,7 +53,7 @@ BenchmarkProblems:
         - StreamKAtomic: [0]
         - GlobalSplitU: [1]
         - ScheduleIterAlg: [3]
-        - PrefetchGlobalRead: [0, 1]
+        - PrefetchGlobalRead: [0, 1, 2]
         - PrefetchAcrossPersistent: [0]
         - DirectToLds: [1]
         - UseSubtileImpl: [True]

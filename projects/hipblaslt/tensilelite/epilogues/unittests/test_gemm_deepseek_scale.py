@@ -1,6 +1,6 @@
 # Copyright Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier: MIT
-"""Pytest suite for the fused GEMM+DeepseekScale Subtile mainloop scale path (PGR=0, gfx950, fp8 in / f32 out).
+"""Pytest suite for the fused GEMM+DeepseekScale Subtile mainloop scale path (PGR=0/1/2, gfx950, fp8 in / f32 out).
 
 Covers three flag combinations:
   - A-only: D = alpha * scaleA[m] * (A_fp8 @ B_fp8) + beta*C
@@ -18,6 +18,16 @@ keeping the product of scaleA * scaleB * fp8 accumulator in a reasonable fp32 ra
 N-block note: N=320 is a valid partial-block test (3 blocks of 128: 0-127, 128-255, 256-319).
   The third scaleB element scales only the 64 columns [256, 320), which is correctly
   handled by the write-guard in the store path and the numpy reference's [:, :N] slice.
+
+Device layout for scale buffers (matches the b32 DirectToLds load in the kernel):
+  scaleA -- logical uint8 [Mpadded, nKBlocks], device flat uint8 of length nRowGroups*nKBlocks*R*4:
+    R = 64  (MatrixInstM * mma_m = 16 * 4; rows per wave for in-scope configs)
+    rowGroup = m // R;  rowSlot = m % R
+    device[((rowGroup*nKBlocks + kb)*R + rowSlot)*4 + b] = scaleA[m, kb]  for b in 0..3
+
+  scaleB -- logical uint8 [nKBlocks, nNBlocks], device flat uint8 of length nNBlocks*nKBlocks*256:
+    device[(nb*nKBlocks + kb)*256 + j] = scaleB[kb, nb]  for all j in 0..255
+    (all 256 bytes in each (nb, kb) slot hold the same broadcast E8M0 byte)
 """
 
 import math
@@ -126,6 +136,47 @@ def _make_e8m0_bytes(shape, rng):
 
 
 # ---------------------------------------------------------------------------
+# Device-layout swizzle helpers.
+# ---------------------------------------------------------------------------
+
+# R = MatrixInstM * mma_m = 16 * 4 = 64 rows handled per wave for in-scope configs.
+_ROWS_PER_WAVE = 64
+
+
+def _swizzleScaleADevice(scaleA_bytes: np.ndarray, nKBlocks: int) -> np.ndarray:
+    """Convert logical scaleA [Mpadded, nKBlocks] uint8 to the device b32-LDS layout.
+
+    Device layout (flat uint8, length nRowGroups*nKBlocks*R*4):
+      device[((rowGroup*nKBlocks + kb)*R + rowSlot)*4 + b] = scaleA[m, kb]
+    where R=64, rowGroup=m//R, rowSlot=m%R, b in 0..3 (broadcast).
+    """
+    R = _ROWS_PER_WAVE
+    mPadded = scaleA_bytes.shape[0]
+    assert mPadded % R == 0, f"mPadded ({mPadded}) must be divisible by R ({R})"
+    nRowGroups = mPadded // R
+    # Reshape to [nRowGroups, R, nKBlocks], then permute to [nRowGroups, nKBlocks, R].
+    shaped = scaleA_bytes.reshape(nRowGroups, R, nKBlocks).transpose(0, 2, 1)
+    # Broadcast each byte into 4 identical bytes: add axis, tile to length 4.
+    broadcast = np.repeat(shaped[:, :, :, np.newaxis], 4, axis=3)
+    return broadcast.ravel()
+
+
+def _swizzleScaleBDevice(scaleB_bytes: np.ndarray, nKBlocks: int) -> np.ndarray:
+    """Convert logical scaleB [nKBlocks, nNBlocks] uint8 to the device b32-LDS layout.
+
+    Device layout (flat uint8, length nNBlocks*nKBlocks*256):
+      device[(nb*nKBlocks + kb)*256 + j] = scaleB[kb, nb]  for all j in 0..255
+    Each (nb, kb) slot holds 256 identical copies of the E8M0 byte.
+    """
+    nNBlocks = scaleB_bytes.shape[1]
+    # Transpose to [nNBlocks, nKBlocks] so C-order matches (nb, kb) indexing.
+    transposed = scaleB_bytes.T  # [nNBlocks, nKBlocks]
+    # Broadcast each byte into 256 identical bytes.
+    broadcast = np.repeat(transposed[:, :, np.newaxis], 256, axis=2)
+    return broadcast.ravel()
+
+
+# ---------------------------------------------------------------------------
 # GPU execution helpers.
 # ---------------------------------------------------------------------------
 
@@ -224,10 +275,9 @@ def _run_shape_ab_multik(solution, kernelName, hsaco, chip, M, N, K,
     dRef = numpy_ref_multiblock(aMK, np.asarray(bKN), scaleARef, scaleBRef,
                                 alpha, beta, c_ref)
 
-    # scaleA buffer: flat row-major [mPadded * nKBlocks] E8M0 uint8 array.
-    # scaleB buffer: flat row-major [nKBlocks * nNBlocks] E8M0 uint8 array.
-    epilogueArgs = [amdgpu_exec.InputArray(scaleAPadded.ravel()),
-                    amdgpu_exec.InputArray(scaleBBytes.ravel())]
+    nKBlocks = K // 128
+    epilogueArgs = [amdgpu_exec.InputArray(_swizzleScaleADevice(scaleAPadded, nKBlocks)),
+                    amdgpu_exec.InputArray(_swizzleScaleBDevice(scaleBBytes, nKBlocks))]
     dGpu = _execute_and_compare(solution, kernelName, hsaco, M, N, K, numWG,
                                 aFortran, bFortran, cFortran, dFortran,
                                 epilogueArgs, alpha, beta=beta)
@@ -261,7 +311,7 @@ def _run_shape_a_multik(solution, kernelName, hsaco, chip, M, N, K,
     dRef = numpy_ref_multiblock(aMK, np.asarray(bKN), scaleARef, unitScaleBRef,
                                 alpha, beta, c_ref)
 
-    epilogueArgs = [amdgpu_exec.InputArray(scaleAPadded.ravel())]
+    epilogueArgs = [amdgpu_exec.InputArray(_swizzleScaleADevice(scaleAPadded, nKBlocks))]
     dGpu = _execute_and_compare(solution, kernelName, hsaco, M, N, K, numWG,
                                 aFortran, bFortran, cFortran, dFortran,
                                 epilogueArgs, alpha, beta=beta)
@@ -293,7 +343,8 @@ def _run_shape_b_multik(solution, kernelName, hsaco, chip, M, N, K,
     dRef = numpy_ref_multiblock(aMK, np.asarray(bKN), unitScaleARef, scaleBRef,
                                 alpha, beta, c_ref)
 
-    epilogueArgs = [amdgpu_exec.InputArray(scaleBBytes.ravel())]
+    nKBlocks = K // 128
+    epilogueArgs = [amdgpu_exec.InputArray(_swizzleScaleBDevice(scaleBBytes, nKBlocks))]
     dGpu = _execute_and_compare(solution, kernelName, hsaco, M, N, K, numWG,
                                 aFortran, bFortran, cFortran, dFortran,
                                 epilogueArgs, alpha, beta=beta)

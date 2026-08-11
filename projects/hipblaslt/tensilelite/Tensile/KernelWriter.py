@@ -24,7 +24,7 @@
 
 from rocisa import rocIsa, countInstruction, countGlobalRead, \
             countLocalRead, countLocalWrite, countWeightedLocalRead, countWeightedLocalWrite, countMFMA, getMFMAs
-from rocisa.code import Module, TextBlock, StructuredModule, KernelBody, RegSet
+from rocisa.code import Module, TextBlock, StructuredModule, KernelBody, RegSet, SrdUpperValue
 from rocisa.container import RegisterContainer, replaceHolder, HWRegContainer, VCC, MemTokenData, sgpr, vgpr
 from rocisa.label import LabelManager
 from rocisa.asmpass import rocIsaPass, rocIsaPassOption
@@ -262,6 +262,8 @@ class StateValues:
   preventVgprOverflowDuringNewTile: int  = -1
   interleaveStoreVmcnt: bool             = False
   srdShiftLeft:dict                      = field(init=False)
+  # SRD+3 flags word (buffer descriptor bits 127:96); arch-specific, set in _initKernel.
+  srdElementBits: int                    = 0
   checkGRO: bool                         = False
   combineLocalAddresses: bool            = False # Debug
   unifiedVgprRegs: bool                  = False
@@ -5043,8 +5045,8 @@ class KernelWriter(metaclass=abc.ABCMeta):
     btileInfo = self.states.b.tileInfo
     # TODO: Need corresponding ctileInfo for GSU/StreamK
     dtileInfo = self.states.d.tileInfo
-    mxsatileInfo = self.states.mxsa.tileInfo if kernel["ProblemType"].get("MXBlockA", 0) else None
-    mxsbtileInfo = self.states.mxsb.tileInfo if kernel["ProblemType"].get("MXBlockB", 0) else None
+    mxsatileInfo = self.states.mxsa.tileInfo if usesScaleA(kernel) else None
+    mxsbtileInfo = self.states.mxsb.tileInfo if usesScaleB(kernel) else None
 
     module.addComment0("Number of subtiles for A: %u"%(len(atileInfo.localSubtiles)))
     module.addComment0("Number of subtiles for B: %u"%(len(btileInfo.localSubtiles)))
@@ -5067,7 +5069,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
     if not (kernel["enableTDMA"] and kernel["enableTDMB"]):
       module.add(globalReadDTLInitCommonSgpr(self, kernel))
 
-    if mxsatileInfo != None and mxsbtileInfo != None:
+    if mxsatileInfo is not None and mxsbtileInfo is not None and not isDeepseekScale(kernel):
       if not (kernel["enableTDMA"] and kernel["enableTDMB"]):
         module.add(globalReadScaleSwizzledDTLInitCommonSgpr(self, kernel))
 
@@ -5090,12 +5092,15 @@ class KernelWriter(metaclass=abc.ABCMeta):
     module.addComment1("global read addresses: addresses a")
     if not hasTDM:
       module.add(self.graAddresses(kernel, tensorParametersA))
-      if kernel["ProblemType"]["MXBlockA"]:
+      if usesScaleA(kernel):
         module.addComment1("global read addresses: addresses mxsa")
-        module.add(self.graAddresses(kernel, tensorParametersA["MX"]))
+        if isDeepseekScale(kernel):
+          module.add(initDeepseekScaleSrd(self, kernel))
+        else:
+          module.add(self.graAddresses(kernel, tensorParametersA["MX"]))
       module.addComment1("global read addresses: addresses b")
       module.add(self.graAddresses(kernel, tensorParametersB))
-      if kernel["ProblemType"]["MXBlockB"]:
+      if usesScaleB(kernel) and not isDeepseekScale(kernel):
         module.addComment1("global read addresses: addresses mxsb")
         module.add(self.graAddresses(kernel, tensorParametersB["MX"]))
 
@@ -6937,6 +6942,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
     self.states.asmCaps  = ti.getAsmCaps()
     self.states.archCaps = ti.getArchCaps()
     self.states.regCaps  = ti.getRegCaps()
+    self.states.srdElementBits = SrdUpperValue(version).getValue()
 
     self.asmAssert = Assert(self.states.laneSGPRCount, kernel["WavefrontSize"], self.db["EnableAsserts"])
 
@@ -6992,9 +6998,9 @@ class KernelWriter(metaclass=abc.ABCMeta):
       initSubTileInfo('B')
       initSubTileInfo('D')
 
-      if kernel["ProblemType"].get("MXBlockA", 0) > 0:
+      if usesScaleA(kernel):
         initSubTileInfo('MXSA')
-      if kernel["ProblemType"].get("MXBlockB", 0) > 0:
+      if usesScaleB(kernel):
         initSubTileInfo('MXSB')
 
       self.ldsStartOffsetA = 0
@@ -7014,15 +7020,16 @@ class KernelWriter(metaclass=abc.ABCMeta):
       self.ldsStartOffsetB = sizeA
       sizeMXSA = 0
       sizeMXSB = 0
-      if kernel["ProblemType"].get("MXBlockA", 0) > 0 and kernel["ProblemType"].get("MXBlockB", 0) > 0:
+      # For swizzled scale we use extra LDS space to allow wider DTL loads.
+      # Each active scale operand gets its own contiguous LDS region.
+      numWaves = kernel["MIWaveGroup"][0] * kernel["MIWaveGroup"][1]
+      if usesScaleA(kernel):
         mxsaTileInfo = self.states.mxsa.tileInfo
-        mxsbTileInfo = self.states.mxsb.tileInfo
-
-        # For Swizzled scale we use extra LDS space for now to allow wider DTL loads
-        numWaves = kernel["MIWaveGroup"][0] * kernel["MIWaveGroup"][1]
         sizeMXSA = mxsaTileInfo.loadWidthGR * kernel["WavefrontSize"] * numWaves
-        sizeMXSB = mxsbTileInfo.loadWidthGR * kernel["WavefrontSize"] * numWaves
         self.ldsStartOffsetMXSA = sizeA + sizeB
+      if usesScaleB(kernel):
+        mxsbTileInfo = self.states.mxsb.tileInfo
+        sizeMXSB = mxsbTileInfo.loadWidthGR * kernel["WavefrontSize"] * numWaves
         self.ldsStartOffsetMXSB = sizeA + sizeB + sizeMXSA
 
       self.ldsTotalSize = sizeA + sizeB + sizeMXSA + sizeMXSB
@@ -7431,7 +7438,9 @@ class KernelWriter(metaclass=abc.ABCMeta):
     tensorParametersB["PackedIndices"] = kernel["PackedC%uIndicesX"%tensorParametersB["tile01Idx"]]
 
     tensorParametersMXSA = None
-    if kernel["ProblemType"]["MXBlockA"]:
+    # DeepseekScale uses states.mxsa.tileInfo (SubtileImpl path); it does not
+    # go through the standard GR/LW tensor-parameter infrastructure.
+    if usesScaleA(kernel) and not isDeepseekScale(kernel):
       itP["MXSA"] = readWriteVectors("MXSA", vwmxsa, kernel)
       tensorParametersMXSA = {}
       self.getTensorParameters(tensorParametersMXSA, kernel, itP, "MXSA")
@@ -7439,7 +7448,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
       tensorParametersA["MX"] = tensorParametersMXSA
 
     tensorParametersMXSB = None
-    if kernel["ProblemType"]["MXBlockB"]:
+    if usesScaleB(kernel) and not isDeepseekScale(kernel):
       itP["MXSB"] = readWriteVectors("MXSB", vwmxsb, kernel)
       tensorParametersMXSB = {}
       self.getTensorParameters(tensorParametersMXSB, kernel, itP, "MXSB")
@@ -9569,9 +9578,9 @@ class KernelWriter(metaclass=abc.ABCMeta):
         self.defineSgpr("SwapA", 1)
       if kernel["LocalWriteUseSgprB"]:
         self.defineSgpr("SwapB", 1)
-      if kernel["ProblemType"]["MXBlockA"] and kernel["LocalWriteUseSgprMXSA"]:
+      if usesScaleA(kernel) and kernel["LocalWriteUseSgprMXSA"]:
           self.defineSgpr("SwapMXSA", 1)
-      if kernel["ProblemType"]["MXBlockB"] and kernel["LocalWriteUseSgprMXSB"]:
+      if usesScaleB(kernel) and kernel["LocalWriteUseSgprMXSB"]:
           self.defineSgpr("SwapMXSB", 1)
       if kernel["ProblemType"]["Sparse"] and kernel["LocalWriteUseSgprMetadata"]:
         self.defineSgpr("SwapMetadata", 1)
@@ -9690,15 +9699,15 @@ class KernelWriter(metaclass=abc.ABCMeta):
       if not (kernel["enableTDMA"] and kernel["enableTDMB"]):
         requiredUnalignedSgprVar.append("LocalWriteBaseAddrA")
         requiredUnalignedSgprVar.append("LocalWriteBaseAddrB")
-        if kernel["ProblemType"]["MXBlockA"]:
+        if usesScaleA(kernel):
           requiredUnalignedSgprVar.append("LocalWriteBaseAddrMXSA")
-        if kernel["ProblemType"]["MXBlockB"]:
+        if usesScaleB(kernel):
           requiredUnalignedSgprVar.append("LocalWriteBaseAddrMXSB")
         requiredUnalignedSgprVar.append("SwapA")
         requiredUnalignedSgprVar.append("SwapB")
-        if kernel["ProblemType"]["MXBlockA"]:
+        if usesScaleA(kernel):
           requiredUnalignedSgprVar.append("SwapMXSA")
-        if kernel["ProblemType"]["MXBlockB"]:
+        if usesScaleB(kernel):
           requiredUnalignedSgprVar.append("SwapMXSB")
       if kernel["ProblemType"]["Sparse"] and kernel["LocalWriteUseSgprMetadata"]:
         requiredUnalignedSgprVar.append("SwapMetadata")

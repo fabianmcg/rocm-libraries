@@ -368,7 +368,7 @@ def _validateRstdScale(state, printRejectionReason):
     - OutputAmaxD and MBSK/AdaptiveGemmGSUA rejected (kernarg layout conflict).
     - No cross-wave LDS needed; no wg_n constraint.
   """
-  if not state["RstdScale"]:
+  if not state.get("RstdScale", False):
     return
   if state["PartialRMS"]:
     reject(state, printRejectionReason, "RstdScale and PartialRMS are mutually exclusive")
@@ -493,7 +493,7 @@ def _validateTileQuant(state, printRejectionReason):
 def _validateDeepseekScaleMultiK(state, printRejectionReason):
   """Validate additional constraints for the Deepseek multi-K mainloop path.
 
-  This path is active when PrefetchGlobalRead in (0, 1) and DepthU == DeepseekScaleBlockK.
+  This path is active when PrefetchGlobalRead in (0, 1, 2) and DepthU == DeepseekScaleBlockK.
   The mainloop loads one scaleA/scaleB value per K-block iteration; several
   microarchitectural limits apply only in this mode.
   """
@@ -607,13 +607,13 @@ def _validateDeepseekScale(state, printRejectionReason):
       return
   if _validateDeepseekScaleEpilogueModifiers(state, printRejectionReason):
     return
-  # Mainloop scale path supports PGR=0 (no prefetch) and PGR=1 (1-deep data
-  # prefetch; scale is loaded per K-block in each unroll copy and the NLL).
-  # PGR>=2 is unsupported: it adds NGLL consuming loops and 2-deep lookahead
-  # that the per-iteration scale drain does not handle.
-  if state.get("PrefetchGlobalRead", 1) not in (0, 1):
+  # Mainloop scale path supports PGR=0 (no prefetch), PGR=1 (1-deep data
+  # prefetch; scale is loaded per K-block in each unroll copy and the NLL),
+  # and PGR=2 (2-deep lookahead; codegen support added in a later phase).
+  # PGR>=3 is unsupported.
+  if state.get("PrefetchGlobalRead", 1) not in (0, 1, 2):
     reject(state, printRejectionReason,
-           "useDeepseekScale supports only PrefetchGlobalRead=0 or 1 (mainloop scale path)")
+           "useDeepseekScale supports only PrefetchGlobalRead=0, 1, or 2 (mainloop scale path)")
     return
   _validateDeepseekScaleMultiK(state, printRejectionReason)
 
@@ -3458,9 +3458,13 @@ class Solution(collections.abc.Mapping):
       state["_DepthUA"] = depthUA# internal — data SRD advance
       if state["ProblemType"]["MXBlockA"]:
         state["_DepthUMXSA"] = depthU // state["ProblemType"]["MXBlockA"]
+      elif state.get("UseDeepseekScaleA", False):
+        state["_DepthUMXSA"] = depthU  # DS: one scale K-block per depthU
       state["_DepthUB"] = depthUB# internal — data SRD advance
       if state["ProblemType"]["MXBlockB"]:
         state["_DepthUMXSB"] = depthU // state["ProblemType"]["MXBlockB"]
+      elif state.get("UseDeepseekScaleB", False):
+        state["_DepthUMXSB"] = depthU  # DS: one scale K-block per depthU
       state["_DepthUMetadata"] = depthUM# internal
 
       # Runs here (not earlier) because it needs MacroTileA/B and _DepthUA/B,

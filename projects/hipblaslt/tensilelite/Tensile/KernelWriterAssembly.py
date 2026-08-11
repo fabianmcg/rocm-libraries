@@ -656,29 +656,32 @@ class KernelWriterAssembly(KernelWriter):
   def removeGRSrdVariableSgprsFromPool(self, kernel):
     module = Module("RemoveGRSrdSgprsFromPool")
 
+    _usesScaleA = kernel["ProblemType"]["MXBlockA"] or kernel.get("UseDeepseekScaleA", False)
+    _usesScaleB = kernel["ProblemType"]["MXBlockB"] or kernel.get("UseDeepseekScaleB", False)
+
     if kernel["BufferLoad"]:
        # resource descriptor (SRD) A and B, must be aligned on 4-SGPR boundary
       self.removeSgprVarFromPool("SrdA")
       self.removeSgprVarFromPool("SrdB")
-      if kernel["ProblemType"]["MXBlockA"]:
+      if _usesScaleA:
         self.removeSgprVarFromPool("SrdMXSA")
-      if kernel["ProblemType"]["MXBlockB"]:
+      if _usesScaleB:
         self.removeSgprVarFromPool("SrdMXSB")
 
     if self.states.use64bShadowLimit:
       self.removeSgprVarFromPool("ShadowLimitA")
       self.removeSgprVarFromPool("ShadowLimitB")
     if self.states.use64bShadowLimitMX:
-      if kernel["ProblemType"]["MXBlockA"]:
+      if _usesScaleA:
         self.removeSgprVarFromPool("ShadowLimitMXSA")
-      if kernel["ProblemType"]["MXBlockB"]:
+      if _usesScaleB:
         self.removeSgprVarFromPool("ShadowLimitMXSB")
 
     self.removeSgprVarFromPool("WrapUA")
     self.removeSgprVarFromPool("WrapUB")
-    if kernel["ProblemType"]["MXBlockA"]:
+    if _usesScaleA:
       self.removeSgprVarFromPool("WrapUMXSA")
-    if kernel["ProblemType"]["MXBlockB"]:
+    if _usesScaleB:
       self.removeSgprVarFromPool("WrapUMXSB")
 
     return module
@@ -704,12 +707,14 @@ class KernelWriterAssembly(KernelWriter):
     # uses tdm*Incs only. GlobalReadIncs* are released afterward — do not pin them here,
     # UNLESS stagger code needs them (calculateStagger references GlobalReadIncs for all tensors).
     needsStaggerSgprs = kernel["StaggerU"] > 0 or kernel["InternalSupportParams"]["SupportCustomStaggerU"]
+    _usesScaleA = kernel["ProblemType"]["MXBlockA"] or kernel.get("UseDeepseekScaleA", False)
+    _usesScaleB = kernel["ProblemType"]["MXBlockB"] or kernel.get("UseDeepseekScaleB", False)
     if not self.isTdmWaveSeparated(kernel) or needsStaggerSgprs:
       self.removeSgprVarFromPool("GlobalReadIncsA")
       self.removeSgprVarFromPool("GlobalReadIncsB")
-      if kernel["ProblemType"]["MXBlockA"]:
+      if _usesScaleA:
         self.removeSgprVarFromPool("GlobalReadIncsMXSA")
-      if kernel["ProblemType"]["MXBlockB"]:
+      if _usesScaleB:
         self.removeSgprVarFromPool("GlobalReadIncsMXSB")
 
     return module
@@ -724,13 +729,15 @@ class KernelWriterAssembly(KernelWriter):
     module = Module("ReleaseGlobalReadIncsAfterTdmWaveSep")
     if not self.isTdmWaveSeparated(kernel):
       return module
+    _usesScaleA = kernel["ProblemType"]["MXBlockA"] or kernel.get("UseDeepseekScaleA", False)
+    _usesScaleB = kernel["ProblemType"]["MXBlockB"] or kernel.get("UseDeepseekScaleB", False)
     if self.states.a.numSgprGlobalReadIncs > 0:
       module.add(self.addSgprVarToPool("GlobalReadIncsA"))
     if self.states.b.numSgprGlobalReadIncs > 0:
       module.add(self.addSgprVarToPool("GlobalReadIncsB"))
-    if kernel["ProblemType"]["MXBlockA"] and self.states.mxsa.numSgprGlobalReadIncs > 0:
+    if _usesScaleA and self.states.mxsa.numSgprGlobalReadIncs > 0:
       module.add(self.addSgprVarToPool("GlobalReadIncsMXSA"))
-    if kernel["ProblemType"]["MXBlockB"] and self.states.mxsb.numSgprGlobalReadIncs > 0:
+    if _usesScaleB and self.states.mxsb.numSgprGlobalReadIncs > 0:
       module.add(self.addSgprVarToPool("GlobalReadIncsMXSB"))
     return module
 
@@ -756,10 +763,12 @@ class KernelWriterAssembly(KernelWriter):
       if not kernel["enableTDMB"]:
         module.add(self.defineSgpr("SrdB", 4, 4))
         self.addSgprVarToPool("SrdB")
-      if kernel["ProblemType"]["MXBlockA"] and not kernel["enableTDMA"]:
+      _usesScaleA = kernel["ProblemType"]["MXBlockA"] or kernel.get("UseDeepseekScaleA", False)
+      _usesScaleB = kernel["ProblemType"]["MXBlockB"] or kernel.get("UseDeepseekScaleB", False)
+      if _usesScaleA and not kernel["enableTDMA"]:
         module.add(self.defineSgpr("SrdMXSA", 4, 4))
         self.addSgprVarToPool("SrdMXSA")
-      if kernel["ProblemType"]["MXBlockB"] and not kernel["enableTDMB"]:
+      if _usesScaleB and not kernel["enableTDMB"]:
         module.add(self.defineSgpr("SrdMXSB", 4, 4))
         self.addSgprVarToPool("SrdMXSB")
       if not kernel["enableTDMMetadata"] and kernel["ProblemType"]["Sparse"]:
@@ -775,10 +784,10 @@ class KernelWriterAssembly(KernelWriter):
       if not kernel["enableTDMMetadata"] and kernel["ProblemType"]["Sparse"]:
         module.add(self.defineSgpr("ShadowLimitMetadata", 2, 2))
     if self.states.use64bShadowLimitMX:
-      if kernel["ProblemType"]["MXBlockA"] and not kernel["enableTDMA"]:
+      if _usesScaleA and not kernel["enableTDMA"]:
         module.add(self.defineSgpr("ShadowLimitMXSA", 2, 2))
         self.addSgprVarToPool("ShadowLimitMXSA")
-      if kernel["ProblemType"]["MXBlockB"] and not kernel["enableTDMB"]:
+      if _usesScaleB and not kernel["enableTDMB"]:
         module.add(self.defineSgpr("ShadowLimitMXSB", 2, 2))
         self.addSgprVarToPool("ShadowLimitMXSB")
 
@@ -791,9 +800,9 @@ class KernelWriterAssembly(KernelWriter):
       wrapAlignment = 2 if self.states.asmCaps["s_sub_u64"] and self.states.asmCaps["HasWMMA_V3"] else 1
       module.add(self.defineSgpr("WrapUA", 2, wrapAlignment))  # Bytes to add to SrdA to reset address from N-1 iter to AddressA
       module.add(self.defineSgpr("WrapUB", 2, wrapAlignment))  # Bytes to add to SrdB to reset address from N-1 iter to AddressB
-      if kernel["ProblemType"]["MXBlockA"]:
+      if _usesScaleA:
         module.add(self.defineSgpr("WrapUMXSA", 2, wrapAlignment))  # Bytes to add to SrdA to reset address from N-1 iter to AddressMXSA
-      if kernel["ProblemType"]["MXBlockB"]:
+      if _usesScaleB:
         module.add(self.defineSgpr("WrapUMXSB", 2, wrapAlignment))  # Bytes to add to SrdA to reset address from N-1 iter to AddressMXSB
       if kernel["ProblemType"]["Sparse"]:
         module.add(self.defineSgpr("WrapUMetadata", 2, wrapAlignment))  # Bytes to add to SrdMetadata to reset address from N-1 iter to AddressMetadata
@@ -805,7 +814,7 @@ class KernelWriterAssembly(KernelWriter):
       module.add(self.defineSgpr("GlobalReadIncsA", self.states.a.numSgprGlobalReadIncs))
       if kernel["NumWaves"] < 2:
         self.addSgprVarToPool("GlobalReadIncsA")
-    if kernel["ProblemType"]["MXBlockA"] and self.states.mxsa.numSgprGlobalReadIncs > 0:
+    if _usesScaleA and self.states.mxsa.numSgprGlobalReadIncs > 0:
       module.add(self.defineSgpr("GlobalReadIncsMXSA", self.states.mxsa.numSgprGlobalReadIncs))
       if kernel["NumWaves"] < 2:
         self.addSgprVarToPool("GlobalReadIncsMXSA")
@@ -813,7 +822,7 @@ class KernelWriterAssembly(KernelWriter):
       module.add(self.defineSgpr("GlobalReadIncsB", self.states.b.numSgprGlobalReadIncs))
       if kernel["NumWaves"] < 2:
         self.addSgprVarToPool("GlobalReadIncsB")
-    if kernel["ProblemType"]["MXBlockB"] and self.states.mxsb.numSgprGlobalReadIncs > 0:
+    if _usesScaleB and self.states.mxsb.numSgprGlobalReadIncs > 0:
       module.add(self.defineSgpr("GlobalReadIncsMXSB", self.states.mxsb.numSgprGlobalReadIncs))
       if kernel["NumWaves"] < 2:
         self.addSgprVarToPool("GlobalReadIncsMXSB")

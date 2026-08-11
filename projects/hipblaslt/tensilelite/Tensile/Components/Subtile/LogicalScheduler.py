@@ -3656,17 +3656,6 @@ class LogicalScheduler:
         module.add(self._emitLoop(writer, kernel, "PRELOOP",
                                   preloop_emitted, schedule=False))
 
-        # Deepseek mainloop scale is bolted onto the A/B schedule via a raw
-        # module (not scheduler-integrated). It is loaded per consuming K-block:
-        # once per mainloop unroll copy and once in the NLL (PGR=1's last block).
-        dmlActive = kernel.get("_deepseekML") is not None
-        assert not dmlActive or self.config.pgr <= 1, \
-            "deepseek mainloop scale supports only PGR<=1 (NGLL path not handled)"
-
-        def _emitDeepseekScale():
-            from .SubtileDeepseekScaleEmit import emitDeepseekScaleGR
-            return emitDeepseekScaleGR(writer, kernel)
-
         # ── Mainloop ──
         module.addComment0("MAINLOOP")
         loopBegin = Label("LoopBeginL", "", alignment=16)
@@ -3689,8 +3678,6 @@ class LogicalScheduler:
             # K-block gets its own scale (PGR=1 uses uf=2). The load's vlcnt=0
             # drain waits only for the current K-block's in-flight data (1-deep
             # PGR=1 lookahead), preserving the next K-block's prefetch overlap.
-            if dmlActive:
-                module.add(_emitDeepseekScale())
             if emitTraceMarker:
                 # Mainloop iteration marker for SQTT / trace decoder: write
                 # LoopCounterL into M0 then emit it via s_ttracedata. Decoder
@@ -3740,8 +3727,6 @@ class LogicalScheduler:
                                       self._ngll_per_unroll[(last + 1) % uf]))
         if nll_ft == 0:
             module.add(Label("SkipToNLL", ""))
-        if dmlActive and self.config.pgr >= 1:
-            module.add(_emitDeepseekScale())
         module.addComment0(f"NLL_C{last}")
         module.add(self._emitLoop(writer, kernel, f"NLL_C{last}",
                                   inject_pap_after_nll_drain(self._nll_per_unroll[nll_ft])))
@@ -3758,8 +3743,6 @@ class LogicalScheduler:
                                           self._ngll_per_unroll[(ui + 1) % uf]))
             if nll_idx == 0:
                 module.add(Label("SkipToNLL", ""))
-            if dmlActive and self.config.pgr >= 1:
-                module.add(_emitDeepseekScale())
             module.addComment0(f"NLL_C{ui}")
             module.add(self._emitLoop(writer, kernel, f"NLL_C{ui}",
                                       inject_pap_after_nll_drain(self._nll_per_unroll[nll_idx])))

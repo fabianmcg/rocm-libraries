@@ -176,16 +176,7 @@ class InstructionEmitter:
             bTile = self.vgprTilesB[tile_maps['B'][groupB]]
             dTile = self.dtileInfo.vgprTiles[a + b * self.dtileInfo.localMMATileGrid[0]]
 
-            dml = self.kernel.get("_deepseekML")
-            if dml:
-                # E8M0 byte loaded per K-block; MFMA with sAsel=sBsel=0 reads byte 0.
-                unit_e8m0 = dml["unitE8m0"]
-                useDsa = self.kernel.get("UseDeepseekScaleA", False)
-                useDsb = self.kernel.get("UseDeepseekScaleB", False)
-                scaleAVgpr = dml["scaleAVgprs"] + a if useDsa else unit_e8m0
-                scaleBVgpr = dml["scaleBVgpr"] if useDsb else unit_e8m0
-                sAsel = sBsel = 0
-            elif self.hasScale:
+            if self.hasScale:
                 scaleGroupA = (a // self.config.lrSA.mn) * self.config.lrSA.mn
                 scaleGroupB = (b // self.config.lrSB.mn) * self.config.lrSB.mn
                 scaleATile = self.vgprTilesSA[tile_maps['SA'][scaleGroupA]]

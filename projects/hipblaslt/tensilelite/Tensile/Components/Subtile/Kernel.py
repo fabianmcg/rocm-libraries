@@ -66,6 +66,7 @@ from .SubtileGeometry import (
   MFMA_16x16_1B_4K_8V,
   MFMA_16x16_1B_4N_4V,
   MFMA_SCALE_16x16_1B_MX32_8V,
+  MFMA_SCALE_16x16_DS,
   TileGeometry,
   ABInputGeometry,
   ABGRGeometry,
@@ -121,6 +122,7 @@ from .SubtileScaleEmit import (
     globalReadDoScaleSubtile, localReadDoScaleSubtile,
     globalReadScalePtrUpdates, globalReadScaleSwizzledDTLInitCommonSgpr,
     emitSubtileScaleDsRead,
+    usesScaleA, usesScaleB, isDeepseekScale, initDeepseekScaleSrd,
 )
 
 class ABGRTile:
@@ -327,6 +329,16 @@ MXSB_B4 = MXScaleTilePair(gr=MXScaleGRGeometry(**_MXS_B4, loadWidth=16), lr=MXSc
 MXSA_B8 = MXScaleTilePair(gr=MXScaleGRGeometry(**_MXS_B8, loadWidth=16), lr=MXScaleLRGeometry(**_MXS_B8, loadWidth=4))
 MXSB_B8 = MXScaleTilePair(gr=MXScaleGRGeometry(**_MXS_B8, loadWidth=16), lr=MXScaleLRGeometry(**_MXS_B8, loadWidth=4))
 
+# DeepseekScale: pre-broadcast fp8 per-row / per-K-block. bpe=4 models the 4-byte host
+# pre-broadcast layout so mmaTileRegCount = 16*1*4/64/4 = 0.25 (1 VGPR per subtile via ceil).
+# GR: loadWidth=4 (b32 per lane), subtileShape derived from kernel as (mt_mma, 1).
+# LR: subtileShape=(1,1) guarantees sAsel=0 for all MFMA iterations.
+_DS_SCALE = dict(scaleLayout=MFMA_SCALE_16x16_DS, instK=128, bpe=4, supportedTypes=('fp8', 'bf8'))
+DS_SCALE_A = MXScaleTilePair(gr=MXScaleGRGeometry(**_DS_SCALE, loadWidth=4),
+                              lr=MXScaleLRGeometry(**_DS_SCALE, loadWidth=4, subtileShape=(1, 1)))
+DS_SCALE_B = MXScaleTilePair(gr=MXScaleGRGeometry(**_DS_SCALE, loadWidth=4),
+                              lr=MXScaleLRGeometry(**_DS_SCALE, loadWidth=4, subtileShape=(1, 1)))
+
 # C/D output: 128-bit store = 4 f32 elements along N
 CD_F32 = CDTile_1x1(mmaLayout=MFMA_16x16_1B_4N_4V, bpe=4, supportedTypes=('f32',), storeShape=LoadShape(m=1, k=4))
 # Wave32 f32 output: 8 VGPRs per lane (WMMA V3 gfx1250)
@@ -334,12 +346,17 @@ CD_F32_W32 = CDTile_1x1(mmaLayout=MMALayout(instM=16, blocks=1, vgprs=8, waveSiz
 
 def selectMXScaleGeometry(kernel: dict, tc: str) -> MXScaleTilePair:
   """Return the MXScaleTilePair for scale tensor tc ('MXSA' or 'MXSB')."""
-  data_tc = 'A' if tc == 'MXSA' else 'B'
+  isA = tc == 'MXSA'
+  # DeepseekScale: per-row E8M0, host pre-broadcast layout, mxBlock=128.
+  use_ds = kernel.get("UseDeepseekScaleA", False) if isA else kernel.get("UseDeepseekScaleB", False)
+  if use_ds:
+    return DS_SCALE_A if isA else DS_SCALE_B
+  data_tc = 'A' if isA else 'B'
   dtype = kernel["ProblemType"][f"DataType{data_tc}"]
   if dtype.is6bitFloat() or dtype.isFloat4():
-    return MXSA_B4 if tc == 'MXSA' else MXSB_B4
+    return MXSA_B4 if isA else MXSB_B4
   if dtype.is8bitFloat():
-    return MXSA_B8 if tc == 'MXSA' else MXSB_B8
+    return MXSA_B8 if isA else MXSB_B8
   raise NotImplementedError(f"selectMXScaleGeometry: unsupported dtype {dtype} for tc={tc}")
 
 
@@ -1142,14 +1159,12 @@ def emitMfmaCode(writer, kernel):
   tiA = writer.states.a.tileInfo
   tiB = writer.states.b.tileInfo
   dtileInfo = writer.states.d.tileInfo  # D has no TileInfo yet
-  tiMXSA = writer.states.mxsa.tileInfo if kernel["ProblemType"].get("MXBlockA", 0) > 0 else None
-  tiMXSB = writer.states.mxsb.tileInfo if kernel["ProblemType"].get("MXBlockB", 0) > 0 else None
+  tiMXSA = writer.states.mxsa.tileInfo if usesScaleA(kernel) else None
+  tiMXSB = writer.states.mxsb.tileInfo if usesScaleB(kernel) else None
 
-  # Use loaded scale VGPRs when MX block scaling is active.
-  # Note: scaleVgprTiles is only populated by the scheduler path;
-  # in the non-scheduler path we use vgprTiles (populated by localReadDoScaleSubtile).
-  hasScaleA = tiMXSA is not None and tiMXSA.mxBlock > 0
-  hasScaleB = tiMXSB is not None and tiMXSB.mxBlock > 0
+  # Use loaded scale VGPRs when MX block scaling or DeepseekScale is active.
+  hasScaleA = tiMXSA is not None
+  hasScaleB = tiMXSB is not None
 
   # LR subtile shape governs the MFMA register layout (always (1,2) for current geometries).
   # Use ti.lr.subtileShape rather than ti.subtileShape (= GR subtileShape, which differs for
@@ -1179,19 +1194,7 @@ def emitMfmaCode(writer, kernel):
         btiles = tiB.vgprTiles[btileId]
         dtiles = dtileInfo.vgprTiles[mma0 + mma1 * dtileInfo.localMMATileGrid[0]]
 
-        dml = kernel.get("_deepseekML")
-        if dml is not None:
-          # Deepseek multi-K mainloop path: E8M0 byte loaded per K-block by emitDeepseekScaleGR.
-          # scaleAVgprs[mma0] holds the E8M0 byte (in bits [7:0]) for the current iteration.
-          # scaleBVgpr holds the E8M0 byte for the current K-block's N-block.
-          # unitE8m0 (byte 0x7f = 1.0 in E8M0) is used when one side is inactive.
-          # Both use byte 0 (scaleAsel=0, scaleBsel=0) via the standard MX E8M0 MFMA path.
-          useDsa = kernel.get("UseDeepseekScaleA", False)
-          useDsb = kernel.get("UseDeepseekScaleB", False)
-          scaleAVgpr = (dml["scaleAVgprs"] + mma0) if useDsa else dml["unitE8m0"]
-          scaleBVgpr = dml["scaleBVgpr"] if useDsb else dml["unitE8m0"]
-          sAsel = sBsel = 0
-        elif hasScaleA:
+        if hasScaleA:
           # Scale group index: one VGPR per lrSubtileShape[0] M-tiles x lrSubtileShape[1] K-tiles
           scaleMShapeA = tiMXSA.lrSubtileShape[0]
           scaleMShapeB = tiMXSB.lrSubtileShape[0]
@@ -1339,8 +1342,8 @@ def mainLoop(writer, kernel):
 
   tiA = writer.states.a.tileInfo
   tiB = writer.states.b.tileInfo
-  scaleTiA = writer.states.mxsa.tileInfo if kernel["ProblemType"].get("MXBlockA", 0) else None
-  scaleTiB = writer.states.mxsb.tileInfo if kernel["ProblemType"].get("MXBlockB", 0) else None
+  scaleTiA = writer.states.mxsa.tileInfo if usesScaleA(kernel) else None
+  scaleTiB = writer.states.mxsb.tileInfo if usesScaleB(kernel) else None
 
   lrAGran = ReadGranularity(mn=1, k=1)
   lrBGran = ReadGranularity(mn=1, k=1)
@@ -1410,19 +1413,11 @@ def mainLoop(writer, kernel):
   # asymmetric mixed-scale case where one of A/B has an MX scale and the other
   # does not). Requiring both unscaled would leave the fallback asserting on a
   # missing _subtileUnitScaleVgpr.
-  if miK == 128 and (scaleTiA is None or scaleTiB is None):
+  if miK == 128 and (not usesScaleA(kernel) or not usesScaleB(kernel)):
       unitScaleVgpr = writer.vgprPool.checkOut(1)
       module.add(VMovB32(dst=vgpr(unitScaleVgpr), src=hex(0x7f7f7f7f),
                          comment="unit scale=1.0 (E8M0) for plain FP8 MFMA"))
       kernel["_subtileUnitScaleVgpr"] = unitScaleVgpr
-  # Deepseek mainloop scale (PGR=0 and PGR=1): alloc VGPRs/SGPRs, precompute vaddrs.
-  # The v_mfma_scale_f32_16x16x128_f8f6f4 instruction applies per-lane E8M0 scaleA
-  # and uniform scaleB inline during each MFMA, one K-block at a time.
-  useDeepseekScale = kernel.get("UseDeepseekScaleA", False) or kernel.get("UseDeepseekScaleB", False)
-  if useDeepseekScale and pgr in (0, 1):
-      from .SubtileDeepseekScaleEmit import setupDeepseekMainloopScale
-      mma_m = tiA.localMMATileGrid[0]
-      setupDeepseekMainloopScale(module, writer, kernel, mma_m)
   scheduler.populate_instructions(
       writer, kernel,
       tileInfoA=tiA, tileInfoB=tiB, dtileInfo=dtileInfo,
@@ -1501,25 +1496,5 @@ def mainLoop(writer, kernel):
 
   if unitScaleVgpr >= 0:
       writer.vgprPool.checkIn(unitScaleVgpr)
-
-  dml = kernel.get("_deepseekML")
-  if dml is not None:
-      writer.vgprPool.checkIn(dml["unitE8m0"])
-      if "scaleAVaddrs" in dml:
-          writer.vgprPool.checkIn(dml["scaleAVaddrs"])
-      if "scaleAVgprs" in dml:
-          writer.vgprPool.checkIn(dml["scaleAVgprs"])
-      if "kbOffset" in dml:
-          writer.sgprPool.checkIn(dml["kbOffset"])
-      if "scaleBVaddr" in dml:
-          writer.vgprPool.checkIn(dml["scaleBVaddr"])
-      if "scaleBVgpr" in dml:
-          writer.vgprPool.checkIn(dml["scaleBVgpr"])
-      if "kbBOffset" in dml:
-          writer.vgprPool.checkIn(dml["kbBOffset"])
-      if "nNBlocksStride" in dml:
-          writer.vgprPool.checkIn(dml["nNBlocksStride"])
-      if "sharedBufPtrSgpr" in dml:
-          writer.sgprPool.checkIn(dml["sharedBufPtrSgpr"])
 
   return module
