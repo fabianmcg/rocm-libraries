@@ -230,6 +230,10 @@ def _getName(state, requiredParameters: frozenset, splitGSU: bool, ignoreInterna
   if not state.get("TileQuant", False):
     requiredParametersTemp.discard("TileQuantShape")
 
+  # MXFP8QuantShape is only meaningful when MXFP8Quant is active.
+  if not state.get("MXFP8Quant", False):
+    requiredParametersTemp.discard("MXFP8QuantShape")
+
   # DeepseekScale parameters are only meaningful when at least one scale flag is active.
   use_scale_a = state.get("UseDeepseekScaleA", False)
   use_scale_b = state.get("UseDeepseekScaleB", False)

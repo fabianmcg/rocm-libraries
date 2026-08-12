@@ -508,6 +508,8 @@ defaultBenchmarkCommonParameters = [
     {"RstdScale": [False]},
     {"TileQuant": [False]},
     {"TileQuantShape": [[-1, -1]]},
+    {"MXFP8Quant": [False]},
+    {"MXFP8QuantShape": [[-1, -1]]},
     {"UseDeepseekScaleA": [False]},
     {"UseDeepseekScaleB": [False]},
     {"DeepseekScaleBlockK": [128]},

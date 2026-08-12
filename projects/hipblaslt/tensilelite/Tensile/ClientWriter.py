@@ -592,7 +592,7 @@ def pruneModeName(mode):
     if mode == 5: return 'Prune0X0X'
     if mode == 6: return 'Prune00XX'
 
-def writeClientConfigIni(forBenchmark, problemSizes, biasTypeArgs, factorDimArgs, activationArgs, icacheFlushArgs, problemType, sourceDir, codeObjectFiles, resultsFileName, parametersFilePath, deviceId: int, gfxName: str, libraryFile, gateTypeArgs="", probSolMap={}, partialRMSMT0=0, partialRMSMT1=0, anyPartialRMSResidualAdd=False, useRstdScale=False, anyPartialRMSQuant=False, useTileQuant=False, tileQuantQ0=0, tileQuantQ1=0):
+def writeClientConfigIni(forBenchmark, problemSizes, biasTypeArgs, factorDimArgs, activationArgs, icacheFlushArgs, problemType, sourceDir, codeObjectFiles, resultsFileName, parametersFilePath, deviceId: int, gfxName: str, libraryFile, gateTypeArgs="", probSolMap={}, partialRMSMT0=0, partialRMSMT1=0, anyPartialRMSResidualAdd=False, useRstdScale=False, anyPartialRMSQuant=False, useTileQuant=False, tileQuantQ0=0, tileQuantQ1=0, useMXFP8Quant=False, mxfp8QuantQ0=0, mxfp8QuantQ1=0):
 
     assert os.path.exists(sourceDir), f"sourceDir={sourceDir} does not exist"
     # libraryFile must point at the per-base TensileLibrary{,.yaml,.dat}; the
@@ -649,6 +649,11 @@ def writeClientConfigIni(forBenchmark, problemSizes, biasTypeArgs, factorDimArgs
             param('tile-quant-q0', tileQuantQ0)
         if useTileQuant and tileQuantQ1 > 0:
             param('tile-quant-q1', tileQuantQ1)
+        param('use-mxfp8-quant', useMXFP8Quant)
+        if useMXFP8Quant and mxfp8QuantQ0 > 0:
+            param('mxfp8-quant-q0', mxfp8QuantQ0)
+        if useMXFP8Quant and mxfp8QuantQ1 > 0:
+            param('mxfp8-quant-q1', mxfp8QuantQ1)
         param('use-scaleAB',   problemType.useScaleAB)
         param('use-scaleCD',   problemType.useScaleCD)
         param('use-scaleAlphaVec',   problemType.useScaleAlphaVec)
@@ -833,6 +838,9 @@ def writeClientConfig(
     anyTileQuant   = False
     tileQuantQ0    = 0
     tileQuantQ1    = 0
+    anyMXFP8Quant  = False
+    mxfp8QuantQ0   = 0
+    mxfp8QuantQ1   = 0
     # When solutions is None (library-client mode), derive flags from the problem type.
     if solutions is None:
         anyRstdScale = getattr(newSolution.problemType, 'useRstdScale', False)
@@ -846,6 +854,10 @@ def writeClientConfig(
         if anyTileQuant:
             tileQuantQ0 = newSolution.sizeMapping.tileQuantQ0
             tileQuantQ1 = newSolution.sizeMapping.tileQuantQ1
+        anyMXFP8Quant = getattr(newSolution.problemType, 'useMXFP8Quant', False)
+        if anyMXFP8Quant:
+            mxfp8QuantQ0 = newSolution.sizeMapping.mxfp8QuantQ0
+            mxfp8QuantQ1 = newSolution.sizeMapping.mxfp8QuantQ1
     else:
         anyRstdScale = any(bool(sol.get("RstdScale", False)) for sol in solutions)
         if getattr(newSolution.problemType, 'usePartialRMS', False):
@@ -908,8 +920,26 @@ def writeClientConfig(
                 )
             tileQuantQ0 = q0Values.pop() if q0Values else 0
             tileQuantQ1 = q1Values.pop() if q1Values else 0
+        anyMXFP8Quant = any(bool(sol.get("MXFP8Quant", False)) for sol in solutions)
+        if anyMXFP8Quant:
+            mxQ0Values = set()
+            mxQ1Values = set()
+            for libSol in newLibrary.solutions.values():
+                if not getattr(libSol.problemType, 'useMXFP8Quant', False):
+                    continue
+                mxQ0Values.add(libSol.sizeMapping.mxfp8QuantQ0)
+                mxQ1Values.add(libSol.sizeMapping.mxfp8QuantQ1)
+            if len(mxQ0Values) > 1 or len(mxQ1Values) > 1:
+                raise ValueError(
+                    f"MXFP8Quant benchmark pass mixes solutions with different quant "
+                    f"shapes (Q0={sorted(mxQ0Values)}, Q1={sorted(mxQ1Values)}). Each "
+                    f"BenchmarkProblemSizeGroup must contain a single MXFP8QuantShape. "
+                    f"Use separate ForkParameters groups per quant tile."
+                )
+            mxfp8QuantQ0 = mxQ0Values.pop() if mxQ0Values else 0
+            mxfp8QuantQ1 = mxQ1Values.pop() if mxQ1Values else 0
 
-    writeClientConfigIni(forBenchmark, problemSizes, biasTypeArgs, factorDimArgs, activationArgs, icacheFlushArgs, newSolution.problemType, sourceDir, codeObjectFiles, resultsFileName, filename, deviceId, gfxName, libraryFile, gateTypeArgs, probSolMap, minMT0, minMT1, anyResidualAdd, anyRstdScale, anyQuantFlag, anyTileQuant, tileQuantQ0, tileQuantQ1)
+    writeClientConfigIni(forBenchmark, problemSizes, biasTypeArgs, factorDimArgs, activationArgs, icacheFlushArgs, newSolution.problemType, sourceDir, codeObjectFiles, resultsFileName, filename, deviceId, gfxName, libraryFile, gateTypeArgs, probSolMap, minMT0, minMT1, anyResidualAdd, anyRstdScale, anyQuantFlag, anyTileQuant, tileQuantQ0, tileQuantQ1, anyMXFP8Quant, mxfp8QuantQ0, mxfp8QuantQ1)
 
     return filename
 

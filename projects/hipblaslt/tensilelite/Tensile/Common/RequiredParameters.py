@@ -171,6 +171,8 @@ def getRequiredParametersMin() -> set:
         'RstdScale',
         'TileQuant',
         'TileQuantShape',
+        'MXFP8Quant',
+        'MXFP8QuantShape',
         'UseDeepseekScaleA',
         'UseDeepseekScaleB',
         'DeepseekScaleBlockK',

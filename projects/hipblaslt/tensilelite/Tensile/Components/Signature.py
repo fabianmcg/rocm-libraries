@@ -384,6 +384,16 @@ class SignatureDefault(Signature):
             signature.addArg("QuantScale", SVK.SIG_GLOBALBUFFER, "f32", "generic")
             userArgumentsInfo.rmsNormSize += 8  # 8B quantScale ptr
 
+        if kernel["MXFP8Quant"]:
+            # MXFP8Quant epilogue appends MXScale: u8 global buffer pointer (8 bytes).
+            # KernelWriter._initKernel is the source of truth for the 64-bit alignment pad;
+            # mirror it exactly by checking whether it inserted the pad entry.
+            if "MXFP8QuantPad" in writer.states.numStoreSgprNames:
+                signature.addArg("MXFP8QuantPad", SVK.SIG_VALUE, "u32")
+                userArgumentsInfo.rmsNormSize += 4
+            signature.addArg("MXScale", SVK.SIG_GLOBALBUFFER, "u8", "generic")
+            userArgumentsInfo.rmsNormSize += 8  # 8B MXScale ptr
+
         if kernel.get("UseDeepseekScaleA", False):
             # DeepseekScaleA epilogue appends ScaleABuf: fp32 global buffer pointer (8 bytes).
             # KernelWriter._initKernel is the source of truth for the 64-bit alignment pad;

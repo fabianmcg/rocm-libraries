@@ -5248,6 +5248,12 @@ class KernelWriter(metaclass=abc.ABCMeta):
         tqEmitter = SubtileTileQuantEmitter(self, kernel)
         module.add(tqEmitter.emit(dtileInfo.vgprTiles))
 
+      if kernel["MXFP8Quant"]:
+        from .Components.Subtile.SubtileMXFP8QuantEmit import SubtileMXFP8QuantEmitter
+        module.addComment1("MXFP8Quant: per-block e8m0 dynamic quant for fp8 D output.")
+        mxEmitter = SubtileMXFP8QuantEmitter(self, kernel)
+        module.add(mxEmitter.emit(dtileInfo.vgprTiles))
+
       # global write indices
       module.addComment1("not-LocalSplitU: global write indices")
       module.add(self.notLocalSplitUGlobalWriteIndices(kernel))
@@ -10211,6 +10217,15 @@ class KernelWriter(metaclass=abc.ABCMeta):
         self.states.numStoreSgprNameSizes.append(1)
         storeSgprLoad += 1
       self.states.numStoreSgprNames.append("QuantScale")
+      self.states.numStoreSgprNameSizes.append(self.states.rpga)  # 2 SGPRs (64-bit ptr)
+      storeSgprLoad += self.states.rpga
+    if kernel["MXFP8Quant"]:
+      # MXScale: 64-bit pointer (2 SGPRs) for the e8m0 side buffer.
+      if sum(self.states.numStoreSgprNameSizes) % 2:
+        self.states.numStoreSgprNames.append("MXFP8QuantPad")
+        self.states.numStoreSgprNameSizes.append(1)
+        storeSgprLoad += 1
+      self.states.numStoreSgprNames.append("MXScale")
       self.states.numStoreSgprNameSizes.append(self.states.rpga)  # 2 SGPRs (64-bit ptr)
       storeSgprLoad += self.states.rpga
     if kernel.get("UseDeepseekScaleA", False):

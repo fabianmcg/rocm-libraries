@@ -430,6 +430,7 @@ _defaultProblemType = {
     "PartialRMSQuant":       False,
     "RstdScale":             False,
     "TileQuant":             False,
+    "MXFP8Quant":            False,
     "UseDeepseekScaleA":     False,
     "UseDeepseekScaleB":     False,
     "Gradient": False,  # =True set globalWriteElements to gradient mode

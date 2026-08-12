@@ -74,7 +74,7 @@ class ProblemType:
                  'sparse', 'f32XdlMathOp', 'supportDeviceUserArguments', 'outputAmaxD', 'swizzleTensorA', 'swizzleTensorB', 'metadataLayout',
                  'mxBlockA', 'mxBlockB', 'mxTypeA', 'mxTypeB', 'mxScaleFormat',
                  'usePartialRMS', 'partialRMSResidualAdd', 'partialRMSQuant', 'useRstdScale',
-                 'useTileQuant', 'useDeepseekScaleA', 'useDeepseekScaleB']
+                 'useTileQuant', 'useMXFP8Quant', 'useDeepseekScaleA', 'useDeepseekScaleB']
     @classmethod
     def FromOriginalState(cls, d):
         indices = [None]*d['TotalIndices']
@@ -265,6 +265,7 @@ class ProblemType:
         rv.partialRMSQuant = bool(d.get('PartialRMSQuant', False))
         rv.useRstdScale = bool(d.get('RstdScale', False))
         rv.useTileQuant = bool(d.get('TileQuant', False))
+        rv.useMXFP8Quant = bool(d.get('MXFP8Quant', False))
         rv.useDeepseekScaleA = bool(d.get('UseDeepseekScaleA', False))
         rv.useDeepseekScaleB = bool(d.get('UseDeepseekScaleB', False))
 
@@ -446,6 +447,7 @@ class ProblemType:
             predicates.append(ProblemPredicate("UsePartialRMSResidualAdd", value=self.partialRMSResidualAdd))
             predicates.append(ProblemPredicate("UsePartialRMSQuant", value=self.partialRMSQuant))
             predicates.append(ProblemPredicate("UseTileQuant", value=self.useTileQuant))
+            predicates.append(ProblemPredicate("UseMXFP8Quant", value=self.useMXFP8Quant))
             predicates.append(ProblemPredicate("UseDeepseekScaleA", value=self.useDeepseekScaleA))
             predicates.append(ProblemPredicate("UseDeepseekScaleB", value=self.useDeepseekScaleB))
         return predicates
@@ -622,6 +624,10 @@ class ProblemPredicate(Properties.Predicate):
             rv += [cls('TileQuantQ0', value=state['_TileQuantQ0'])]
             rv += [cls('TileQuantQ1', value=state['_TileQuantQ1'])]
 
+        if state.get('MXFP8Quant', False):
+            rv += [cls('MXFP8QuantQ0', value=state['_MXFP8QuantQ0'])]
+            rv += [cls('MXFP8QuantQ1', value=state['_MXFP8QuantQ1'])]
+
         return rv
 
     @classmethod
@@ -682,6 +688,9 @@ class SizeMapping:
                  'TileQuant',
                  'tileQuantQ0',
                  'tileQuantQ1',
+                 'MXFP8Quant',
+                 'mxfp8QuantQ0',
+                 'mxfp8QuantQ1',
                  'useDeepseekScaleA',
                  'useDeepseekScaleB',
                  'NonTemporalD',
@@ -785,6 +794,9 @@ class SizeMapping:
                    TileQuant                = bool(d.get('TileQuant', False)),
                    tileQuantQ0              = int(d.get('_TileQuantQ0', 0)),
                    tileQuantQ1              = int(d.get('_TileQuantQ1', 0)),
+                   MXFP8Quant               = bool(d.get('MXFP8Quant', False)),
+                   mxfp8QuantQ0             = int(d.get('_MXFP8QuantQ0', 0)),
+                   mxfp8QuantQ1             = int(d.get('_MXFP8QuantQ1', 0)),
                    useDeepseekScaleA        = bool(d.get('UseDeepseekScaleA', False)),
                    useDeepseekScaleB        = bool(d.get('UseDeepseekScaleB', False)),
                    NonTemporalD             = d['NonTemporalD'],

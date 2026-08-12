@@ -14620,9 +14620,10 @@ class KernelWriterAssembly(KernelWriter):
     # print("len(elements)= ", len(elements_1))
     noGSUBranch = (kernel["GlobalSplitU"] == 0 and (not self.states.streamK.requiresWorkspaceReductionStorePath or kernel["StreamKForceDPOnly"]))
     module = Module("notLocalSplitUGlobalWrite")
-    # TileQuant applies alpha and handles beta=0 in its epilogue; suppress both here.
-    applyAlpha = not kernel.get("TileQuant", False)
-    betas = [False] if kernel.get("TileQuant", False) else None
+    # TileQuant and MXFP8Quant apply alpha and handle beta=0 in their epilogues.
+    ownsEpilogue = kernel.get("TileQuant", False) or kernel.get("MXFP8Quant", False)
+    applyAlpha = not ownsEpilogue
+    betas = [False] if ownsEpilogue else None
     storeModule, deferredGSU0 = self.globalWriteElements(
         kernel, tPA, tPB, fullVws, fullVws_1, elements, elements_1,
         noGSUBranch=noGSUBranch,

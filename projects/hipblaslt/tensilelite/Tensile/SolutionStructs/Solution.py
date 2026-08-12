@@ -434,12 +434,106 @@ def _resolveTileQuantShape(state, printRejectionReason):
   return True
 
 
+def _resolveMXFP8QuantShape(state, printRejectionReason):
+  """Resolve and validate MXFP8QuantShape; set _MXFP8QuantQ0/Q1 in state.
+
+  Returns True on success, False if the state was rejected.
+  Checks power-of-two, even divisibility, and Phase-1 wave-span bounds.
+  """
+  mt0, mt1 = state["MacroTile0"], state["MacroTile1"]
+  q = list(state.get("MXFP8QuantShape", [-1, -1]))
+  q0 = mt0 if q[0] in (-1, 0) else q[0]
+  q1 = mt1 if q[1] in (-1, 0) else q[1]
+  state["_MXFP8QuantQ0"], state["_MXFP8QuantQ1"] = q0, q1
+  for name, qd, mtd in (("Q0", q0, mt0), ("Q1", q1, mt1)):
+    if qd <= 0 or (qd & (qd - 1)) != 0:
+      reject(state, printRejectionReason, f"MXFP8Quant {name} must be a power of two")
+      return False
+    if mtd % qd != 0:
+      reject(state, printRejectionReason, f"MXFP8Quant {name} must divide MacroTile evenly")
+      return False
+  mfmaM = state["MatrixInstM"]
+  if q0 < mfmaM:
+    rowsPerLane = (mfmaM * state["MatrixInstN"]) // state["WavefrontSize"]
+    if q0 > rowsPerLane or (rowsPerLane % q0) != 0:
+      reject(state, printRejectionReason,
+             f"MXFP8Quant Q0={q0} < MatrixInstM={mfmaM} is only supported when "
+             f"Q0 <= rowsPerLane={rowsPerLane} and Q0 divides rowsPerLane")
+      return False
+  mfmaN = state["MatrixInstN"]
+  if q1 < mfmaN:
+    reject(state, printRejectionReason,
+           f"MXFP8Quant Q1={q1} must be >= MatrixInstN={mfmaN} (sub-mfma column quantization not supported)")
+    return False
+  wg = state["MIWaveGroup"]
+  if q0 > (mt0 // wg[0]) or q1 > (mt1 // wg[1]):
+    reject(state, printRejectionReason,
+           "MXFP8Quant Phase 1 requires QuantTileShape within a single wave sub-tile")
+    return False
+  return True
+
+
+def _validateMXFP8Quant(state, printRejectionReason):
+  """Validate MXFP8Quant fused epilogue constraints (feature flags, type, shape)."""
+  if not state.get("MXFP8Quant", False):
+    return
+  if state.get("TileQuant", False) or state.get("PartialRMS", False) or state.get("RstdScale", False):
+    reject(state, printRejectionReason,
+           "MXFP8Quant is mutually exclusive with TileQuant/PartialRMS/RstdScale")
+    return
+  if not _validateSubtileEpiloguePrereqs(state, printRejectionReason, "MXFP8Quant"):
+    return
+  if not state["ProblemType"]["DestDataType"].isFloat8():
+    reject(state, printRejectionReason,
+           "MXFP8Quant requires DestDataType=F8 (OCP e4m3); D is the fp8 output")
+    return
+  if not state["ProblemType"]["HighPrecisionAccumulate"]:
+    reject(state, printRejectionReason, "MXFP8Quant requires HighPrecisionAccumulate=True")
+    return
+  if state["ProblemType"].get("UseBeta", True):
+    reject(state, printRejectionReason, "MXFP8Quant requires UseBeta=False (beta must be 0)")
+    return
+  if state["ProblemType"].get("UseScaleCD", False):
+    reject(state, printRejectionReason,
+           "MXFP8Quant is incompatible with UseScaleCD (per-tile scale only)")
+    return
+  if state["ProblemType"].get("UseBias", 0) != 0:
+    reject(state, printRejectionReason, "MXFP8Quant does not support UseBias")
+    return
+  if state["ProblemType"].get("UseE", False):
+    reject(state, printRejectionReason, "MXFP8Quant does not support UseE")
+    return
+  if state["ProblemType"].get("UseGateResidual", False):
+    reject(state, printRejectionReason, "MXFP8Quant does not support UseGateResidual")
+    return
+  if state["ProblemType"].get("UseScaleAlphaVec", 0) != 0:
+    reject(state, printRejectionReason, "MXFP8Quant does not support UseScaleAlphaVec")
+    return
+  if state.get("PrefetchAcrossPersistent", 0):
+    reject(state, printRejectionReason,
+           "MXFP8Quant is not supported with PrefetchAcrossPersistent")
+    return
+  if state["ProblemType"]["OutputAmaxD"]:
+    reject(state, printRejectionReason, "MXFP8Quant does not support OutputAmaxD")
+    return
+  if (state.get("_GlobalAccumulation") == "MultipleBufferSingleKernel"
+      or state.get("AdaptiveGemmGSUA") == 1):
+    reject(state, printRejectionReason, "MXFP8Quant does not support MBSK/AdaptiveGemmGSUA")
+    return
+  if state["ProblemType"].get("GroupedGemm", False):
+    reject(state, printRejectionReason, "MXFP8Quant does not support GroupedGemm")
+    return
+  if not _resolveMXFP8QuantShape(state, printRejectionReason):
+    return
+
+
 def _validateTileQuant(state, printRejectionReason):
   """Validate TileQuant fused epilogue constraints (feature flags, type, shape)."""
   if not state.get("TileQuant", False):
     return
-  if state.get("PartialRMS", False) or state.get("RstdScale", False):
-    reject(state, printRejectionReason, "TileQuant is mutually exclusive with PartialRMS/RstdScale")
+  if state.get("PartialRMS", False) or state.get("RstdScale", False) or state.get("MXFP8Quant", False):
+    reject(state, printRejectionReason,
+           "TileQuant is mutually exclusive with PartialRMS/RstdScale/MXFP8Quant")
     return
   if not _validateSubtileEpiloguePrereqs(state, printRejectionReason, "TileQuant"):
     return
@@ -612,7 +706,7 @@ def _validateDeepseekScale(state, printRejectionReason):
     return
   if _validateDeepseekScaleDepthU(state, printRejectionReason):
     return
-  for flag in ("TileQuant", "RstdScale", "PartialRMS"):
+  for flag in ("TileQuant", "RstdScale", "PartialRMS", "MXFP8Quant"):
     if state.get(flag, False):
       reject(state, printRejectionReason,
              f"useDeepseekScale is mutually exclusive with {flag}")
@@ -1495,6 +1589,10 @@ class Solution(collections.abc.Mapping):
       return
 
     _validateTileQuant(state, printRejectionReason)
+    if not state["Valid"]:
+      return
+
+    _validateMXFP8Quant(state, printRejectionReason)
     if not state["Valid"]:
       return
 
