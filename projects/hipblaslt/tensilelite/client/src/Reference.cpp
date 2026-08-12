@@ -2335,9 +2335,9 @@ namespace TensileLite
                                     * static_cast<float>(cPtr[cIndex]);
                         dPtr[dIndex] = SaturateCast<typename Inputs::DType>(dVal);
                     }
-                    // TileQuant owns D: the second-pass block below writes every element,
-                    // so skip the standard per-element store here to avoid dead writes.
-                    else if(!problem.useTileQuant())
+                    // TileQuant and MXFP8Quant each own D via their second-pass blocks below;
+                    // skip the standard per-element store here to avoid dead writes.
+                    else if(!problem.useTileQuant() && !problem.useMXFP8Quant())
                     {
                         dPtr[dIndex] = SaturateCast<typename Inputs::DType>(resultD);
                     }
@@ -2549,6 +2549,114 @@ namespace TensileLite
 
                             // Second pass: reuse cached eff values; no second dot-product.
                             float quantMult = (amax > 0.0f) ? (kFp8Max / amax) : 0.0f;
+                            for(size_t m = mLo; m < mHi; ++m)
+                            {
+                                for(size_t n = nLo; n < nHi; ++n)
+                                {
+                                    std::vector<int64_t> dc(d.dimensions(), 0);
+                                    dc[dDimM] = static_cast<int64_t>(m);
+                                    dc[dDimN] = static_cast<int64_t>(n);
+                                    float eff = effTile[(m - mLo) * tileCols + (n - nLo)];
+                                    dPtr[d.index(dc)]
+                                        = SaturateCast<typename Inputs::DType>(eff * quantMult);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Compute MXFP8Quant reference: per-block e8m0 MX quantization of fp8 D.
+            // Alpha is applied before amax; beta=0 is required.
+            if constexpr(notCmplxAmaxD)
+            {
+                if(problem.useMXFP8Quant() && inputs.mxScale != nullptr
+                   && inputs.d != nullptr)
+                {
+                    float alphaF = static_cast<float>(constVariantCast<Accumulator>(inputs.alpha));
+
+                    int q0 = problem.mxfp8QuantQ0() > 0 ? problem.mxfp8QuantQ0() : static_cast<int>(d.sizes()[0]);
+                    int q1 = problem.mxfp8QuantQ1() > 0 ? problem.mxfp8QuantQ1() : static_cast<int>(d.sizes()[1]);
+
+                    uint8_t* mxPtr = static_cast<uint8_t*>(inputs.mxScale);
+
+                    size_t M      = static_cast<size_t>(d.sizes()[0]);
+                    size_t N      = static_cast<size_t>(d.sizes()[1]);
+                    size_t mTiles = (M + static_cast<size_t>(q0) - 1) / static_cast<size_t>(q0);
+                    size_t nTiles = (N + static_cast<size_t>(q1) - 1) / static_cast<size_t>(q1);
+
+                    size_t dDimM = freeIndicesA[0].d;
+                    size_t dDimN = freeIndicesB[0].d;
+                    size_t aDimM = freeIndicesA[0].i;
+                    size_t bDimN = freeIndicesB[0].i;
+                    size_t aDimK = boundIndices[0].a;
+                    size_t bDimK = boundIndices[0].b;
+
+                    constexpr float kFp8Max = 448.0f;
+
+                    omp_set_num_threads(MAX_OMP_THREADS);
+#pragma omp parallel for schedule(dynamic) collapse(2)
+                    for(size_t ti = 0; ti < mTiles; ++ti)
+                    {
+                        for(size_t tj = 0; tj < nTiles; ++tj)
+                        {
+                            size_t mLo = ti * static_cast<size_t>(q0);
+                            size_t mHi = std::min(mLo + static_cast<size_t>(q0), M);
+                            size_t nLo = tj * static_cast<size_t>(q1);
+                            size_t nHi = std::min(nLo + static_cast<size_t>(q1), N);
+
+                            size_t tileRows = mHi - mLo;
+                            size_t tileCols = nHi - nLo;
+                            std::vector<float> effTile(tileRows * tileCols, 0.0f);
+
+                            float amax = 0.0f;
+                            for(size_t m = mLo; m < mHi; ++m)
+                            {
+                                for(size_t n = nLo; n < nHi; ++n)
+                                {
+                                    std::vector<int64_t> ac(a.dimensions(), 0);
+                                    std::vector<int64_t> bc(b.dimensions(), 0);
+                                    ac[aDimM] = static_cast<int64_t>(m);
+                                    bc[bDimN] = static_cast<int64_t>(n);
+                                    float dot = 0.0f;
+                                    for(size_t k = 0; k < boundSize[0]; ++k)
+                                    {
+                                        ac[aDimK] = static_cast<int64_t>(k);
+                                        bc[bDimK] = static_cast<int64_t>(k);
+                                        dot += GetValue<float>(a.dataType(), inputs.a,
+                                                               static_cast<int>(a.index(ac)), false)
+                                               * GetValue<float>(b.dataType(), inputs.b,
+                                                                 static_cast<int>(b.index(bc)), false);
+                                    }
+                                    float eff    = alphaF * dot;
+                                    effTile[(m - mLo) * tileCols + (n - nLo)] = eff;
+                                    float absVal = eff < 0.0f ? -eff : eff;
+                                    if(absVal > amax)
+                                        amax = absVal;
+                                }
+                            }
+
+                            // Compute the e8m0 scale byte using the ceil-exponent formula.
+                            // Ceil guarantees amax/S <= 448, preventing fp8 NaN.
+                            uint8_t scaleByte = 0;
+                            float   quantMult  = 0.0f;
+                            if(amax > 0.0f)
+                            {
+                                float    scaleF = amax / kFp8Max;
+                                uint32_t bits;
+                                std::memcpy(&bits, &scaleF, sizeof(bits));
+                                int expByte = static_cast<int>((bits >> 23) & 0xFF);
+                                int ceilAdj = (bits & 0x7FFFFF) != 0 ? 1 : 0;
+                                int sb      = expByte + ceilAdj;
+                                sb          = sb < 0 ? 0 : (sb > 254 ? 254 : sb);
+                                scaleByte   = static_cast<uint8_t>(sb);
+                                int qExp    = 254 - sb;
+                                qExp        = qExp < 1 ? 1 : (qExp > 254 ? 254 : qExp);
+                                uint32_t qbits = static_cast<uint32_t>(qExp) << 23;
+                                std::memcpy(&quantMult, &qbits, sizeof(quantMult));
+                            }
+                            mxPtr[ti * nTiles + tj] = scaleByte;
+
                             for(size_t m = mLo; m < mHi; ++m)
                             {
                                 for(size_t n = nLo; n < nHi; ++n)

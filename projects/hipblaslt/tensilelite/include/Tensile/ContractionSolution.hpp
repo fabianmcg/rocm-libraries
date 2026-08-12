@@ -187,6 +187,9 @@ namespace TensileLite
         bool tileQuant             = false;
         int  tileQuantQ0           = 0;
         int  tileQuantQ1           = 0;
+        bool mxfp8Quant            = false;
+        int  mxfp8QuantQ0          = 0;
+        int  mxfp8QuantQ1          = 0;
         bool deepseekScaleA        = false;
         bool deepseekScaleB        = false;
 
@@ -666,6 +669,7 @@ namespace TensileLite
             bool partialRMSQuant       = false;
             bool useRstdScale          = false;
             bool useTileQuant          = false;
+            bool useMXFP8Quant         = false;
             bool useDeepseekScaleA     = false;
             bool useDeepseekScaleB     = false;
         };

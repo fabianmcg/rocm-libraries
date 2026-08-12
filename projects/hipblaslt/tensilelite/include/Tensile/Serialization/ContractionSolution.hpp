@@ -142,6 +142,9 @@ namespace TensileLite
                 iot::mapOptional(io, "TileQuant",             s.tileQuant);
                 iot::mapOptional(io, "tileQuantQ0",           s.tileQuantQ0);
                 iot::mapOptional(io, "tileQuantQ1",           s.tileQuantQ1);
+                iot::mapOptional(io, "MXFP8Quant",            s.mxfp8Quant);
+                iot::mapOptional(io, "mxfp8QuantQ0",          s.mxfp8QuantQ0);
+                iot::mapOptional(io, "mxfp8QuantQ1",          s.mxfp8QuantQ1);
                 iot::mapOptional(io, "useDeepseekScaleA",     s.deepseekScaleA);
                 iot::mapOptional(io, "useDeepseekScaleB",     s.deepseekScaleB);
                 iot::mapRequired(io, "NonTemporalD", s.NonTemporalD);
@@ -239,6 +242,7 @@ namespace TensileLite
                 iot::mapOptional(io, "partialRMSQuant", s.partialRMSQuant);
                 iot::mapOptional(io, "useRstdScale", s.useRstdScale);
                 iot::mapOptional(io, "useTileQuant", s.useTileQuant);
+                iot::mapOptional(io, "useMXFP8Quant", s.useMXFP8Quant);
                 iot::mapOptional(io, "useDeepseekScaleA", s.useDeepseekScaleA);
                 iot::mapOptional(io, "useDeepseekScaleB", s.useDeepseekScaleB);
             }

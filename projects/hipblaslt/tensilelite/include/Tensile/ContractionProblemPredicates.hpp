@@ -2222,6 +2222,108 @@ namespace TensileLite
                 }
             };
 
+            struct UseMXFP8QuantEqual
+                : public Predicate_CRTP<UseMXFP8QuantEqual, ContractionProblemGemm>
+            {
+                enum
+                {
+                    HasIndex = false,
+                    HasValue = true
+                };
+                bool value;
+
+                UseMXFP8QuantEqual() = default;
+                UseMXFP8QuantEqual(bool value)
+                    : value(value)
+                {
+                }
+
+                static std::string Type()
+                {
+                    return "UseMXFP8Quant";
+                }
+
+                virtual bool operator()(ContractionProblemGemm const& problem) const override
+                {
+                    return problem.useMXFP8Quant() == value;
+                }
+
+                virtual bool debugEval(ContractionProblemGemm const& problem,
+                                       std::ostream&                 stream) const override
+                {
+                    return debugEvalCmp(
+                        problem, stream, "prob", problem.useMXFP8Quant(), "==", "sol", value);
+                }
+            };
+
+            struct MXFP8QuantQ0Equal
+                : public Predicate_CRTP<MXFP8QuantQ0Equal, ContractionProblemGemm>
+            {
+                enum
+                {
+                    HasIndex = false,
+                    HasValue = true
+                };
+                int value;
+
+                MXFP8QuantQ0Equal() = default;
+                MXFP8QuantQ0Equal(int value)
+                    : value(value)
+                {
+                }
+
+                static std::string Type()
+                {
+                    return "MXFP8QuantQ0";
+                }
+
+                virtual bool operator()(ContractionProblemGemm const& problem) const override
+                {
+                    return problem.mxfp8QuantQ0() == value;
+                }
+
+                virtual bool debugEval(ContractionProblemGemm const& problem,
+                                       std::ostream&                 stream) const override
+                {
+                    return debugEvalCmp(
+                        problem, stream, "prob", problem.mxfp8QuantQ0(), "==", "sol", value);
+                }
+            };
+
+            struct MXFP8QuantQ1Equal
+                : public Predicate_CRTP<MXFP8QuantQ1Equal, ContractionProblemGemm>
+            {
+                enum
+                {
+                    HasIndex = false,
+                    HasValue = true
+                };
+                int value;
+
+                MXFP8QuantQ1Equal() = default;
+                MXFP8QuantQ1Equal(int value)
+                    : value(value)
+                {
+                }
+
+                static std::string Type()
+                {
+                    return "MXFP8QuantQ1";
+                }
+
+                virtual bool operator()(ContractionProblemGemm const& problem) const override
+                {
+                    return problem.mxfp8QuantQ1() == value;
+                }
+
+                virtual bool debugEval(ContractionProblemGemm const& problem,
+                                       std::ostream&                 stream) const override
+                {
+                    return debugEvalCmp(
+                        problem, stream, "prob", problem.mxfp8QuantQ1(), "==", "sol", value);
+                }
+            };
+
             struct UseRstdScaleEqual
                 : public Predicate_CRTP<UseRstdScaleEqual, ContractionProblemGemm>
             {

@@ -86,6 +86,9 @@ namespace TensileLite
             bool        m_useTileQuant            = false;
             int         m_tileQuantQ0Override     = 0;
             int         m_tileQuantQ1Override     = 0;
+            bool        m_useMXFP8Quant           = false;
+            int         m_mxfp8QuantQ0Override    = 0;
+            int         m_mxfp8QuantQ1Override    = 0;
             bool        m_usePartialRMS         = false;
             bool        m_partialRMSResidualAdd  = false;
             bool        m_partialRMSQuant        = false;

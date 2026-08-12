@@ -554,6 +554,12 @@ namespace TensileLite
                     resPtr = result.quantScale;
                 }
                 break;
+                case ContractionProblemGemm::TENSOR::MXSCALE:
+                {
+                    refPtr = reference.mxScale;
+                    resPtr = result.mxScale;
+                }
+                break;
                 default:
                     throw std::runtime_error("Unrecognized output tensor.");
                 }

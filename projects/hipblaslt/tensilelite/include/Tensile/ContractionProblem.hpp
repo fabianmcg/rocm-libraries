@@ -356,6 +356,7 @@ namespace TensileLite
             QUANTSCALE    = 22, // f32 output: per-tile amax/448 scale [ceil(M/Q0) x ceil(N/Q1)] row-major.
             SCALEA_DS     = 23, // E8M0 byte input: per-row A dequantization scale [M rows].
             SCALEB_DS     = 24, // E8M0 byte input: per-128col-block B dequantization scale [ceil(N/128)].
+            MXSCALE       = 25, // e8m0 (UE8M0, 1 byte) per-block MX scale [ceil(M/Q0) x ceil(N/Q1)] row-major.
             TENSOR_COUNT
         };
 
@@ -797,6 +798,23 @@ namespace TensileLite
                 m_tensors[TENSOR::QUANTSCALE]
                     = {"quantScale", rocisa::DataType::Float, {mTiles, nTiles}, {nTiles, 1}};
                 m_tensors[TENSOR::QUANTSCALE].setAsOutput(true);
+            }
+        }
+
+        void setUseMXFP8Quant(bool v)   { m_useMXFP8Quant = v; }
+        bool useMXFP8Quant() const      { return m_useMXFP8Quant; }
+        void setMxfp8QuantQ0(int v)     { m_mxfp8QuantQ0 = v; }
+        int  mxfp8QuantQ0() const       { return m_mxfp8QuantQ0; }
+        void setMxfp8QuantQ1(int v)     { m_mxfp8QuantQ1 = v; }
+        int  mxfp8QuantQ1() const       { return m_mxfp8QuantQ1; }
+
+        void setMXScale(size_t mTiles, size_t nTiles)
+        {
+            if(m_useMXFP8Quant)
+            {
+                m_tensors[TENSOR::MXSCALE]
+                    = {"mxScale", rocisa::DataType::E8, {mTiles, nTiles}, {nTiles, 1}};
+                m_tensors[TENSOR::MXSCALE].setAsOutput(true);
             }
         }
 
@@ -1577,6 +1595,9 @@ namespace TensileLite
         bool             m_useTileQuant            = false;
         int              m_tileQuantQ0             = 0;
         int              m_tileQuantQ1             = 0;
+        bool             m_useMXFP8Quant           = false;
+        int              m_mxfp8QuantQ0            = 0;
+        int              m_mxfp8QuantQ1            = 0;
         bool             m_useDeepseekScaleA       = false;
         bool             m_useDeepseekScaleB       = false;
         bool             m_swizzleTensorA          = false;
@@ -1723,6 +1744,7 @@ namespace TensileLite
         void const* residual        = nullptr;
         void const* rstdBuf         = nullptr;
         void*       quantScale      = nullptr;
+        void*       mxScale         = nullptr;
         void const* scaleADeepseek  = nullptr;
         void const* scaleBDeepseek  = nullptr;
 

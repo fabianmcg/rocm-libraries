@@ -1268,6 +1268,8 @@ namespace TensileLite
             args.template append<void const*>("RstdBuf", inputs.rstdBuf);
         if(sizeMapping.tileQuant)
             args.template append<void*>("QuantScale", inputs.quantScale);
+        if(sizeMapping.mxfp8Quant)
+            args.template append<void*>("MXScale", inputs.mxScale);
         if(sizeMapping.deepseekScaleA)
             args.template append<void const*>("ScaleABuf", inputs.scaleADeepseek);
         if(sizeMapping.deepseekScaleB)

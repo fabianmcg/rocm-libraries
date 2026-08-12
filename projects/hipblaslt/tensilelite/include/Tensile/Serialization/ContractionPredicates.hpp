@@ -114,6 +114,9 @@ namespace TensileLite
                      Base::template Pair<Predicates::Contraction::UseTileQuantEqual>(),
                      Base::template Pair<Predicates::Contraction::TileQuantQ0Equal>(),
                      Base::template Pair<Predicates::Contraction::TileQuantQ1Equal>(),
+                     Base::template Pair<Predicates::Contraction::UseMXFP8QuantEqual>(),
+                     Base::template Pair<Predicates::Contraction::MXFP8QuantQ0Equal>(),
+                     Base::template Pair<Predicates::Contraction::MXFP8QuantQ1Equal>(),
                      Base::template Pair<Predicates::Contraction::UseDeepseekScaleAEqual>(),
                      Base::template Pair<Predicates::Contraction::UseDeepseekScaleBEqual>(),
                      Base::template Pair<Predicates::Contraction::UsePartialRMSResidualAddEqual>(),
@@ -482,6 +485,24 @@ namespace TensileLite
         template <typename IO>
         struct MappingTraits<Predicates::Contraction::TileQuantQ1Equal, IO>
             : public AutoMappingTraits<Predicates::Contraction::TileQuantQ1Equal, IO>
+        {
+        };
+
+        template <typename IO>
+        struct MappingTraits<Predicates::Contraction::UseMXFP8QuantEqual, IO>
+            : public AutoMappingTraits<Predicates::Contraction::UseMXFP8QuantEqual, IO>
+        {
+        };
+
+        template <typename IO>
+        struct MappingTraits<Predicates::Contraction::MXFP8QuantQ0Equal, IO>
+            : public AutoMappingTraits<Predicates::Contraction::MXFP8QuantQ0Equal, IO>
+        {
+        };
+
+        template <typename IO>
+        struct MappingTraits<Predicates::Contraction::MXFP8QuantQ1Equal, IO>
+            : public AutoMappingTraits<Predicates::Contraction::MXFP8QuantQ1Equal, IO>
         {
         };
 

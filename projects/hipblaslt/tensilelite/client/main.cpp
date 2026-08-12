@@ -416,6 +416,9 @@ namespace TensileLite
                 ("tile-quant-q0",             po::value<size_t>()->default_value(0),               "Quant tile M extent (0 = whole MacroTile0).")
                 ("tile-quant-q1",             po::value<size_t>()->default_value(0),               "Quant tile N extent (0 = whole MacroTile1).")
                 ("init-quantScale",           po::value<InitMode>()->default_value(InitMode::Zero), "Init mode for quantScale output.")
+                ("use-mxfp8-quant",           po::value<bool>()->default_value(false),              "Enable dynamic mxfp8 (e8m0) quant epilogue.")
+                ("mxfp8-quant-q0",            po::value<size_t>()->default_value(0),                "MX block M extent (0 = whole MacroTile0).")
+                ("mxfp8-quant-q1",            po::value<size_t>()->default_value(0),                "MX block N extent (0 = whole MacroTile1).")
                 ("use-deepseek-scale-a",      po::value<bool>()->default_value(false), "Enable Deepseek per-row A dequantization scale epilogue.")
                 ("use-deepseek-scale-b",      po::value<bool>()->default_value(false), "Enable Deepseek per-128col B dequantization scale epilogue.")
                 ("deepseek-scale-block-k",    po::value<size_t>()->default_value(128), "Column-block width for Deepseek B scale (default 128).")
@@ -578,6 +581,9 @@ namespace TensileLite
             DUMP_OPT("tile-quant-q0", size_t);
             DUMP_OPT("tile-quant-q1", size_t);
             DUMP_OPT("init-quantScale", InitMode);
+            DUMP_OPT("use-mxfp8-quant", bool);
+            DUMP_OPT("mxfp8-quant-q0", size_t);
+            DUMP_OPT("mxfp8-quant-q1", size_t);
             DUMP_OPT("use-deepseek-scale-a", bool);
             DUMP_OPT("use-deepseek-scale-b", bool);
             DUMP_OPT("deepseek-scale-block-k", size_t);
