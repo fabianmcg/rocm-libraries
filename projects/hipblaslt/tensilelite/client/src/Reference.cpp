@@ -2302,8 +2302,11 @@ namespace TensileLite
 
                 if constexpr(notCmplxAmaxD)
                 {
+                    // When MXFP8Quant is also active, D ownership belongs to the MX
+                    // second-pass block below; skip the gamma*D store here to avoid
+                    // a dead write (gamma is folded into the MX eff computation instead).
                     if(problem.usePartialRMS() && inputs.partialBuf != nullptr
-                       && inputs.rmsGamma != nullptr)
+                       && inputs.rmsGamma != nullptr && !problem.useMxfp8Quant())
                     {
                         // PartialRMSAxis=0: free0=N_hidden (mCoord), free1=M_tokens (nCoord).
                         // gamma is indexed by free0 position (mCoord).
@@ -2612,6 +2615,16 @@ namespace TensileLite
                             float amax = 0.0f;
                             for(size_t m = mLo; m < mHi; ++m)
                             {
+                                // Gamma is indexed by free0 (m = N_hidden position); hoist
+                                // the lookup out of the inner n loop to avoid redundant loads.
+                                // When PartialRMS is also active, gamma is applied in-place
+                                // before MX amax on the GPU, so fold it into eff here.
+                                float gammaM = 1.0f;
+                                if(problem.usePartialRMS() && inputs.rmsGamma != nullptr)
+                                    gammaM = static_cast<float>(
+                                        GetValue<float>(rocisa::DataType::BFloat16,
+                                                        inputs.rmsGamma,
+                                                        static_cast<int>(m), false));
                                 for(size_t n = nLo; n < nHi; ++n)
                                 {
                                     std::vector<int64_t> ac(a.dimensions(), 0);
@@ -2628,7 +2641,7 @@ namespace TensileLite
                                                * GetValue<float>(b.dataType(), inputs.b,
                                                                  static_cast<int>(b.index(bc)), false);
                                     }
-                                    float eff    = alphaF * dot;
+                                    float eff = alphaF * gammaM * dot;
                                     effTile[(m - mLo) * tileCols + (n - nLo)] = eff;
                                     float absVal = eff < 0.0f ? -eff : eff;
                                     if(absVal > amax)
