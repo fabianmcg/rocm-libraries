@@ -2245,14 +2245,14 @@ namespace TensileLite
 
                 virtual bool operator()(ContractionProblemGemm const& problem) const override
                 {
-                    return problem.useMXFP8Quant() == value;
+                    return problem.useMxfp8Quant() == value;
                 }
 
                 virtual bool debugEval(ContractionProblemGemm const& problem,
                                        std::ostream&                 stream) const override
                 {
                     return debugEvalCmp(
-                        problem, stream, "prob", problem.useMXFP8Quant(), "==", "sol", value);
+                        problem, stream, "prob", problem.useMxfp8Quant(), "==", "sol", value);
                 }
             };
 

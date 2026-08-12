@@ -194,7 +194,7 @@ namespace TensileLite
             if(args.count("tile-quant-q1"))
                 m_tileQuantQ1Override = static_cast<int>(args["tile-quant-q1"].as<size_t>());
             if(args.count("use-mxfp8-quant"))
-                m_useMXFP8Quant = args["use-mxfp8-quant"].as<bool>();
+                m_useMxfp8Quant = args["use-mxfp8-quant"].as<bool>();
             if(args.count("mxfp8-quant-q0"))
                 m_mxfp8QuantQ0Override = static_cast<int>(args["mxfp8-quant-q0"].as<size_t>());
             if(args.count("mxfp8-quant-q1"))
@@ -430,7 +430,7 @@ namespace TensileLite
                                 rv.back().setUseE(m_useE);
                                 rv.back().setOutputAmaxD(m_outputAmaxD);
                                 rv.back().setUseTileQuant(m_useTileQuant);
-                                rv.back().setUseMXFP8Quant(m_useMXFP8Quant);
+                                rv.back().setUseMxfp8Quant(m_useMxfp8Quant);
                                 rv.back().setUseDeepseekScaleA(m_useDeepseekScaleA);
                                 rv.back().setUseDeepseekScaleB(m_useDeepseekScaleB);
                                 rv.back().setUsePartialRMS(m_usePartialRMS);
@@ -543,7 +543,7 @@ namespace TensileLite
                                     rv.back().setTileQuantQ1(q1);
                                     rv.back().setQuantScale((M + q0 - 1) / q0, (N + q1 - 1) / q1);
                                 }
-                                if(m_useMXFP8Quant)
+                                if(m_useMxfp8Quant)
                                 {
                                     size_t M  = rv.back().d().sizes()[0];
                                     size_t N  = rv.back().d().sizes()[1];
@@ -551,7 +551,7 @@ namespace TensileLite
                                     int    q1 = m_mxfp8QuantQ1Override > 0 ? m_mxfp8QuantQ1Override : static_cast<int>(N);
                                     rv.back().setMxfp8QuantQ0(q0);
                                     rv.back().setMxfp8QuantQ1(q1);
-                                    rv.back().setMXScale((M + q0 - 1) / q0, (N + q1 - 1) / q1);
+                                    rv.back().setMxScale((M + q0 - 1) / q0, (N + q1 - 1) / q1);
                                 }
                                 if(m_useDeepseekScaleA)
                                 {

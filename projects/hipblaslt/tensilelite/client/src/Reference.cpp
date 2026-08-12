@@ -2337,7 +2337,7 @@ namespace TensileLite
                     }
                     // TileQuant and MXFP8Quant each own D via their second-pass blocks below;
                     // skip the standard per-element store here to avoid dead writes.
-                    else if(!problem.useTileQuant() && !problem.useMXFP8Quant())
+                    else if(!problem.useTileQuant() && !problem.useMxfp8Quant())
                     {
                         dPtr[dIndex] = SaturateCast<typename Inputs::DType>(resultD);
                     }
@@ -2570,7 +2570,7 @@ namespace TensileLite
             // Alpha is applied before amax; beta=0 is required.
             if constexpr(notCmplxAmaxD)
             {
-                if(problem.useMXFP8Quant() && inputs.mxScale != nullptr
+                if(problem.useMxfp8Quant() && inputs.mxScale != nullptr
                    && inputs.d != nullptr)
                 {
                     float alphaF = static_cast<float>(constVariantCast<Accumulator>(inputs.alpha));

@@ -398,6 +398,18 @@ namespace TensileLite
                                        threshold);
             }
             break;
+            case rocisa::DataType::E8:
+            {
+                // E8 encodes e8m0 scale bytes; exact byte match is required.
+                rv = checkResultsTyped(tensor,
+                                       (uint8_t const*)refPtr,
+                                       (uint8_t const*)resPtr,
+                                       maxElements,
+                                       isgpu,
+                                       validationStride,
+                                       0.0);
+            }
+            break;
             default:
                 throw std::runtime_error("Unsupported validator data type");
             }

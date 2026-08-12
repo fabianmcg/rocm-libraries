@@ -242,7 +242,7 @@ namespace TensileLite
                 iot::mapOptional(io, "partialRMSQuant", s.partialRMSQuant);
                 iot::mapOptional(io, "useRstdScale", s.useRstdScale);
                 iot::mapOptional(io, "useTileQuant", s.useTileQuant);
-                iot::mapOptional(io, "useMXFP8Quant", s.useMXFP8Quant);
+                iot::mapOptional(io, "useMXFP8Quant", s.useMxfp8Quant);
                 iot::mapOptional(io, "useDeepseekScaleA", s.useDeepseekScaleA);
                 iot::mapOptional(io, "useDeepseekScaleB", s.useDeepseekScaleB);
             }

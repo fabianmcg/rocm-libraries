@@ -801,16 +801,16 @@ namespace TensileLite
             }
         }
 
-        void setUseMXFP8Quant(bool v)   { m_useMXFP8Quant = v; }
-        bool useMXFP8Quant() const      { return m_useMXFP8Quant; }
+        void setUseMxfp8Quant(bool v)   { m_useMxfp8Quant = v; }
+        bool useMxfp8Quant() const      { return m_useMxfp8Quant; }
         void setMxfp8QuantQ0(int v)     { m_mxfp8QuantQ0 = v; }
         int  mxfp8QuantQ0() const       { return m_mxfp8QuantQ0; }
         void setMxfp8QuantQ1(int v)     { m_mxfp8QuantQ1 = v; }
         int  mxfp8QuantQ1() const       { return m_mxfp8QuantQ1; }
 
-        void setMXScale(size_t mTiles, size_t nTiles)
+        void setMxScale(size_t mTiles, size_t nTiles)
         {
-            if(m_useMXFP8Quant)
+            if(m_useMxfp8Quant)
             {
                 m_tensors[TENSOR::MXSCALE]
                     = {"mxScale", rocisa::DataType::E8, {mTiles, nTiles}, {nTiles, 1}};
@@ -1595,7 +1595,7 @@ namespace TensileLite
         bool             m_useTileQuant            = false;
         int              m_tileQuantQ0             = 0;
         int              m_tileQuantQ1             = 0;
-        bool             m_useMXFP8Quant           = false;
+        bool             m_useMxfp8Quant           = false;
         int              m_mxfp8QuantQ0            = 0;
         int              m_mxfp8QuantQ1            = 0;
         bool             m_useDeepseekScaleA       = false;
