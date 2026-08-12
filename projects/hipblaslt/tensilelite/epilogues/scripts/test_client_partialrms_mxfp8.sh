@@ -35,7 +35,7 @@ while [[ $# -gt 0 ]]; do
         --chip)    CHIP="$2";       shift 2 ;;
         --client)  CLIENT_BIN="$2"; shift 2 ;;
         --out-dir) OUT_DIR="$2";    shift 2 ;;
-        *) echo "Unknown argument: $1" >&2; exit 1 ;;
+        *) echo "unknown argument: $1" >&2; exit 1 ;;
     esac
 done
 
