@@ -126,6 +126,24 @@ def mxfp8QuantReference(dEff_f32, q0, q1):
     return scale, dFp8
 
 
+def partialRmsMxfp8Reference(aRow, bRow, gammaBf16, mt0, q0, q1):
+    """Combined K1 reference (free0=N_hidden, free1=M).
+
+    Returns (sumsqRef, mxScaleRef, dFp8Ref):
+      sumsqRef  : [M, ceil(N/mt0)] f32 = per-MT0-tile Σh1² (pre-gamma).
+      mxScaleRef: [ceil(N/q0), ceil(M/q1)] u8 = e8m0 per block of gamma·h1 (free0×free1).
+      dFp8Ref   : [N, M] fp8 e4m3 = MX-quantized gamma·h1 (free0×free1 layout).
+
+    gammaBf16 is cast bf16→f32 to match the GPU (which loads gamma as bf16).
+    """
+    h1 = np.asarray(aRow).astype(np.float32) @ np.asarray(bRow).astype(np.float32)
+    gammaF = np.asarray(gammaBf16).astype(np.float32)
+    sumsqRef = partialSumSq(h1, h1.shape[1], mt0)
+    dOutT = (h1 * gammaF[np.newaxis, :]).T
+    mxScaleRef, dFp8Ref = mxfp8QuantReference(dOutT, q0, q1)
+    return sumsqRef, mxScaleRef, dFp8Ref
+
+
 def rmsNormReference(aRow, bRow, gammaBf16, invD, eps):
     """End-to-end RMSNorm reference: bf16(A@B * gamma) / rms(A@B), float32 (M, nHidden).
 

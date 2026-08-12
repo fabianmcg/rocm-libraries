@@ -477,9 +477,9 @@ def _validateMXFP8Quant(state, printRejectionReason):
   """Validate MXFP8Quant fused epilogue constraints (feature flags, type, shape)."""
   if not state.get("MXFP8Quant", False):
     return
-  if state.get("TileQuant", False) or state.get("PartialRMS", False) or state.get("RstdScale", False):
+  if state.get("TileQuant", False) or state.get("RstdScale", False):
     reject(state, printRejectionReason,
-           "MXFP8Quant is mutually exclusive with TileQuant/PartialRMS/RstdScale")
+           "MXFP8Quant is mutually exclusive with TileQuant/RstdScale")
     return
   if not _validateSubtileEpiloguePrereqs(state, printRejectionReason, "MXFP8Quant"):
     return
@@ -524,6 +524,29 @@ def _validateMXFP8Quant(state, printRejectionReason):
     reject(state, printRejectionReason, "MXFP8Quant does not support GroupedGemm")
     return
   if not _resolveMXFP8QuantShape(state, printRejectionReason):
+    return
+
+
+def _validatePartialRMSMXFP8Combo(state, printRejectionReason):
+  """Validate the combined PartialRMS + MXFP8Quant fused epilogue.
+
+  Called after both individual validators so that _resolveMXFP8QuantShape and
+  PartialRMS geometry are already set on state. Enforces the constraints that
+  are specific to the combination and cannot be caught individually.
+  """
+  if not (state.get("PartialRMS", False) and state.get("MXFP8Quant", False)):
+    return
+  if state.get("PartialRMSQuant", False):
+    reject(state, printRejectionReason,
+           "PartialRMS+MXFP8Quant: PartialRMSQuant must be False (MXFP8Quant owns quantization)")
+    return
+  if not state["ProblemType"]["DestDataType"].isFloat8():
+    reject(state, printRejectionReason,
+           "PartialRMS+MXFP8Quant requires DestDataType=F8 (fp8 e4m3 D output)")
+    return
+  if state["ProblemType"].get("UseBeta", True):
+    reject(state, printRejectionReason,
+           "PartialRMS+MXFP8Quant requires UseBeta=False (beta must be 0)")
     return
 
 
@@ -1593,6 +1616,10 @@ class Solution(collections.abc.Mapping):
       return
 
     _validateMXFP8Quant(state, printRejectionReason)
+    if not state["Valid"]:
+      return
+
+    _validatePartialRMSMXFP8Combo(state, printRejectionReason)
     if not state["Valid"]:
       return
 
