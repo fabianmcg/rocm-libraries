@@ -18,19 +18,14 @@ def _parseBenchmarkGroup(yamlPath, problemIdx=0, groupIdx=0):
     return process, process[0]
 
 
-def buildSolutionsFromYaml(yamlPath, assembler, isaInfoMap, debugConfig,
-                           problemIdx=0, groupIdx=0):
-    """Build every forked Solution for a benchmark YAML group via the normal pipeline.
-
-    Returns a list of valid Solution objects (None results and duplicates removed).
-    """
+def _buildSolutionsForProblemIdx(yamlPath, assembler, isaInfoMap, debugConfig,
+                                  problemIdx, groupIdx, seen):
+    """Build solutions for one BenchmarkProblems entry, deduplicating against seen."""
     from Tensile.BenchmarkStructs import constructForkPermutations
     from Tensile.BenchmarkProblems import _generate_single_solution
 
     process, step = _parseBenchmarkGroup(yamlPath, problemIdx, groupIdx)
-
     solutions = []
-    seen = set()
     for perm in constructForkPermutations(step.forkParams, step.paramGroups):
         solution = _generate_single_solution(
             perm, process.problemType, step.constantParams,
@@ -40,6 +35,33 @@ def buildSolutionsFromYaml(yamlPath, assembler, isaInfoMap, debugConfig,
             continue
         seen.add(solution)
         solutions.append(solution)
+    return solutions
+
+
+def buildSolutionsFromYaml(yamlPath, assembler, isaInfoMap, debugConfig,
+                           problemIdx=None, groupIdx=0):
+    """Build every forked Solution for a benchmark YAML group via the normal pipeline.
+
+    When problemIdx is None (the default), all BenchmarkProblems entries are read.
+    Returns a list of valid Solution objects (None results and duplicates removed).
+    """
+    from Tensile import LibraryIO
+
+    if problemIdx is not None:
+        return _buildSolutionsForProblemIdx(
+            yamlPath, assembler, isaInfoMap, debugConfig, problemIdx, groupIdx, set()
+        )
+
+    data = LibraryIO.readYAML(yamlPath)
+    nProblems = len(data["BenchmarkProblems"])
+    seen = set()
+    solutions = []
+    for idx in range(nProblems):
+        solutions.extend(
+            _buildSolutionsForProblemIdx(
+                yamlPath, assembler, isaInfoMap, debugConfig, idx, groupIdx, seen
+            )
+        )
     return solutions
 
 
@@ -123,10 +145,11 @@ def solutionId(solution):
 
 
 def solutionsFromYaml(yamlPath, assembler, isaInfoMap, debugConfig,
-                      problemIdx=0, groupIdx=0):
-    """Return all (solution, id) pairs produced by a benchmark YAML group.
+                      problemIdx=None, groupIdx=0):
+    """Return all (solution, id) pairs produced by a benchmark YAML file.
 
-    Solutions are enumerated exactly as the YAML specifies — no overrides.
+    When problemIdx is None (the default), every BenchmarkProblems entry is read
+    and their solutions are combined. Pass an explicit index to read one entry.
     The id string is derived from tile dimensions and epilogue flags.
     """
     solutions = buildSolutionsFromYaml(

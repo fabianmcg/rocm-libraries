@@ -7030,8 +7030,10 @@ class KernelWriter(metaclass=abc.ABCMeta):
         sizeMXSA = mxsaTileInfo.loadWidthGR * kernel["WavefrontSize"] * numWaves
         self.ldsStartOffsetMXSA = sizeA + sizeB
       if usesScaleB(kernel):
+        from .Components.Subtile.SubtileScaleEmit import deepseekScaleBNBlocksPerWave
         mxsbTileInfo = self.states.mxsb.tileInfo
-        sizeMXSB = mxsbTileInfo.loadWidthGR * kernel["WavefrontSize"] * numWaves
+        nBlocksB = deepseekScaleBNBlocksPerWave(kernel) if kernel.get("UseDeepseekScaleB", False) else 1
+        sizeMXSB = mxsbTileInfo.loadWidthGR * kernel["WavefrontSize"] * numWaves * nBlocksB
         self.ldsStartOffsetMXSB = sizeA + sizeB + sizeMXSA
 
       self.ldsTotalSize = sizeA + sizeB + sizeMXSA + sizeMXSB

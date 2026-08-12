@@ -48,6 +48,16 @@ def isDeepseekScale(kernel) -> bool:
     return kernel.get("UseDeepseekScaleA", False) or kernel.get("UseDeepseekScaleB", False)
 
 
+def deepseekScaleBNBlocksPerWave(kernel) -> int:
+    """N-blocks (128 cols each) covered by one wave for DeepseekScale scaleB.
+
+    MT1=128 -> 1; MT1=256,wg_n=1 -> 2; MT1=256,wg_n=2 -> 1.
+    """
+    mt1 = kernel.get("MacroTile1", 0)
+    wgN = kernel["MIWaveGroup"][1]
+    return max(1, mt1 // (128 * wgN))
+
+
 # ---------------------------------------------------------------------------
 # Scale GR offset
 # ---------------------------------------------------------------------------
@@ -269,12 +279,18 @@ def graTileAssignmentScaleSwizzled(writer, kernel):
 def _applyScaleWavePartitionLROffset(module, writer, kernel, ti_, waveId):
   tc = ti_.tc
 
-  # totalScaleBytes = bytes per wave partition in LDS for this scale tensor.
-  # lrGlobalSubtileGrid[0] = M-dim LR subtile count (globalMMATileGrid[0] / lrSubtileShape[0])
-  # lrGlobalSubtileGrid[1] = K-dim LR subtile count
-  # lrSubtileSize = bytes per LR subtile (2x2 MMA tiles for FP4 scale)
-  index = 0 if tc == 'MXSA' else 1
-  totalScaleBytes = (int(ti_.lrGlobalSubtileGrid[0]) // kernel["MIWaveGroup"][index]) * int(ti_.lrGlobalSubtileGrid[1]) * int(ti_.lrSubtileSize)
+  # For DeepseekScale scaleB, each wave DTL-writes waveSize * loadWidthGR * nBlocksB
+  # bytes. The LR partition stride must equal this write size so each N-wave reads
+  # from its own region. For MX scale the subtile-grid formula applies.
+  if isDeepseekScale(kernel) and tc == 'MXSB':
+    totalScaleBytes = ti_.waveSize * ti_.loadWidthGR * deepseekScaleBNBlocksPerWave(kernel)
+  else:
+    # totalScaleBytes = bytes per wave partition in LDS for this scale tensor.
+    # lrGlobalSubtileGrid[0] = M-dim LR subtile count (globalMMATileGrid[0] / lrSubtileShape[0])
+    # lrGlobalSubtileGrid[1] = K-dim LR subtile count
+    # lrSubtileSize = bytes per LR subtile (2x2 MMA tiles for FP4 scale)
+    index = 0 if tc == 'MXSA' else 1
+    totalScaleBytes = (int(ti_.lrGlobalSubtileGrid[0]) // kernel["MIWaveGroup"][index]) * int(ti_.lrGlobalSubtileGrid[1]) * int(ti_.lrSubtileSize)
 
   tmpSgpr = writer.sgprPool.checkOut(1, tag="_applyScaleWavePartitionLROffset_tmpSgpr")
   tmp = writer.vgprPool.checkOut(2, tag="_applyScaleWavePartitionLROffset_tmp")
@@ -372,6 +388,33 @@ def _lraTileAssignmentScaleSwizzled_legacy(writer, kernel):
 # Uses BufferLoadB128 with lds=True. M0 is set to scaleLdsBase, and
 # sharedVgprGROffset[0] = serial * scaleLoadWidth serves as both the
 # global read offset (from SRD) and the LDS write offset (from M0).
+
+def _emitDeepseekScaleBGR(writer, kernel, tileInfo, mubuf):
+  """Emit one BufferLoadB32 DTL per N-block for DeepseekScale scaleB.
+
+  Block j reads from SrdMXSB + j*(nKBlocks*wave_bytes) and writes to LDS
+  at M0 + j*wave_bytes; M0 is updated before each load for j>0.
+  """
+  module = Module()
+  nBlocksB = deepseekScaleBNBlocksPerWave(kernel)
+  waveBytes = kernel["WavefrontSize"] * tileInfo.loadWidthGR
+  for j in range(nBlocksB):
+    if j > 0:
+      with writer.allocTmpSgpr(1, tag="dsScaleBGrM0") as t:
+        module.add(SAddU32(dst=sgpr(t.idx), src0=sgpr("LocalWriteBaseAddrMXSB"),
+                           src1=j * waveBytes,
+                           comment="scaleMXSB: LDS base for block%u" % j))
+        module.add(SMovB32(dst=mgpr(0), src=sgpr(t.idx),
+                           comment="scaleMXSB: M0 = LDS base block%u" % j))
+      soffset = sgpr("DsScaleBBlockStride")
+    else:
+      soffset = 0
+    module.add(BufferLoadB32(dst=None, vaddr=vgpr(tileInfo.sharedVgprGROffset[0]),
+                             saddr=sgpr("SrdMXSB", 4), soffset=soffset, mubuf=mubuf,
+                             comment="scaleMXSB[block%u]: DeepseekScale DTL b32 load" % j))
+  return module
+
+
 def globalReadDoScaleSubtile(tc, writer, kernel):
   module = Module()
 
@@ -390,17 +433,21 @@ def globalReadDoScaleSubtile(tc, writer, kernel):
 
   assert len(tileInfo.sharedVgprGROffset) > 0, "scale GR requires at least 1 GR offset VGPR"
 
+  # Set M0 to the wave's LDS base for j=0 (and for MXSA or non-DeepseekScale).
   module.add(SMovB32(dst=mgpr(0), src=sgpr("LocalWriteBaseAddr%s" % tc),
                      comment="scale%s: M0 = scaleLdsBase" % tc))
 
   mubuf = MUBUFModifiers(offen=True, offset12=0, glc=isGlc, slc=isSlc, nt=isNT, lds=True)
   if isDeepseekScale(kernel):
-    # DeepseekScale: 4 bytes/lane (b32 DTL). The host pre-broadcasts the E8M0
-    # value to all 4 bytes of each 4-byte group, so a plain b32 load suffices.
+    # DeepseekScale: 4 bytes/lane (b32 DTL). For scaleB with nBlocksB>1 each
+    # N-block gets its own load; scaleA is a single b32 load.
     module.addComment0("Scale GR: %s (DeepseekScale DTL: BufferLoadB32 -> LDS)" % tc)
-    module.add(BufferLoadB32(dst=None, vaddr=vgpr(tileInfo.sharedVgprGROffset[0]),
-                              saddr=sgpr("Srd%s" % tc, 4), soffset=0, mubuf=mubuf,
-                              comment="scale%s: DeepseekScale DTL b32 load" % tc))
+    if tc == 'MXSB':
+      module.add(_emitDeepseekScaleBGR(writer, kernel, tileInfo, mubuf))
+    else:
+      module.add(BufferLoadB32(dst=None, vaddr=vgpr(tileInfo.sharedVgprGROffset[0]),
+                               saddr=sgpr("Srd%s" % tc, 4), soffset=0, mubuf=mubuf,
+                               comment="scale%s: DeepseekScale DTL b32 load" % tc))
   else:
     module.addComment0("Scale GR: %s (DTL: BufferLoadB128 -> LDS)" % tc)
     module.add(BufferLoadB128(dst=None, vaddr=vgpr(tileInfo.sharedVgprGROffset[0]),
@@ -465,6 +512,32 @@ def globalReadScalePtrUpdates(tc, writer, kernel):
   ti_ = writer.states.mxsa.tileInfo if tc == 'MXSA' else writer.states.mxsb.tileInfo
   return emitScaleGRPtrUpdate(ti_, writer, kernel)
 
+
+def _emitWaveBase(module, writer, tc, ldsStartOffset, swapName, bytesPerLoad, vWaveIdVgpr):
+  """Emit LDS base + swap initialisation for one scale tensor.
+
+  Derives baseAddrName as 'LocalWriteBaseAddr' + tc so callers don't need to
+  pass it separately.
+  """
+  baseAddrName = "LocalWriteBaseAddr" + tc
+  vTmp = writer.vgprPool.checkOut(1, tag="globalReadScaleSwizzledDTLInitCommonSgpr_%s" % tc)
+  module.add(VLShiftLeftB32(dst=vgpr(vTmp),
+                            shiftHex=hex(bytesPerLoad.bit_length() - 1),
+                            src=vgpr(vWaveIdVgpr),
+                            comment="%s: wave LDS offset (%u bytes/wave)" % (tc, bytesPerLoad)))
+  module.add(SNop(waitState=0, comment="wait for VGPR to be ready"))
+  module.add(VReadfirstlaneB32(dst=sgpr(baseAddrName), src=vgpr(vTmp),
+                               comment="scale%s: wave LDS base" % tc))
+  module.add(SAddU32(dst=sgpr(baseAddrName),
+                     src0=sgpr(baseAddrName),
+                     src1=hex(ldsStartOffset), comment=""))
+  module.add(SAddU32(dst=sgpr(swapName), src0=sgpr(baseAddrName),
+                     src1=writer.ldsTotalSize, comment=""))
+  module.add(SXorB32(dst=sgpr(swapName), src0=sgpr(baseAddrName),
+                     src1=sgpr(swapName), comment=""))
+  writer.vgprPool.checkIn(vTmp)
+
+
 ##################################################
 # Subroutine to generate DTL M0 LDS buffer swap
 #
@@ -478,45 +551,26 @@ def globalReadScaleSwizzledDTLInitCommonSgpr(writer, kernel):
   tiMXSA_ = writer.states.mxsa.tileInfo if usesScaleA(kernel) else None
   tiMXSB_ = writer.states.mxsb.tileInfo if usesScaleB(kernel) else None
 
-  # Use the first available tile info for loadWidth (both SA/SB have the same
-  # loadWidthGR for any given kernel: b128 for MX scale, b32 for DeepseekScale).
-  ref_ti = tiMXSA_ if tiMXSA_ is not None else tiMXSB_
-  loadWidth = ref_ti.loadWidthGR
-  bytesPerLoad = loadWidth * wavesize
-
-  vgprWaveId = writer.vgprPool.checkOut(1, tag="globalReadScaleSwizzledDTLInitCommonSgpr_vgprWaveId")
+  # Compute the plain wave index (0, 1, ..., numWaves-1); each tensor may need
+  # a different per-wave LDS byte stride (scaleB with nBlocksB>1 uses a wider
+  # slot), so the left-shift is applied per-tensor inside _emitWaveBase.
+  vWaveId = writer.vgprPool.checkOut(1, tag="globalReadScaleSwizzledDTLInitCommonSgpr_vgprWaveId")
   module.addComment0("Compute shared offsets used by m0 in scale DTL loads")
-  module.add(VLShiftRightB32(dst=vgpr(vgprWaveId), shiftHex=hex(wavesize.bit_length() - 1),
+  module.add(VLShiftRightB32(dst=vgpr(vWaveId), shiftHex=hex(wavesize.bit_length() - 1),
                              src=vgpr("Serial"), comment="Wave Id"))
-  module.add(VLShiftLeftB32(dst=vgpr(vgprWaveId),
-                            shiftHex=hex((bytesPerLoad).bit_length() - 1),
-                            src=vgpr(vgprWaveId),
-                            comment="wave-specific LDS offset (%u bytes/wave)" % bytesPerLoad))
-  module.add(SNop(waitState=0, comment="wait for VGPR to be ready"))
 
   if usesScaleA(kernel):
-    module.add(VReadfirstlaneB32(dst=sgpr("LocalWriteBaseAddrMXSA"), src=vgpr(vgprWaveId),
-                                 comment="scaleA: wave LDS base"))
-    module.add(SAddU32(dst=sgpr("LocalWriteBaseAddrMXSA"),
-                       src0=sgpr("LocalWriteBaseAddrMXSA"),
-                       src1=hex(writer.ldsStartOffsetMXSA), comment=""))
-    module.add(SAddU32(dst=sgpr("SwapMXSA"), src0=sgpr("LocalWriteBaseAddrMXSA"),
-                       src1=writer.ldsTotalSize, comment=""))
-    module.add(SXorB32(dst=sgpr("SwapMXSA"), src0=sgpr("LocalWriteBaseAddrMXSA"),
-                       src1=sgpr("SwapMXSA"), comment=""))
+    bytesPerLoadA = tiMXSA_.loadWidthGR * wavesize
+    _emitWaveBase(module, writer, 'MXSA', writer.ldsStartOffsetMXSA,
+                  "SwapMXSA", bytesPerLoadA, vWaveId)
 
   if usesScaleB(kernel):
-    module.add(VReadfirstlaneB32(dst=sgpr("LocalWriteBaseAddrMXSB"), src=vgpr(vgprWaveId),
-                                 comment="scaleB: wave LDS base"))
-    module.add(SAddU32(dst=sgpr("LocalWriteBaseAddrMXSB"),
-                       src0=sgpr("LocalWriteBaseAddrMXSB"),
-                       src1=hex(writer.ldsStartOffsetMXSB), comment=""))
-    module.add(SAddU32(dst=sgpr("SwapMXSB"), src0=sgpr("LocalWriteBaseAddrMXSB"),
-                       src1=writer.ldsTotalSize, comment=""))
-    module.add(SXorB32(dst=sgpr("SwapMXSB"), src0=sgpr("LocalWriteBaseAddrMXSB"),
-                       src1=sgpr("SwapMXSB"), comment=""))
+    nBlocksB = deepseekScaleBNBlocksPerWave(kernel)
+    bytesPerLoadB = tiMXSB_.loadWidthGR * wavesize * nBlocksB
+    _emitWaveBase(module, writer, 'MXSB', writer.ldsStartOffsetMXSB,
+                  "SwapMXSB", bytesPerLoadB, vWaveId)
 
-  writer.vgprPool.checkIn(vgprWaveId)
+  writer.vgprPool.checkIn(vWaveId)
   return module
 
 
@@ -528,20 +582,31 @@ def _dsByteOffset(module, waveIdSgpr, waveOffSgpr, stmp, log2wg_m, isN, wgSgpr, 
   """Emit SGPR code for a per-wave byte offset into one DS scale buffer.
 
   A-side (isN=False): waveM = waveId & (wg_m-1); globalIdx = waveM + WG0*wg_m.
-  B-side (isN=True):  globalIdx = N-block index = (WG1*MT1)>>7, uniform across N-waves.
+  B-side (isN=True):  globalIdx = first N-block of this wave = (WG1*MT1 + waveN*(MT1/wg_n)) >> 7.
   waveOff = globalIdx * strideSgpr, where strideSgpr = nKBlocks * wave_bytes.
-  Result in waveOffSgpr; stmp used as scratch (A-side only).
+  Result in waveOffSgpr; stmp used as scratch.
   """
   if isN:
-    assert 128 % mt1 == 0, f"MacroTile1={mt1} must divide 128 (DeepseekScaleBlockK=128)"
-    nBlockShift = (128 // mt1).bit_length() - 1
-    if nBlockShift > 0:
-      module.add(SLShiftRightB32(dst=sgpr(waveOffSgpr), src=sgpr(wgSgpr),
-                                 shiftHex=hex(nBlockShift),
-                                 comment="globalIdx = WG1 >> log2(128/MT1)"))
+    # First N-block of this wave = (WG1*MT1 + waveN_idx*(MT1/wg_n)) / 128,
+    # where waveN_idx = waveId / wg_m. Handles MT1>128 (wave spans multiple
+    # N-blocks) and wg_n splitting within or across N-blocks.
+    colPerWaveN = mt1 // wg_dim
+    if log2wg_m > 0:
+      module.add(SLShiftRightB32(dst=sgpr(stmp), src=sgpr(waveIdSgpr),
+                                 shiftHex=hex(log2wg_m),
+                                 comment="waveN_idx = waveId / wg_m"))
     else:
-      module.add(SMovB32(dst=sgpr(waveOffSgpr), src=sgpr(wgSgpr),
-                         comment="globalIdx = WG1 (N-block index, MT1=128)"))
+      module.add(SMovB32(dst=sgpr(stmp), src=sgpr(waveIdSgpr),
+                         comment="waveN_idx = waveId (wg_m=1)"))
+    module.add(SMulI32(dst=sgpr(waveOffSgpr), src0=sgpr(stmp), src1=colPerWaveN,
+                       comment="waveN_idx * (MT1/wg_n) columns"))
+    module.add(SMulI32(dst=sgpr(stmp), src0=sgpr(wgSgpr), src1=mt1,
+                       comment="WG1 * MT1 columns"))
+    module.add(SAddU32(dst=sgpr(waveOffSgpr), src0=sgpr(waveOffSgpr), src1=sgpr(stmp),
+                       comment="firstColumn = WG1*MT1 + waveN_idx*(MT1/wg_n)"))
+    module.add(SLShiftRightB32(dst=sgpr(waveOffSgpr), src=sgpr(waveOffSgpr),
+                               shiftHex=hex(7),
+                               comment="globalIdx = firstColumn / 128 (N-block index)"))
     module.add(SMulI32(dst=sgpr(waveOffSgpr), src0=sgpr(waveOffSgpr), src1=sgpr(strideSgpr),
                        comment="waveOff = globalIdx * (nKBlocks * wave_bytes)"))
     return
@@ -573,6 +638,44 @@ def _dsSetSrd(module, off, stmp, waveOffSgpr, srdName, srdBits):
                      comment="%s[3] = buffer flags" % srdName))
 
 
+def _initDeepseekScaleSrdSide(module, writer, kernel, isN, off, tileInfo, wgSgpr, wgDim,
+                               waveIdSgpr, waveOffSgpr, stmp, strideSgpr, log2wg_m, log2du,
+                               srdBits):
+  """Emit SRD init instructions for one DeepseekScale side (A or B).
+
+  Computes nKBlocks*wave_bytes stride, calls _dsByteOffset for the per-wave
+  global offset, persists DsScaleBBlockStride on the B-side when needed, then
+  calls _dsSetSrd to load the pointer and write the SRD quad.
+  """
+  bufName = "scaleBBuf" if isN else "scaleABuf"
+  assert off is not None, "%s not found in numStoreSgprNames" % bufName
+  waveSize = kernel["WavefrontSize"]
+  waveBytes = waveSize * tileInfo.loadWidthGR
+  side = "B" if isN else "A"
+  srdName = "SrdMXSB" if isN else "SrdMXSA"
+  mt1 = kernel["MacroTile1"] if isN else 128
+  module.add(SLShiftRightB32(dst=sgpr(stmp), src=sgpr("SizesSum"),
+                             shiftHex=hex(log2du), comment="nKBlocks = K / DepthU"))
+  module.add(SMulI32(dst=sgpr(strideSgpr), src0=sgpr(stmp), src1=waveBytes,
+                     comment="stride%s = nKBlocks * wave_bytes_%s" % (side, side.lower())))
+  _dsByteOffset(module, waveIdSgpr, waveOffSgpr, stmp, log2wg_m, isN,
+                wgSgpr, wgDim, strideSgpr, mt1)
+  if isN and deepseekScaleBNBlocksPerWave(kernel) > 1:
+    module.add(SMovB32(dst=sgpr("DsScaleBBlockStride"), src=sgpr(strideSgpr),
+                       comment="persist nKBlocks*wave_bytes for 2nd N-block GR soffset"))
+  _dsSetSrd(module, off, stmp, waveOffSgpr, srdName, srdBits)
+
+
+def _emitUniformWaveIdToSgpr(module, writer, log2ws, waveIdSgpr):
+    """Read Serial >> log2ws into a uniform SGPR (VALU write -> readlane hazard guarded)."""
+    vWaveId = writer.vgprPool.checkOut(1, tag="ds_srd_waveId")
+    module.add(VLShiftRightB32(dst=vgpr(vWaveId), shiftHex=hex(log2ws),
+                               src=vgpr("Serial"), comment="waveId = Serial >> log2(waveSize)"))
+    module.add(SNop(waitState=0, comment="wait for VGPR before readfirstlane (VALU write hazard)"))
+    module.add(VReadfirstlaneB32(dst=sgpr(waveIdSgpr), src=vgpr(vWaveId), comment="uniform waveId"))
+    writer.vgprPool.checkIn(vWaveId)
+
+
 def initDeepseekScaleSrd(writer, kernel):
   """Load ScaleABuf / ScaleBBuf pointers into SrdMXSA/B for DeepseekScale.
 
@@ -584,54 +687,39 @@ def initDeepseekScaleSrd(writer, kernel):
   from .SubtileDeepseekScaleEmit import _scaleBufKernArgOffsets
 
   offA, offB = _scaleBufKernArgOffsets(writer, kernel)
-  waveSize = kernel["WavefrontSize"]
   wg_m = kernel["MIWaveGroup"][0]
   wg_n = kernel["MIWaveGroup"][1]
   use_a = kernel.get("UseDeepseekScaleA", False)
   use_b = kernel.get("UseDeepseekScaleB", False)
   log2wg_m = wg_m.bit_length() - 1
+  waveSize = kernel["WavefrontSize"]
   log2ws = waveSize.bit_length() - 1
-  depthU = kernel["DepthU"]
-  log2du = depthU.bit_length() - 1
+  log2du = kernel["DepthU"].bit_length() - 1
   srdBits = writer.states.srdElementBits
   module = Module("DeepseekScale SRD init")
 
-  # stmp[0:2] = scratch (nkBlocks temp + 64-bit ptr load); waveIdSgpr, waveOffSgpr,
-  # strideSgpr = nKBlocks * wave_bytes for the current side.
+  # stmp[0:2]: scratch for nKBlocks temp and 64-bit ptr load.
+  # waveIdSgpr, waveOffSgpr, strideSgpr: per-wave index, byte offset, and
+  # nKBlocks*wave_bytes stride (reused for each active side).
   with writer.allocTmpSgpr(5, tag="dsInitSrd") as tmp5:
     stmp = tmp5.idx
     waveIdSgpr = tmp5.idx + 2
     waveOffSgpr = tmp5.idx + 3
     strideSgpr = tmp5.idx + 4
 
-    vWaveId = writer.vgprPool.checkOut(1, tag="ds_srd_waveId")
-    module.add(VLShiftRightB32(dst=vgpr(vWaveId), shiftHex=hex(log2ws),
-                               src=vgpr("Serial"), comment="waveId = Serial >> log2(waveSize)"))
-    module.add(SNop(waitState=0, comment="wait for VGPR before readfirstlane (VALU write hazard)"))
-    module.add(VReadfirstlaneB32(dst=sgpr(waveIdSgpr), src=vgpr(vWaveId),
-                                 comment="uniform waveId"))
-    writer.vgprPool.checkIn(vWaveId)
+    _emitUniformWaveIdToSgpr(module, writer, log2ws, waveIdSgpr)
 
     if use_a:
-      assert offA is not None, "ScaleABuf not found in numStoreSgprNames"
-      wave_bytes_a = waveSize * writer.states.mxsa.tileInfo.loadWidthGR
-      module.add(SLShiftRightB32(dst=sgpr(stmp), src=sgpr("SizesSum"),
-                                 shiftHex=hex(log2du), comment="nKBlocks = K / DepthU"))
-      module.add(SMulI32(dst=sgpr(strideSgpr), src0=sgpr(stmp), src1=wave_bytes_a,
-                         comment="strideA = nKBlocks * wave_bytes_a"))
-      _dsByteOffset(module, waveIdSgpr, waveOffSgpr, stmp, log2wg_m, False,
-                    "WorkGroup0", wg_m, strideSgpr)
-      _dsSetSrd(module, offA, stmp, waveOffSgpr, "SrdMXSA", srdBits)
-
+      _initDeepseekScaleSrdSide(module, writer, kernel, False, offA,
+                                writer.states.mxsa.tileInfo,
+                                "WorkGroup0", wg_m,
+                                waveIdSgpr, waveOffSgpr, stmp, strideSgpr,
+                                log2wg_m, log2du, srdBits)
     if use_b:
-      assert offB is not None, "ScaleBBuf not found in numStoreSgprNames"
-      wave_bytes_b = waveSize * writer.states.mxsb.tileInfo.loadWidthGR
-      module.add(SLShiftRightB32(dst=sgpr(stmp), src=sgpr("SizesSum"),
-                                 shiftHex=hex(log2du), comment="nKBlocks = K / DepthU"))
-      module.add(SMulI32(dst=sgpr(strideSgpr), src0=sgpr(stmp), src1=wave_bytes_b,
-                         comment="strideB = nKBlocks * wave_bytes_b"))
-      _dsByteOffset(module, waveIdSgpr, waveOffSgpr, stmp, log2wg_m, True,
-                    "WorkGroup1", wg_n, strideSgpr, kernel["MacroTile1"])
-      _dsSetSrd(module, offB, stmp, waveOffSgpr, "SrdMXSB", srdBits)
+      _initDeepseekScaleSrdSide(module, writer, kernel, True, offB,
+                                writer.states.mxsb.tileInfo,
+                                "WorkGroup1", wg_n,
+                                waveIdSgpr, waveOffSgpr, stmp, strideSgpr,
+                                log2wg_m, log2du, srdBits)
 
   return module

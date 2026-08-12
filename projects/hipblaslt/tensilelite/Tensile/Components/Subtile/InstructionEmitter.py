@@ -255,7 +255,14 @@ class InstructionEmitter:
                 groupKey = scaleGroupIdx * lrGran.mn
                 kGroupIdx = placement.tiles.subIterK_start // ti.lrSubtileShape[1]
                 numKGroups = ti.lrLocalSubtileGrid[1]
-                dsOffset = int(ti.lrSubtileSize) * (scaleGroupIdx * numKGroups + kGroupIdx)
+                if isDeepseekScale(self.kernel) and tc == 'MXSB':
+                    # Physical LDS stride between a wave's N-blocks is wave_bytes.
+                    # lrSubtileSize (512) is larger than the actual per-block slot (256),
+                    # so use the physical stride directly for the N-block offset.
+                    physStride = self.kernel["WavefrontSize"] * ti.loadWidthGR
+                    dsOffset = physStride * scaleGroupIdx
+                else:
+                    dsOffset = int(ti.lrSubtileSize) * (scaleGroupIdx * numKGroups + kGroupIdx)
                 vdst = next(iter(vgprTilesScale[tile_map[groupKey]]))
                 module.add(DSLoadB32(
                     dst=vgpr(vdst),

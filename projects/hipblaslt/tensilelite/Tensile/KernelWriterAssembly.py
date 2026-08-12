@@ -771,6 +771,10 @@ class KernelWriterAssembly(KernelWriter):
       if _usesScaleB and not kernel["enableTDMB"]:
         module.add(self.defineSgpr("SrdMXSB", 4, 4))
         self.addSgprVarToPool("SrdMXSB")
+        if kernel.get("UseDeepseekScaleB", False):
+          from Tensile.Components.Subtile.SubtileScaleEmit import deepseekScaleBNBlocksPerWave
+          if deepseekScaleBNBlocksPerWave(kernel) > 1:
+            module.add(self.defineSgpr("DsScaleBBlockStride", 1))
       if not kernel["enableTDMMetadata"] and kernel["ProblemType"]["Sparse"]:
         module.add(self.defineSgpr("SrdMetadata", 4, 4))
 

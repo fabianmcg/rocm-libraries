@@ -506,13 +506,21 @@ def _validateDeepseekScaleMultiK(state, printRejectionReason):
   if asem % depthU != 0:
     state["AssertSummationElementMultiple"] = max(asem, depthU)
 
-  # Guard 2: scaleB mainloop path loads one E8M0 byte per K-block (one N-block).
-  # MacroTile1 > 128 spans two N-blocks but only the first block's scale is loaded.
+  # Guard 2: scaleB mainloop loads one E8M0 byte per N-block; a wave may span
+  # up to 2 N-blocks (MT1=256). Wider single-wave N-tiles are not yet wired.
   use_b = state.get("UseDeepseekScaleB", False)
   mt1 = state.get("MacroTile1", 0)
-  if use_b and mt1 > 128:
+  wgN = state["MIWaveGroup"][1] if state.get("MIWaveGroup") else 1
+  nBlocksB = max(1, mt1 // (128 * wgN)) if mt1 else 1
+  if use_b and nBlocksB > 2:
     reject(state, printRejectionReason,
-           f"useDeepseekScaleB multi-K path: MacroTile1 must be <= 128 (MacroTile1={mt1})")
+           f"useDeepseekScaleB multi-K path: wave spans {nBlocksB} N-blocks (max 2)")
+    return
+
+  if use_b and nBlocksB > 1 and state.get("PrefetchGlobalRead", 0) >= 1:
+    reject(state, printRejectionReason,
+           f"useDeepseekScaleB multi-K path: MacroTile1 spanning {nBlocksB} N-blocks "
+           f"per wave requires PrefetchGlobalRead=0 (VGPR pressure)")
     return
 
 
