@@ -2305,22 +2305,22 @@ namespace TensileLite
         template <>
         inline uint8_t DataInitialization::getValue<uint8_t, InitMode::DenormMin>()
         {
-            throw std::runtime_error("DenormMin not available for uint8_t.");
+            throw std::runtime_error("denormMin not available for uint8_t");
         }
         template <>
         inline uint8_t DataInitialization::getValue<uint8_t, InitMode::DenormMax>()
         {
-            throw std::runtime_error("DenormMax not available for uint8_t.");
+            throw std::runtime_error("denormMax not available for uint8_t");
         }
         template <>
         inline uint8_t DataInitialization::getValue<uint8_t, InitMode::NaN>()
         {
-            throw std::runtime_error("NaN not available for uint8_t.");
+            throw std::runtime_error("NaN not available for uint8_t");
         }
         template <>
         inline uint8_t DataInitialization::getValue<uint8_t, InitMode::Inf>()
         {
-            throw std::runtime_error("Inf not available for uint8_t.");
+            throw std::runtime_error("Inf not available for uint8_t");
         }
         template <>
         inline uint8_t DataInitialization::getValue<uint8_t, InitMode::Random>()
