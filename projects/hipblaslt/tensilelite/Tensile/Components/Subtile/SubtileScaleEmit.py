@@ -193,15 +193,20 @@ def _graTileAssignmentScaleSwizzledCommon(tc, writer, kernel):
   ti_ = writer.states.mxsa.tileInfo if tc == 'MXSA' else writer.states.mxsb.tileInfo
 
   if isDeepseekScale(kernel):
-    # DeepseekScale: vaddr = serial * loadWidthGR (plain linear per-lane offset).
-    # The host pre-organises the device buffer so lane L's 4-byte group holds
-    # the pre-broadcast E8M0 scale for row (L % 16). This vaddr doubles as
+    # DeepseekScale: vaddr = laneWithinWave * loadWidthGR. Use the lane index
+    # within the wave (not the workgroup-wide serial): initDeepseekScaleSrd
+    # already advances SrdMXSA by the per-wave row-group offset, so adding the
+    # wave part of the serial here would double-count it. This vaddr doubles as
     # both the global read offset (from SrdMXSA) and the LDS write offset (from M0).
     loadWidth = ti_.loadWidthGR  # = 4 for DeepseekScale (b32)
     loadWidthShift = loadWidth.bit_length() - 1
+    waveSize = kernel["WavefrontSize"]
+    module.add(VAndB32(dst=vgpr(ti_.sharedVgprGROffset[0]),
+                       src0=hex(waveSize - 1), src1=vgpr("Serial"),
+                       comment="%s: laneWithinWave = serial %% %d" % (tc, waveSize)))
     module.add(VLShiftLeftB32(dst=vgpr(ti_.sharedVgprGROffset[0]),
-                              shiftHex=hex(loadWidthShift), src=vgpr("Serial"),
-                              comment="%s: DeepseekScale vaddr = serial * %d" % (tc, loadWidth)))
+                              shiftHex=hex(loadWidthShift), src=vgpr(ti_.sharedVgprGROffset[0]),
+                              comment="%s: DeepseekScale vaddr = laneWithinWave * %d" % (tc, loadWidth)))
     return module
 
   loadWidth = ti_.loadWidthGR
@@ -578,7 +583,7 @@ def initDeepseekScaleSrd(writer, kernel):
   """
   from .SubtileDeepseekScaleEmit import _scaleBufKernArgOffsets
 
-  off_a, off_b = _scaleBufKernArgOffsets(writer)
+  offA, offB = _scaleBufKernArgOffsets(writer, kernel)
   waveSize = kernel["WavefrontSize"]
   wg_m = kernel["MIWaveGroup"][0]
   wg_n = kernel["MIWaveGroup"][1]
@@ -602,12 +607,13 @@ def initDeepseekScaleSrd(writer, kernel):
     vWaveId = writer.vgprPool.checkOut(1, tag="ds_srd_waveId")
     module.add(VLShiftRightB32(dst=vgpr(vWaveId), shiftHex=hex(log2ws),
                                src=vgpr("Serial"), comment="waveId = Serial >> log2(waveSize)"))
+    module.add(SNop(waitState=0, comment="wait for VGPR before readfirstlane (VALU write hazard)"))
     module.add(VReadfirstlaneB32(dst=sgpr(waveIdSgpr), src=vgpr(vWaveId),
                                  comment="uniform waveId"))
     writer.vgprPool.checkIn(vWaveId)
 
     if use_a:
-      assert off_a is not None, "ScaleABuf not found in numStoreSgprNames"
+      assert offA is not None, "ScaleABuf not found in numStoreSgprNames"
       wave_bytes_a = waveSize * writer.states.mxsa.tileInfo.loadWidthGR
       module.add(SLShiftRightB32(dst=sgpr(stmp), src=sgpr("SizesSum"),
                                  shiftHex=hex(log2du), comment="nKBlocks = K / DepthU"))
@@ -615,10 +621,10 @@ def initDeepseekScaleSrd(writer, kernel):
                          comment="strideA = nKBlocks * wave_bytes_a"))
       _dsByteOffset(module, waveIdSgpr, waveOffSgpr, stmp, log2wg_m, False,
                     "WorkGroup0", wg_m, strideSgpr)
-      _dsSetSrd(module, off_a, stmp, waveOffSgpr, "SrdMXSA", srdBits)
+      _dsSetSrd(module, offA, stmp, waveOffSgpr, "SrdMXSA", srdBits)
 
     if use_b:
-      assert off_b is not None, "ScaleBBuf not found in numStoreSgprNames"
+      assert offB is not None, "ScaleBBuf not found in numStoreSgprNames"
       wave_bytes_b = waveSize * writer.states.mxsb.tileInfo.loadWidthGR
       module.add(SLShiftRightB32(dst=sgpr(stmp), src=sgpr("SizesSum"),
                                  shiftHex=hex(log2du), comment="nKBlocks = K / DepthU"))
@@ -626,6 +632,6 @@ def initDeepseekScaleSrd(writer, kernel):
                          comment="strideB = nKBlocks * wave_bytes_b"))
       _dsByteOffset(module, waveIdSgpr, waveOffSgpr, stmp, log2wg_m, True,
                     "WorkGroup1", wg_n, strideSgpr, kernel["MacroTile1"])
-      _dsSetSrd(module, off_b, stmp, waveOffSgpr, "SrdMXSB", srdBits)
+      _dsSetSrd(module, offB, stmp, waveOffSgpr, "SrdMXSB", srdBits)
 
   return module

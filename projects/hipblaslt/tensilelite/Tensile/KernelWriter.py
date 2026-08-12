@@ -5069,9 +5069,11 @@ class KernelWriter(metaclass=abc.ABCMeta):
     if not (kernel["enableTDMA"] and kernel["enableTDMB"]):
       module.add(globalReadDTLInitCommonSgpr(self, kernel))
 
-    if mxsatileInfo is not None and mxsbtileInfo is not None and not isDeepseekScale(kernel):
-      if not (kernel["enableTDMA"] and kernel["enableTDMB"]):
-        module.add(globalReadScaleSwizzledDTLInitCommonSgpr(self, kernel))
+    # DeepseekScale supports single-sided scale; non-DS MX scale always pairs both sides.
+    hasScaleDTL = (mxsatileInfo is not None or mxsbtileInfo is not None) if isDeepseekScale(kernel) \
+                  else (mxsatileInfo is not None and mxsbtileInfo is not None)
+    if hasScaleDTL and not (kernel["enableTDMA"] and kernel["enableTDMB"]):
+      module.add(globalReadScaleSwizzledDTLInitCommonSgpr(self, kernel))
 
     # TODOBS: globalWriteWorkGroupInit can be emitted here or later on, check..
     if self.states.doShadowInit:
@@ -5092,12 +5094,12 @@ class KernelWriter(metaclass=abc.ABCMeta):
     module.addComment1("global read addresses: addresses a")
     if not hasTDM:
       module.add(self.graAddresses(kernel, tensorParametersA))
-      if usesScaleA(kernel):
+      if isDeepseekScale(kernel):
+        module.addComment1("global read addresses: DeepseekScale SRD init (A and/or B)")
+        module.add(initDeepseekScaleSrd(self, kernel))
+      elif usesScaleA(kernel):
         module.addComment1("global read addresses: addresses mxsa")
-        if isDeepseekScale(kernel):
-          module.add(initDeepseekScaleSrd(self, kernel))
-        else:
-          module.add(self.graAddresses(kernel, tensorParametersA["MX"]))
+        module.add(self.graAddresses(kernel, tensorParametersA["MX"]))
       module.addComment1("global read addresses: addresses b")
       module.add(self.graAddresses(kernel, tensorParametersB))
       if usesScaleB(kernel) and not isDeepseekScale(kernel):

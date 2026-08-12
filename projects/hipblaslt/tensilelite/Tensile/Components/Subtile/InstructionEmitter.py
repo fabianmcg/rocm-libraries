@@ -17,7 +17,7 @@ from Tensile.Components.Subtile.SubtileLREmit import (
     emitSingleDsRead, localReadLDSBufferSwap,
 )
 from Tensile.Components.Subtile.SubtileScaleEmit import (
-    globalReadDoScaleSubtile, globalReadScalePtrUpdates,
+    globalReadDoScaleSubtile, globalReadScalePtrUpdates, isDeepseekScale,
 )
 from rocisa.code import Module
 from rocisa.instruction import (
@@ -107,12 +107,15 @@ class InstructionEmitter:
         if tensorParametersB is not None:
             self.tensorParametersMap['B'] = tensorParametersB
 
-        # Derived state
-        self.hasScale = scaleTileInfoA is not None and scaleTileInfoB is not None
+        # Derived state — hasScaleA/B track which sides are individually present.
+        self.hasScaleA = scaleTileInfoA is not None
+        self.hasScaleB = scaleTileInfoB is not None
+        self.hasScale = self.hasScaleA or self.hasScaleB
         self.subtileShapeK = tileInfoA.subtileShape[1]
         self.tileInfoMap = {'A': tileInfoA, 'B': tileInfoB}
-        if self.hasScale:
+        if self.hasScaleA:
             self.tileInfoMap['SA'] = scaleTileInfoA
+        if self.hasScaleB:
             self.tileInfoMap['SB'] = scaleTileInfoB
 
         # Per-uid K-window: numSubIterK / numUnroll[t].  Single-DU configs
@@ -121,8 +124,9 @@ class InstructionEmitter:
             t: config.numSubIterK // config.numUnroll.get(t, 1)
             for t in ('A', 'B')
         }
-        if self.hasScale:
+        if self.hasScaleA:
             self._per_uid_k['SA'] = config.numSubIterK // config.numUnroll.get('SA', 1)
+        if self.hasScaleB:
             self._per_uid_k['SB'] = config.numSubIterK // config.numUnroll.get('SB', 1)
 
         # Dispatch table — unroll_iter is passed for mfma/lr
@@ -177,18 +181,30 @@ class InstructionEmitter:
             dTile = self.dtileInfo.vgprTiles[a + b * self.dtileInfo.localMMATileGrid[0]]
 
             if self.hasScale:
-                scaleGroupA = (a // self.config.lrSA.mn) * self.config.lrSA.mn
-                scaleGroupB = (b // self.config.lrSB.mn) * self.config.lrSB.mn
-                scaleATile = self.vgprTilesSA[tile_maps['SA'][scaleGroupA]]
-                scaleBTile = self.vgprTilesSB[tile_maps['SB'][scaleGroupB]]
-                scaleAVgpr = next(iter(scaleATile))
-                scaleBVgpr = next(iter(scaleBTile))
-                mShapeA = self.tileInfoMap['SA'].lrSubtileShape[0]
-                mShapeB = self.tileInfoMap['SB'].lrSubtileShape[0]
-                kShapeA = self.tileInfoMap['SA'].lrSubtileShape[1]
-                kShapeB = self.tileInfoMap['SB'].lrSubtileShape[1]
-                sAsel = (a % mShapeA) + mShapeA * (subIterK % kShapeA)
-                sBsel = (b % mShapeB) + mShapeB * (subIterK % kShapeB)
+                if self.hasScaleA:
+                    scaleGroupA = (a // self.config.lrSA.mn) * self.config.lrSA.mn
+                    scaleATile = self.vgprTilesSA[tile_maps['SA'][scaleGroupA]]
+                    scaleAVgpr = next(iter(scaleATile))
+                    mShapeA = self.tileInfoMap['SA'].lrSubtileShape[0]
+                    kShapeA = self.tileInfoMap['SA'].lrSubtileShape[1]
+                    sAsel = (a % mShapeA) + mShapeA * (subIterK % kShapeA)
+                else:
+                    scaleAVgpr = -1
+                    sAsel = 0
+                if self.hasScaleB:
+                    scaleGroupB = (b // self.config.lrSB.mn) * self.config.lrSB.mn
+                    scaleBTile = self.vgprTilesSB[tile_maps['SB'][scaleGroupB]]
+                    scaleBVgpr = next(iter(scaleBTile))
+                    mShapeB = self.tileInfoMap['SB'].lrSubtileShape[0]
+                    kShapeB = self.tileInfoMap['SB'].lrSubtileShape[1]
+                    sBsel = (b % mShapeB) + mShapeB * (subIterK % kShapeB)
+                else:
+                    scaleBVgpr = -1
+                    sBsel = 0
+                # DeepseekScale broadcasts each E8M0 byte to all 4 bytes of the b32
+                # VGPR, so the correct selector is always 0 for both sides.
+                if isDeepseekScale(self.kernel):
+                    sAsel = sBsel = 0
             else:
                 scaleAVgpr = scaleBVgpr = -1
                 sAsel = sBsel = 0

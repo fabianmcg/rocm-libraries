@@ -10,22 +10,30 @@ importing from KernelWriter directly.
 """
 
 
-def _scaleBufKernArgOffsets(writer):
-    """Return (offset_a_or_None, offset_b_or_None) byte offsets of ScaleABuf/ScaleBBuf.
+def _scaleBufKernArgOffsets(writer, kernel):
+    """Return (offA_or_None, offB_or_None) byte offsets of ScaleABuf/ScaleBBuf.
 
     Byte offsets are relative to the per-GEMM kernel arg base (KernArgAddress after
     the common-args shift), computed by walking numStoreSgprNames from the argLoader
     current position.
+
+    For non-GroupedGemm kernels, Signature.py inserts batchOffset{D,C,A,B} (4*8=32
+    bytes) before the DeepseekScale args. Those entries are absent from
+    numStoreSgprNames, so the walk must start 32 bytes later to land at the correct
+    ScaleABuf/ScaleBBuf positions.
     """
     base = writer.argLoader.getOffset()
     names = writer.states.numStoreSgprNames
     sizes = writer.states.numStoreSgprNameSizes
-    off_a = off_b = None
-    cur = base
+    offA = offB = None
+    # Account for the batchOffset block that Signature.py inserts before the
+    # DeepseekScale args in non-GroupedGemm kernels.
+    batchOffsetBytes = 0 if kernel["ProblemType"]["GroupedGemm"] else 32
+    cur = base + batchOffsetBytes
     for name, size in zip(names, sizes):
         if name == "ScaleABuf":
-            off_a = cur
+            offA = cur
         elif name == "ScaleBBuf":
-            off_b = cur
+            offB = cur
         cur += size * 4
-    return off_a, off_b
+    return offA, offB

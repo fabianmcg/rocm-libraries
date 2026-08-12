@@ -192,11 +192,14 @@ def _execute_and_compare(solution, kernelName, hsaco, M, N, K, numWG,
         amdgpu_exec.InOutArray(dFortran), amdgpu_exec.InputArray(cFortran),
         amdgpu_exec.InputArray(aFortran), amdgpu_exec.InputArray(bFortran),
         skArgs, ki0, ki1,
-        epilogueArgs,
+        [],                       # no epilogue args before the batchOffsets.
         alpha=np.float32(alpha),
         hasBeta=True,
         beta=np.float32(beta),
     )
+    # Scaled-GEMM kernarg layout: ScaleABuf/ScaleBBuf follow the batchOffset block
+    # (see Signature.py), so append them after buildSubtileArgs' trailing batchOffsets.
+    args.extend(epilogueArgs)
 
     result_holder = {}
 
