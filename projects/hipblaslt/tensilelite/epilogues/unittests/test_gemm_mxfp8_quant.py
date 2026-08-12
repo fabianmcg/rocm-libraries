@@ -2,12 +2,12 @@
 # SPDX-License-Identifier: MIT
 """Pytest suite for the fused GEMM+MXFP8Quant (K1) Subtile epilogue (gfx950, bf16 in / fp8 out).
 
-Exercises a set of (M, K, N_hidden) shapes and alpha values, verifying:
-  - MXScale (uint8 [ceil(N_hidden/q0), ceil(M/q1)], exact byte equality): e8m0 per-block scale
+Exercises a set of (M, K, nHidden) shapes and alpha values, verifying:
+  - MXScale (uint8 [ceil(nHidden/q0), ceil(M/q1)], exact byte equality): e8m0 per-block scale
   - D output (OCP e4m3 fp8, compared as float32 with tol=0.1): quantized GEMM result
 
 D is the fp8 output; MXScale is the only epilogue side buffer (1 byte per block).
-free0 = N_hidden direction (tiled by q0), free1 = M_tokens direction (tiled by q1).
+free0 = nHidden direction (tiled by q0), free1 = M_tokens direction (tiled by q1).
 """
 
 import math
@@ -26,17 +26,17 @@ from epilogues.tensilelite.partialrms_helpers import (
 from epilogues.tensilelite.numpy_helpers import randBf16, mxfp8QuantReference
 from epilogues.tensilelite.yaml_solution_builder import readTestAxes
 
-_K1_YAML = yamlPath("gemm_mxfp8_quant_k1.yaml")
+_k1Yaml = yamlPath("gemm_mxfp8_quant_k1.yaml")
 
-_K1_SOLUTIONS = enumerateSolutions("gemm_mxfp8_quant_k1.yaml")
+_k1Solutions = enumerateSolutions("gemm_mxfp8_quant_k1.yaml")
 
-_K1_AXES = {}
+_k1Axes = {}
 try:
-    _K1_AXES = readTestAxes(_K1_YAML, "K1", mt1=1)  # mt1 placeholder; expanded below
+    _k1Axes = readTestAxes(_k1Yaml, "K1", mt1=1)  # mt1 placeholder; expanded below
 except Exception:
     pass
 
-_KN_PAIRS = _K1_AXES.get("KNHidden", [])
+_knPairs = _k1Axes.get("KNHidden", [])
 
 
 # ---------------------------------------------------------------------------
@@ -45,8 +45,8 @@ _KN_PAIRS = _K1_AXES.get("KNHidden", [])
 
 @pytest.fixture(
     scope="session",
-    params=[sol for sol, _id in _K1_SOLUTIONS],
-    ids=[sid for _sol, sid in _K1_SOLUTIONS],
+    params=[sol for sol, _id in _k1Solutions],
+    ids=[sid for _sol, sid in _k1Solutions],
 )
 def k1_mx_kernel(request):
     """Assemble and compile one K1 MXFP8Quant solution from the benchmark YAML."""
@@ -103,7 +103,7 @@ def _build_kernel_args(solution, M, K, nHidden, q0, q1, alpha=1.0, zeroInput=Fal
     return args, mxScale, dFortran, mxScaleRef, dFp8Ref, mT, nT, numWG
 
 
-def _run_shape(solution, kernelName, hsaco, chip, M, K, nHidden, alpha=1.0, zeroInput=False):
+def _runShape(solution, kernelName, hsaco, chip, M, K, nHidden, alpha=1.0, zeroInput=False):
     """Run K1 MXFP8Quant for one (M, K, nHidden, alpha) configuration.
 
     Returns (mx_gpu, mx_ref, d_gpu_f32, d_ref_f32).
@@ -148,7 +148,7 @@ def _check(solution, kernelName, hsaco, chip, M, K, nHidden, alpha=1.0):
         f"Q=[{q0},{q1}] M={M} K={K} N={nHidden} "
         f"wgM={numWgM} wgN={numWgN} alpha={alpha}"
     )
-    mxGpu, mxRef, dGpuF32, dRefF32 = _run_shape(
+    mxGpu, mxRef, dGpuF32, dRefF32 = _runShape(
         solution, kernelName, hsaco, chip, M, K, nHidden, alpha=alpha
     )
     # MXScale bytes must match exactly; e8m0 bytes are deterministic.
@@ -169,20 +169,20 @@ def _check(solution, kernelName, hsaco, chip, M, K, nHidden, alpha=1.0):
 
 @requires_gfx950
 @pytest.mark.parametrize(
-    "K,N_hidden",
-    _KN_PAIRS,
-    ids=[f"K{k}-N{n}" for k, n in _KN_PAIRS],
+    "K,nHidden",
+    _knPairs,
+    ids=[f"K{k}-N{n}" for k, n in _knPairs],
 )
-def test_k1_mx_shape(k1_mx_kernel, K, N_hidden):
+def test_k1_mx_shape(k1_mx_kernel, K, nHidden):
     """Verify K1 MXFP8Quant outputs: MXScale bytes and fp8 D."""
     solution, kernelName, hsaco, chip = k1_mx_kernel
     MT1 = solution["MacroTile1"]
 
-    for M, mLabel in readTestAxes(_K1_YAML, "K1", mt1=MT1)["M"]:
-        mxGpu, mxRef, dGpuF32, dRefF32 = _run_shape(
-            solution, kernelName, hsaco, chip, M, K, N_hidden
+    for M, mLabel in readTestAxes(_k1Yaml, "K1", mt1=MT1)["M"]:
+        mxGpu, mxRef, dGpuF32, dRefF32 = _runShape(
+            solution, kernelName, hsaco, chip, M, K, nHidden
         )
-        label = f"MT0={solution['MacroTile0']} MT1={MT1} {mLabel} N={N_hidden} K={K}"
+        label = f"MT0={solution['MacroTile0']} MT1={MT1} {mLabel} N={nHidden} K={K}"
         assert np.array_equal(mxGpu, mxRef), (
             f"{label}: MXScale byte mismatch. "
             f"gpu={mxGpu.ravel()[:8]} ref={mxRef.ravel()[:8]}"
@@ -198,8 +198,8 @@ def test_k1_mx_shape(k1_mx_kernel, K, N_hidden):
 # Test: multi-workgroup shapes in M and N.
 # ---------------------------------------------------------------------------
 
-_MULTI_WG_SHAPES = [
-    # (M, K, N_hidden)
+_multiWgShapes = [
+    # (M, K, nHidden)
     (256,  64,  128),   # numWG_M=2, numWG_N=2: multi-WG M
     (512,  64,  128),   # numWG_M=4, numWG_N=2: more M workgroups
     (128,  64,  256),   # numWG_M=1, numWG_N=4: multi-WG N only
@@ -211,22 +211,22 @@ _MULTI_WG_SHAPES = [
 
 @requires_gfx950
 @pytest.mark.parametrize(
-    "M,K,N_hidden",
-    _MULTI_WG_SHAPES,
-    ids=[f"M{m}-K{k}-N{n}" for m, k, n in _MULTI_WG_SHAPES],
+    "M,K,nHidden",
+    _multiWgShapes,
+    ids=[f"M{m}-K{k}-N{n}" for m, k, n in _multiWgShapes],
 )
-def test_k1_mx_multiWG_shape(k1_mx_kernel, M, K, N_hidden):
+def test_k1_mx_multiWG_shape(k1_mx_kernel, M, K, nHidden):
     """Verify K1 MXFP8Quant for multi-workgroup shapes (numWG_M > 1 and/or numWG_N > 1)."""
     solution, kernelName, hsaco, chip = k1_mx_kernel
-    _check(solution, kernelName, hsaco, chip, M, K, N_hidden)
+    _check(solution, kernelName, hsaco, chip, M, K, nHidden)
 
 
 # ---------------------------------------------------------------------------
 # Test: non-tile-aligned M and N (partial quant-tile boundary at the edge).
 # ---------------------------------------------------------------------------
 
-_UNALIGNED_SHAPES = [
-    # (M, K, N_hidden)
+_unalignedShapes = [
+    # (M, K, nHidden)
     ( 17,  64,  80),    # M=17 not MT1-aligned, N=80 not MT0-aligned
     (113,  64, 200),    # non-round M and N
     (200,  64, 113),    # swap of above
@@ -241,14 +241,14 @@ _UNALIGNED_SHAPES = [
 
 @requires_gfx950
 @pytest.mark.parametrize(
-    "M,K,N_hidden",
-    _UNALIGNED_SHAPES,
-    ids=[f"M{m}-K{k}-N{n}" for m, k, n in _UNALIGNED_SHAPES],
+    "M,K,nHidden",
+    _unalignedShapes,
+    ids=[f"M{m}-K{k}-N{n}" for m, k, n in _unalignedShapes],
 )
-def test_k1_mx_unaligned(k1_mx_kernel, M, K, N_hidden):
+def test_k1_mx_unaligned(k1_mx_kernel, M, K, nHidden):
     """Verify K1 MXFP8Quant on shapes where M or N is not tile-aligned."""
     solution, kernelName, hsaco, chip = k1_mx_kernel
-    _check(solution, kernelName, hsaco, chip, M, K, N_hidden)
+    _check(solution, kernelName, hsaco, chip, M, K, nHidden)
 
 
 # ---------------------------------------------------------------------------
@@ -256,7 +256,7 @@ def test_k1_mx_unaligned(k1_mx_kernel, M, K, N_hidden):
 # ---------------------------------------------------------------------------
 
 _ALPHA_SHAPES = [
-    # (M, K, N_hidden, alpha)
+    # (M, K, nHidden, alpha)
     (128,  64, 128, 2.0),
     (128,  64, 128, 0.5),
     (128,  64, 128, -1.0),
@@ -268,22 +268,22 @@ _ALPHA_SHAPES = [
 
 @requires_gfx950
 @pytest.mark.parametrize(
-    "M,K,N_hidden,alpha",
+    "M,K,nHidden,alpha",
     _ALPHA_SHAPES,
     ids=[f"M{m}-K{k}-N{n}-a{a}" for m, k, n, a in _ALPHA_SHAPES],
 )
-def test_k1_mx_alpha(k1_mx_kernel, M, K, N_hidden, alpha):
+def test_k1_mx_alpha(k1_mx_kernel, M, K, nHidden, alpha):
     """Verify K1 MXFP8Quant correctly applies alpha before quantization."""
     solution, kernelName, hsaco, chip = k1_mx_kernel
-    _check(solution, kernelName, hsaco, chip, M, K, N_hidden, alpha=alpha)
+    _check(solution, kernelName, hsaco, chip, M, K, nHidden, alpha=alpha)
 
 
 # ---------------------------------------------------------------------------
 # Test: varying K (reduction depth).
 # ---------------------------------------------------------------------------
 
-_K_SHAPES = [
-    # (M, K, N_hidden)
+_kShapes = [
+    # (M, K, nHidden)
     (128,   1, 128),    # K=1: minimal reduction
     (128,  32, 128),    # K=32: sub-DepthU
     (128,  64, 128),    # K=64: one DepthU tile
@@ -295,14 +295,14 @@ _K_SHAPES = [
 
 @requires_gfx950
 @pytest.mark.parametrize(
-    "M,K,N_hidden",
-    _K_SHAPES,
-    ids=[f"M{m}-K{k}-N{n}" for m, k, n in _K_SHAPES],
+    "M,K,nHidden",
+    _kShapes,
+    ids=[f"M{m}-K{k}-N{n}" for m, k, n in _kShapes],
 )
-def test_k1_mx_k_sweep(k1_mx_kernel, M, K, N_hidden):
+def test_k1_mx_k_sweep(k1_mx_kernel, M, K, nHidden):
     """Verify K1 MXFP8Quant across a range of reduction depths."""
     solution, kernelName, hsaco, chip = k1_mx_kernel
-    _check(solution, kernelName, hsaco, chip, M, K, N_hidden)
+    _check(solution, kernelName, hsaco, chip, M, K, nHidden)
 
 
 # ---------------------------------------------------------------------------
@@ -310,7 +310,7 @@ def test_k1_mx_k_sweep(k1_mx_kernel, M, K, N_hidden):
 # ---------------------------------------------------------------------------
 
 _LARGE_SHAPES = [
-    # (M, K, N_hidden) — representative LLM decode/prefill sizes.
+    # (M, K, nHidden) — representative LLM decode/prefill sizes.
     ( 512,  128, 4096),
     (1024,  128, 4096),
     ( 512,  128, 8192),
@@ -322,21 +322,21 @@ _LARGE_SHAPES = [
 
 @requires_gfx950
 @pytest.mark.parametrize(
-    "M,K,N_hidden",
+    "M,K,nHidden",
     _LARGE_SHAPES,
     ids=[f"M{m}-K{k}-N{n}" for m, k, n in _LARGE_SHAPES],
 )
-def test_k1_mx_large(k1_mx_kernel, M, K, N_hidden):
+def test_k1_mx_large(k1_mx_kernel, M, K, nHidden):
     """Verify K1 MXFP8Quant on production-scale LLM shapes."""
     solution, kernelName, hsaco, chip = k1_mx_kernel
-    _check(solution, kernelName, hsaco, chip, M, K, N_hidden)
+    _check(solution, kernelName, hsaco, chip, M, K, nHidden)
 
 
 # ---------------------------------------------------------------------------
 # Test: all-zero input -> amax=0 produces all-zero D and all-zero MXScale.
 # ---------------------------------------------------------------------------
 
-_ALL_ZERO_SHAPES = [
+_allZeroShapes = [
     (128, 64, 128),
     (256, 64, 256),
 ]
@@ -344,18 +344,18 @@ _ALL_ZERO_SHAPES = [
 
 @requires_gfx950
 @pytest.mark.parametrize(
-    "M,K,N_hidden",
-    _ALL_ZERO_SHAPES,
-    ids=[f"M{m}-K{k}-N{n}" for m, k, n in _ALL_ZERO_SHAPES],
+    "M,K,nHidden",
+    _allZeroShapes,
+    ids=[f"M{m}-K{k}-N{n}" for m, k, n in _allZeroShapes],
 )
-def test_k1_mx_all_zero(k1_mx_kernel, M, K, N_hidden):
+def test_k1_mx_all_zero(k1_mx_kernel, M, K, nHidden):
     """amax=0 (all-zero A) must yield all-zero D and all-zero MXScale."""
     solution, kernelName, hsaco, chip = k1_mx_kernel
-    mxGpu, mxRef, dGpuF32, dRefF32 = _run_shape(
-        solution, kernelName, hsaco, chip, M, K, N_hidden, zeroInput=True,
+    mxGpu, mxRef, dGpuF32, dRefF32 = _runShape(
+        solution, kernelName, hsaco, chip, M, K, nHidden, zeroInput=True,
     )
     label = (f"all-zero MT{solution['MacroTile0']}x{solution['MacroTile1']}"
-             f" M={M} K={K} N={N_hidden}")
+             f" M={M} K={K} N={nHidden}")
     assert np.all(mxGpu == 0), f"{label}: MXScale not all zero"
     assert np.all(dGpuF32 == 0.0), f"{label}: D not all zero"
     assert np.array_equal(mxGpu, mxRef), f"{label}: MXScale gpu != ref"
@@ -381,13 +381,13 @@ _SUBROW_SHAPES = [
 
 @requires_gfx950
 @pytest.mark.parametrize(
-    "M,K,N_hidden",
+    "M,K,nHidden",
     _SUBROW_SHAPES,
     ids=[f"M{m}-K{k}-N{n}" for m, k, n in _SUBROW_SHAPES],
 )
-def test_k1_mx_subrow(k1_mx_kernel, M, K, N_hidden):
+def test_k1_mx_subrow(k1_mx_kernel, M, K, nHidden):
     """Verify sub-row MXFP8Quant (q0 < mfmaM) row addressing and OOB-row suppression."""
     solution, kernelName, hsaco, chip = k1_mx_kernel
     if solution.get("_MXFP8QuantQ0", solution["MacroTile0"]) >= solution["MatrixInstM"]:
         pytest.skip("not a sub-row (q0<mfmaM) solution")
-    _check(solution, kernelName, hsaco, chip, M, K, N_hidden)
+    _check(solution, kernelName, hsaco, chip, M, K, nHidden)

@@ -538,15 +538,15 @@ def _validatePartialRMSMXFP8Combo(state, printRejectionReason):
     return
   if state.get("PartialRMSQuant", False):
     reject(state, printRejectionReason,
-           "PartialRMS+MXFP8Quant: PartialRMSQuant must be False (MXFP8Quant owns quantization)")
+           "combined PartialRMS+MXFP8Quant mode: PartialRMSQuant must be False (MXFP8Quant owns quantization)")
     return
   if not state["ProblemType"]["DestDataType"].isFloat8():
     reject(state, printRejectionReason,
-           "PartialRMS+MXFP8Quant requires DestDataType=F8 (fp8 e4m3 D output)")
+           "combined PartialRMS+MXFP8Quant mode requires DestDataType=F8 (fp8 e4m3 D output)")
     return
   if state["ProblemType"].get("UseBeta", True):
     reject(state, printRejectionReason,
-           "PartialRMS+MXFP8Quant requires UseBeta=False (beta must be 0)")
+           "combined PartialRMS+MXFP8Quant mode requires UseBeta=False")
     return
 
 

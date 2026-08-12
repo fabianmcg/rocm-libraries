@@ -38,17 +38,17 @@ from epilogues.tensilelite.numpy_helpers import (
 )
 from epilogues.tensilelite.yaml_solution_builder import readTestAxes
 
-_K1_YAML = yamlPath("gemm_partial_rms_mxfp8_quant_k1.yaml")
+_k1Yaml = yamlPath("gemm_partial_rms_mxfp8_quant_k1.yaml")
 
-_K1_SOLUTIONS = enumerateSolutions("gemm_partial_rms_mxfp8_quant_k1.yaml")
+_k1Solutions = enumerateSolutions("gemm_partial_rms_mxfp8_quant_k1.yaml")
 
-_K1_AXES = {}
+_k1Axes = {}
 try:
-    _K1_AXES = readTestAxes(_K1_YAML, "K1", mt1=1)
+    _k1Axes = readTestAxes(_k1Yaml, "K1", mt1=1)
 except Exception:
     pass
 
-_KN_PAIRS = _K1_AXES.get("KNHidden", [])
+_knPairs = _k1Axes.get("KNHidden", [])
 
 
 # ---------------------------------------------------------------------------
@@ -57,8 +57,8 @@ _KN_PAIRS = _K1_AXES.get("KNHidden", [])
 
 @pytest.fixture(
     scope="session",
-    params=[sol for sol, _id in _K1_SOLUTIONS],
-    ids=[sid for _sol, sid in _K1_SOLUTIONS],
+    params=[sol for sol, _id in _k1Solutions],
+    ids=[sid for _sol, sid in _k1Solutions],
 )
 def k1_combo_kernel(request):
     """Assemble and compile one K1 PartialRMS+MXFP8Quant solution."""
@@ -71,7 +71,7 @@ def k1_combo_kernel(request):
 # Helper: run one shape, return comparison data.
 # ---------------------------------------------------------------------------
 
-def _run_shape(solution, kernelName, hsaco, chip, M, K, nHidden, alpha=1.0,
+def _runShape(solution, kernelName, hsaco, chip, M, K, nHidden, alpha=1.0,
                zeroInput=False):
     """Run K1 combined epilogue for one (M, K, nHidden) shape.
 
@@ -167,7 +167,7 @@ def _check(solution, kernelName, hsaco, chip, M, K, nHidden, alpha=1.0):
     label = (
         f"MT{MT0}x{MT1} Q=[{q0},{q1}] M={M} K={K} N={nHidden} alpha={alpha}"
     )
-    pbGpu, sumsqRef, mxGpu, mxRef, dGpuF32, dRefF32, mPadded, _ = _run_shape(
+    pbGpu, sumsqRef, mxGpu, mxRef, dGpuF32, dRefF32, mPadded, _ = _runShape(
         solution, kernelName, hsaco, chip, M, K, nHidden, alpha=alpha
     )
     assertClose(pbGpu[:M, :], sumsqRef, label, rtol=1e-4, atol=1e-4,
@@ -185,21 +185,21 @@ def _check(solution, kernelName, hsaco, chip, M, K, nHidden, alpha=1.0):
 
 @requires_gfx950
 @pytest.mark.parametrize(
-    "K,N_hidden",
-    _KN_PAIRS,
-    ids=[f"K{k}-N{n}" for k, n in _KN_PAIRS],
+    "K,nHidden",
+    _knPairs,
+    ids=[f"K{k}-N{n}" for k, n in _knPairs],
 )
-def test_k1_combo_shape(k1_combo_kernel, K, N_hidden):
+def test_k1_combo_shape(k1_combo_kernel, K, nHidden):
     """Verify K1 PartialRMS+MXFP8Quant outputs: partialBuf Σx², MXScale bytes, fp8 D."""
     solution, kernelName, hsaco, chip = k1_combo_kernel
     MT0 = solution["MacroTile0"]
     MT1 = solution["MacroTile1"]
 
-    for M, mLabel in readTestAxes(_K1_YAML, "K1", mt1=MT1)["M"]:
-        pbGpu, sumsqRef, mxGpu, mxRef, dGpuF32, dRefF32, mPadded, nD = _run_shape(
-            solution, kernelName, hsaco, chip, M, K, N_hidden
+    for M, mLabel in readTestAxes(_k1Yaml, "K1", mt1=MT1)["M"]:
+        pbGpu, sumsqRef, mxGpu, mxRef, dGpuF32, dRefF32, mPadded, nD = _runShape(
+            solution, kernelName, hsaco, chip, M, K, nHidden
         )
-        label = f"MT0={MT0} MT1={MT1} {mLabel} N={N_hidden} K={K}"
+        label = f"MT0={MT0} MT1={MT1} {mLabel} N={nHidden} K={K}"
         assertClose(pbGpu[:M, :], sumsqRef, label, rtol=1e-4, atol=1e-4,
                     kind="partialBuf_sumsq")
         assert np.array_equal(mxGpu, mxRef), (
@@ -213,7 +213,7 @@ def test_k1_combo_shape(k1_combo_kernel, K, N_hidden):
 # Test: multi-workgroup shapes.
 # ---------------------------------------------------------------------------
 
-_MULTI_WG_SHAPES = [
+_multiWgShapes = [
     (256,  64,  128),
     (512,  64,  128),
     (128,  64,  256),
@@ -225,21 +225,21 @@ _MULTI_WG_SHAPES = [
 
 @requires_gfx950
 @pytest.mark.parametrize(
-    "M,K,N_hidden",
-    _MULTI_WG_SHAPES,
-    ids=[f"M{m}-K{k}-N{n}" for m, k, n in _MULTI_WG_SHAPES],
+    "M,K,nHidden",
+    _multiWgShapes,
+    ids=[f"M{m}-K{k}-N{n}" for m, k, n in _multiWgShapes],
 )
-def test_k1_combo_multiWG(k1_combo_kernel, M, K, N_hidden):
+def test_k1_combo_multiWG(k1_combo_kernel, M, K, nHidden):
     """Verify combined epilogue for multi-workgroup shapes."""
     solution, kernelName, hsaco, chip = k1_combo_kernel
-    _check(solution, kernelName, hsaco, chip, M, K, N_hidden)
+    _check(solution, kernelName, hsaco, chip, M, K, nHidden)
 
 
 # ---------------------------------------------------------------------------
 # Test: non-tile-aligned M and N.
 # ---------------------------------------------------------------------------
 
-_UNALIGNED_SHAPES = [
+_unalignedShapes = [
     ( 17,  64,  80),
     (113,  64, 200),
     (200,  64, 113),
@@ -253,21 +253,21 @@ _UNALIGNED_SHAPES = [
 
 @requires_gfx950
 @pytest.mark.parametrize(
-    "M,K,N_hidden",
-    _UNALIGNED_SHAPES,
-    ids=[f"M{m}-K{k}-N{n}" for m, k, n in _UNALIGNED_SHAPES],
+    "M,K,nHidden",
+    _unalignedShapes,
+    ids=[f"M{m}-K{k}-N{n}" for m, k, n in _unalignedShapes],
 )
-def test_k1_combo_unaligned(k1_combo_kernel, M, K, N_hidden):
+def test_k1_combo_unaligned(k1_combo_kernel, M, K, nHidden):
     """Verify combined epilogue on shapes where M or N is not tile-aligned."""
     solution, kernelName, hsaco, chip = k1_combo_kernel
-    _check(solution, kernelName, hsaco, chip, M, K, N_hidden)
+    _check(solution, kernelName, hsaco, chip, M, K, nHidden)
 
 
 # ---------------------------------------------------------------------------
 # Test: K sweep.
 # ---------------------------------------------------------------------------
 
-_K_SHAPES = [
+_kShapes = [
     (128,   1, 128),
     (128,  32, 128),
     (128,  64, 128),
@@ -279,14 +279,14 @@ _K_SHAPES = [
 
 @requires_gfx950
 @pytest.mark.parametrize(
-    "M,K,N_hidden",
-    _K_SHAPES,
-    ids=[f"M{m}-K{k}-N{n}" for m, k, n in _K_SHAPES],
+    "M,K,nHidden",
+    _kShapes,
+    ids=[f"M{m}-K{k}-N{n}" for m, k, n in _kShapes],
 )
-def test_k1_combo_k_sweep(k1_combo_kernel, M, K, N_hidden):
+def test_k1_combo_k_sweep(k1_combo_kernel, M, K, nHidden):
     """Verify combined epilogue across a range of reduction depths."""
     solution, kernelName, hsaco, chip = k1_combo_kernel
-    _check(solution, kernelName, hsaco, chip, M, K, N_hidden)
+    _check(solution, kernelName, hsaco, chip, M, K, nHidden)
 
 
 # ---------------------------------------------------------------------------
@@ -303,21 +303,21 @@ _LARGE_SHAPES = [
 
 @requires_gfx950
 @pytest.mark.parametrize(
-    "M,K,N_hidden",
+    "M,K,nHidden",
     _LARGE_SHAPES,
     ids=[f"M{m}-K{k}-N{n}" for m, k, n in _LARGE_SHAPES],
 )
-def test_k1_combo_large(k1_combo_kernel, M, K, N_hidden):
+def test_k1_combo_large(k1_combo_kernel, M, K, nHidden):
     """Verify combined epilogue on production-scale LLM shapes."""
     solution, kernelName, hsaco, chip = k1_combo_kernel
-    _check(solution, kernelName, hsaco, chip, M, K, N_hidden)
+    _check(solution, kernelName, hsaco, chip, M, K, nHidden)
 
 
 # ---------------------------------------------------------------------------
 # Test: all-zero input → partialBuf=0, MXScale=0, D=0.
 # ---------------------------------------------------------------------------
 
-_ALL_ZERO_SHAPES = [
+_allZeroShapes = [
     (128, 64, 128),
     (256, 64, 256),
 ]
@@ -325,18 +325,18 @@ _ALL_ZERO_SHAPES = [
 
 @requires_gfx950
 @pytest.mark.parametrize(
-    "M,K,N_hidden",
-    _ALL_ZERO_SHAPES,
-    ids=[f"M{m}-K{k}-N{n}" for m, k, n in _ALL_ZERO_SHAPES],
+    "M,K,nHidden",
+    _allZeroShapes,
+    ids=[f"M{m}-K{k}-N{n}" for m, k, n in _allZeroShapes],
 )
-def test_k1_combo_all_zero(k1_combo_kernel, M, K, N_hidden):
+def test_k1_combo_all_zero(k1_combo_kernel, M, K, nHidden):
     """All-zero A input must yield Σx²=0, MXScale=0, D=0."""
     solution, kernelName, hsaco, chip = k1_combo_kernel
-    pbGpu, sumsqRef, mxGpu, mxRef, dGpuF32, dRefF32, mPadded, _ = _run_shape(
-        solution, kernelName, hsaco, chip, M, K, N_hidden, zeroInput=True
+    pbGpu, sumsqRef, mxGpu, mxRef, dGpuF32, dRefF32, mPadded, _ = _runShape(
+        solution, kernelName, hsaco, chip, M, K, nHidden, zeroInput=True
     )
     label = (f"all-zero MT{solution['MacroTile0']}x{solution['MacroTile1']}"
-             f" M={M} K={K} N={N_hidden}")
+             f" M={M} K={K} N={nHidden}")
     assert np.all(pbGpu[:M, :] == 0.0), f"{label}: partialBuf not all zero"
     assert np.all(mxGpu == 0), f"{label}: MXScale not all zero"
     assert np.all(dGpuF32 == 0.0), f"{label}: D not all zero"
