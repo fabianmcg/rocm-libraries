@@ -328,40 +328,41 @@ class SubtileMXFP8QuantEmitter:
         self.writer.vgprPool.checkIn(addrV)
         return module
 
-    def _computeOneMXScale(self, module, slot: int, amaxVgpr: int,
-                            quantMultVgpr: int, invFp8V: int,
-                            c254V: int, zeroMask: int) -> None:
-        """Emit quantMult for one quant tile slot.
+    def _computeCeilAdj(self, module, scaleFV: int, adjV: int) -> None:
+        """Compute ceil adjustment (0 or 1) from scaleFV mantissa into adjV.
 
-        quantMultVgpr is used as a temp for intermediate scaleByte computation
-        and then overwritten with the final quantMult = qExpField << 23.
-        When amax==0: quantMultVgpr = 0 (scaleByte is naturally 0 in this case).
-        c254V and zeroMask are shared across all slots (passed in).
+        Internally allocates and frees a temporary mantissa VGPR and mask SGPR.
         """
-        lsc = self.laneSgprCount
-        # scaleF = amax * (1/448) → into quantMultVgpr (temp for scaleByte).
-        module.add(VMulF32(dst=vgpr(quantMultVgpr), src0=vgpr(amaxVgpr),
-                           src1=vgpr(invFp8V),
-                           comment=f"scaleF[{slot}] = amax * (1/448)."))
-        # Mantissa check for ceiling via left-shift (avoids literal 0x7FFFFF).
-        # mantV = scaleF << 9 discards sign and exponent; mantV!=0 iff mantissa!=0.
+        # mantV = scaleFV << 9: discards sign and exponent, non-zero iff mantissa != 0.
         mantV = self.writer.vgprPool.checkOut(1, tag="mx_mant")
         module.add(VLShiftLeftB32(dst=vgpr(mantV), shiftHex=hex(9),
-                                  src=vgpr(quantMultVgpr),
+                                  src=vgpr(scaleFV),
                                   comment="mantV = scaleF << 9 (mant != 0 iff mantV != 0)."))
-        # expByte = scaleF >> 23; & 0xFF not needed since scaleF >= 0 (sign bit = 0).
-        module.add(VLShiftRightB32(dst=vgpr(quantMultVgpr), shiftHex=hex(23),
-                                   src=vgpr(quantMultVgpr),
-                                   comment="expByte = scaleF >> 23."))
+        lsc = self.laneSgprCount
         zmc = self.writer.sgprPool.checkOutAligned(lsc, lsc, tag="mx_zmc", preventOverflow=False)
         module.add(VCmpEQU32(dst=sgpr(zmc, lsc), src0=0, src1=vgpr(mantV),
                              comment="mant == 0?."))
-        adjV = self.writer.vgprPool.checkOut(1, tag="mx_adj")
         # When zmc TRUE (mant==0): dst=src1=0; FALSE (mant!=0): dst=src0=1.
         module.add(VCndMaskB32(dst=vgpr(adjV), src0=1, src1=0, src2=sgpr(zmc, lsc),
                                comment="adj = (mant!=0) ? 1 : 0."))
         self.writer.sgprPool.checkIn(zmc)
         self.writer.vgprPool.checkIn(mantV)
+
+    def _computeOneMXScale(self, module, slot: int, amaxVgpr: int,
+                            quantMultVgpr: int, invFp8V: int,
+                            c254V: int, zeroMask: int) -> None:
+        """Emit e8m0 quantMult for slot; quantMultVgpr reused as temp, c254V/zeroMask shared."""
+        lsc = self.laneSgprCount
+        # scaleF = amax * (1/448) → into quantMultVgpr (temp for scaleByte).
+        module.add(VMulF32(dst=vgpr(quantMultVgpr), src0=vgpr(amaxVgpr),
+                           src1=vgpr(invFp8V),
+                           comment=f"scaleF[{slot}] = amax * (1/448)."))
+        adjV = self.writer.vgprPool.checkOut(1, tag="mx_adj")
+        self._computeCeilAdj(module, quantMultVgpr, adjV)
+        # expByte = scaleF >> 23; & 0xFF not needed since scaleF >= 0 (sign bit = 0).
+        module.add(VLShiftRightB32(dst=vgpr(quantMultVgpr), shiftHex=hex(23),
+                                   src=vgpr(quantMultVgpr),
+                                   comment="expByte = scaleF >> 23."))
         # scaleByte = expByte + adj → into quantMultVgpr.
         module.add(VAddU32(vgpr(quantMultVgpr), vgpr(quantMultVgpr), vgpr(adjV),
                            comment=f"scaleByte[{slot}] = expByte + ceilAdj."))
@@ -608,23 +609,17 @@ class SubtileMXFP8QuantEmitter:
                                                          preventOverflow=False)
         module.add(VCmpEQU32(dst=sgpr(zeroMask, lsc), src0=0,
                              src1=vgpr(quantMultVgprs + slot),
-                             comment=f"quantMult[{slot}] == 0?"))
+                             comment=f"quantMult[{slot}] == 0?."))
         module.add(VCndMaskB32(dst=vgpr(scaleByteV), src0=vgpr(scaleByteV), src1=0,
                                src2=sgpr(zeroMask, lsc),
                                comment=f"scaleByte[{slot}] = 0 if amax==0."))
         self.writer.sgprPool.checkIn(zeroMask)
 
-    def _writeTileStore(self, module, qi: int, qj: int, mxSrd: int,
-                         quantMultVgprs: int, col: int, rowGroup: int,
-                         savedExec: int, laneMask: int,
-                         addrV: int, tmpV: int, tmp2V: int, nQTN: int,
-                         waveM, waveN) -> None:
-        """Predicated write of one MXScale byte for quant tile (qi, qj)."""
-        lsc     = self.laneSgprCount
-        slot    = qi * self.nQTilesN + qj
-        repCol = (qj * self.q1) % self.mfmaN
-        repRg  = ((qi * self.q0) % self.mfmaM) // self.rowsPerLane
-        module.addComment0(f"  Tile qi={qi}, qj={qj}: repCol={repCol}, repRg={repRg}.")
+    def _buildTileWriteMask(self, module, col: int, rowGroup: int, repCol: int, repRg: int,
+                             tmpV: int, tmp2V: int, waveN, qj: int, nQTN: int,
+                             laneMask: int) -> None:
+        """Build write mask: col==repCol AND rowGroup==repRg AND qTileCol<totalQTilesN."""
+        lsc = self.laneSgprCount
         colCond = self.writer.sgprPool.checkOutAligned(lsc, lsc, tag="mx_wColCond",
                                                         preventOverflow=False)
         rgCond  = self.writer.sgprPool.checkOutAligned(lsc, lsc, tag="mx_wRgCond",
@@ -656,6 +651,20 @@ class SubtileMXFP8QuantEmitter:
                            src1=sgpr(colInRange, lsc),
                            comment="AND qTileCol in range."))
         self.writer.sgprPool.checkIn(colInRange)
+
+    def _writeTileStore(self, module, qi: int, qj: int, mxSrd: int,
+                         quantMultVgprs: int, col: int, rowGroup: int,
+                         savedExec: int, laneMask: int,
+                         addrV: int, tmpV: int, tmp2V: int, nQTN: int,
+                         waveM, waveN) -> None:
+        """Predicated write of one MXScale byte for quant tile (qi, qj)."""
+        lsc    = self.laneSgprCount
+        slot   = qi * self.nQTilesN + qj
+        repCol = (qj * self.q1) % self.mfmaN
+        repRg  = ((qi * self.q0) % self.mfmaM) // self.rowsPerLane
+        module.addComment0(f"  Tile qi={qi}, qj={qj}: repCol={repCol}, repRg={repRg}.")
+        self._buildTileWriteMask(module, col, rowGroup, repCol, repRg,
+                                 tmpV, tmp2V, waveN, qj, nQTN, laneMask)
         module.add(SAndSaveExecB64(dst=sgpr(savedExec, lsc), src=sgpr(laneMask, lsc),
                                    comment="save exec; set exec = write-lane mask."))
         self._tileByteOffset(module, addrV, tmpV, tmp2V, nQTN, qi, qj, waveM, waveN)
@@ -670,21 +679,13 @@ class SubtileMXFP8QuantEmitter:
         module.add(SMovB64(dst=EXEC(), src=sgpr(savedExec, lsc),
                            comment="restore exec mask."))
 
-    def _writeTileStoreSubRow(self, module, m: int, kBlock: int, qj: int, slot: int,
-                               mxSrd: int, quantMultVgprs: int,
-                               col: int, rowGroup: int, savedExec: int, laneMask: int,
-                               addrV: int, tmpV: int, tmp2V: int,
-                               nQTN: int, nQTM: int, waveM, waveN) -> None:
-        """Predicated write of sub-row MXScale byte for tile (m, kBlock, qj).
-
-        Recovers scaleByte inline from quantMultVgprs[slot].
-        Predicate: col==0 AND qTileCol < totalQTilesN AND qTileRow < totalQTilesM.
-        """
+    def _buildSubRowWriteMask(self, module, col: int, rowGroup: int, constRow: int,
+                               qj: int, tmpV: int, tmp2V: int, waveM, waveN,
+                               nQTN: int, nQTM: int, laneMask: int) -> None:
+        """Build write mask: col==0 AND qTileCol<totalQTilesN AND qTileRow<totalQTilesM."""
         lsc = self.laneSgprCount
         nQTilesMPerWG = self.nQTilesM * self.wgM
         nQTilesNPerWG = self.nQTilesN * self.wgN
-        constRow = m * self.tilesPerMfmaM + kBlock
-        module.addComment0(f"  SubRow tile m={m}, kBlock={kBlock}, qj={qj}, slot={slot}.")
         module.add(VCmpEQU32(dst=sgpr(laneMask, lsc), src0=0, src1=vgpr(col),
                              comment="col == 0 (representative free1 lane)."))
         self._mulVgprBySgprConst(module, tmpV, "WorkGroup1", nQTilesNPerWG,
@@ -701,8 +702,7 @@ class SubtileMXFP8QuantEmitter:
         module.add(VCmpLtU32(dst=sgpr(colInRange, lsc), src0=vgpr(tmpV), src1=vgpr(nQTN),
                              comment="qTileCol < totalQTilesN?."))
         module.add(SAndB64(dst=sgpr(laneMask, lsc), src0=sgpr(laneMask, lsc),
-                           src1=sgpr(colInRange, lsc),
-                           comment="AND col in range."))
+                           src1=sgpr(colInRange, lsc), comment="AND col in range."))
         self.writer.sgprPool.checkIn(colInRange)
         self._mulVgprBySgprConst(module, tmpV, "WorkGroup0", nQTilesMPerWG,
                                   "WG0 * nQTilesMPerWG.")
@@ -724,9 +724,24 @@ class SubtileMXFP8QuantEmitter:
         module.add(VCmpLtU32(dst=sgpr(rowInRange, lsc), src0=vgpr(tmpV), src1=vgpr(nQTM),
                              comment="qTileRow < totalQTilesM?."))
         module.add(SAndB64(dst=sgpr(laneMask, lsc), src0=sgpr(laneMask, lsc),
-                           src1=sgpr(rowInRange, lsc),
-                           comment="AND row in range."))
+                           src1=sgpr(rowInRange, lsc), comment="AND row in range."))
         self.writer.sgprPool.checkIn(rowInRange)
+
+    def _writeTileStoreSubRow(self, module, m: int, kBlock: int, qj: int, slot: int,
+                               mxSrd: int, quantMultVgprs: int,
+                               col: int, rowGroup: int, savedExec: int, laneMask: int,
+                               addrV: int, tmpV: int, tmp2V: int,
+                               nQTN: int, nQTM: int, waveM, waveN) -> None:
+        """Predicated write of sub-row MXScale byte for tile (m, kBlock, qj).
+
+        Recovers scaleByte inline from quantMultVgprs[slot].
+        Predicate: col==0 AND qTileCol < totalQTilesN AND qTileRow < totalQTilesM.
+        """
+        lsc = self.laneSgprCount
+        constRow = m * self.tilesPerMfmaM + kBlock
+        module.addComment0(f"  SubRow tile m={m}, kBlock={kBlock}, qj={qj}, slot={slot}.")
+        self._buildSubRowWriteMask(module, col, rowGroup, constRow, qj,
+                                   tmpV, tmp2V, waveM, waveN, nQTN, nQTM, laneMask)
         module.add(SAndSaveExecB64(dst=sgpr(savedExec, lsc), src=sgpr(laneMask, lsc),
                                    comment="save exec; set exec = write-lane mask."))
         self._tileByteOffsetSubRow(module, addrV, tmpV, tmp2V, nQTN,
