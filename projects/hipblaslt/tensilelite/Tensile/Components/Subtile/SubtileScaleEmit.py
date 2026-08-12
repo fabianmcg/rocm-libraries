@@ -683,6 +683,10 @@ def initDeepseekScaleSrd(writer, kernel):
   globalIdx = waveIdx + WG * wg_dim and nKBlocks = K / DepthU.  This keeps each
   wave's base at the start of its row-group (A) or N-group (B) slice; the DTL
   advance (emitScaleGRPtrUpdate) then steps by wave_bytes per K-block.
+
+  For non-DP Stream-K (StreamKForceDPOnly=0), WGs with StreamKLocalStart > 0
+  start mid-K-dimension. After the base SRD is set, advance it by
+  StreamKLocalStart * wave_bytes so the first DTL load reads the correct K-block.
   """
   from .SubtileDeepseekScaleEmit import _scaleBufKernArgOffsets
 
@@ -721,5 +725,28 @@ def initDeepseekScaleSrd(writer, kernel):
                                 "WorkGroup1", wg_n,
                                 waveIdSgpr, waveOffSgpr, stmp, strideSgpr,
                                 log2wg_m, log2du, srdBits)
+
+    # Non-DP Stream-K: advance SrdMXSA/B by StreamKLocalStart K-blocks so WGs
+    # that start mid-K use the correct scale entry. StreamKLocalStart is not
+    # allocated in DP-only mode, so skip the offset when ForceDPOnly is set.
+    if kernel.get("StreamK", 0) > 0 and not kernel.get("StreamKForceDPOnly", 1):
+      if use_a:
+        inc_a = waveSize * writer.states.mxsa.tileInfo.loadWidthGR
+        module.addComment0("SK non-DP: advance SrdMXSA by StreamKLocalStart K-blocks")
+        module.add(SMulI32(dst=sgpr(stmp), src0=sgpr("StreamKLocalStart"), src1=inc_a,
+                           comment="skOff = StreamKLocalStart * %d (wave_bytes_a)" % inc_a))
+        module.add(SAddU32(dst=sgpr("SrdMXSA"), src0=sgpr("SrdMXSA"), src1=sgpr(stmp),
+                           comment="SrdMXSA[0] += skOff (lo)"))
+        module.add(SAddCU32(dst=sgpr("SrdMXSA+1"), src0=sgpr("SrdMXSA+1"), src1=0,
+                            comment="SrdMXSA[1] += carry"))
+      if use_b:
+        inc_b = waveSize * writer.states.mxsb.tileInfo.loadWidthGR
+        module.addComment0("SK non-DP: advance SrdMXSB by StreamKLocalStart K-blocks")
+        module.add(SMulI32(dst=sgpr(stmp), src0=sgpr("StreamKLocalStart"), src1=inc_b,
+                           comment="skOff = StreamKLocalStart * %d (wave_bytes_b)" % inc_b))
+        module.add(SAddU32(dst=sgpr("SrdMXSB"), src0=sgpr("SrdMXSB"), src1=sgpr(stmp),
+                           comment="SrdMXSB[0] += skOff (lo)"))
+        module.add(SAddCU32(dst=sgpr("SrdMXSB+1"), src0=sgpr("SrdMXSB+1"), src1=0,
+                            comment="SrdMXSB[1] += carry"))
 
   return module

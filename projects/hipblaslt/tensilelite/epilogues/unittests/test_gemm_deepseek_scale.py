@@ -41,7 +41,8 @@ from epilogue_test_common import (
     enumerateSolutions, assertClose,
 )
 from epilogues.tensilelite.partialrms_helpers import (
-    compute_sk3_dp_args, _pack_kernel_info, compileSolution, buildSubtileArgs,
+    compute_sk3_dp_args, compute_sk_split_args, makeSKSplitBuffers,
+    _pack_kernel_info, compileSolution, buildSubtileArgs,
 )
 
 _DSAB_MULTIK_YAML  = yamlPath("gemm_deepseek_scale_ab_multik.yaml")
@@ -51,6 +52,9 @@ _DSB_MULTIK_YAML   = yamlPath("gemm_deepseek_scale_b_multik.yaml")
 _DSAB_MULTIK_SOLUTIONS = enumerateSolutions("gemm_deepseek_scale_ab_multik.yaml")
 _DSA_MULTIK_SOLUTIONS  = enumerateSolutions("gemm_deepseek_scale_a_multik.yaml")
 _DSB_MULTIK_SOLUTIONS  = enumerateSolutions("gemm_deepseek_scale_b_multik.yaml")
+
+_DSAB_SK_SPLIT_YAML       = yamlPath("gemm_deepseek_scale_ab_sk_split.yaml")
+_DSAB_SK_SPLIT_SOLUTIONS  = enumerateSolutions("gemm_deepseek_scale_ab_sk_split.yaml")
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +92,18 @@ def dsa_multik_kernel(request):
 )
 def dsb_multik_kernel(request):
     """Assemble and compile one multi-K DeepseekScaleB-only solution (PGR=0)."""
+    solution = request.param
+    kernelName, hsaco, chip = compileSolution(solution)
+    return solution, kernelName, hsaco, chip
+
+
+@pytest.fixture(
+    scope="session",
+    params=[sol for sol, _id in _DSAB_SK_SPLIT_SOLUTIONS],
+    ids=[sid for _sol, sid in _DSAB_SK_SPLIT_SOLUTIONS],
+)
+def dsab_sk_split_kernel(request):
+    """Assemble and compile one non-DP Stream-K DeepseekScaleAB solution."""
     solution = request.param
     kernelName, hsaco, chip = compileSolution(solution)
     return solution, kernelName, hsaco, chip
@@ -209,6 +225,46 @@ def _execute_and_compare(solution, kernelName, hsaco, M, N, K, numWG,
     amdgpu_exec.execute_hsaco(
         hsaco=hsaco, kernel_name=kernelName, arguments=args,
         grid_dim=(numWG, 1, 1), block_dim=(solution["NumThreads"], 1, 1),
+        num_iterations=1, verify_fn=capture,
+    )
+
+    return result_holder["d_gpu"].reshape(M, N, order="F").astype(np.float32)
+
+
+def _execute_and_compare_sk_split(solution, kernelName, hsaco, M, N, K, sk_grid,
+                                  aFortran, bFortran, cFortran, dFortran,
+                                  epilogueArgs, alpha, beta=0.0):
+    """Build args, execute a non-DP Stream-K kernel on GPU, return D row-major f32.
+
+    Launches sk_grid workgroups (numWG == sk_grid) with a zeroed workspace and
+    flags buffer so K is split across workgroups and combined by the fixup.
+    """
+    skArgs = compute_sk_split_args(M, N, K, solution, sk_grid)
+    ki0, ki1 = _pack_kernel_info(solution)
+    ws, flags = makeSKSplitBuffers(solution, sk_grid)
+
+    args = buildSubtileArgs(
+        M, N, K, sk_grid,
+        amdgpu_exec.InOutArray(dFortran), amdgpu_exec.InputArray(cFortran),
+        amdgpu_exec.InputArray(aFortran), amdgpu_exec.InputArray(bFortran),
+        skArgs, ki0, ki1,
+        [],
+        alpha=np.float32(alpha),
+        hasBeta=True,
+        beta=np.float32(beta),
+        wsArray=amdgpu_exec.InputArray(ws),
+        flagsArray=amdgpu_exec.InputArray(flags),
+    )
+    args.extend(epilogueArgs)
+
+    result_holder = {}
+
+    def capture(arguments):
+        result_holder["d_gpu"] = np.asarray(arguments[8].array).copy()
+
+    amdgpu_exec.execute_hsaco(
+        hsaco=hsaco, kernel_name=kernelName, arguments=args,
+        grid_dim=(sk_grid, 1, 1), block_dim=(solution["NumThreads"], 1, 1),
         num_iterations=1, verify_fn=capture,
     )
 
@@ -427,3 +483,45 @@ def test_deepseek_scale_ab_batched():
         "batch>1 is not supported by the Python amdgpu_exec harness; "
         "multi-batch correctness is validated by the C++ client."
     )
+
+
+def _run_shape_ab_sk_split(solution, kernelName, hsaco, chip, M, N, K, sk_grid,
+                           alpha=1.0, beta=0.0, cMatrix=None):
+    """Run a non-DP Stream-K DeepseekScaleAB kernel for one (M, N, K) shape."""
+    MT0     = solution["MacroTile0"]
+    mPadded = math.ceil(M / MT0) * MT0
+
+    (aFortran, bFortran, cFortran, dFortran,
+     scaleAPadded, scaleBBytes, scaleBRef, aKM, bKN, scaleARef) = \
+        _make_inputs_ab_multik(M, N, K, mPadded)
+
+    if cMatrix is not None:
+        cFortran = np.asfortranarray(cMatrix.astype(np.float32))
+
+    c_ref = cMatrix if cMatrix is not None else np.zeros((M, N), dtype=np.float32)
+    aMK  = np.asarray(aKM).T
+    dRef = numpy_ref_multiblock(aMK, np.asarray(bKN), scaleARef, scaleBRef,
+                                alpha, beta, c_ref)
+
+    nKBlocks = K // 128
+    epilogueArgs = [amdgpu_exec.InputArray(_swizzleScaleADevice(scaleAPadded, nKBlocks)),
+                    amdgpu_exec.InputArray(_swizzleScaleBDevice(scaleBBytes, nKBlocks))]
+    dGpu = _execute_and_compare_sk_split(solution, kernelName, hsaco, M, N, K, sk_grid,
+                                         aFortran, bFortran, cFortran, dFortran,
+                                         epilogueArgs, alpha, beta=beta)
+    return dGpu, dRef.astype(np.float32)
+
+
+@requires_gfx950
+def test_deepseek_scale_ab_sk_split(dsab_sk_split_kernel):
+    """Verify non-DP Stream-K DeepseekScaleAB: K split across workgroups, combined
+    by the workspace-reduction fixup with deferred alpha applied once."""
+    solution, kernelName, hsaco, chip = dsab_sk_split_kernel
+    M, N, K = 128, 256, 512
+    MT0, MT1 = solution["MacroTile0"], solution["MacroTile1"]
+    tiles = math.ceil(M / MT0) * math.ceil(N / MT1)
+    sk_grid = 2 * tiles  # sk_grid > tiles -> each output tile is K-split across WGs.
+    dGpu, dRef = _run_shape_ab_sk_split(solution, kernelName, hsaco, chip, M, N, K,
+                                        sk_grid, alpha=2.0, beta=0.0)
+    label = (f"MT{MT0}x{MT1} A+B sk-split M={M} N={N} K={K} sk_grid={sk_grid}")
+    assertClose(dGpu[:M, :N], dRef[:M, :N], label, rtol=2e-2, atol=2e-2, kind="D_f32")

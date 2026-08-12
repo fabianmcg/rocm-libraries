@@ -126,6 +126,56 @@ def compute_sk3_dp_args(M: int, N: int, K: int, solution) -> dict:
     }
 
 
+def compute_sk_split_args(M: int, N: int, K: int, solution, sk_grid: int) -> dict:
+    """Compute StreamK=3 non-DP (StreamKForceDPOnly=0) K-split decomposition args.
+
+    Mirrors ContractionSolution.cpp singleCallArgs' SK3 tree-reduction path.
+    Callers pass sk_grid > tiles so sk_tiles == tiles (the skFullTiles term only
+    applies when tiles > sk_grid), giving each output tile several contributing
+    workgroups and a clean K-split (skExtraIters == 0).
+    """
+    MT0 = solution["MacroTile0"]
+    MT1 = solution["MacroTile1"]
+    depth_u = solution["DepthU"]
+
+    tiles = math.ceil(M / MT0) * math.ceil(N / MT1)
+    iters_per_tile = max(1, math.ceil(K / depth_u))
+    magic_ipt, shift_ipt = _magic_number_alg2(iters_per_tile)
+
+    if tiles % sk_grid == 0:
+        sk_tiles = sk_grid
+    else:
+        # skFullTiles defaults to 0; it only contributes when tiles > sk_grid.
+        sk_tiles = (tiles % sk_grid) if tiles > sk_grid else tiles
+        sk_tiles = min(sk_tiles, tiles)
+    sk_iters_per_wg = sk_tiles * iters_per_tile // sk_grid
+
+    return {
+        "iters_per_tile": np.uint32(iters_per_tile),
+        "magic_iters_per_tile": np.uint32(magic_ipt),
+        "shift_iters_per_tile": np.uint32(shift_ipt),
+        "sk_iters_per_wg": np.uint32(sk_iters_per_wg),
+        "sk_grid": np.uint32(sk_grid),
+        "sk_tiles": np.uint32(sk_tiles),
+    }
+
+
+def makeSKSplitBuffers(solution, sk_grid: int):
+    """Allocate zeroed workspace (partials) and flags buffers for SK3 non-DP.
+
+    Workspace holds one MacroTile0 x MacroTile1 f32 partial tile per Stream-K
+    workgroup (ContractionSolution.cpp partialTileSize). Flags is one uint32
+    ready-word per workgroup and must be zero-initialized: a partial-producing
+    WG stores 1 and the fixup WG spin-waits on it, so a stale non-zero would
+    break the first launch.
+    """
+    MT0 = solution["MacroTile0"]
+    MT1 = solution["MacroTile1"]
+    ws = np.zeros(MT0 * MT1 * sk_grid, dtype=np.float32)
+    flags = np.zeros(sk_grid, dtype=np.uint32)
+    return ws, flags
+
+
 def _pack_kernel_info(solution) -> tuple:
     """Pack StaggerU and WorkGroupMapping fields into kernel_info0 / kernel_info1."""
     su = solution.get("StaggerU", 0)
@@ -179,18 +229,23 @@ def compileSolution(solution):
 
 def buildSubtileArgs(free0, free1, bound, numWG, dOut, cIn, aOperand, bOperand,
                      skArgs, ki0, ki1, epilogueArgs, alpha=np.float32(1.0),
-                     hasBeta=True, beta=np.float32(0.0)):
-    """Build the StreamK=3/ForceDPOnly subtile kernel argument list.
+                     hasBeta=True, beta=np.float32(0.0),
+                     wsArray=None, flagsArray=None):
+    """Build the StreamK=3 subtile kernel argument list.
 
-    All subtile kernels use StreamKForceDPOnly=1, which drops AddressWS and
-    AddressFlags from the kernarg layout (see Tensile/Components/Signature.py).
+    Pass wsArray and flagsArray (already-wrapped InputArray objects) for the
+    StreamKForceDPOnly=0 K-split path: Signature.py inserts AddressWS and
+    AddressFlags right after the operand buffers and before the strides. Omit
+    them (leave as None) for the DP-only path; the byte layout is then identical
+    to the old ForceDPOnly=1 layout.
+
     Four zero u64 batchOffset{D,C,A,B} args are appended at the tail for
     non-grouped-GEMM kernels (batch=1, so offsets are all zero).
 
     Pass hasBeta=False for kernels with UseBeta=False (e.g. TileQuant), which
     do not load a beta SGPR; epilogue args then start one slot earlier.
 
-    Slot layout (0-indexed) with hasBeta=True:
+    Slot layout (0-indexed) with hasBeta=True and wsArray=None:
       0        : kernel_info_flags (uint32, always 1)
       1, 2     : ki0, ki1
       3        : numWG
@@ -205,18 +260,27 @@ def buildSubtileArgs(free0, free1, bound, numWG, dOut, cIn, aOperand, bOperand,
       28+      : epilogue-specific args
       tail     : batchOffsetD, batchOffsetC, batchOffsetA, batchOffsetB (u64, all 0)
 
-    With hasBeta=False slot 21 (beta) is absent; epilogue args start at slot 27.
+    With wsArray set, AddressWS and AddressFlags are inserted at slots 12–13
+    and all subsequent slots shift up by two.
+    With hasBeta=False slot 21 (beta) is absent; epilogue args start one slot earlier.
     """
     args = [
         np.uint32(1), ki0, ki1, np.uint32(numWG),
         np.uint32(free0), np.uint32(free1), np.uint32(1), np.uint32(bound),
         dOut, cIn, aOperand, bOperand,
+    ]
+    # StreamKForceDPOnly=0 (K-split) inserts AddressWS + AddressFlags right after
+    # the operand buffers and before the strides (Signature.py:174-176); DP-only
+    # kernels omit them.
+    if wsArray is not None:
+        args.extend([wsArray, flagsArray])
+    args.extend([
         np.uint32(free0), np.uint32(0),
         np.uint32(free0), np.uint32(0),
         np.uint32(bound), np.uint32(0),
         np.uint32(bound), np.uint32(0),
         np.float32(alpha),
-    ]
+    ])
     if hasBeta:
         args.append(np.float32(beta))
     args.extend([

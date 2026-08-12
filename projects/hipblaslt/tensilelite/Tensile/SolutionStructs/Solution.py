@@ -600,11 +600,15 @@ def _validateDeepseekScale(state, printRejectionReason):
   if state["ProblemType"].get("GroupedGemm", False):
     reject(state, printRejectionReason, "useDeepseekScale does not support GroupedGemm")
     return
-  # StreamK-completeness: when StreamK is active require full data-parallel tiles
-  # (no K-split fixup); per-WG scaling would corrupt the cross-WG reduction otherwise.
-  if state["StreamK"] and not state["StreamKForceDPOnly"]:
+  # The per-K-block scale is baked into each MFMA accumulation, so partial sums
+  # from K-splitting workgroups reduce correctly under the plain-summation
+  # workspace fixup (alpha is deferred to a single final store). Only the atomic
+  # reduction path is rejected: its alpha/beta timing is not audited for the
+  # mainloop scale.
+  if state["StreamK"] and state["StreamKAtomic"]:
     reject(state, printRejectionReason,
-           "useDeepseekScale requires StreamKForceDPOnly=1 (complete tiles, no K-split fixup)")
+           "useDeepseekScale does not support atomic Stream-K (StreamKAtomic=1): "
+           "the atomic reduction path is not audited for the mainloop scale")
     return
   if _validateDeepseekScaleDepthU(state, printRejectionReason):
     return
