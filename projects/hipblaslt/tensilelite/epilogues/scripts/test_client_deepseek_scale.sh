@@ -10,9 +10,15 @@
 #   A+B:    --use-deepseek-scale-a --use-deepseek-scale-b
 #
 # Steps:
-#   1. Run the Tensile pipeline to generate LibraryLogic YAMLs for all modes.
-#   2. Compile a device library (YAML format) with TensileCreateLibrary.
-#   3. Run the client for each mode and shape, verify PASSED.
+#   1. Run the Tensile pipeline to generate per-mode kernels (one cache per mode).
+#   2. Locate the per-mode cache libraries by inspecting kernel names.
+#   3. Run the client for each mode and shape against the matching library.
+#
+# The three BenchmarkProblems sections in gemm_deepseek_scale_client.yaml share the
+# same problem-type name, so TensileCreateLibrary would merge them into a single
+# kernel entry. To avoid that, this script reads from the per-mode benchmark caches
+# that Tensile already built (one cache hash per BenchmarkProblems section), matching
+# each cache to its mode by inspecting the kernel name for UDSA1/UDSB1 tokens.
 #
 # Usage:
 #   epilogues/scripts/test_client_deepseek_scale.sh [--chip CHIP] [--client PATH] [--out-dir DIR]
@@ -47,8 +53,6 @@ if [[ -z "$OUT_DIR" ]]; then
     OUT_DIR="/tmp/ds_test_${CHIP}"
 fi
 
-LIB_DIR="${OUT_DIR}/library_yaml"
-
 # ── Resolve client binary ─────────────────────────────────────────────────────
 if [[ -z "$CLIENT_BIN" ]]; then
     if command -v tensilelite-client &>/dev/null; then
@@ -82,11 +86,48 @@ check() {
     fi
 }
 
+# Find the benchmark cache directory whose TensileLibrary.yaml has a kernel name
+# matching the requested UDSA/UDSB combination. Prints the path to the cache's
+# library directory on success, or exits with error if none is found.
+#   $1: want_udsa — "yes" if UDSA1 must appear in the kernel name, "no" otherwise.
+#   $2: want_udsb — "yes" if UDSB1 must appear in the kernel name, "no" otherwise.
+find_mode_lib_dir() {
+    local want_udsa="$1"
+    local want_udsb="$2"
+    local label="$3"
+    local caches_root="${OUT_DIR}/tensile_out/1_BenchmarkProblems/Cijk_Alik_Bljk_F8SS_BH_UserArgs_00/00_Final/caches"
+
+    for cache_dir in "${caches_root}"/*/; do
+        local yaml="${cache_dir}source/library/${CHIP}/TensileLibrary.yaml"
+        [[ -f "$yaml" ]] || continue
+
+        local kname
+        kname="$(python3 -c "
+import yaml
+with open('${yaml}') as f:
+    d = yaml.safe_load(f)
+print(d['solutions'][0]['kernelName'])
+" 2>/dev/null)" || continue
+
+        local has_udsa=no has_udsb=no
+        echo "$kname" | grep -q 'UDSA1' && has_udsa=yes
+        echo "$kname" | grep -q 'UDSB1' && has_udsb=yes
+
+        if [[ "$has_udsa" == "$want_udsa" && "$has_udsb" == "$want_udsb" ]]; then
+            echo "${cache_dir}source/library/${CHIP}"
+            return 0
+        fi
+    done
+
+    echo "error: could not find benchmark cache for mode $label (want_udsa=$want_udsa want_udsb=$want_udsb)" >&2
+    exit 1
+}
+
 # ── Step 1: Run Tensile pipeline ──────────────────────────────────────────────
 echo "==> Running Tensile pipeline for $CHIP ..."
 TENSILELITE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # The benchmark phase validates with its own reference; a FAILED result there
-# does not indicate a kernel bug.  Correctness is checked by the client below
+# does not indicate a kernel bug. Correctness is checked by the client below
 # with --num-elements-to-validate -1.
 set +e
 python3 "${TENSILELITE_ROOT}/Tensile/bin/Tensile" \
@@ -94,41 +135,42 @@ python3 "${TENSILELITE_ROOT}/Tensile/bin/Tensile" \
     "${OUT_DIR}/tensile_out"
 TENSILE_EXIT=$?
 set -e
-if [[ ! -d "${OUT_DIR}/tensile_out/3_LibraryLogic" ]]; then
-    echo "error: Tensile pipeline did not produce 3_LibraryLogic (exit ${TENSILE_EXIT})" >&2
+CACHES_ROOT="${OUT_DIR}/tensile_out/1_BenchmarkProblems/Cijk_Alik_Bljk_F8SS_BH_UserArgs_00/00_Final/caches"
+if [[ ! -d "$CACHES_ROOT" ]]; then
+    echo "error: Tensile pipeline did not produce benchmark caches (exit ${TENSILE_EXIT})" >&2
     exit 1
 fi
 
-# ── Step 2: Build device library ─────────────────────────────────────────────
-echo "==> Building device library (YAML format) ..."
-python3 -m Tensile.TensileCreateLibrary \
-    --library-format=yaml \
-    --architecture "$CHIP" \
-    "${OUT_DIR}/tensile_out/3_LibraryLogic" \
-    "$LIB_DIR" \
-    HIP
+# ── Step 2: Locate per-mode cache libraries ───────────────────────────────────
+echo "==> Locating per-mode cache libraries ..."
 
-# Locate the non-lazy YAML and its code object.
-LIB_YAML="$(find "${LIB_DIR}/library/${CHIP}" -maxdepth 1 \
-    -name "TensileLibrary_BB_*.yaml" ! -name "*lazy*" | head -1)"
-if [[ -z "$LIB_YAML" ]]; then
-    echo "error: could not find non-lazy library YAML under ${LIB_DIR}/library/${CHIP}" >&2
-    exit 1
-fi
-LIB_CO="${LIB_YAML%.yaml}.co"
-if [[ ! -f "$LIB_CO" ]]; then
-    echo "error: code object not found: $LIB_CO" >&2
-    exit 1
-fi
-echo "  Library YAML: $LIB_YAML"
-echo "  Code object : $LIB_CO"
+AONLY_LIB_DIR="$(find_mode_lib_dir yes no A-only)"
+BONLY_LIB_DIR="$(find_mode_lib_dir no  yes B-only)"
+AB_LIB_DIR="$(find_mode_lib_dir    yes yes A+B)"
 
-# ── Common client arguments ───────────────────────────────────────────────────
+# Each mode's library dir holds TensileLibrary.yaml and TensileLibrary_<chip>.co.
+AONLY_YAML="${AONLY_LIB_DIR}/TensileLibrary.yaml"
+AONLY_CO="${AONLY_LIB_DIR}/TensileLibrary_${CHIP}.co"
+BONLY_YAML="${BONLY_LIB_DIR}/TensileLibrary.yaml"
+BONLY_CO="${BONLY_LIB_DIR}/TensileLibrary_${CHIP}.co"
+AB_YAML="${AB_LIB_DIR}/TensileLibrary.yaml"
+AB_CO="${AB_LIB_DIR}/TensileLibrary_${CHIP}.co"
+
+for f in "$AONLY_YAML" "$AONLY_CO" "$BONLY_YAML" "$BONLY_CO" "$AB_YAML" "$AB_CO"; do
+    if [[ ! -f "$f" ]]; then
+        echo "error: expected library file not found: $f" >&2
+        exit 1
+    fi
+done
+
+echo "  A-only : $AONLY_LIB_DIR"
+echo "  B-only : $BONLY_LIB_DIR"
+echo "  A+B    : $AB_LIB_DIR"
+
+# ── Common client arguments (no library — supplied per mode below) ─────────────
 # Inputs: fp8 e4m3 (F8); output: f32 (S); compute: f32.
 # Transpose: A=TN (TransposeA=True, TransposeB=False).
-BASE_ARGS=(
-    --library-file      "$LIB_YAML"
-    --code-object       "$LIB_CO"
+COMMON_ARGS=(
     --problem-identifier "Contraction_l_Alik_Bljk_Cijk_Dijk"
     --a-type Float8 --b-type Float8 --c-type Float --d-type Float
     --compute-input-type-A Float8 --compute-input-type-B Float8
@@ -149,7 +191,9 @@ for MN in "128,128" "256,256"; do
     K=128
     label="A-only M=${M} N=${N} K=${K}"
     echo "  ==> $label ..."
-    OUT="$("$CLIENT_BIN" "${BASE_ARGS[@]}" \
+    OUT="$("$CLIENT_BIN" "${COMMON_ARGS[@]}" \
+        --library-file "$AONLY_YAML" \
+        --code-object  "$AONLY_CO" \
         --use-deepseek-scale-a \
         --problem-size "${M},${N},1,${K}" 2>&1)" || true
     check "$label" "$OUT"
@@ -164,7 +208,9 @@ for MN in "128,128" "256,256"; do
     K=128
     label="B-only M=${M} N=${N} K=${K}"
     echo "  ==> $label ..."
-    OUT="$("$CLIENT_BIN" "${BASE_ARGS[@]}" \
+    OUT="$("$CLIENT_BIN" "${COMMON_ARGS[@]}" \
+        --library-file "$BONLY_YAML" \
+        --code-object  "$BONLY_CO" \
         --use-deepseek-scale-b \
         --problem-size "${M},${N},1,${K}" 2>&1)" || true
     check "$label" "$OUT"
@@ -179,7 +225,9 @@ for MN in "128,128" "256,256"; do
     K=128
     label="A+B M=${M} N=${N} K=${K}"
     echo "  ==> $label ..."
-    OUT="$("$CLIENT_BIN" "${BASE_ARGS[@]}" \
+    OUT="$("$CLIENT_BIN" "${COMMON_ARGS[@]}" \
+        --library-file "$AB_YAML" \
+        --code-object  "$AB_CO" \
         --use-deepseek-scale-a \
         --use-deepseek-scale-b \
         --problem-size "${M},${N},1,${K}" 2>&1)" || true

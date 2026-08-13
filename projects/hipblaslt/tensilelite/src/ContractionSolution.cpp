@@ -1270,10 +1270,6 @@ namespace TensileLite
             args.template append<void*>("QuantScale", inputs.quantScale);
         if(sizeMapping.mxfp8Quant)
             args.template append<void*>("MXScale", inputs.mxScale);
-        if(sizeMapping.deepseekScaleA)
-            args.template append<void const*>("ScaleABuf", inputs.scaleADeepseek);
-        if(sizeMapping.deepseekScaleB)
-            args.template append<void const*>("ScaleBBuf", inputs.scaleBDeepseek);
     }
 
     inline uint32_t getNumWorkGroups(const KernelInvocation& rv)
@@ -2033,6 +2029,13 @@ namespace TensileLite
             rv.args.append<int64_t>("batchOffsetA", inputs.batchOffsetA);
             rv.args.append<int64_t>("batchOffsetB", inputs.batchOffsetB);
         }
+
+        // Deepseek scale pointers follow batchOffsets in the kernel signature, matching
+        // the order emitted by Signature.py (see SubtileDeepseekScaleEmit.py).
+        if(sizeMapping.deepseekScaleA)
+            rv.args.append<void const*>("ScaleABuf", inputs.scaleADeepseek);
+        if(sizeMapping.deepseekScaleB)
+            rv.args.append<void const*>("ScaleBBuf", inputs.scaleBDeepseek);
 
         if(problemType.stochasticRounding)
         {
