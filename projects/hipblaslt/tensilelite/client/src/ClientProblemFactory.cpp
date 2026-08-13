@@ -512,10 +512,11 @@ namespace TensileLite
                                     size_t mPadded  = ((mTokens  + static_cast<size_t>(mt1) - 1) / static_cast<size_t>(mt1)) * static_cast<size_t>(mt1);
                                     size_t nTilesN  = (nHidden   + static_cast<size_t>(mt0) - 1) / static_cast<size_t>(mt0);
 
-                                    rocisa::DataType bf16Type = rocisa::DataType::BFloat16;
+                                    // Use the A-input dtype for gamma and residual buffers.
+                                    rocisa::DataType inputType = rv.back().a().dataType();
                                     rv.back().setPartialRMSMT0(mt0);
                                     rv.back().setPartialRMSMT1(mt1);
-                                    rv.back().setRMSGamma(bf16Type, nHidden);
+                                    rv.back().setRMSGamma(inputType, nHidden);
                                     rv.back().setPartialRMSQuant(m_partialRMSQuant);
                                     // Double the row count so both halves fit: first half = Σx²,
                                     // second half = amax(|D|)/448.
@@ -523,9 +524,9 @@ namespace TensileLite
                                     rv.back().setPartialBuf(pbRows, nTilesN);
                                     rv.back().setPartialRMSResidualAdd(m_partialRMSResidualAdd);
                                     if(m_partialRMSResidualAdd)
-                                        // residual is row-major [M_tokens, N_hidden] bf16;
+                                        // residual is row-major [M_tokens, N_hidden] in the input dtype;
                                         // setResidual allocates mTokens*nHidden elements.
-                                        rv.back().setResidual(bf16Type, mTokens, nHidden);
+                                        rv.back().setResidual(inputType, mTokens, nHidden);
                                 }
                                 if(m_useRstdScale)
                                 {

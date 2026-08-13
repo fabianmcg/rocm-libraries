@@ -231,9 +231,10 @@ def _validateSubtileEpiloguePrereqs(state, printRejectionReason, epilogueName):
   """Validate the shared prerequisites for the Subtile fused epilogues.
 
   PartialRMS and RstdScale share five structural requirements: the Subtile code
-  path, gfx950, bf16 I/O, StreamKForceDPOnly (complete tiles, no K-split
-  fixup), and MIArchVgpr=False (the emitters use AGPR read/write instructions).
-  Returns True when all hold; rejects the solution and returns False otherwise.
+  path, gfx950, bf16/f16/fp8/bfp8 I/O, StreamKForceDPOnly (complete tiles, no
+  K-split fixup), and MIArchVgpr=False (the emitters use AGPR read/write
+  instructions). Returns True when all hold; rejects the solution and returns
+  False otherwise.
   """
   if not state["UseSubtileImpl"]:
     reject(state, printRejectionReason, "%s requires UseSubtileImpl" % epilogueName)
@@ -241,8 +242,10 @@ def _validateSubtileEpiloguePrereqs(state, printRejectionReason, epilogueName):
   if state["ISA"] != (9, 5, 0):
     reject(state, printRejectionReason, "%s is only implemented on gfx950" % epilogueName)
     return False
-  if not state["ProblemType"]["DataType"].isBFloat16():
-    reject(state, printRejectionReason, "%s currently supports bf16 data type only" % epilogueName)
+  dt = state["ProblemType"]["DataType"]
+  if not (dt.isBFloat16() or dt.isHalf() or dt.isAnyFloat8() or dt.isAnyBFloat8()):
+    reject(state, printRejectionReason,
+           "%s currently supports bf16, f16, fp8, and bfp8 data types only" % epilogueName)
     return False
   # StreamK-completeness: when StreamK is active, require full data-parallel
   # tiles (no K-split fixup). Non-StreamK solutions are always complete-tile;

@@ -1,10 +1,10 @@
 # Copyright Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier: MIT
-"""PartialRMS fused epilogue emitter for the Subtile kernel (gfx950, bf16).
+"""PartialRMS fused epilogue emitter for the Subtile kernel (gfx950, bf16/f16/fp8/bfp8 A/B input).
 
 Reduces the fp32 GEMM accumulator (AGPRs) over free0 (the N_hidden dimension),
 producing one fp32 Σx² per output token (free1 row) per free0 tile (WorkGroup0).
-Also applies the gamma weight (bf16) to the accumulator in-place.
+Also applies the gamma weight to the accumulator in-place.
 
 This is Phase 1 (K1) of a two-kernel RMSNorm pipeline operating on row-major output:
   - K1 (this kernel): free0=N_hidden, free1=M_tokens. Each WG writes
@@ -29,9 +29,8 @@ Reduction stages (free0 axis):
   4. Lanes with rowGroup==0 and waveM==0 write partialBuf[token, WG0].
 
 Gamma application:
-  Loads gamma (bf16) for each free0 position via BufferLoadD16B16, converts to
-  fp32, and multiplies each accumulator element in-place before the store path
-  writes D as bf16.
+  Loads gamma for each free0 position (1 byte for fp8/bfp8, 2 bytes for bf16/f16),
+  converts to fp32, and multiplies each accumulator element in-place.
 
 MFMA layout (gfx950, waveSize=64, 16x16 MFMA):
   - lane % mfma_n = free1 column within MMA tile (token lane)
@@ -60,6 +59,7 @@ from rocisa.container import (
 from rocisa.functions import vectorStaticDivide
 from rocisa.instruction import (
     BufferLoadD16B16,
+    BufferLoadD16U8,
     BufferStoreB32,
     DSBPermuteB32,
     DSLoadB32,
@@ -79,6 +79,9 @@ from rocisa.instruction import (
     VCmpLtU32,
     VCndMaskB32,
     VCvtBF16toFP32,
+    VCvtF16toF32,
+    VCvtFP8toF32,
+    VCvtBF8toF32,
     VFmaF32,
     VLShiftLeftB32,
     SAddU32,
@@ -140,6 +143,29 @@ class SubtilePartialRMSEmitter:
         self.lane_sgpr_count = writer.states.laneSGPRCount
         self.residualAdd = bool(kernel.get("PartialRMSResidualAdd", False))
         self.quant = bool(kernel.get("PartialRMSQuant", False))
+
+        dt = kernel["ProblemType"]["DataType"]
+        self.isF16Input  = dt.isHalf()
+        self.isFp8Input  = dt.isAnyFloat8()
+        self.isBf8Input  = dt.isAnyBFloat8()
+        self.elemBytes   = 1 if (self.isFp8Input or self.isBf8Input) else 2
+        self.log2ElemBytes = 0 if self.elemBytes == 1 else 1
+
+    def _loadConvertSideElem(self, module, dstVgpr: int, addrVgpr: int, srd: int,
+                             comment: str) -> None:
+        """Load one gamma/residual element and convert it to fp32 in place."""
+        loadCls = BufferLoadD16B16 if self.elemBytes == 2 else BufferLoadD16U8
+        module.add(loadCls(vgpr(dstVgpr), vgpr(addrVgpr), sgpr(srd, 4), 0,
+                           MUBUFModifiers(offen=True), comment=comment))
+        module.add(SWaitCnt(vlcnt=0, comment="wait side-buffer load."))
+        if self.isF16Input:
+            module.add(VCvtF16toF32(vgpr(dstVgpr), vgpr(dstVgpr), comment="f16 -> fp32."))
+        elif self.isFp8Input:
+            module.add(VCvtFP8toF32(dst=vgpr(dstVgpr), src=vgpr(dstVgpr), comment="fp8 -> fp32."))
+        elif self.isBf8Input:
+            module.add(VCvtBF8toF32(dst=vgpr(dstVgpr), src=vgpr(dstVgpr), comment="bfp8 -> fp32."))
+        else:
+            module.add(VCvtBF16toFP32(vgpr(dstVgpr), vgpr(dstVgpr), None, 0, comment="bf16 -> fp32."))
 
     def _readAccInto(self, module, dst: int, vgprTiles, m: int, n: int, k: int, comment: str) -> None:
         """Copy accumulator element (m, n, k) into VGPR dst, selecting the right register file."""
@@ -335,14 +361,15 @@ class SubtilePartialRMSEmitter:
                            comment="laneId = Serial & (waveSize-1)"))
         module.add(VAndB32(dst=vgpr(colByte), src0=vgpr(laneId), src1=self.mfma_n - 1,
                            comment=f"colInMma = laneId % {self.mfma_n}"))
-        module.add(VLShiftLeftB32(dst=vgpr(colByte), shiftHex=hex(1), src=vgpr(colByte),
-                                  comment="colByte = colInMma * 2 (bf16 size)"))
+        module.add(VLShiftLeftB32(dst=vgpr(colByte), shiftHex=hex(self.log2ElemBytes), src=vgpr(colByte),
+                                  comment="colByte = colInMma * elemBytes."))
         self._addWaveNColByte(module, colByte)
         with self.writer.allocTmpSgpr(1, tag="pRMS_setupWG1") as wg1S:
-            module.add(SMulI32(dst=sgpr(wg1S.idx), src0=sgpr("WorkGroup1"), src1=self.macro_tile1 * 2,
-                               comment=f"wg1ColByte = WorkGroup1 * MT1*2 (MT1={self.macro_tile1})"))
+            module.add(SMulI32(dst=sgpr(wg1S.idx), src0=sgpr("WorkGroup1"),
+                               src1=self.macro_tile1 * self.elemBytes,
+                               comment=f"wg1ColByte = WorkGroup1 * MT1*elemBytes (MT1={self.macro_tile1})"))
             module.add(VAddU32(vgpr(colByte), vgpr(colByte), sgpr(wg1S.idx),
-                               comment="colByte += WorkGroup1 * MT1 * 2"))
+                               comment="colByte += WorkGroup1 * MT1 * elemBytes"))
         return module
 
     def _addWaveNColByte(self, module, colByte: int) -> None:
@@ -353,12 +380,12 @@ class SubtilePartialRMSEmitter:
         tmpRes = ContinuousRegister(tmpVgpr, 2)
         module.add(vectorStaticDivide(waveN, "Serial", self.waveSize * self.wg_m, tmpRes,
                                       comment=f"waveN = Serial / {self.waveSize * self.wg_m}"))
-        colBaseBytes = self.mma_n * self.mfma_n * 2
+        colBaseBytes = self.mma_n * self.mfma_n * self.elemBytes
         with self.writer.allocTmpSgpr(1, tag="pRMS_setupColBase") as tmpSgprInfo:
             module.add(SMovB32(dst=sgpr(tmpSgprInfo.idx), src=hex(colBaseBytes),
                                comment=f"col base bytes per wave ({colBaseBytes})"))
             module.add(VMulLOU32(dst=vgpr(waveN), src0=sgpr(tmpSgprInfo.idx), src1=vgpr(waveN),
-                                 comment="waveN * mma_n * mfma_n * 2"))
+                                 comment="waveN * mma_n * mfma_n * elemBytes"))
         module.add(VAddU32(vgpr(colByte), vgpr(colByte), vgpr(waveN),
                            comment="colByte += wave column base"))
         self.writer.vgprPool.checkIn(tmpVgpr)
@@ -374,16 +401,18 @@ class SubtilePartialRMSEmitter:
                                comment="residual SRD base"))
             module.add(SMulI32(dst=sgpr(tmpSgpr.idx), src0=sgpr("SizesFree+0"),
                                src1=sgpr("SizesFree+1"), comment="numRecords = N_hidden * M_tokens"))
-            module.add(SLShiftLeftB32(dst=sgpr(resSrd + 2), src=sgpr(tmpSgpr.idx), shiftHex=hex(1),
-                                      comment="numRecords *= 2 (bf16 element size)"))
+            module.add(SLShiftLeftB32(dst=sgpr(resSrd + 2), src=sgpr(tmpSgpr.idx),
+                                      shiftHex=hex(self.log2ElemBytes),
+                                      comment="numRecords *= elemBytes."))
         module.add(SMovB32(dst=sgpr(resSrd + 3), src="Srd127_96", comment="residual SRD flags"))
         rowGroupOff = self.writer.vgprPool.checkOut(1, tag="pRMS_rF0RGOff")
         nhiddenBase = self.writer.vgprPool.checkOut(1, tag="pRMS_rF0NHiddenBase")
         tokenBase = self.writer.vgprPool.checkOut(1, tag="pRMS_rF0TokenBase")
         self._computeRowGroupOff(module, rowGroupOff)
         self._computeFree0RowBase(module, nhiddenBase)
-        module.add(VLShiftRightB32(dst=vgpr(tokenBase), shiftHex=hex(1), src=vgpr(colByte),
-                                   comment="tokenBase = colByte >> 1"))
+        module.add(VLShiftRightB32(dst=vgpr(tokenBase), shiftHex=hex(self.log2ElemBytes),
+                                   src=vgpr(colByte),
+                                   comment="tokenBase = colByte >> log2ElemBytes."))
         module.add(self._loopResidualFree0(vgprTiles, accTmp, resTmp, resAddr,
                                            nhiddenBase, tokenBase, rowGroupOff, resSrd))
         self.writer.vgprPool.checkIn(tokenBase)
@@ -396,8 +425,8 @@ class SubtilePartialRMSEmitter:
         self._addImmU32(module, dst, tokenBase, nOff, scratch, f"token_n = tokenBase + {nOff} (n={n})")
         module.add(VMulLOU32(dst=vgpr(dst), src0=sgpr("SizesFree+0"), src1=vgpr(dst),
                              comment="token_n * SizesFree0"))
-        module.add(VLShiftLeftB32(dst=vgpr(dst), shiftHex=hex(1), src=vgpr(dst),
-                                  comment="rowByteBase = token_n * SizesFree0 * 2"))
+        module.add(VLShiftLeftB32(dst=vgpr(dst), shiftHex=hex(self.log2ElemBytes), src=vgpr(dst),
+                                  comment="rowByteBase = token_n * SizesFree0 * elemBytes."))
 
     def _addResidualElement(self, module, vgprTiles, accTmp: int, resTmp: int, resAddr: int,
                             rowByteBase: int, nhiddenBase: int, rowGroupOff: int, resSrd: int,
@@ -405,18 +434,16 @@ class SubtilePartialRMSEmitter:
         self._free0RowPos(module, resAddr, nhiddenBase, rowGroupOff, m, k, scratch)
         module.add(VCmpLtU32(dst=sgpr(oobMask, self.lane_sgpr_count), src0=vgpr(resAddr),
                              src1=sgpr("SizesFree+0"), comment="inRange = nhidden_pos < N_hidden"))
-        module.add(VLShiftLeftB32(dst=vgpr(resAddr), shiftHex=hex(1), src=vgpr(resAddr),
-                                  comment="nhiddenByte = nhidden_pos * 2"))
+        module.add(VLShiftLeftB32(dst=vgpr(resAddr), shiftHex=hex(self.log2ElemBytes),
+                                  src=vgpr(resAddr),
+                                  comment="nhiddenByte = nhidden_pos * elemBytes."))
         module.add(VAddU32(vgpr(resAddr), vgpr(resAddr), vgpr(rowByteBase),
                            comment="byteAddr = rowByteBase + nhiddenByte"))
         module.add(VCndMaskB32(dst=vgpr(resAddr), src0=vgpr(oobV), src1=vgpr(resAddr),
                                src2=sgpr(oobMask, self.lane_sgpr_count),
                                comment="clamp OOB when nhidden_pos >= N_hidden"))
-        module.add(BufferLoadD16B16(vgpr(resTmp), vgpr(resAddr), sgpr(resSrd, 4), 0,
-                                    MUBUFModifiers(offen=True),
-                                    comment=f"R[token_n, nhidden_pos] bf16 (m={m},n={n},k={k})"))
-        module.add(SWaitCnt(vlcnt=0, comment="wait residual load"))
-        module.add(VCvtBF16toFP32(vgpr(resTmp), vgpr(resTmp), None, 0, comment="residual bf16 -> fp32"))
+        self._loadConvertSideElem(module, resTmp, resAddr, resSrd,
+                                  f"R[token_n, nhidden_pos] (m={m},n={n},k={k})")
         self._readAccInto(module, accTmp, vgprTiles, m, n, k, f"read acc[m={m},n={n},k={k}]")
         module.add(VAddF32(dst=vgpr(accTmp), src0=vgpr(accTmp), src1=vgpr(resTmp),
                            comment="H = GEMM + residual"))
@@ -708,8 +735,9 @@ class SubtilePartialRMSEmitter:
         ntilesV = self.writer.vgprPool.checkOut(1, tag="pRMS_wF0NTiles")
         self._computeNTiles(module, ntilesV)
         tokenBase = self.writer.vgprPool.checkOut(1, tag="pRMS_wF0TokenBase")
-        module.add(VLShiftRightB32(dst=vgpr(tokenBase), shiftHex=hex(1), src=vgpr(colByte),
-                                   comment="tokenBase = colByte >> 1 (token index for n=0)"))
+        module.add(VLShiftRightB32(dst=vgpr(tokenBase), shiftHex=hex(self.log2ElemBytes),
+                                   src=vgpr(colByte),
+                                   comment="tokenBase = colByte >> log2ElemBytes."))
         module.add(SAndSaveExecB64(dst=sgpr(savedExec, lsc), src=sgpr(laneMaskSgpr, lsc),
                                    comment="save exec; set exec = writing-lane mask"))
         nOffVgpr = self.writer.vgprPool.checkOut(1, tag="pRMS_wF0NOff")
@@ -741,13 +769,11 @@ class SubtilePartialRMSEmitter:
                        gammaByteVgpr: int, rowGroupOff: int, wgRowBase: int, scratch: int,
                        m: int, k: int) -> None:
         self._free0RowPos(module, gammaByteVgpr, wgRowBase, rowGroupOff, m, k, scratch)
-        module.add(VLShiftLeftB32(dst=vgpr(gammaByteVgpr), shiftHex=hex(1), src=vgpr(gammaByteVgpr),
-                                  comment="gammaByte = globalRow * 2"))
-        module.add(BufferLoadD16B16(vgpr(gammaTmp), vgpr(gammaByteVgpr), sgpr(gammaSrd, 4), 0,
-                                    MUBUFModifiers(offen=True),
-                                    comment=f"gamma bf16[globalRow] (m={m},k={k})"))
-        module.add(SWaitCnt(vlcnt=0, comment="wait gamma load"))
-        module.add(VCvtBF16toFP32(vgpr(gammaTmp), vgpr(gammaTmp), None, 0, comment="gamma bf16 -> fp32"))
+        module.add(VLShiftLeftB32(dst=vgpr(gammaByteVgpr), shiftHex=hex(self.log2ElemBytes),
+                                  src=vgpr(gammaByteVgpr),
+                                  comment="gammaByte = globalRow * elemBytes."))
+        self._loadConvertSideElem(module, gammaTmp, gammaByteVgpr, gammaSrd,
+                                  f"gamma[globalRow] (m={m},k={k})")
         for n in range(self.mma_n):
             self._readAccInto(module, accTmp, vgprTiles, m, n, k, f"read acc[m={m},n={n},k={k}]")
             module.add(VMulF32(dst=vgpr(accTmp), src0=vgpr(accTmp), src1=vgpr(gammaTmp),

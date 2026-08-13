@@ -2325,12 +2325,12 @@ namespace TensileLite
                             // residual is row-major [M_tokens, N_hidden]: offset = nCoord*N + mCoord.
                             size_t residualIdx = nCoord * static_cast<size_t>(d.sizes()[0]) + mCoord;
                             hF += static_cast<float>(
-                                GetValue<float>(rocisa::DataType::BFloat16,
+                                GetValue<float>(problem.tensor(ContractionProblemGemm::TENSOR::RESIDUAL).dataType(),
                                                 inputs.residual, (int)residualIdx, aConjugate));
                         }
-                        // D = bf16(alpha * gamma[mCoord] * hF + beta * C).
+                        // D = alpha * gamma[mCoord] * hF + beta * C.
                         float gammaVal = static_cast<float>(
-                            GetValue<float>(rocisa::DataType::BFloat16,
+                            GetValue<float>(problem.tensor(ContractionProblemGemm::TENSOR::RMSGAMMA).dataType(),
                                             inputs.rmsGamma, (int)mCoord, aConjugate));
                         float dVal = static_cast<float>(alpha) * hF * gammaVal;
                         if(beta != zero)
@@ -2441,7 +2441,7 @@ namespace TensileLite
                                 size_t residualIdx
                                     = realToken * static_cast<size_t>(d.sizes()[0]) + m;
                                 dot += static_cast<float>(
-                                    GetValue<float>(rocisa::DataType::BFloat16,
+                                    GetValue<float>(problem.tensor(ContractionProblemGemm::TENSOR::RESIDUAL).dataType(),
                                                     inputs.residual,
                                                     static_cast<int>(residualIdx), false));
                             }
@@ -2453,7 +2453,7 @@ namespace TensileLite
                             {
                                 // amax uses the post-gamma pre-D-store value.
                                 float gammaM = static_cast<float>(
-                                    GetValue<float>(rocisa::DataType::BFloat16,
+                                    GetValue<float>(problem.tensor(ContractionProblemGemm::TENSOR::RMSGAMMA).dataType(),
                                                     inputs.rmsGamma,
                                                     static_cast<int>(m), false));
                                 float absDVal = gammaM * dot;

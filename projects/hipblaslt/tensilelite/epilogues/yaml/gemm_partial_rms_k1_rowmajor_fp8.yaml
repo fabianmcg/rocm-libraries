@@ -1,0 +1,391 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+
+GlobalParameters:
+  MinimumRequiredVersion: 5.0.0
+  NumElementsToValidate: 128
+
+BenchmarkProblems:
+  # --------------------------------------------------------------------------
+  # PartialRMS, no residual add.
+  # Groups are split by MT1 (wg1) because the native Tensile pipeline requires
+  # all solutions in one BenchmarkProblemSizeGroup to share the same MT1.
+  # MT1 = mfma_n * macs_n * wg1 = 16 * 8 * wg1.
+  # --------------------------------------------------------------------------
+  -
+    - # ProblemType — fp8 (OCP e4m3) TN GEMM with PartialRMS epilogue (no residual add)
+      OperationType: GEMM
+      DataType: F8
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: True
+      TransposeB: False
+      UseBeta: True
+      Batched: True
+      StridedBatched: True
+      GroupedGemm: False
+      UseBias: 0
+      UseScaleAB: ""
+      UseScaleCD: False
+      UseScaleAlphaVec: 0
+      Sparse: 0
+      UsePartialRMS: True
+      PartialRMSResidualAdd: False
+
+    - # MT1=128, DirectToLds=1 — no residual add
+      # PAP=1 permutations are enumerated here and rejected by the validator
+      # (papDtlSaveLdsBank is absent in the Subtile path). They are kept in
+      # the fork list so future PAP+PartialRMS enablement only requires removing
+      # the validator guard, not updating the YAML.
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+            - [16, 16, 128, 1, 1, 4, 8, 1, 1]   # MT0=64   MT1=128  wg0=1 wg1=1
+            - [16, 16, 128, 1, 1, 4, 8, 2, 1]   # MT0=128  MT1=128  wg0=2 wg1=1
+            - [16, 16, 128, 1, 1, 4, 8, 4, 1]   # MT0=256  MT1=128  wg0=4 wg1=1
+        - PartialRMSResidualAdd: [False]
+        - StreamK: [3]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0, 1]
+        - GlobalSplitU: [1]
+        - ScheduleIterAlg: [3]
+        - PrefetchGlobalRead: [1, 2]
+        - PrefetchAcrossPersistent: [0, 1]
+        - DirectToLds: [1]
+        - UseSubtileImpl: [True]
+        - PartialRMS: [True]
+        - StaggerU: [0, 8]
+        - DepthU: [128]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - PreloadKernArgs: [False, True]
+        - 1LDSBuffer: [0]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+            - Exact: [4096, 4096, 1, 4096]
+            - Exact: [8192, 4096, 1, 4096]
+            - Exact: [8192, 8192, 1, 8192]
+
+    - # MT1=128, DirectToLds=0 — no residual add
+      # PAP is rejected for all PartialRMS kernels; omit [1] here.
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+            - [16, 16, 128, 1, 1, 4, 8, 1, 1]   # MT0=64   MT1=128  wg0=1 wg1=1
+            - [16, 16, 128, 1, 1, 4, 8, 2, 1]   # MT0=128  MT1=128  wg0=2 wg1=1
+            - [16, 16, 128, 1, 1, 4, 8, 4, 1]   # MT0=256  MT1=128  wg0=4 wg1=1
+        - PartialRMSResidualAdd: [False]
+        - StreamK: [3]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0, 1]
+        - GlobalSplitU: [1]
+        - ScheduleIterAlg: [3]
+        - PrefetchGlobalRead: [1, 2]
+        - PrefetchAcrossPersistent: [0]
+        - DirectToLds: [0]
+        - UseSubtileImpl: [True]
+        - PartialRMS: [True]
+        - StaggerU: [0, 8]
+        - DepthU: [128]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - PreloadKernArgs: [False, True]
+        - 1LDSBuffer: [0]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+            - Exact: [4096, 4096, 1, 4096]
+            - Exact: [8192, 4096, 1, 4096]
+            - Exact: [8192, 8192, 1, 8192]
+
+    - # MT1=256, DirectToLds=1 — no residual add
+      # PAP=1 permutations are enumerated and rejected by the validator; see
+      # the MT1=128 DtL=1 group comment for rationale.
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+            - [16, 16, 128, 1, 1, 4, 8, 1, 2]   # MT0=64   MT1=256  wg0=1 wg1=2
+            - [16, 16, 128, 1, 1, 4, 8, 4, 2]   # MT0=256  MT1=256  wg0=4 wg1=2
+        - PartialRMSResidualAdd: [False]
+        - StreamK: [3]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0, 1]
+        - GlobalSplitU: [1]
+        - ScheduleIterAlg: [3]
+        - PrefetchGlobalRead: [1, 2]
+        - PrefetchAcrossPersistent: [0, 1]
+        - DirectToLds: [1]
+        - UseSubtileImpl: [True]
+        - PartialRMS: [True]
+        - StaggerU: [0, 8]
+        - DepthU: [128]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - PreloadKernArgs: [False, True]
+        - 1LDSBuffer: [0]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+            - Exact: [4096, 4096, 1, 4096]
+            - Exact: [8192, 4096, 1, 4096]
+            - Exact: [8192, 8192, 1, 8192]
+
+    - # MT1=256, DirectToLds=0 — no residual add
+      # PAP is rejected for all PartialRMS kernels; omit [1] here.
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+            - [16, 16, 128, 1, 1, 4, 8, 1, 2]   # MT0=64   MT1=256  wg0=1 wg1=2
+            - [16, 16, 128, 1, 1, 4, 8, 4, 2]   # MT0=256  MT1=256  wg0=4 wg1=2
+        - PartialRMSResidualAdd: [False]
+        - StreamK: [3]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0, 1]
+        - GlobalSplitU: [1]
+        - ScheduleIterAlg: [3]
+        - PrefetchGlobalRead: [1, 2]
+        - PrefetchAcrossPersistent: [0]
+        - DirectToLds: [0]
+        - UseSubtileImpl: [True]
+        - PartialRMS: [True]
+        - StaggerU: [0, 8]
+        - DepthU: [128]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - PreloadKernArgs: [False, True]
+        - 1LDSBuffer: [0]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+            - Exact: [4096, 4096, 1, 4096]
+            - Exact: [8192, 4096, 1, 4096]
+            - Exact: [8192, 8192, 1, 8192]
+
+    - # Best config for [8192, 8192, 1, 8192] on gfx950.
+      # MT0=64 MT1=256 (wg0=1, wg1=2), DU=128, DTL=1, PGR=2, PAP=0,
+      # StaggerU=0, StreamKAtomic=0, PreloadKernArgs=True, 1LDSBuffer=0.
+      # fp8/bfp8 subtile geometry (AB_B8) requires DepthU to be a multiple of 128.
+      # MT256x256 (wg0=4, wg1=2) exceeds gfx950 LDS with DepthU=128 (MLDS163840>limit).
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+            - [16, 16, 128, 1, 1, 4, 8, 1, 2]   # MT0=64   MT1=256  wg0=1 wg1=2
+        - PartialRMSResidualAdd: [False]
+        - StreamK: [3]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0]
+        - GlobalSplitU: [1]
+        - ScheduleIterAlg: [3]
+        - PrefetchGlobalRead: [2]
+        - PrefetchAcrossPersistent: [0]
+        - DirectToLds: [1]
+        - UseSubtileImpl: [True]
+        - PartialRMS: [True]
+        - StaggerU: [0]
+        - DepthU: [128]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - PreloadKernArgs: [True]
+        - 1LDSBuffer: [0]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+            - Exact: [8192, 8192, 1, 8192]
+
+  # --------------------------------------------------------------------------
+  # PartialRMS + residual add.
+  # wg0 <= 2 is required for residual add kernels.
+  # --------------------------------------------------------------------------
+  -
+    - # ProblemType — fp8 (OCP e4m3) TN GEMM with PartialRMS epilogue (residual add)
+      OperationType: GEMM
+      DataType: F8
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: True
+      TransposeB: False
+      UseBeta: True
+      Batched: True
+      StridedBatched: True
+      GroupedGemm: False
+      UseBias: 0
+      UseScaleAB: ""
+      UseScaleCD: False
+      UseScaleAlphaVec: 0
+      Sparse: 0
+      UsePartialRMS: True
+      PartialRMSResidualAdd: True
+
+    - # MT1=128, DirectToLds=1 — residual add (wg0<=2)
+      # PAP=1 permutations are enumerated and rejected by the validator; see
+      # the no-residual MT1=128 DtL=1 group comment for rationale.
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+            - [16, 16, 128, 1, 1, 4, 8, 1, 1]   # MT0=64   MT1=128  wg0=1 wg1=1
+            - [16, 16, 128, 1, 1, 4, 8, 2, 1]   # MT0=128  MT1=128  wg0=2 wg1=1
+        - PartialRMSResidualAdd: [True]
+        - StreamK: [3]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0, 1]
+        - GlobalSplitU: [1]
+        - ScheduleIterAlg: [3]
+        - PrefetchGlobalRead: [1, 2]
+        - PrefetchAcrossPersistent: [0, 1]
+        - DirectToLds: [1]
+        - UseSubtileImpl: [True]
+        - PartialRMS: [True]
+        - StaggerU: [0, 8]
+        - DepthU: [128]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - PreloadKernArgs: [False, True]
+        - 1LDSBuffer: [0]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+            - Exact: [4096, 4096, 1, 4096]
+            - Exact: [8192, 4096, 1, 4096]
+            - Exact: [8192, 8192, 1, 8192]
+
+    - # MT1=128, DirectToLds=0 — residual add (wg0<=2)
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+            - [16, 16, 128, 1, 1, 4, 8, 1, 1]   # MT0=64   MT1=128  wg0=1 wg1=1
+            - [16, 16, 128, 1, 1, 4, 8, 2, 1]   # MT0=128  MT1=128  wg0=2 wg1=1
+        - PartialRMSResidualAdd: [True]
+        - StreamK: [3]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0, 1]
+        - GlobalSplitU: [1]
+        - ScheduleIterAlg: [3]
+        - PrefetchGlobalRead: [1, 2]
+        - PrefetchAcrossPersistent: [0]
+        - DirectToLds: [0]
+        - UseSubtileImpl: [True]
+        - PartialRMS: [True]
+        - StaggerU: [0, 8]
+        - DepthU: [128]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - PreloadKernArgs: [False, True]
+        - 1LDSBuffer: [0]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+            - Exact: [4096, 4096, 1, 4096]
+            - Exact: [8192, 4096, 1, 4096]
+            - Exact: [8192, 8192, 1, 8192]
+
+    - # MT1=256, DirectToLds=1 — residual add (wg0<=2)
+      # PAP=1 permutations are enumerated and rejected by the validator; see
+      # the no-residual MT1=128 DtL=1 group comment for rationale.
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+            - [16, 16, 128, 1, 1, 4, 8, 1, 2]   # MT0=64   MT1=256  wg0=1 wg1=2
+        - PartialRMSResidualAdd: [True]
+        - StreamK: [3]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0, 1]
+        - GlobalSplitU: [1]
+        - ScheduleIterAlg: [3]
+        - PrefetchGlobalRead: [1, 2]
+        - PrefetchAcrossPersistent: [0, 1]
+        - DirectToLds: [1]
+        - UseSubtileImpl: [True]
+        - PartialRMS: [True]
+        - StaggerU: [0, 8]
+        - DepthU: [128]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - PreloadKernArgs: [False, True]
+        - 1LDSBuffer: [0]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+            - Exact: [4096, 4096, 1, 4096]
+            - Exact: [8192, 4096, 1, 4096]
+            - Exact: [8192, 8192, 1, 8192]
+
+    - # MT1=256, DirectToLds=0 — residual add (wg0<=2)
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+            - [16, 16, 128, 1, 1, 4, 8, 1, 2]   # MT0=64   MT1=256  wg0=1 wg1=2
+        - PartialRMSResidualAdd: [True]
+        - StreamK: [3]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0, 1]
+        - GlobalSplitU: [1]
+        - ScheduleIterAlg: [3]
+        - PrefetchGlobalRead: [1, 2]
+        - PrefetchAcrossPersistent: [0]
+        - DirectToLds: [0]
+        - UseSubtileImpl: [True]
+        - PartialRMS: [True]
+        - StaggerU: [0, 8]
+        - DepthU: [128]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - PreloadKernArgs: [False, True]
+        - 1LDSBuffer: [0]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+            - Exact: [4096, 4096, 1, 4096]
+            - Exact: [8192, 4096, 1, 4096]
+            - Exact: [8192, 8192, 1, 8192]
+
+# TestAxes is read by testAxesFromYaml() in yaml_solution_builder and is not
+# consumed by TensileCreateLibrary.
+TestAxes:
+  K1:
+    MMultipliers: [1, 2, 4, 8, 16, 32]
+    MFractions:   [[1, 4], [1, 2]]
+    MOffsets:     [[-1, -1], [1, 1], [2, -1]]
+    MFixed:       [1, 3, 7, 31, 4096, 8192]
+    KNHidden:     [[64, 128], [256, 512], [8192, 4096]]
+  Pipeline:
+    MMultipliers: [1, 2, 4, 8, 16, 32]
+    MFractions:   [[1, 4], [1, 2]]
+    MOffsets:     [[-1, -1], [1, 1], [2, -1]]
+    MFixed:       [1, 3, 7, 31, 127, 193, 317, 511, 769, 1009, 1537, 4097, 8191]
+    NHidden:      [128, 256, 384, 512, 768, 1024]
+    K:            [64, 256, 4096]
+
+LibraryLogic:
+  ScheduleName: "partialrms_k1_fp8"
+  DeviceNames: ["Device 74a1", "Device 75a0", "Device 75b0", "Device 75a2", "Device 75b2", "Device 75a3", "Device 75b3", "Device 75a8", "Device 75b8"]
+  ArchitectureName: "gfx950"

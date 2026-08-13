@@ -1139,8 +1139,10 @@ def emitMfmaInstruction(writer, kernel, vgprTileA, vgprTileB, vgprTileC, vgprTil
                                    mxsa=vgpr(unitScaleVgpr), mxsb=vgpr(unitScaleVgpr), \
                                    comment=comment))
   else:
-    # BF16: 16x16x32
-    module.add(MFMAInstruction(instType=InstType.INST_BF16, accType=InstType.INST_F32, variant=[16,16,miK,1], mfma1k=False, \
+    # 16x16x32: use the MFMA variant that matches the actual input element type.
+    dt = kernel["ProblemType"]["DataType"]
+    instType = InstType.INST_F16 if dt.isHalf() else InstType.INST_BF16
+    module.add(MFMAInstruction(instType=instType, accType=InstType.INST_F32, variant=[16,16,miK,1], mfma1k=False, \
                                acc=dAccAlias(vgprDStart,opDSize), \
                                a=aOperand, \
                                b=bOperand, \
