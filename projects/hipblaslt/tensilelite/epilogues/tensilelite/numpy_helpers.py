@@ -45,6 +45,24 @@ def rmsDenom(rowSumSq, invD, eps):
     return np.sqrt(np.asarray(rowSumSq, dtype=np.float32) * invD + eps).astype(np.float32)
 
 
+def swizzleMxScaleGfx950(scale2d):
+    """Pre-swizzle an (mTiles, nTiles) e8m0 grid into the GFX950 device layout.
+
+    Rows are padded to a multiple of 32 and cols to a multiple of 8; returns a
+    flat uint8 buffer of length paddedRows*paddedCols whose byte order matches
+    the epilogue's on-device swizzle (DGen::preSwizzleScalesGFX950).
+    """
+    scale2d = np.ascontiguousarray(scale2d, dtype=np.uint8)
+    mTiles, nTiles = scale2d.shape
+    paddedRows = ((mTiles + 31) // 32) * 32
+    paddedCols = ((nTiles + 7) // 8) * 8
+    padded = np.zeros((paddedRows, paddedCols), dtype=np.uint8)
+    padded[:mTiles, :nTiles] = scale2d
+    view = padded.reshape(paddedRows // 32, 2, 16, paddedCols // 8, 2, 4)
+    view = view.transpose(0, 3, 5, 2, 4, 1)
+    return np.ascontiguousarray(view).reshape(-1)
+
+
 def tileQuantReference(dEff_f32, q0, q1, fp8Max=448.0):
     """Compute per-tile dynamic fp8 quantization reference outputs.
 
@@ -123,7 +141,7 @@ def mxfp8QuantReference(dEff_f32, q0, q1):
     dFp8 = out.astype(ml_dtypes.float8_e4m3fn)
     assert np.all(np.isfinite(dFp8.astype(np.float32))), \
         "mxfp8QuantReference: NaN in fp8 D (ceiling exponent should prevent overflow)"
-    return scale, dFp8
+    return swizzleMxScaleGfx950(scale), dFp8
 
 
 def partialRmsMxfp8Reference(aRow, bRow, gammaBf16, mt0, q0, q1):

@@ -105,7 +105,9 @@ def _runShape(solution, kernelName, hsaco, chip, M, K, nHidden, alpha=1.0,
 
     mT = math.ceil(nHidden / q0)
     nT = math.ceil(M / q1)
-    mxScale = np.zeros((mT, nT), dtype=np.uint8, order="C")
+    paddedRows = ((mT + 31) // 32) * 32
+    paddedCols = ((nT + 7) // 8) * 8
+    mxScale = np.zeros(paddedRows * paddedCols, dtype=np.uint8)
 
     # Combined reference: Σx² (pre-gamma), e8m0 MXScale, fp8 D (post-gamma).
     sumsqRef, mxScaleRef, dFp8Ref = partialRmsMxfp8Reference(
@@ -137,7 +139,7 @@ def _runShape(solution, kernelName, hsaco, chip, M, K, nHidden, alpha=1.0,
         # args[28] = partialBuf InOutArray (gamma=27, partialBuf=28, mxScale=29).
         pb = np.asarray(arguments[28].array).copy().reshape(mPadded, nD)
         result_holder["pb_gpu"] = pb
-        mx = np.asarray(arguments[29].array).copy().reshape(mT, nT)
+        mx = np.asarray(arguments[29].array).copy().reshape(-1)
         result_holder["mx_gpu"] = mx
 
     amdgpu_exec.execute_hsaco(

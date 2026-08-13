@@ -82,8 +82,10 @@ def _build_kernel_args(solution, M, K, nHidden, q0, q1, alpha=1.0, zeroInput=Fal
 
     mT = math.ceil(nHidden / q0)
     nT = math.ceil(M / q1)
-    # MXScale: 1 byte per block, shape [ceil(N/q0), ceil(M/q1)].
-    mxScale = np.zeros((mT, nT), dtype=np.uint8, order="C")
+    paddedRows = ((mT + 31) // 32) * 32
+    paddedCols = ((nT + 7) // 8) * 8
+    # MXScale: GFX950 pre-swizzled, flat uint8 [paddedRows*paddedCols].
+    mxScale = np.zeros(paddedRows * paddedCols, dtype=np.uint8)
 
     # Transpose h1 to (nHidden, M) to match free0=nHidden, free1=M layout.
     h1T = (aRow.astype(np.float32) @ bRow.astype(np.float32)).T
@@ -122,7 +124,7 @@ def _runShape(solution, kernelName, hsaco, chip, M, K, nHidden, alpha=1.0, zeroI
         dRaw = np.asarray(arguments[8].array)
         result_holder["d_gpu"] = dRaw.reshape(nHidden, M, order="F")
         # mxScale is at slot 27 (first epilogue arg; no beta slot since UseBeta=False).
-        result_holder["mx_gpu"] = np.asarray(arguments[27].array).copy().reshape(mT, nT)
+        result_holder["mx_gpu"] = np.asarray(arguments[27].array).copy().reshape(-1)
 
     amdgpu_exec.execute_hsaco(
         hsaco=hsaco, kernel_name=kernelName, arguments=args,

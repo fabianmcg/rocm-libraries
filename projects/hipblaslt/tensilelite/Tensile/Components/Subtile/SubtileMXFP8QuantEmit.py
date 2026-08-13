@@ -10,7 +10,9 @@ one e8m0 byte to the MXScale side buffer. The subsequent standard fp8 store
 converts the already-in-range values to OCP e4m3 for D.
 
 D is the fp8 (OCP e4m3) output; MXScale is the only new side buffer (uint8),
-shape [ceil(M/Q0), ceil(N/Q1)] row-major. One byte encodes 2^(byte-127).
+written in the GFX950 pre-swizzled layout (rows padded to a multiple of 32,
+cols to a multiple of 8; total paddedRows*paddedCols bytes). One byte encodes
+2^(byte-127).
 
 e8m0 math (per block, after alpha applied):
   amax = max(|x|)
@@ -63,6 +65,7 @@ from rocisa.instruction import (
     VMovB32,
     VMulF32,
     VMulLOU32,
+    VOrB32,
     VSubU32,
     VXorB32,
 )
@@ -517,7 +520,7 @@ class SubtileMXFP8QuantEmitter:
 
     def _tileByteOffset(self, module, addrV: int, tmpV: int, tmp2V: int, nQTN: int,
                          qi: int, qj: int, waveM, waveN) -> None:
-        """Compute byteOff = linear_tile_idx (1 byte per tile; no shift) into addrV."""
+        """Compute GFX950 pre-swizzled MXScale byte offset into addrV."""
         nQTilesMPerWG = self.nQTilesM * self.wgM
         nQTilesNPerWG = self.nQTilesN * self.wgN
         module.add(VMulLOU32(dst=vgpr(addrV), src0=sgpr("WorkGroup0"), src1=nQTilesMPerWG,
@@ -529,8 +532,6 @@ class SubtileMXFP8QuantEmitter:
                                comment="+ waveM * nQTilesM."))
         if qi:
             module.add(VAddU32(vgpr(addrV), vgpr(addrV), qi, comment=f"qTileRow += {qi}."))
-        module.add(VMulLOU32(dst=vgpr(addrV), src0=vgpr(addrV), src1=vgpr(nQTN),
-                             comment="qTileRow * totalQTilesN."))
         module.add(VMulLOU32(dst=vgpr(tmpV), src0=sgpr("WorkGroup1"), src1=nQTilesNPerWG,
                              comment="WG1 * nQTilesNPerWG."))
         if waveN is not None:
@@ -540,8 +541,61 @@ class SubtileMXFP8QuantEmitter:
                                comment="+ waveN * nQTilesN."))
         if qj:
             module.add(VAddU32(vgpr(tmpV), vgpr(tmpV), qj, comment=f"qTileCol += {qj}."))
-        module.add(VAddU32(vgpr(addrV), vgpr(addrV), vgpr(tmpV),
-                           comment="byteOff = linear_tile_idx (1B per tile; no <<2 shift)."))
+        # addrV = qTileRow, tmpV = qTileCol -> GFX950 pre-swizzled byte offset.
+        self._swizzleTileByteOffset(module, addrV, tmpV, nQTN)
+
+    def _swizzleTileByteOffset(self, module, addrV: int, colV: int, nQTN: int) -> None:
+        """Overwrite addrV with the GFX950 pre-swizzled MXScale byte offset.
+
+        addrV holds qTileRow, colV holds qTileCol, nQTN is a VGPR holding totalQTilesN.
+        Layout matches DGen::preSwizzleScalesGFX950: rows blocked by 32, cols by
+        8, byteOff = d0*(colBlocks*256) + d3*256 + d5*64 + d2*4 + d4*2 + d1.
+        """
+        sLow    = self.writer.vgprPool.checkOut(1, tag="mx_swzLow")
+        sTmp    = self.writer.vgprPool.checkOut(1, tag="mx_swzTmp")
+        sStride = self.writer.vgprPool.checkOut(1, tag="mx_swzStride")
+        # colBlocks = (nTiles + 7) >> 3; d0 stride = colBlocks << 8.
+        module.add(VAddU32(vgpr(sStride), vgpr(nQTN), 7, comment="nTiles + 7."))
+        module.add(VLShiftRightB32(dst=vgpr(sStride), shiftHex=hex(3), src=vgpr(sStride),
+                                   comment="colBlocks = ceil(nTiles/8)."))
+        module.add(VLShiftLeftB32(dst=vgpr(sStride), shiftHex=hex(8), src=vgpr(sStride),
+                                  comment="d0 stride = colBlocks * 256."))
+        # d0 = qTileRow >> 5; d0 term = d0 * stride.
+        module.add(VLShiftRightB32(dst=vgpr(sTmp), shiftHex=hex(5), src=vgpr(addrV),
+                                   comment="d0 = qTileRow >> 5."))
+        module.add(VMulLOU32(dst=vgpr(sStride), src0=vgpr(sTmp), src1=vgpr(sStride),
+                             comment="d0 * stride."))
+        # low part from row: d2 = row & 0xF -> <<2, then d1 = (row>>4)&1.
+        module.add(VAndB32(dst=vgpr(sLow), src0=vgpr(addrV), src1=0xF, comment="d2 = row & 0xF."))
+        module.add(VLShiftLeftB32(dst=vgpr(sLow), shiftHex=hex(2), src=vgpr(sLow),
+                                  comment="d2 << 2."))
+        module.add(VLShiftRightB32(dst=vgpr(sTmp), shiftHex=hex(4), src=vgpr(addrV),
+                                   comment="row >> 4."))
+        module.add(VAndB32(dst=vgpr(sTmp), src0=vgpr(sTmp), src1=1, comment="d1 = (row>>4)&1."))
+        module.add(VOrB32(dst=vgpr(sLow), src0=vgpr(sLow), src1=vgpr(sTmp), comment="+ d1."))
+        # low part from col: d5 = col & 3 -> <<6.
+        module.add(VAndB32(dst=vgpr(sTmp), src0=vgpr(colV), src1=3, comment="d5 = col & 3."))
+        module.add(VLShiftLeftB32(dst=vgpr(sTmp), shiftHex=hex(6), src=vgpr(sTmp),
+                                  comment="d5 << 6."))
+        module.add(VOrB32(dst=vgpr(sLow), src0=vgpr(sLow), src1=vgpr(sTmp), comment="+ d5<<6."))
+        # d4 = (col>>2)&1 -> <<1.
+        module.add(VLShiftRightB32(dst=vgpr(sTmp), shiftHex=hex(2), src=vgpr(colV),
+                                   comment="col >> 2."))
+        module.add(VAndB32(dst=vgpr(sTmp), src0=vgpr(sTmp), src1=1, comment="d4 = (col>>2)&1."))
+        module.add(VLShiftLeftB32(dst=vgpr(sTmp), shiftHex=hex(1), src=vgpr(sTmp),
+                                  comment="d4 << 1."))
+        module.add(VOrB32(dst=vgpr(sLow), src0=vgpr(sLow), src1=vgpr(sTmp), comment="+ d4<<1."))
+        # d3 = col >> 3 -> <<8.
+        module.add(VLShiftRightB32(dst=vgpr(sTmp), shiftHex=hex(3), src=vgpr(colV),
+                                   comment="d3 = col >> 3."))
+        module.add(VLShiftLeftB32(dst=vgpr(sTmp), shiftHex=hex(8), src=vgpr(sTmp),
+                                  comment="d3 << 8."))
+        module.add(VOrB32(dst=vgpr(sLow), src0=vgpr(sLow), src1=vgpr(sTmp), comment="+ d3<<8."))
+        # byteOff = d0*stride + lowPart.
+        module.add(VAddU32(vgpr(addrV), vgpr(sStride), vgpr(sLow), comment="swizzled byteOff."))
+        self.writer.vgprPool.checkIn(sStride)
+        self.writer.vgprPool.checkIn(sTmp)
+        self.writer.vgprPool.checkIn(sLow)
 
     def _mulVgprBySgprConst(self, module, dst_vgpr: int, sgpr_name: str,
                              const: int, comment: str) -> None:
@@ -555,7 +609,7 @@ class SubtileMXFP8QuantEmitter:
     def _tileByteOffsetSubRow(self, module, addrV: int, tmpV: int, tmp2V: int,
                                nQTN: int, m: int, kBlock: int, qj: int,
                                rowGroup: int, waveM, waveN) -> None:
-        """Compute byteOff for sub-row MXScale tile (m, kBlock, qj) into addrV."""
+        """Compute GFX950 pre-swizzled MXScale byte offset for sub-row tile (m, kBlock, qj) into addrV."""
         nQTilesMPerWG = self.nQTilesM * self.wgM
         nQTilesNPerWG = self.nQTilesN * self.wgN
         constRow = m * self.tilesPerMfmaM + kBlock
@@ -574,8 +628,6 @@ class SubtileMXFP8QuantEmitter:
         if constRow:
             module.add(VAddU32(vgpr(addrV), vgpr(addrV), constRow,
                                comment=f"qTileRow += constRow={constRow}."))
-        module.add(VMulLOU32(dst=vgpr(addrV), src0=vgpr(addrV), src1=vgpr(nQTN),
-                             comment="qTileRow * totalQTilesN."))
         self._mulVgprBySgprConst(module, tmpV, "WorkGroup1", nQTilesNPerWG,
                                   "WG1 * nQTilesNPerWG.")
         if waveN is not None:
@@ -585,8 +637,8 @@ class SubtileMXFP8QuantEmitter:
                                comment="+ waveN * nQTilesN."))
         if qj:
             module.add(VAddU32(vgpr(tmpV), vgpr(tmpV), qj, comment=f"qTileCol += {qj}."))
-        module.add(VAddU32(vgpr(addrV), vgpr(addrV), vgpr(tmpV),
-                           comment="byteOff = linear_tile_idx (1B per tile; no <<2 shift)."))
+        # addrV = qTileRow, tmpV = qTileCol -> GFX950 pre-swizzled byte offset.
+        self._swizzleTileByteOffset(module, addrV, tmpV, nQTN)
 
     def _computeScaleByteInline(self, module, slot: int, quantMultVgprs: int,
                                  scaleByteV: int) -> None:
