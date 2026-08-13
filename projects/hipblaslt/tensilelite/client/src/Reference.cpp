@@ -2588,6 +2588,11 @@ namespace TensileLite
                     size_t mTiles = (M + static_cast<size_t>(q0) - 1) / static_cast<size_t>(q0);
                     size_t nTiles = (N + static_cast<size_t>(q1) - 1) / static_cast<size_t>(q1);
 
+                    size_t paddedRows = ((mTiles + 31) / 32) * 32;
+                    size_t paddedCols = ((nTiles + 7) / 8) * 8;
+                    size_t colBlocks  = paddedCols / 8;
+                    std::memset(mxPtr, 0, paddedRows * paddedCols * sizeof(uint8_t));
+
                     size_t dDimM = freeIndicesA[0].d;
                     size_t dDimN = freeIndicesB[0].d;
                     size_t aDimM = freeIndicesA[0].i;
@@ -2668,7 +2673,15 @@ namespace TensileLite
                                 uint32_t qbits = static_cast<uint32_t>(qExp) << 23;
                                 std::memcpy(&quantMult, &qbits, sizeof(quantMult));
                             }
-                            mxPtr[ti * nTiles + tj] = scaleByte;
+                            size_t d0 = ti >> 5;
+                            size_t d1 = (ti >> 4) & 1;
+                            size_t d2 = ti & 0xF;
+                            size_t d3 = tj >> 3;
+                            size_t d4 = (tj >> 2) & 1;
+                            size_t d5 = tj & 0x3;
+                            size_t swzOff = d0 * (colBlocks * 256) + d3 * 256
+                                            + d5 * 64 + d2 * 4 + d4 * 2 + d1;
+                            mxPtr[swzOff] = scaleByte;
 
                             for(size_t m = mLo; m < mHi; ++m)
                             {

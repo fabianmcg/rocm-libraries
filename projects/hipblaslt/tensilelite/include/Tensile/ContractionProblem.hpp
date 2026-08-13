@@ -356,7 +356,7 @@ namespace TensileLite
             QUANTSCALE    = 22, // f32 output: per-tile amax/448 scale [ceil(M/Q0) x ceil(N/Q1)] row-major.
             SCALEA_DS     = 23, // E8M0 byte input: per-row A dequantization scale [M rows].
             SCALEB_DS     = 24, // E8M0 byte input: per-128col-block B dequantization scale [ceil(N/128)].
-            MXSCALE       = 25, // e8m0 (UE8M0, 1 byte) per-block MX scale [ceil(M/Q0) x ceil(N/Q1)] row-major.
+            MXSCALE       = 25, // e8m0 (UE8M0, 1 byte) per-block MX scale; GFX950 pre-swizzled, rows padded to multiple of 32, cols to multiple of 8, total paddedRows*paddedCols bytes.
             TENSOR_COUNT
         };
 
@@ -812,8 +812,11 @@ namespace TensileLite
         {
             if(m_useMxfp8Quant)
             {
+                // GFX950 pre-swizzled layout: rows padded to multiple of 32, cols to multiple of 8.
+                size_t paddedRows = ((mTiles + 31) / 32) * 32;
+                size_t paddedCols = ((nTiles + 7) / 8) * 8;
                 m_tensors[TENSOR::MXSCALE]
-                    = {"mxScale", rocisa::DataType::E8, {mTiles, nTiles}, {nTiles, 1}};
+                    = {"mxScale", rocisa::DataType::E8, {paddedRows, paddedCols}, {paddedCols, 1}};
                 m_tensors[TENSOR::MXSCALE].setAsOutput(true);
             }
         }
