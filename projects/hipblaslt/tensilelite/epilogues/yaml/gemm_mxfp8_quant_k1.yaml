@@ -66,8 +66,10 @@ BenchmarkProblems:
         - 1LDSBuffer: [0]
       BenchmarkFinalParameters:
         - ProblemSizes:
-            - Exact: [512, 512, 1, 512]
-            - Exact: [4096, 4096, 1, 4096]
+            # Distinct sizes ensure LibraryLogic preserves this Q shape in the
+            # library rather than collapsing it against the other shape groups.
+            - Exact: [128, 512, 1, 64]
+            - Exact: [512, 4096, 1, 256]
 
     # Group 2: quant tile 32x32 (full-tile path).
     - BenchmarkCommonParameters:
@@ -98,8 +100,10 @@ BenchmarkProblems:
         - 1LDSBuffer: [0]
       BenchmarkFinalParameters:
         - ProblemSizes:
-            - Exact: [512, 512, 1, 512]
-            - Exact: [4096, 4096, 1, 4096]
+            # Distinct sizes ensure LibraryLogic preserves this Q shape in the
+            # library rather than collapsing it against the other shape groups.
+            - Exact: [256, 512, 1, 128]
+            - Exact: [512, 2048, 1, 512]
 
     # Group 3: quant tile 16x16 (full-tile path).
     - BenchmarkCommonParameters:
@@ -130,8 +134,10 @@ BenchmarkProblems:
         - 1LDSBuffer: [0]
       BenchmarkFinalParameters:
         - ProblemSizes:
-            - Exact: [512, 512, 1, 512]
-            - Exact: [4096, 4096, 1, 4096]
+            # Distinct sizes ensure LibraryLogic preserves this Q shape in the
+            # library rather than collapsing it against the other shape groups.
+            - Exact: [512, 512, 1, 256]
+            - Exact: [1024, 4096, 1, 1024]
 
 # TestAxes is read by readTestAxes() in yaml_solution_builder and is not
 # consumed by TensileCreateLibrary.

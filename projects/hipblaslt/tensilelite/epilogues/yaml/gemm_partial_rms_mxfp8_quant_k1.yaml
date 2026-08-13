@@ -80,8 +80,11 @@ BenchmarkProblems:
         - 1LDSBuffer: [0]
       BenchmarkFinalParameters:
         - ProblemSizes:
-            - Exact: [512, 512, 1, 512]
-            - Exact: [4096, 4096, 1, 4096]
+            # Distinct sizes (different from gemm_mxfp8_quant_k1.yaml) ensure
+            # LibraryLogic preserves this Q shape and avoids cross-contamination
+            # when both YAMLs are combined into a single library.
+            - Exact: [128, 256, 1, 64]
+            - Exact: [256, 2048, 1, 128]
 
     # Group 2: quant tile 32x32 (full-tile path).
     - BenchmarkCommonParameters:
@@ -115,8 +118,10 @@ BenchmarkProblems:
         - 1LDSBuffer: [0]
       BenchmarkFinalParameters:
         - ProblemSizes:
-            - Exact: [512, 512, 1, 512]
-            - Exact: [4096, 4096, 1, 4096]
+            # Distinct sizes ensure LibraryLogic preserves this Q shape in the
+            # library rather than collapsing it against Group 1.
+            - Exact: [512, 1024, 1, 256]
+            - Exact: [1024, 2048, 1, 512]
 
 # TestAxes is read by readTestAxes() in yaml_solution_builder and is not
 # consumed by TensileCreateLibrary.

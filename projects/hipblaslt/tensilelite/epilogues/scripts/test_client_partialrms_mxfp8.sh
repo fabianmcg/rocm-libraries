@@ -142,13 +142,15 @@ COMMON_ARGS=(
 )
 
 # ── Step 3: Aligned shapes with sub-row MX block Q=[1,32] ────────────────────
-echo "==> Running client: N=128 M=512 K=64 ..."
-OUT="$("$CLIENT_BIN" "${COMMON_ARGS[@]}" --problem-size "128,512,1,64" 2>&1)" || true
-check "N=128,M=512,K=64" "$OUT"
+# Sizes match the Q=[1,32] benchmark group in gemm_partial_rms_mxfp8_quant_k1.yaml
+# so that LibraryLogic dispatches the Q=[1,32] kernel.
+echo "==> Running client: N=128 M=256 K=64 ..."
+OUT="$("$CLIENT_BIN" "${COMMON_ARGS[@]}" --problem-size "128,256,1,64" 2>&1)" || true
+check "N=128,M=256,K=64" "$OUT"
 
-echo "==> Running client: N=512 M=4096 K=256 ..."
-OUT="$("$CLIENT_BIN" "${COMMON_ARGS[@]}" --problem-size "512,4096,1,256" 2>&1)" || true
-check "N=512,M=4096,K=256" "$OUT"
+echo "==> Running client: N=256 M=2048 K=128 ..."
+OUT="$("$CLIENT_BIN" "${COMMON_ARGS[@]}" --problem-size "256,2048,1,128" 2>&1)" || true
+check "N=256,M=2048,K=128" "$OUT"
 
 # ── Step 4: Non-multiple-of-tile M (tokens) ──────────────────────────────────
 echo "==> Running client: N=128 M=100 K=64 (non-multiple M) ..."

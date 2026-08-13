@@ -654,6 +654,8 @@ def writeClientConfigIni(forBenchmark, problemSizes, biasTypeArgs, factorDimArgs
             param('mxfp8-quant-q0', mxfp8QuantQ0)
         if useMXFP8Quant and mxfp8QuantQ1 > 0:
             param('mxfp8-quant-q1', mxfp8QuantQ1)
+        param('use-deepseek-scale-a', problemType.useDeepseekScaleA)
+        param('use-deepseek-scale-b', problemType.useDeepseekScaleB)
         param('use-scaleAB',   problemType.useScaleAB)
         param('use-scaleCD',   problemType.useScaleCD)
         param('use-scaleAlphaVec',   problemType.useScaleAlphaVec)

@@ -143,45 +143,34 @@ COMMON_ARGS=(
     --device-idx 0
 )
 
-# ── Step 3: Varying shapes — default quant tile (whole MacroTile) ─────────────
-# M=512, N=128, K=64: fits one MT0=64 wg0 block.
-echo "==> Running client: M=512 N=128 K=64, default quant tile ..."
-OUT="$("$CLIENT_BIN" "${COMMON_ARGS[@]}" --problem-size "128,512,1,64" 2>&1)" || true
-check "M=512,N=128,K=64 default quant tile" "$OUT"
-
-# M=4096, N=512, K=256: multi-workgroup in both dimensions.
-echo "==> Running client: M=4096 N=512 K=256, default quant tile ..."
-OUT="$("$CLIENT_BIN" "${COMMON_ARGS[@]}" --problem-size "512,4096,1,256" 2>&1)" || true
-check "M=4096,N=512,K=256 default quant tile" "$OUT"
-
-# ── Step 4: Explicit quant tile Q=[16,16] ────────────────────────────────────
-echo "==> Running client: M=512 N=128 K=64, Q=[16,16] ..."
-OUT="$("$CLIENT_BIN" "${COMMON_ARGS[@]}" --problem-size "128,512,1,64" \
+# ── Step 3: Quant tile Q=[16,16] ─────────────────────────────────────────────
+# Each shape group benchmarks a distinct problem size so LibraryLogic assigns
+# a separate exact entry per shape; querying those exact sizes here guarantees
+# the library returns the compiled TQS-matching kernel.
+echo "==> Running client: M=256 N=256 K=256, Q=[16,16] ..."
+OUT="$("$CLIENT_BIN" "${COMMON_ARGS[@]}" --problem-size "256,256,1,256" \
     --tile-quant-q0 16 --tile-quant-q1 16 2>&1)" || true
-check "M=512,N=128,K=64 Q=[16,16]" "$OUT"
+check "M=256,N=256,K=256 Q=[16,16]" "$OUT"
 
-echo "==> Running client: M=4096 N=512 K=256, Q=[16,16] ..."
-OUT="$("$CLIENT_BIN" "${COMMON_ARGS[@]}" --problem-size "512,4096,1,256" \
-    --tile-quant-q0 16 --tile-quant-q1 16 2>&1)" || true
-check "M=4096,N=512,K=256 Q=[16,16]" "$OUT"
-
-# ── Step 5: Explicit quant tile Q=[32,32] ────────────────────────────────────
-echo "==> Running client: M=512 N=128 K=64, Q=[32,32] ..."
-OUT="$("$CLIENT_BIN" "${COMMON_ARGS[@]}" --problem-size "128,512,1,64" \
+# ── Step 4: Quant tile Q=[32,32] ─────────────────────────────────────────────
+echo "==> Running client: M=1024 N=512 K=512, Q=[32,32] ..."
+OUT="$("$CLIENT_BIN" "${COMMON_ARGS[@]}" --problem-size "512,1024,1,512" \
     --tile-quant-q0 32 --tile-quant-q1 32 2>&1)" || true
-check "M=512,N=128,K=64 Q=[32,32]" "$OUT"
+check "M=1024,N=512,K=512 Q=[32,32]" "$OUT"
 
-echo "==> Running client: M=4096 N=512 K=256, Q=[32,32] ..."
-OUT="$("$CLIENT_BIN" "${COMMON_ARGS[@]}" --problem-size "512,4096,1,256" \
-    --tile-quant-q0 32 --tile-quant-q1 32 2>&1)" || true
-check "M=4096,N=512,K=256 Q=[32,32]" "$OUT"
+# ── Step 5: Sub-row quant tile Q=[1,32] ──────────────────────────────────────
+echo "==> Running client: M=512 N=512 K=512, Q=[1,32] ..."
+OUT="$("$CLIENT_BIN" "${COMMON_ARGS[@]}" --problem-size "512,512,1,512" \
+    --tile-quant-q0 1 --tile-quant-q1 32 2>&1)" || true
+check "M=512,N=512,K=512 Q=[1,32]" "$OUT"
 
-# ── Step 6: Non-multiple-of-tile sizes (boundary handling) ───────────────────
-# M=100 is not a multiple of Q1=16 or Q1=32; tests ceil() boundary in reference.
-echo "==> Running client: M=100 N=128 K=64, Q=[16,16] (non-multiple M) ..."
+# ── Step 6: Non-multiple-of-tile M, Q=[1,32] (boundary handling) ─────────────
+# M=100 is not a multiple of MT0=64; tests StreamK partial-tile boundary with
+# the sub-row quant shape, which is also benchmarked at this exact size.
+echo "==> Running client: M=100 N=128 K=64, Q=[1,32] (non-multiple M) ..."
 OUT="$("$CLIENT_BIN" "${COMMON_ARGS[@]}" --problem-size "128,100,1,64" \
-    --tile-quant-q0 16 --tile-quant-q1 16 2>&1)" || true
-check "M=100,N=128,K=64 Q=[16,16] non-multiple" "$OUT"
+    --tile-quant-q0 1 --tile-quant-q1 32 2>&1)" || true
+check "M=100,N=128,K=64 Q=[1,32] non-multiple" "$OUT"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""

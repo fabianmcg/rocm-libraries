@@ -65,8 +65,7 @@ BenchmarkProblems:
         - 1LDSBuffer: [0]
       BenchmarkFinalParameters:
         - ProblemSizes:
-            - Exact: [512, 512, 1, 512]
-            - Exact: [4096, 4096, 1, 4096]
+            - Exact: [256, 256, 1, 256]
 
     # Group 2: quant tile 32x32.
     - BenchmarkCommonParameters:
@@ -97,8 +96,7 @@ BenchmarkProblems:
         - 1LDSBuffer: [0]
       BenchmarkFinalParameters:
         - ProblemSizes:
-            - Exact: [512, 512, 1, 512]
-            - Exact: [4096, 4096, 1, 4096]
+            - Exact: [512, 1024, 1, 512]
 
     # Group 3: sub-row quant tile 1x32 (q0=1 per nHidden row, q1=32 per 32 M cols).
     - BenchmarkCommonParameters:
@@ -130,7 +128,7 @@ BenchmarkProblems:
       BenchmarkFinalParameters:
         - ProblemSizes:
             - Exact: [512, 512, 1, 512]
-            - Exact: [4096, 4096, 1, 4096]
+            - Exact: [128, 100, 1, 64]
 
 # TestAxes is read by readTestAxes() in yaml_solution_builder and is not
 # consumed by TensileCreateLibrary.

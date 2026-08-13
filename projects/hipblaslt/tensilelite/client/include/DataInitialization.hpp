@@ -2665,7 +2665,9 @@ namespace TensileLite
         template <>
         inline E8 DataInitialization::getValue<E8, InitMode::Zero>()
         {
-            throw std::runtime_error("Zero not available for E8.");
+            // e8m0 has no representable zero; byte 0 is the canonical fill for a
+            // zero-initialized scale/output buffer (matches the reference memset).
+            return E8(static_cast<uint8_t>(0));
         }
         template <>
         inline E8 DataInitialization::getValue<E8, InitMode::One>()

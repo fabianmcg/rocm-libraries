@@ -135,43 +135,49 @@ COMMON_ARGS=(
 )
 
 # ── Step 3: Sub-row MX block Q=[1,32] ────────────────────────────────────────
-echo "==> Running client: M=512 N=128 K=64, MX Q=[1,32] ..."
+# Uses the sizes benchmarked for the Q=[1,32] shape group so that LibraryLogic
+# dispatches the Q=[1,32] kernel rather than a different shape's winner.
+echo "==> Running client: N=128 M=512 K=64, MX Q=[1,32] ..."
 OUT="$("$CLIENT_BIN" "${COMMON_ARGS[@]}" --problem-size "128,512,1,64" \
     --mxfp8-quant-q0 1 --mxfp8-quant-q1 32 2>&1)" || true
-check "M=512,N=128,K=64 Q=[1,32]" "$OUT"
+check "N=128,M=512,K=64 Q=[1,32]" "$OUT"
 
-echo "==> Running client: M=4096 N=512 K=256, MX Q=[1,32] ..."
+echo "==> Running client: N=512 M=4096 K=256, MX Q=[1,32] ..."
 OUT="$("$CLIENT_BIN" "${COMMON_ARGS[@]}" --problem-size "512,4096,1,256" \
     --mxfp8-quant-q0 1 --mxfp8-quant-q1 32 2>&1)" || true
-check "M=4096,N=512,K=256 Q=[1,32]" "$OUT"
+check "N=512,M=4096,K=256 Q=[1,32]" "$OUT"
 
 # ── Step 4: Full-tile MX block Q=[16,16] ─────────────────────────────────────
-echo "==> Running client: M=512 N=128 K=64, MX Q=[16,16] ..."
-OUT="$("$CLIENT_BIN" "${COMMON_ARGS[@]}" --problem-size "128,512,1,64" \
+# Uses the sizes benchmarked for the Q=[16,16] shape group so that LibraryLogic
+# dispatches the Q=[16,16] kernel rather than a different shape's winner.
+echo "==> Running client: N=512 M=512 K=256, MX Q=[16,16] ..."
+OUT="$("$CLIENT_BIN" "${COMMON_ARGS[@]}" --problem-size "512,512,1,256" \
     --mxfp8-quant-q0 16 --mxfp8-quant-q1 16 2>&1)" || true
-check "M=512,N=128,K=64 Q=[16,16]" "$OUT"
+check "N=512,M=512,K=256 Q=[16,16]" "$OUT"
 
-echo "==> Running client: M=4096 N=512 K=256, MX Q=[16,16] ..."
-OUT="$("$CLIENT_BIN" "${COMMON_ARGS[@]}" --problem-size "512,4096,1,256" \
+echo "==> Running client: N=1024 M=4096 K=1024, MX Q=[16,16] ..."
+OUT="$("$CLIENT_BIN" "${COMMON_ARGS[@]}" --problem-size "1024,4096,1,1024" \
     --mxfp8-quant-q0 16 --mxfp8-quant-q1 16 2>&1)" || true
-check "M=4096,N=512,K=256 Q=[16,16]" "$OUT"
+check "N=1024,M=4096,K=1024 Q=[16,16]" "$OUT"
 
 # ── Step 5: Full-tile MX block Q=[32,32] ─────────────────────────────────────
-echo "==> Running client: M=512 N=128 K=64, MX Q=[32,32] ..."
-OUT="$("$CLIENT_BIN" "${COMMON_ARGS[@]}" --problem-size "128,512,1,64" \
+# Uses the sizes benchmarked for the Q=[32,32] shape group so that LibraryLogic
+# dispatches the Q=[32,32] kernel rather than a different shape's winner.
+echo "==> Running client: N=256 M=512 K=128, MX Q=[32,32] ..."
+OUT="$("$CLIENT_BIN" "${COMMON_ARGS[@]}" --problem-size "256,512,1,128" \
     --mxfp8-quant-q0 32 --mxfp8-quant-q1 32 2>&1)" || true
-check "M=512,N=128,K=64 Q=[32,32]" "$OUT"
+check "N=256,M=512,K=128 Q=[32,32]" "$OUT"
 
-echo "==> Running client: M=4096 N=512 K=256, MX Q=[32,32] ..."
-OUT="$("$CLIENT_BIN" "${COMMON_ARGS[@]}" --problem-size "512,4096,1,256" \
+echo "==> Running client: N=512 M=2048 K=512, MX Q=[32,32] ..."
+OUT="$("$CLIENT_BIN" "${COMMON_ARGS[@]}" --problem-size "512,2048,1,512" \
     --mxfp8-quant-q0 32 --mxfp8-quant-q1 32 2>&1)" || true
-check "M=4096,N=512,K=256 Q=[32,32]" "$OUT"
+check "N=512,M=2048,K=512 Q=[32,32]" "$OUT"
 
 # ── Step 6: Non-multiple-of-tile size ────────────────────────────────────────
-echo "==> Running client: M=100 N=128 K=64, MX Q=[1,32] (non-multiple M) ..."
+echo "==> Running client: N=128 M=100 K=64, MX Q=[1,32] (non-multiple M) ..."
 OUT="$("$CLIENT_BIN" "${COMMON_ARGS[@]}" --problem-size "128,100,1,64" \
     --mxfp8-quant-q0 1 --mxfp8-quant-q1 32 2>&1)" || true
-check "M=100,N=128,K=64 Q=[1,32] non-multiple" "$OUT"
+check "N=128,M=100,K=64 Q=[1,32] non-multiple" "$OUT"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""

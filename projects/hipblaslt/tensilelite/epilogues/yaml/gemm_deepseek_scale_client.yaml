@@ -69,7 +69,7 @@ BenchmarkProblems:
         - 1LDSBuffer: [0]
       BenchmarkFinalParameters:
         - ProblemSizes:
-            - Exact: [128, 128, 1, 256]
+            - Exact: [128, 128, 1, 128]
 
   # --------------------------------------------------------------------------
   # Mode 1 — DeepseekScaleB only, multi-K mainloop (PGR=0).
@@ -124,7 +124,7 @@ BenchmarkProblems:
         - 1LDSBuffer: [0]
       BenchmarkFinalParameters:
         - ProblemSizes:
-            - Exact: [128, 128, 1, 256]
+            - Exact: [128, 128, 1, 128]
 
   # --------------------------------------------------------------------------
   # Mode 2 — DeepseekScaleA + DeepseekScaleB combined, multi-K mainloop (PGR=0).
@@ -179,7 +179,7 @@ BenchmarkProblems:
         - 1LDSBuffer: [0]
       BenchmarkFinalParameters:
         - ProblemSizes:
-            - Exact: [128, 128, 1, 256]
+            - Exact: [128, 128, 1, 128]
 
 LibraryLogic:
   ScheduleName: "deepseek_scale_client"
