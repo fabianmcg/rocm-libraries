@@ -544,54 +544,55 @@ class SubtileMXFP8QuantEmitter:
         # addrV = qTileRow, tmpV = qTileCol -> GFX950 pre-swizzled byte offset.
         self._swizzleTileByteOffset(module, addrV, tmpV, nQTN)
 
+    def _swizzleRowBits(self, module, rowV: int, lowV: int, tmpV: int) -> None:
+        """Write d2<<2 | d1 into lowV using rowV; clobbers tmpV. rowV is not modified."""
+        module.add(VAndB32(dst=vgpr(lowV), src0=vgpr(rowV), src1=0xF, comment="d2 = row & 0xF."))
+        module.add(VLShiftLeftB32(dst=vgpr(lowV), shiftHex=hex(2), src=vgpr(lowV),
+                                  comment="d2 << 2."))
+        module.add(VLShiftRightB32(dst=vgpr(tmpV), shiftHex=hex(4), src=vgpr(rowV),
+                                   comment="row >> 4."))
+        module.add(VAndB32(dst=vgpr(tmpV), src0=vgpr(tmpV), src1=1, comment="d1 = (row>>4)&1."))
+        module.add(VOrB32(dst=vgpr(lowV), src0=vgpr(lowV), src1=vgpr(tmpV), comment="lowV |= d1."))
+
+    def _swizzleColBits(self, module, colV: int, lowV: int, tmpV: int) -> None:
+        """OR d5<<6 | d4<<1 | d3<<8 into lowV using colV; clobbers tmpV."""
+        module.add(VAndB32(dst=vgpr(tmpV), src0=vgpr(colV), src1=3, comment="d5 = col & 3."))
+        module.add(VLShiftLeftB32(dst=vgpr(tmpV), shiftHex=hex(6), src=vgpr(tmpV),
+                                  comment="d5 << 6."))
+        module.add(VOrB32(dst=vgpr(lowV), src0=vgpr(lowV), src1=vgpr(tmpV), comment="lowV |= d5<<6."))
+        module.add(VLShiftRightB32(dst=vgpr(tmpV), shiftHex=hex(2), src=vgpr(colV),
+                                   comment="col >> 2."))
+        module.add(VAndB32(dst=vgpr(tmpV), src0=vgpr(tmpV), src1=1, comment="d4 = (col>>2)&1."))
+        module.add(VLShiftLeftB32(dst=vgpr(tmpV), shiftHex=hex(1), src=vgpr(tmpV),
+                                  comment="d4 << 1."))
+        module.add(VOrB32(dst=vgpr(lowV), src0=vgpr(lowV), src1=vgpr(tmpV), comment="lowV |= d4<<1."))
+        module.add(VLShiftRightB32(dst=vgpr(tmpV), shiftHex=hex(3), src=vgpr(colV),
+                                   comment="d3 = col >> 3."))
+        module.add(VLShiftLeftB32(dst=vgpr(tmpV), shiftHex=hex(8), src=vgpr(tmpV),
+                                  comment="d3 << 8."))
+        module.add(VOrB32(dst=vgpr(lowV), src0=vgpr(lowV), src1=vgpr(tmpV), comment="lowV |= d3<<8."))
+
     def _swizzleTileByteOffset(self, module, addrV: int, colV: int, nQTN: int) -> None:
         """Overwrite addrV with the GFX950 pre-swizzled MXScale byte offset.
 
         addrV holds qTileRow, colV holds qTileCol, nQTN is a VGPR holding totalQTilesN.
-        Layout matches DGen::preSwizzleScalesGFX950: rows blocked by 32, cols by
-        8, byteOff = d0*(colBlocks*256) + d3*256 + d5*64 + d2*4 + d4*2 + d1.
+        byteOff = d0*(colBlocks*256) + d3*256 + d5*64 + d2*4 + d4*2 + d1.
         """
         sLow    = self.writer.vgprPool.checkOut(1, tag="mx_swzLow")
         sTmp    = self.writer.vgprPool.checkOut(1, tag="mx_swzTmp")
         sStride = self.writer.vgprPool.checkOut(1, tag="mx_swzStride")
-        # colBlocks = (nTiles + 7) >> 3; d0 stride = colBlocks << 8.
+        # d0 stride = ceil(nTiles/8) * 256.
         module.add(VAddU32(vgpr(sStride), vgpr(nQTN), 7, comment="nTiles + 7."))
         module.add(VLShiftRightB32(dst=vgpr(sStride), shiftHex=hex(3), src=vgpr(sStride),
                                    comment="colBlocks = ceil(nTiles/8)."))
         module.add(VLShiftLeftB32(dst=vgpr(sStride), shiftHex=hex(8), src=vgpr(sStride),
                                   comment="d0 stride = colBlocks * 256."))
-        # d0 = qTileRow >> 5; d0 term = d0 * stride.
         module.add(VLShiftRightB32(dst=vgpr(sTmp), shiftHex=hex(5), src=vgpr(addrV),
                                    comment="d0 = qTileRow >> 5."))
         module.add(VMulLOU32(dst=vgpr(sStride), src0=vgpr(sTmp), src1=vgpr(sStride),
                              comment="d0 * stride."))
-        # low part from row: d2 = row & 0xF -> <<2, then d1 = (row>>4)&1.
-        module.add(VAndB32(dst=vgpr(sLow), src0=vgpr(addrV), src1=0xF, comment="d2 = row & 0xF."))
-        module.add(VLShiftLeftB32(dst=vgpr(sLow), shiftHex=hex(2), src=vgpr(sLow),
-                                  comment="d2 << 2."))
-        module.add(VLShiftRightB32(dst=vgpr(sTmp), shiftHex=hex(4), src=vgpr(addrV),
-                                   comment="row >> 4."))
-        module.add(VAndB32(dst=vgpr(sTmp), src0=vgpr(sTmp), src1=1, comment="d1 = (row>>4)&1."))
-        module.add(VOrB32(dst=vgpr(sLow), src0=vgpr(sLow), src1=vgpr(sTmp), comment="+ d1."))
-        # low part from col: d5 = col & 3 -> <<6.
-        module.add(VAndB32(dst=vgpr(sTmp), src0=vgpr(colV), src1=3, comment="d5 = col & 3."))
-        module.add(VLShiftLeftB32(dst=vgpr(sTmp), shiftHex=hex(6), src=vgpr(sTmp),
-                                  comment="d5 << 6."))
-        module.add(VOrB32(dst=vgpr(sLow), src0=vgpr(sLow), src1=vgpr(sTmp), comment="+ d5<<6."))
-        # d4 = (col>>2)&1 -> <<1.
-        module.add(VLShiftRightB32(dst=vgpr(sTmp), shiftHex=hex(2), src=vgpr(colV),
-                                   comment="col >> 2."))
-        module.add(VAndB32(dst=vgpr(sTmp), src0=vgpr(sTmp), src1=1, comment="d4 = (col>>2)&1."))
-        module.add(VLShiftLeftB32(dst=vgpr(sTmp), shiftHex=hex(1), src=vgpr(sTmp),
-                                  comment="d4 << 1."))
-        module.add(VOrB32(dst=vgpr(sLow), src0=vgpr(sLow), src1=vgpr(sTmp), comment="+ d4<<1."))
-        # d3 = col >> 3 -> <<8.
-        module.add(VLShiftRightB32(dst=vgpr(sTmp), shiftHex=hex(3), src=vgpr(colV),
-                                   comment="d3 = col >> 3."))
-        module.add(VLShiftLeftB32(dst=vgpr(sTmp), shiftHex=hex(8), src=vgpr(sTmp),
-                                  comment="d3 << 8."))
-        module.add(VOrB32(dst=vgpr(sLow), src0=vgpr(sLow), src1=vgpr(sTmp), comment="+ d3<<8."))
-        # byteOff = d0*stride + lowPart.
+        self._swizzleRowBits(module, addrV, sLow, sTmp)
+        self._swizzleColBits(module, colV,  sLow, sTmp)
         module.add(VAddU32(vgpr(addrV), vgpr(sStride), vgpr(sLow), comment="swizzled byteOff."))
         self.writer.vgprPool.checkIn(sStride)
         self.writer.vgprPool.checkIn(sTmp)

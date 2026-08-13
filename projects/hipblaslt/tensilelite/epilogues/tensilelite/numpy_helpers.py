@@ -95,9 +95,11 @@ def tileQuantReference(dEff_f32, q0, q1, fp8Max=448.0):
 def mxfp8QuantReference(dEff_f32, q0, q1):
     """Compute per-block e8m0 MX dynamic fp8 quantization reference outputs.
 
-    Returns (mxScale, dFp8) where mxScale has shape [ceil(M/q0), ceil(N/q1)]
-    uint8 (e8m0 bytes) and dFp8 has the same shape as dEff_f32 in OCP e4m3.
-    dEff_f32 is the f32 effective D before quantization (alpha already applied).
+    Returns (mxScale, dFp8) where mxScale is a flat uint8 array of length
+    paddedRows*paddedCols in the GFX950 pre-swizzled layout (rows padded to a
+    multiple of 32, cols to a multiple of 8) and dFp8 has the same shape as
+    dEff_f32 in OCP e4m3. dEff_f32 is the f32 effective D before quantization
+    (alpha already applied).
 
     e8m0 math (per block):
       if amax == 0: scaleByte = 0, quantMult = 0
@@ -149,7 +151,7 @@ def partialRmsMxfp8Reference(aRow, bRow, gammaBf16, mt0, q0, q1):
 
     Returns (sumsqRef, mxScaleRef, dFp8Ref):
       sumsqRef  : [M, ceil(N/mt0)] f32 = per-MT0-tile Σh1² (pre-gamma).
-      mxScaleRef: [ceil(N/q0), ceil(M/q1)] u8 = e8m0 per block of gamma·h1 (free0×free1).
+      mxScaleRef: flat uint8 GFX950 pre-swizzled scale buffer for gamma·h1 blocks.
       dFp8Ref   : [N, M] fp8 e4m3 = MX-quantized gamma·h1 (free0×free1 layout).
 
     gammaBf16 is cast bf16→f32 to match the GPU (which loads gamma as bf16).
