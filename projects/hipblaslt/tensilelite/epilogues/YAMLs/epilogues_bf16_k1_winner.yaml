@@ -1,0 +1,93 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+
+# Isolated top-performing solution from epilogues_bf16_k1.yaml on gfx950 for the
+# bf16-in / bf16-out PartialRMS + ResidualAdd RMSNorm epilogue (no MXFP8 quant).
+# The fused K1 epilogue computes h_eff = h1 + residual and the per-row partial
+# sum-of-squares partialBuf (f32). PartialRMSStoreBf16D is enabled, which splits
+# the store into an RMS pass writing bf16 to ResidualOut plus the D store.
+#
+# NOTE: PartialRMSStoreBf16D MUST be set in BOTH the ProblemType block AND
+# ForkParameters. The solution-selection predicate is built from the ProblemType
+# field while the problem's store-bf16-d flag comes from the solutions; if it is
+# set in only one place the values disagree and the client rejects every solution
+# with DID_NOT_SATISFY_ASSERTS (kernel builds, but nothing benchmarks -> GFlops 0).
+#
+# Winner tile (full bf16 sweep at 8192x8192x1x8192): MT 384x256x64, MI 16x16x32,
+# MIWaveTile [12,8], MIWaveGroup [2,2], WorkGroup [32,8,1], PrefetchGlobalRead=2,
+# DepthU=64, StreamK=3. KeepBuildTmp retains the generated assembly for ASM
+# comparison against the no-epilogue baseline.
+
+TestParameters:
+  marks: [skip-gfx900, skip-gfx906, skip-gfx908, skip-gfx90a, skip-gfx940, skip-gfx941, skip-gfx942, skip-gfx1010, skip-gfx1011, skip-gfx1012, skip-gfx1030, skip-gfx1100, skip-gfx1101, skip-gfx1102, skip-gfx1200, skip-gfx1201, skip-gfx1250]
+
+GlobalParameters:
+  MinimumRequiredVersion: 5.0.0
+  NumElementsToValidate: -1
+  ExitOnFails: 0
+  PrintSolutionRejectionReason: True
+  KernelTime: True
+  KeepBuildTmp: True
+
+BenchmarkProblems:
+
+  -
+    - # ProblemType — bf16 in, bf16 out, f32 compute, residual add
+      OperationType: GEMM
+      DataType: b
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: True
+      TransposeB: False
+      UseBeta: False
+      Batched: True
+      StridedBatched: True
+      GroupedGemm: False
+      UseBias: 0
+      UseScaleAB: ""
+      UseScaleCD: False
+      UseScaleAlphaVec: 0
+      UseScaleD: False
+      Sparse: 0
+      UsePartialRMS: True
+      PartialRMSResidualAdd: True
+      PartialRMSStoreBf16D: True
+
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+            - [16, 16, 32, 1,  1, 12, 8, 2, 2]  # MT 384x256 (winner)
+        - PartialRMS: [True]
+        - PartialRMSResidualAdd: [True]
+        - PartialRMSStoreBf16D: [True]
+        - StreamK: [3]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0]
+        - GlobalSplitU: [1]
+        - ScheduleIterAlg: [3]
+        - PrefetchGlobalRead: [2]
+        - PrefetchAcrossPersistent: [0]
+        - DirectToLds: [1]
+        - UseSubtileImpl: [True]
+        - StaggerU: [0]
+        - DepthU: [64]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - PreloadKernArgs: [False]
+        - 1LDSBuffer: [0]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+            - Exact: [8192,  8192, 1, 8192]
+
+LibraryLogic:
+  ScheduleName: "partialrms_residualadd_bf16_winner_k1"
+  DeviceNames: ["Device 75a0", "Device 75b0", "Device 75a2", "Device 75b2", "Device 75a3", "Device 75b3", "Device 75a8", "Device 75b8"]
+  ArchitectureName: "gfx950"
+  LibraryType: "Prediction"
