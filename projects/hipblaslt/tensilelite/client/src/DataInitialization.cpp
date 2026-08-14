@@ -947,6 +947,15 @@ namespace TensileLite
             return 1.5;
         }
 
+        // Fill a buffer with valid E8M0 scale bytes near 1.0 (exponents 124..127 ->
+        // 2^-3..2^0) so the kernel and reference decode identical, non-degenerate scales.
+        static void initE8M0Array(void* array, size_t elements)
+        {
+            uint8_t* bytes = static_cast<uint8_t*>(array);
+            for(size_t i = 0; i < elements; ++i)
+                bytes[i] = static_cast<uint8_t>(0x7c + (i & 0x3));
+        }
+
         DataInitialization::DataInitialization(po::variables_map const&    args,
                                                ClientProblemFactory const& problemFactory)
             : m_maxBatch(0)
@@ -1405,6 +1414,7 @@ namespace TensileLite
                     if(!m_problemDependentData)
                     {
 
+                        // scaleADeepseek/scaleBDeepseek are fp32; use the normal initArray path.
                         initArray(p.first, it.init, pUnit.cpuInput.valid.get(), pUnit.maxElements);
                         HIP_CHECK_EXC(
                             hipMemcpy(pUnit.gpuInput.valid.get(),
@@ -2954,6 +2964,13 @@ namespace TensileLite
             inputs->Synchronizer  = (void*)ptrs[ContractionProblemGemm::TENSOR::Synchronizer];
             inputs->amaxD         = (void*)ptrs[ContractionProblemGemm::TENSOR::AMAXD];
             inputs->compressed    = (void*)ptrs[ContractionProblemGemm::TENSOR::COMPRESSED];
+            inputs->partialBuf    = (void*)ptrs[ContractionProblemGemm::TENSOR::PARTIALBUF];
+            inputs->rmsGamma      = (void*)ptrs[ContractionProblemGemm::TENSOR::RMSGAMMA];
+            inputs->residual      = (void*)ptrs[ContractionProblemGemm::TENSOR::RESIDUAL];
+            inputs->quantScale      = (void*)ptrs[ContractionProblemGemm::TENSOR::QUANTSCALE];
+            inputs->mxScale         = (void*)ptrs[ContractionProblemGemm::TENSOR::MXSCALE];
+            inputs->scaleADeepseek = (void*)ptrs[ContractionProblemGemm::TENSOR::SCALEA_DS];
+            inputs->scaleBDeepseek = (void*)ptrs[ContractionProblemGemm::TENSOR::SCALEB_DS];
 
             inputs->batchA    = (void**)batchPtrs[ContractionProblemGemm::TENSOR::A];
             inputs->batchB    = (void**)batchPtrs[ContractionProblemGemm::TENSOR::B];
@@ -3189,6 +3206,31 @@ namespace TensileLite
                 rotatingSize += problem.tensors()[ContractionProblemGemm::TENSOR::METADATA]
                                     .totalAllocatedBytes();
             }
+            if(inputs.partialBuf != nullptr)
+            {
+                rotatingSize += problem.tensors()[ContractionProblemGemm::TENSOR::PARTIALBUF]
+                                    .totalAllocatedBytes();
+            }
+            if(inputs.quantScale != nullptr)
+            {
+                rotatingSize += problem.tensors()[ContractionProblemGemm::TENSOR::QUANTSCALE]
+                                    .totalAllocatedBytes();
+            }
+            if(inputs.mxScale != nullptr)
+            {
+                rotatingSize += problem.tensors()[ContractionProblemGemm::TENSOR::MXSCALE]
+                                    .totalAllocatedBytes();
+            }
+            if(inputs.scaleADeepseek != nullptr)
+            {
+                rotatingSize += problem.tensors()[ContractionProblemGemm::TENSOR::SCALEA_DS]
+                                    .totalAllocatedBytes();
+            }
+            if(inputs.scaleBDeepseek != nullptr)
+            {
+                rotatingSize += problem.tensors()[ContractionProblemGemm::TENSOR::SCALEB_DS]
+                                    .totalAllocatedBytes();
+            }
             return rotatingSize;
         }
 
@@ -3239,6 +3281,36 @@ namespace TensileLite
                 newInputs.e,
                 rotatingPtr,
                 problem.tensors()[ContractionProblemGemm::TENSOR::E].totalAllocatedBytes(),
+                offset,
+                stream);
+            newInputs.partialBuf = copyRotatingInput(
+                newInputs.partialBuf,
+                rotatingPtr,
+                problem.tensors()[ContractionProblemGemm::TENSOR::PARTIALBUF].totalAllocatedBytes(),
+                offset,
+                stream);
+            newInputs.quantScale = copyRotatingInput(
+                newInputs.quantScale,
+                rotatingPtr,
+                problem.tensors()[ContractionProblemGemm::TENSOR::QUANTSCALE].totalAllocatedBytes(),
+                offset,
+                stream);
+            newInputs.mxScale = copyRotatingInput(
+                newInputs.mxScale,
+                rotatingPtr,
+                problem.tensors()[ContractionProblemGemm::TENSOR::MXSCALE].totalAllocatedBytes(),
+                offset,
+                stream);
+            newInputs.scaleADeepseek = copyRotatingInput(
+                newInputs.scaleADeepseek,
+                rotatingPtr,
+                problem.tensors()[ContractionProblemGemm::TENSOR::SCALEA_DS].totalAllocatedBytes(),
+                offset,
+                stream);
+            newInputs.scaleBDeepseek = copyRotatingInput(
+                newInputs.scaleBDeepseek,
+                rotatingPtr,
+                problem.tensors()[ContractionProblemGemm::TENSOR::SCALEB_DS].totalAllocatedBytes(),
                 offset,
                 stream);
             newInputs.scaleA = copyRotatingInput(
