@@ -1,0 +1,78 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+
+# K3 RstdScale consumer GEMM with MX fp8 inputs (symmetric fp8+fp8 variant).
+#
+# Variant used: symmetric fp8 A + fp8 B (both operands fp8-e4m3 with MX block-32
+# UE8M0 input scales). Asymmetric F8+BF16 is not in TensileLite's _validGEMMTypes
+# table, so this symmetric variant is used instead.
+#
+# A = producer D (fp8-e4m3, pre-swizzled UE8M0 MX scale on A).
+# B = W1 quantized to fp8-e4m3 with its own pre-swizzled UE8M0 MX scale.
+# D = bf16 output.
+# UseScaleAlphaVec applies the per-row rstd from the handoff descriptor.
+
+GlobalParameters:
+  MinimumRequiredVersion: 5.0.0
+  NumElementsToValidate: 0
+  ExitOnFails: 0
+  PrintSolutionRejectionReason: True
+
+BenchmarkProblems:
+  # ------------------------------------------------------------------
+  # fp8-e4m3 (A) x fp8-e4m3 (B) -> bf16 (D), f32 compute.
+  # MX block-32 UE8M0 input scale on A and B.
+  # Per-row ScaleAlphaVec (rstd) applied in the epilogue.
+  # ------------------------------------------------------------------
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: F8
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: True
+      TransposeB: False
+      UseBeta: True
+      Batched: True
+      StridedBatched: True
+      GroupedGemm: False
+      UseBias: 0
+      UseScaleAB: ""
+      UseScaleCD: False
+      UseScaleAlphaVec: 1
+      Sparse: 0
+      MXBlockA: 32
+      DataTypeMXSA: E8
+      MXBlockB: 32
+      DataTypeMXSB: E8
+
+    - # BenchmarkProblemSizeGroup
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+            - [16, 16, 128, 1, 1, 4, 2, 2, 2]   # MT0=128  MT1=64
+            - [16, 16, 128, 1, 1, 2, 4, 2, 2]   # MT0=64   MT1=128
+        - GlobalSplitU: [1]
+        - ScheduleIterAlg: [3]
+        - PrefetchGlobalRead: [1]
+        - UseSubtileImpl: [True]
+        - DepthU: [256]
+        - LocalReadVectorWidth: [16]
+        - GlobalReadVectorWidthA: [16]
+        - GlobalReadVectorWidthB: [16]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StoreVectorWidth: [-1]
+        - 1LDSBuffer: [0]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+            - Exact: [256, 64, 1, 2048]
+            - Exact: [512, 128, 1, 2048]
+
+LibraryLogic:
+  ScheduleName: "mxfp8_rstdscale_k3"
+  DeviceNames: ["Device 75a0", "Device 75b0", "Device 75a2", "Device 75b2", "Device 75a3", "Device 75b3", "Device 75a8", "Device 75b8"]
+  ArchitectureName: "gfx950"

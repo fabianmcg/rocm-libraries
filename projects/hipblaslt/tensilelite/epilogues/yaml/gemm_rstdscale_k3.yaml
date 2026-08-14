@@ -1,0 +1,113 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+
+# K3 RstdScale (decomposed RMSNorm consumer / RMSNORM_SCALE_APPLY).
+# Applies a per-row rstd scale to the GEMM output via TensileLite's
+# ScaleAlphaVec feature: D = scaleAlphaVec[row] * (alpha * A*B) + beta * C.
+# Row-major (TN) GEMMs on gfx950 for BF16 and BF8 inputs, sized for the
+# RMSNorm consumer stage.
+
+GlobalParameters:
+  MinimumRequiredVersion: 5.0.0
+  NumElementsToValidate: 128
+  DataInitTypeScaleAlphaVec: 1
+
+BenchmarkProblems:
+  # ------------------------------------------------------------------
+  # BF16 TN GEMM with per-row ScaleAlphaVec (K3 consumer).
+  # ------------------------------------------------------------------
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: b
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: True
+      TransposeB: False
+      UseBeta: True
+      Batched: True
+      StridedBatched: True
+      GroupedGemm: False
+      UseBias: 0
+      UseScaleAB: ""
+      UseScaleCD: False
+      UseScaleAlphaVec: 1
+      Sparse: 0
+
+    - # BenchmarkProblemSizeGroup
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+            - [16, 16, 32, 1, 1, 4, 8, 1, 1]   # MT0=64   MT1=128
+            - [16, 16, 32, 1, 1, 4, 8, 2, 1]   # MT0=128  MT1=128
+            - [16, 16, 32, 1, 1, 4, 8, 4, 2]   # MT0=256  MT1=256
+        - GlobalSplitU: [1]
+        - ScheduleIterAlg: [3]
+        - PrefetchGlobalRead: [1, 2]
+        - DepthU: [32, 64]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - 1LDSBuffer: [-1]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+            - Exact: [4096, 4096, 1, 4096]
+            - Exact: [8192, 4096, 1, 4096]
+            - Exact: [8192, 8192, 1, 8192]
+
+  # ------------------------------------------------------------------
+  # BF8 (OCP e5m2) TN GEMM with per-row ScaleAlphaVec (K3 consumer).
+  # ------------------------------------------------------------------
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: B8
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: True
+      TransposeB: False
+      UseBeta: True
+      Batched: True
+      StridedBatched: True
+      GroupedGemm: False
+      UseBias: 0
+      UseScaleAB: ""
+      UseScaleCD: False
+      UseScaleAlphaVec: 1
+      Sparse: 0
+
+    - # BenchmarkProblemSizeGroup
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+            - [16, 16, 128, 1, 1, 4, 8, 1, 1]   # MT0=64   MT1=128
+            - [16, 16, 128, 1, 1, 4, 8, 2, 1]   # MT0=128  MT1=128
+            - [16, 16, 128, 1, 1, 4, 8, 4, 2]   # MT0=256  MT1=256
+        - GlobalSplitU: [1]
+        - ScheduleIterAlg: [3]
+        - PrefetchGlobalRead: [1, 2]
+        - DepthU: [128]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - 1LDSBuffer: [-1]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+            - Exact: [4096, 4096, 1, 4096]
+            - Exact: [8192, 4096, 1, 4096]
+            - Exact: [8192, 8192, 1, 8192]
+
+LibraryLogic:
+  ScheduleName: "rstdscale_k3"
+  DeviceNames: ["Device 74a1", "Device 75a0", "Device 75b0", "Device 75a2", "Device 75b2", "Device 75a3", "Device 75b3", "Device 75a8", "Device 75b8"]
+  ArchitectureName: "gfx950"

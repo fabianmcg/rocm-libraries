@@ -1,0 +1,71 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+
+GlobalParameters:
+  MinimumRequiredVersion: 5.0.0
+  NumElementsToValidate: 0
+  ExitOnFails: 0
+
+BenchmarkProblems:
+  # --------------------------------------------------------------------------
+  # MXFP8Quant with non-DP Stream-K (StreamKForceDPOnly=0): K is split across
+  # workgroups; the fixup reduction produces complete accumulators at skStoreLabel
+  # before the quantization epilogue runs. Exercises the newly unlocked K-split path.
+  # --------------------------------------------------------------------------
+  -
+    - # ProblemType — bf16 in, OCP fp8 e4m3 out, f32 compute
+      OperationType: GEMM
+      DataType: b
+      DestDataType: F8
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: True
+      TransposeB: False
+      UseBeta: False
+      Batched: True
+      StridedBatched: True
+      GroupedGemm: False
+      UseBias: 0
+      UseScaleAB: ""
+      UseScaleCD: False
+      UseScaleAlphaVec: 0
+      UseScaleD: False
+      Sparse: 0
+      DQuantType: MXFP8
+
+    - BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+            - [16, 16, 32, 1, 1, 4, 8, 1, 1]   # MT0=64  MT1=128 wg0=1 wg1=1
+            - [16, 16, 32, 1, 1, 4, 8, 2, 1]   # MT0=128 MT1=128 wg0=2 wg1=1
+        - DQuantType: [MXFP8]
+        - DQuantSize0: [32]
+        - DQuantSize1: [1]
+        - StreamK: [3]
+        - StreamKForceDPOnly: [0]
+        - StreamKAtomic: [0]
+        - GlobalSplitU: [1]
+        - ScheduleIterAlg: [3]
+        - PrefetchGlobalRead: [1]
+        - PrefetchAcrossPersistent: [0]
+        - DirectToLds: [1]
+        - UseSubtileImpl: [True]
+        - StaggerU: [0]
+        - DepthU: [64]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - PreloadKernArgs: [False]
+        - 1LDSBuffer: [0]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+            - Exact: [64, 128, 1, 128]
+            - Exact: [128, 256, 1, 128]
+
+LibraryLogic:
+  ScheduleName: "mxfp8_quant_k1_sk_split"
+  DeviceNames: ["Device 74a1", "Device 75a0", "Device 75b0", "Device 75a2", "Device 75b2", "Device 75a3", "Device 75b3", "Device 75a8", "Device 75b8"]
+  ArchitectureName: "gfx950"

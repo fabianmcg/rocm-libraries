@@ -1,0 +1,118 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+
+GlobalParameters:
+  MinimumRequiredVersion: 5.0.0
+  # Pipeline benchmark validation is disabled so LibraryLogic always receives
+  # valid GFlops data. Correctness is verified by the explicit GPU tests.
+  NumElementsToValidate: 0
+  ExitOnFails: 0
+
+BenchmarkProblems:
+  # --------------------------------------------------------------------------
+  # PartialRMS+MXFP8Quant (K1): fused GEMM + per-row Σx² partial stat +
+  # per-block e8m0 dynamic fp8 quantization.
+  # f16 (half) inputs, OCP fp8 e4m3 output, f32 compute.
+  # f16 shares the bf16 MFMA K=32 geometry (DepthU=64).
+  # --------------------------------------------------------------------------
+  -
+    - # ProblemType — f16 in, OCP fp8 e4m3 out, f32 compute
+      OperationType: GEMM
+      DataType: h
+      DestDataType: F8
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: True
+      TransposeB: False
+      UseBeta: False
+      Batched: True
+      StridedBatched: True
+      GroupedGemm: False
+      UseBias: 0
+      UseScaleAB: ""
+      UseScaleCD: False
+      UseScaleAlphaVec: 0
+      UseScaleD: False
+      Sparse: 0
+      UsePartialRMS: True
+      PartialRMSResidualAdd: False
+      PartialRMSQuant: False
+      DQuantType: MXFP8
+
+    # Group 1: sub-row quant tile 1x32 (canonical MX block — primary path).
+    - BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+            - [16, 16, 32, 1, 1, 4, 8, 1, 1]   # MT0=64   MT1=128  wg0=1 wg1=1
+            - [16, 16, 32, 1, 1, 4, 8, 2, 1]   # MT0=128  MT1=128  wg0=2 wg1=1
+        - PartialRMS: [True]
+        - PartialRMSResidualAdd: [False]
+        - PartialRMSQuant: [False]
+        - DQuantType: [MXFP8]
+        - DQuantSize0: [32]
+        - DQuantSize1: [1]
+        - StreamK: [3]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0]
+        - GlobalSplitU: [1]
+        - ScheduleIterAlg: [3]
+        - PrefetchGlobalRead: [1]
+        - PrefetchAcrossPersistent: [0]
+        - DirectToLds: [1]
+        - UseSubtileImpl: [True]
+        - StaggerU: [0]
+        - DepthU: [64]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - PreloadKernArgs: [False]
+        - 1LDSBuffer: [0]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+            # Distinct from the bf16 producer YAML sizes.
+            - Exact: [256, 2048, 1, 128]
+            - Exact: [512, 4096, 1, 256]
+
+    # Group 2: quant tile 32x32 (full-tile path).
+    - BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+            - [16, 16, 32, 1, 1, 4, 8, 1, 1]   # MT0=64   MT1=128  wg0=1 wg1=1
+            - [16, 16, 32, 1, 1, 4, 8, 2, 1]   # MT0=128  MT1=128  wg0=2 wg1=1
+        - PartialRMS: [True]
+        - PartialRMSResidualAdd: [False]
+        - PartialRMSQuant: [False]
+        - DQuantType: [MXFP8]
+        - DQuantSize0: [32]
+        - DQuantSize1: [32]
+        - StreamK: [3]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0]
+        - GlobalSplitU: [1]
+        - ScheduleIterAlg: [3]
+        - PrefetchGlobalRead: [1]
+        - PrefetchAcrossPersistent: [0]
+        - DirectToLds: [1]
+        - UseSubtileImpl: [True]
+        - StaggerU: [0]
+        - DepthU: [64]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - PreloadKernArgs: [False]
+        - 1LDSBuffer: [0]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+            - Exact: [512, 4096, 1, 256]
+            - Exact: [1024, 4096, 1, 512]
+
+LibraryLogic:
+  ScheduleName: "partialrms_mxfp8_quant_k1"
+  DeviceNames: ["Device 75a0", "Device 75b0", "Device 75a2", "Device 75b2", "Device 75a3", "Device 75b3", "Device 75a8", "Device 75b8"]
+  ArchitectureName: "gfx950"

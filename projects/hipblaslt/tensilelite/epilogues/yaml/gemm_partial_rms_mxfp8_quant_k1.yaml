@@ -1,0 +1,139 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+
+GlobalParameters:
+  MinimumRequiredVersion: 5.0.0
+  # Pipeline benchmark validation is disabled so LibraryLogic always receives
+  # valid GFlops data. Correctness is verified by the explicit GPU tests in
+  # test_gemm_partial_rms_mxfp8_quant.py.
+  NumElementsToValidate: 0
+  ExitOnFails: 0
+
+BenchmarkProblems:
+  # --------------------------------------------------------------------------
+  # PartialRMS+MXFP8Quant (K1): fused GEMM + per-row Σx² partial stat +
+  # per-block e8m0 dynamic fp8 quantization.
+  #
+  # Data flow:
+  #   1. PartialRMS: writes Σx² of raw acc to partialBuf, then applies gamma
+  #      in-place (acc becomes gamma·h1).
+  #   2. MXFP8Quant: computes amax per block of gamma·h1, derives e8m0 byte,
+  #      scales acc in-place, writes e8m0 byte to MXScale.
+  #   3. Standard store: writes fp8 D = SaturateCast<e4m3>(quantMult·gamma·h1).
+  #
+  # PartialRMSQuant must be False (MXFP8Quant owns quantization).
+  # Alpha=1 is required at runtime (MXFP8Quant applies alpha; contract is 1).
+  # --------------------------------------------------------------------------
+  -
+    - # ProblemType — bf16 in, OCP fp8 e4m3 out, f32 compute
+      OperationType: GEMM
+      DataType: b
+      DestDataType: F8
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: True
+      TransposeB: False
+      UseBeta: False
+      Batched: True
+      StridedBatched: True
+      GroupedGemm: False
+      UseBias: 0
+      UseScaleAB: ""
+      UseScaleCD: False
+      UseScaleAlphaVec: 0
+      UseScaleD: False
+      Sparse: 0
+      UsePartialRMS: True
+      PartialRMSResidualAdd: False
+      PartialRMSQuant: False
+      DQuantType: MXFP8
+
+    # Group 1: sub-row quant tile 1x32 (canonical MX block — primary path).
+    - BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+            - [16, 16, 32, 1, 1, 4, 8, 1, 1]   # MT0=64   MT1=128  wg0=1 wg1=1
+            - [16, 16, 32, 1, 1, 4, 8, 2, 1]   # MT0=128  MT1=128  wg0=2 wg1=1
+        - PartialRMS: [True]
+        - PartialRMSResidualAdd: [False]
+        - PartialRMSQuant: [False]
+        - DQuantType: [MXFP8]
+        - DQuantSize0: [32]
+        - DQuantSize1: [1]
+        - StreamK: [3]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0]
+        - GlobalSplitU: [1]
+        - ScheduleIterAlg: [3]
+        - PrefetchGlobalRead: [1]
+        - PrefetchAcrossPersistent: [0]
+        - DirectToLds: [1]
+        - UseSubtileImpl: [True]
+        - StaggerU: [0]
+        - DepthU: [64]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - PreloadKernArgs: [False]
+        - 1LDSBuffer: [0]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+            # Distinct sizes (different from gemm_mxfp8_quant_k1.yaml) ensure
+            # LibraryLogic preserves this Q shape and avoids cross-contamination
+            # when both YAMLs are combined into a single library.
+            - Exact: [128, 256, 1, 64]
+            - Exact: [256, 2048, 1, 128]
+
+    # Group 2: quant tile 32x32 (full-tile path).
+    - BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+            - [16, 16, 32, 1, 1, 4, 8, 1, 1]   # MT0=64   MT1=128  wg0=1 wg1=1
+            - [16, 16, 32, 1, 1, 4, 8, 2, 1]   # MT0=128  MT1=128  wg0=2 wg1=1
+        - PartialRMS: [True]
+        - PartialRMSResidualAdd: [False]
+        - PartialRMSQuant: [False]
+        - DQuantType: [MXFP8]
+        - DQuantSize0: [32]
+        - DQuantSize1: [32]
+        - StreamK: [3]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0]
+        - GlobalSplitU: [1]
+        - ScheduleIterAlg: [3]
+        - PrefetchGlobalRead: [1]
+        - PrefetchAcrossPersistent: [0]
+        - DirectToLds: [1]
+        - UseSubtileImpl: [True]
+        - StaggerU: [0]
+        - DepthU: [64]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - PreloadKernArgs: [False]
+        - 1LDSBuffer: [0]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+            # Distinct sizes ensure LibraryLogic preserves this Q shape in the
+            # library rather than collapsing it against Group 1.
+            - Exact: [512, 1024, 1, 256]
+            - Exact: [1024, 2048, 1, 512]
+
+# TestAxes is read by readTestAxes() in yaml_solution_builder and is not
+# consumed by TensileCreateLibrary.
+TestAxes:
+  K1:
+    MMultipliers: [1, 2]
+    MFixed:       [1, 7, 129]
+    KNHidden:     [[64, 128], [256, 512]]
+
+LibraryLogic:
+  ScheduleName: "partialrms_mxfp8_quant_k1"
+  DeviceNames: ["Device 75a0", "Device 75b0", "Device 75a2", "Device 75b2", "Device 75a3", "Device 75b3", "Device 75a8", "Device 75b8"]
+  ArchitectureName: "gfx950"

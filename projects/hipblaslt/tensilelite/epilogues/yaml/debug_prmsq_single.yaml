@@ -1,0 +1,71 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+#
+# Single-kernel debug YAML for PartialRMSQuant correctness.
+# MT128x128, DU=64, SK=0, PGR=0, EPS=0, MIWT=4x4, WG=32x8x1
+
+GlobalParameters:
+  SyncsPerBenchmark: 5
+  PrintSolutionRejectionReason: True
+  NumElementsToValidate: 256
+  MinimumRequiredVersion: 5.0.0
+  PrintLevel: 3
+  Device: 0
+  CMakeBuildType: Release
+  KernelTime: True
+  MaxWorkspaceSize: 13421772800
+  DataInitTypeA: 3
+  DataInitTypeB: 3
+  DataInitTypeC: 3
+  DataInitTypeAlpha: 1
+  DataInitTypeBeta: 2
+  DataInitTypeBias: 1
+  BoundsCheck: 0
+  KeepBuildTmp: True
+  CpuThreads: 1
+  RotatingBufferSize: 0
+
+BenchmarkProblems:
+
+  -
+    - OperationType: GEMM
+      DataType: b
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: True
+      TransposeB: False
+      UseBeta: True
+      Batched: True
+      ActivationFuncCall: True
+      UsePartialRMS: True
+      PartialRMSResidualAdd: False
+      PartialRMSQuant: True
+
+    - BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 32, 1, 1,  4,  4,  2, 2]  # MT0=128 MT1=128  2x2 WG
+        - PartialRMS: [True]
+        - PartialRMSResidualAdd: [False]
+        - PartialRMSQuant: [True]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0]
+        - PrefetchGlobalRead: [0]
+        - PrefetchLocalRead: [0]
+        - DepthU: [64]
+        - ScheduleIterAlg: [3]
+        - DirectToLds: [1]
+        - StreamK: [0]
+        - StaggerU: [0]
+        - UseSubtileImpl: [true]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [8192, 8192, 1, 8192]
+
+LibraryLogic:
+  ScheduleName: "debug_prmsq_single"
+  DeviceNames: ["Device 74a1", "Device 75a0", "Device 75b0", "Device 75a2", "Device 75b2", "Device 75a3", "Device 75b3", "Device 75a8", "Device 75b8"]
+  ArchitectureName: "gfx950"

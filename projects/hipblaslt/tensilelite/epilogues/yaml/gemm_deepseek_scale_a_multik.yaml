@@ -1,0 +1,141 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+
+GlobalParameters:
+  MinimumRequiredVersion: 5.0.0
+  NumElementsToValidate: 0
+  ExitOnFails: 0
+
+BenchmarkProblems:
+  # --------------------------------------------------------------------------
+  # DeepseekScaleA only (multi-K): per-K-block E8M0 scaleA via MFMA operand.
+  # scaleB side uses a unit scale (0x7f = 1.0 in E8M0) inside the mainloop.
+  # --------------------------------------------------------------------------
+  -
+    - # ProblemType — fp8 in, f32 out, f32 compute
+      OperationType: GEMM
+      DataType: F8
+      DestDataType: S
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: True
+      TransposeB: False
+      UseBeta: True
+      Batched: True
+      StridedBatched: True
+      GroupedGemm: False
+      UseBias: 0
+      UseScaleAB: ""
+      UseScaleCD: False
+      UseScaleAlphaVec: 0
+      UseScaleD: False
+      Sparse: 0
+      UseDeepseekScaleA: True
+      UseDeepseekScaleB: False
+      DeepseekScaleAq0: 128
+      DeepseekScaleAq1: 128
+      DeepseekScaleBq0: 1
+      DeepseekScaleBq1: 128
+
+    - BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+            - [16, 16, 128, 1, 1, 4, 8, 1, 1]   # MT0=64  MT1=128  wg0=1 wg1=1
+            - [16, 16, 128, 1, 1, 4, 8, 2, 1]   # MT0=128 MT1=128  wg0=2 wg1=1
+            - [16, 16, 128, 1, 1, 4, 8, 1, 2]   # MT0=64  MT1=256  wg0=1 wg1=2
+        - UseDeepseekScaleA: [True]
+        - UseDeepseekScaleB: [False]
+        - DeepseekScaleAq0: [128]
+        - DeepseekScaleAq1: [128]
+        - DeepseekScaleBq0: [1]
+        - DeepseekScaleBq1: [128]
+        - StreamK: [3]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0]
+        - GlobalSplitU: [1]
+        - ScheduleIterAlg: [3]
+        - PrefetchGlobalRead: [0, 1, 2]
+        - PrefetchAcrossPersistent: [0]
+        - DirectToLds: [1]
+        - UseSubtileImpl: [True]
+        - StaggerU: [0]
+        - DepthU: [128]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - PreloadKernArgs: [False]
+        - 1LDSBuffer: [0]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+            - Exact: [64, 128, 1, 256]
+            - Exact: [128, 256, 1, 512]
+  # --------------------------------------------------------------------------
+  # MT0=64 MT1=256 wg0=1 wg1=1: PGR=1/2 overflow VGPRs, PGR=0 only.
+  # --------------------------------------------------------------------------
+  -
+    - # ProblemType — same as above
+      OperationType: GEMM
+      DataType: F8
+      DestDataType: S
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: True
+      TransposeB: False
+      UseBeta: True
+      Batched: True
+      StridedBatched: True
+      GroupedGemm: False
+      UseBias: 0
+      UseScaleAB: ""
+      UseScaleCD: False
+      UseScaleAlphaVec: 0
+      UseScaleD: False
+      Sparse: 0
+      UseDeepseekScaleA: True
+      UseDeepseekScaleB: False
+      DeepseekScaleAq0: 128
+      DeepseekScaleAq1: 128
+      DeepseekScaleBq0: 1
+      DeepseekScaleBq1: 128
+
+    - BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+            - [16, 16, 128, 1, 1, 4, 16, 1, 1]  # MT0=64  MT1=256  wg0=1 wg1=1
+        - UseDeepseekScaleA: [True]
+        - UseDeepseekScaleB: [False]
+        - DeepseekScaleAq0: [128]
+        - DeepseekScaleAq1: [128]
+        - DeepseekScaleBq0: [1]
+        - DeepseekScaleBq1: [128]
+        - StreamK: [3]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0]
+        - GlobalSplitU: [1]
+        - ScheduleIterAlg: [3]
+        - PrefetchGlobalRead: [0]
+        - PrefetchAcrossPersistent: [0]
+        - DirectToLds: [1]
+        - UseSubtileImpl: [True]
+        - StaggerU: [0]
+        - DepthU: [128]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - PreloadKernArgs: [False]
+        - 1LDSBuffer: [0]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+            - Exact: [64, 128, 1, 256]
+            - Exact: [128, 256, 1, 512]
+
+LibraryLogic:
+  ScheduleName: "deepseek_scale_a_multik"
+  DeviceNames: ["Device 74a1", "Device 75a0", "Device 75b0", "Device 75a2", "Device 75b2", "Device 75a3", "Device 75b3", "Device 75a8", "Device 75b8"]
+  ArchitectureName: "gfx950"

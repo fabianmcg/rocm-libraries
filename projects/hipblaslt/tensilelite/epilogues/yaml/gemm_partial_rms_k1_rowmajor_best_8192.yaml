@@ -1,0 +1,68 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+#
+# Best PartialRMS (no residual add) config for [8192, 8192, 1, 8192] on gfx950.
+# Measured: 1.162 PFLOPS (1162450 GFlops) — ~40% of MI350X BF16 peak.
+#
+# Winner: MT0=256 MT1=256, DU=64, DTL=1, PGR=2, PAP=0, StaggerU=0,
+#         StreamKAtomic=0, PreloadKernArgs=True, 1LDSBuffer=0.
+
+GlobalParameters:
+  MinimumRequiredVersion: 5.0.0
+  NumElementsToValidate: 128
+
+BenchmarkProblems:
+  -
+    - # ProblemType — bf16 TN GEMM with PartialRMS epilogue (no residual add)
+      OperationType: GEMM
+      DataType: b
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: True
+      TransposeB: False
+      UseBeta: True
+      Batched: True
+      StridedBatched: True
+      GroupedGemm: False
+      UseBias: 0
+      UseScaleAB: ""
+      UseScaleCD: False
+      UseScaleAlphaVec: 0
+      Sparse: 0
+      UsePartialRMS: True
+      PartialRMSResidualAdd: False
+
+    - BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+            - [16, 16, 32, 1, 1, 2, 8, 8, 2]   # MT0=256  MT1=256  WG=[64,8]  MIWaveGroup=[8,2]
+        - PartialRMSResidualAdd: [False]
+        - StreamK: [3]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0]
+        - GlobalSplitU: [1]
+        - ScheduleIterAlg: [3]
+        - PrefetchGlobalRead: [2]
+        - PrefetchAcrossPersistent: [0]
+        - DirectToLds: [1]
+        - UseSubtileImpl: [True]
+        - PartialRMS: [True]
+        - StaggerU: [8]
+        - DepthU: [64]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - PreloadKernArgs: [True]
+        - 1LDSBuffer: [0]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+            - Exact: [8192, 8192, 1, 8192]
+
+LibraryLogic:
+  ScheduleName: "partialrms_k1_rowmajor_best_8192"
+  DeviceNames: ["Device 74a1", "Device 75a0", "Device 75b0", "Device 75a2", "Device 75b2", "Device 75a3", "Device 75b3", "Device 75a8", "Device 75b8"]
+  ArchitectureName: "gfx950"

@@ -1,0 +1,105 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+
+GlobalParameters:
+  MinimumRequiredVersion: 5.0.0
+  NumElementsToValidate: 0
+  ExitOnFails: 0
+
+BenchmarkProblems:
+  # --------------------------------------------------------------------------
+  # MXFP8Quant (K1): fused GEMM + per-block e8m0 dynamic fp8 quantization.
+  # fp8/e4m3 inputs, OCP fp8 e4m3 output, f32 compute.
+  # fp8 inputs require MFMA K=128, LocalReadVectorWidth=16, GlobalReadVectorWidth=16.
+  # --------------------------------------------------------------------------
+  -
+    - # ProblemType — fp8 e4m3 in, OCP fp8 e4m3 out, f32 compute
+      OperationType: GEMM
+      DataType: F8
+      DestDataType: F8
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: True
+      TransposeB: False
+      UseBeta: False
+      Batched: True
+      StridedBatched: True
+      GroupedGemm: False
+      UseBias: 0
+      UseScaleAB: ""
+      UseScaleCD: False
+      UseScaleAlphaVec: 0
+      UseScaleD: False
+      Sparse: 0
+      DQuantType: MXFP8
+
+    # Group 1: sub-row quant tile 1x32 (canonical MX block — primary path).
+    - BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+            - [16, 16, 128, 1, 1, 4, 2, 2, 2]   # MT0=128  MT1=64
+            - [16, 16, 128, 1, 1, 2, 4, 2, 2]   # MT0=64   MT1=128
+        - DQuantType: [MXFP8]
+        - DQuantSize0: [1]
+        - DQuantSize1: [32]
+        - StreamK: [3]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0]
+        - GlobalSplitU: [1]
+        - ScheduleIterAlg: [3]
+        - PrefetchGlobalRead: [1]
+        - PrefetchAcrossPersistent: [0]
+        - UseSubtileImpl: [True]
+        - StaggerU: [0]
+        - DepthU: [256]
+        - LocalReadVectorWidth: [16]
+        - GlobalReadVectorWidthA: [16]
+        - GlobalReadVectorWidthB: [16]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StoreVectorWidth: [-1]
+        - PreloadKernArgs: [False]
+        - 1LDSBuffer: [0]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+            - Exact: [128, 512, 1, 128]
+            - Exact: [512, 4096, 1, 512]
+
+    # Group 2: quant tile 32x32 (full-tile path).
+    - BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+            - [16, 16, 128, 1, 1, 4, 2, 2, 2]   # MT0=128  MT1=64
+            - [16, 16, 128, 1, 1, 2, 4, 2, 2]   # MT0=64   MT1=128
+        - DQuantType: [MXFP8]
+        - DQuantSize0: [32]
+        - DQuantSize1: [32]
+        - StreamK: [3]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0]
+        - GlobalSplitU: [1]
+        - ScheduleIterAlg: [3]
+        - PrefetchGlobalRead: [1]
+        - PrefetchAcrossPersistent: [0]
+        - UseSubtileImpl: [True]
+        - StaggerU: [0]
+        - DepthU: [256]
+        - LocalReadVectorWidth: [16]
+        - GlobalReadVectorWidthA: [16]
+        - GlobalReadVectorWidthB: [16]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StoreVectorWidth: [-1]
+        - PreloadKernArgs: [False]
+        - 1LDSBuffer: [0]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+            - Exact: [256, 512, 1, 256]
+            - Exact: [512, 2048, 1, 512]
+
+LibraryLogic:
+  ScheduleName: "mxfp8_quant_k1"
+  DeviceNames: ["Device 75a0", "Device 75b0", "Device 75a2", "Device 75b2", "Device 75a3", "Device 75b3", "Device 75a8", "Device 75b8"]
+  ArchitectureName: "gfx950"
