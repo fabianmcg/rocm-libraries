@@ -708,6 +708,10 @@ struct RocblasltFusedEpilogueInfo
     // (partial stats) reduction writes it; the consumer (RMSNorm scale-apply / K3) reads it.
     const void* perRowScale          = nullptr;
     bool        rmsStatsPopulated    = false;
+    // MX microscaling requant: device pointer for UE8M0 block-scale output, block size, and type.
+    const void* requantMxScale       = nullptr;
+    int32_t     requantMxBlockSize   = 32;
+    hipDataType requantMxOutputType  = HIP_R_8F_E4M3;
 };
 
 // Resolve an opaque fused-epilogue handle into the POD above. Returns false when desc is
