@@ -353,7 +353,7 @@ class SignatureDefault(Signature):
                 userArgumentsInfo.rmsNormSize += 4
             signature.addArg("RMSNormGamma", SVK.SIG_GLOBALBUFFER, gammaValueType, "generic")
             signature.addArg("PartialBuf",   SVK.SIG_GLOBALBUFFER, "f32",          "generic")
-            userArgumentsInfo.rmsNormSize = 8 + 8  # gamma ptr + partialBuf ptr
+            userArgumentsInfo.rmsNormSize += 8 + 8  # gamma ptr + partialBuf ptr
             if kernel["PartialRMSResidualAdd"]:
                 resValueType = _partialRMSSideValueType(kernel.get("PartialRMSResidualType"))
                 signature.addArg("ResidualBuf", SVK.SIG_GLOBALBUFFER, resValueType, "generic")
@@ -423,6 +423,7 @@ class SignatureDefault(Signature):
             if "DeepseekScaleAPad" in writer.states.numStoreSgprNames:
                 signature.addArg("DeepseekScaleAPad", SVK.SIG_VALUE, "u32")
                 userArgumentsInfo.rmsNormSize += 4
+            writer.states.scaleABufKernArgOffset = signature.offset - userArgumentsInfo.commonArgsSize
             signature.addArg("ScaleABuf", SVK.SIG_GLOBALBUFFER, "f32", "generic")
             userArgumentsInfo.rmsNormSize += 8  # 8B scaleA ptr.
 
@@ -433,6 +434,7 @@ class SignatureDefault(Signature):
             if "DeepseekScaleBPad" in writer.states.numStoreSgprNames:
                 signature.addArg("DeepseekScaleBPad", SVK.SIG_VALUE, "u32")
                 userArgumentsInfo.rmsNormSize += 4
+            writer.states.scaleBBufKernArgOffset = signature.offset - userArgumentsInfo.commonArgsSize
             signature.addArg("ScaleBBuf", SVK.SIG_GLOBALBUFFER, "f32", "generic")
             userArgumentsInfo.rmsNormSize += 8  # 8B scaleB ptr.
 

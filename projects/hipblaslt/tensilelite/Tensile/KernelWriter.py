@@ -334,6 +334,8 @@ class StateValues:
   batchOffsetCKernArgOffset: int         = 0
   batchOffsetAKernArgOffset: int         = 0
   batchOffsetBKernArgOffset: int         = 0
+  scaleABufKernArgOffset: int            = 0
+  scaleBBufKernArgOffset: int            = 0
   numSgprAlpha: int                      = 0 # For user arguments
   numSgprBeta: int                       = 0 # For user arguments
   numStoreSgprNames: List[str]           = field(init=False) # For post-loop kernel args
@@ -10254,7 +10256,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
         storeSgprLoad += self.states.rpga
     if kernel["DQuantType"] == "Tile":
       # QuantScale: 64-bit pointer (2 SGPRs) for per-tile amax/448 output buffer.
-      if sum(self.states.numStoreSgprNameSizes) % 2:
+      if (self.states.numSgprToLoad + sum(self.states.numStoreSgprNameSizes)) % 2:
         self.states.numStoreSgprNames.append("TileQuantPad")
         self.states.numStoreSgprNameSizes.append(1)
         storeSgprLoad += 1
@@ -10274,7 +10276,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
       storeSgprLoad += self.states.rpga
     if kernel.get("UseDeepseekScaleA", False):
       # ScaleABuf: 64-bit pointer (2 SGPRs) for per-row fp32 A-dequantization scales.
-      if sum(self.states.numStoreSgprNameSizes) % 2:
+      if (self.states.numSgprToLoad + sum(self.states.numStoreSgprNameSizes)) % 2:
         self.states.numStoreSgprNames.append("DeepseekScaleAPad")
         self.states.numStoreSgprNameSizes.append(1)
         storeSgprLoad += 1
@@ -10283,7 +10285,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
       storeSgprLoad += self.states.rpga
     if kernel.get("UseDeepseekScaleB", False):
       # ScaleBBuf: 64-bit pointer (2 SGPRs) for per-128col-block fp32 B-dequantization scales.
-      if sum(self.states.numStoreSgprNameSizes) % 2:
+      if (self.states.numSgprToLoad + sum(self.states.numStoreSgprNameSizes)) % 2:
         self.states.numStoreSgprNames.append("DeepseekScaleBPad")
         self.states.numStoreSgprNameSizes.append(1)
         storeSgprLoad += 1
@@ -10291,21 +10293,6 @@ class KernelWriter(metaclass=abc.ABCMeta):
       self.states.numStoreSgprNameSizes.append(self.states.rpga)  # 2 SGPRs (64-bit ptr)
       storeSgprLoad += self.states.rpga
     self.states.numStoreSgprToLoad = storeSgprLoad
-
-
-    if self.states.useGateResidual:
-      self.states.numSgprAddressGate = self.states.rpga # 64-bit
-      self.states.numStoreSgprNames.append("AddressGate")
-      self.states.numStoreSgprNameSizes.append(self.states.numSgprAddressGate)
-      self.states.GateType   = 1
-      self.states.GateStride = self.states.gate.numSgprStrides
-      self.states.numStoreSgprNames.append("GateType")
-      self.states.numStoreSgprNameSizes.append(self.states.GateType)
-      self.states.numStoreSgprNames.append("GateStride")
-      self.states.numStoreSgprNameSizes.append(self.states.GateStride)
-      storeSgprLoad += self.states.numSgprAddressGate + self.states.GateType + self.states.GateStride
-  
-    self.states.numStoreSgprToLoad = storeSgprLoad      
     if self.db["InitLds"] : print ("\n***WARNING: InitLds enabled, may impact performance\n")
     if self.db["InitSgpr"] : print ("\n***WARNING: InitSgpr enabled, may impact performance\n")
     if self.db["InitVgpr"] : print ("\n***WARNING: InitVgpr enabled, may impact performance\n")
