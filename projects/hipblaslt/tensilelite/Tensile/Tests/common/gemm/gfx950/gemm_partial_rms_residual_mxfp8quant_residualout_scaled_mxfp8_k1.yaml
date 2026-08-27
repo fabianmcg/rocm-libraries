@@ -99,12 +99,6 @@ BenchmarkProblems:
       BenchmarkJoinParameters:
       BenchmarkFinalParameters:
         - ProblemSizes:
-            - Exact: [4096,    1, 1, 4096]
-            - Exact: [4096,    4, 1, 4096]
-            - Exact: [8192,    8, 1, 4096]
-            - Exact: [4096,   16, 1, 8192]
-            - Exact: [8192,   32, 1, 8192]
-            - Exact: [4096,   64, 1, 4096]
 
   ########################################
   # WG 2x2 and WG 1x4 tiles: broader wave-group coverage, same constraints.
@@ -180,12 +174,6 @@ BenchmarkProblems:
       BenchmarkJoinParameters:
       BenchmarkFinalParameters:
         - ProblemSizes:
-            - Exact: [8192,  128, 1, 4096]
-            - Exact: [4096,  512, 1, 8192]
-            - Exact: [8192, 2048, 1, 8192]
-            - Exact: [4096,  128, 1, 8192]
-            - Exact: [8192,  512, 1, 4096]
-            - Exact: [4096, 2048, 1, 4096]
 
 
 

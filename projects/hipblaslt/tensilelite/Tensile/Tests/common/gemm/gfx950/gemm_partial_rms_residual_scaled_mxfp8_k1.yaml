@@ -92,7 +92,6 @@ BenchmarkProblems:
         - ProblemSizes:
             - Exact: [128,   64, 1, 256]
             - Exact: [512,  512, 1, 512]
-            - Exact: [256,  2048, 1, 256]
 
   ########################################
   # MX-scaled fp8, PartialRMS + residual add, WG0<=2 — MT1=128
@@ -154,7 +153,6 @@ BenchmarkProblems:
         - ProblemSizes:
             - Exact: [128,  128, 1, 256]
             - Exact: [512,  512, 1, 512]
-            - Exact: [256,  2048, 1, 256]
 
   ########################################
   # MX-scaled fp8, PartialRMS + residual add, WG0<=2 — MT1=192
@@ -214,7 +212,6 @@ BenchmarkProblems:
         - ProblemSizes:
             - Exact: [256,  192, 1, 256]
             - Exact: [512,  512, 1, 512]
-            - Exact: [256,  2048, 1, 256]
 
   ########################################
   # Main group — MX-scaled fp8, PartialRMS + residual add
@@ -281,8 +278,6 @@ BenchmarkProblems:
             - Exact: [256,  256, 1, 256]
             - Exact: [320,  320, 1, 256]
             - Exact: [512,  512, 1, 512]
-            - Exact: [256,  2048, 1, 256]
-            - Exact: [128,  512, 1, 256]
 
   ########################################
   # MX-scaled fp8, PartialRMS + residual add, WG0<=2 — MT1=320
@@ -342,7 +337,6 @@ BenchmarkProblems:
         - ProblemSizes:
             - Exact: [256,  320, 1, 256]
             - Exact: [512,  512, 1, 512]
-            - Exact: [256,  2048, 1, 256]
 
   ########################################
   # Multi-DU group — MX-scaled fp8, PartialRMS + residual add

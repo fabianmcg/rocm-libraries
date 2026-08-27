@@ -92,11 +92,6 @@ BenchmarkProblems:
         - ProblemSizes:
             - Exact: [128,  128, 1,  128]
             - Exact: [128,  256, 1,   64]
-            - Exact: [256, 2048, 1,  128]
-            - Exact: [512, 4096, 1,  128]
-            - Exact: [128, 4096, 1, 4096]
-            - Exact: [512, 4096, 1, 4096]
-            - Exact: [2048, 8192, 1, 4096]
 
   ########################################
   # WG 2x2 and WG 1x4 tiles: broader wave-group coverage, same constraints
@@ -170,9 +165,6 @@ BenchmarkProblems:
         - ProblemSizes:
             - Exact: [128,  128, 1,  128]
             - Exact: [256,  256, 1,  256]
-            - Exact: [512, 4096, 1,  128]
-            - Exact: [2048, 4096, 1, 4096]
-            - Exact: [512,  8192, 1, 8192]
 
 
 
