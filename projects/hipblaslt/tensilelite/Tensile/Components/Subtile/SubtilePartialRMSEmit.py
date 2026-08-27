@@ -74,6 +74,7 @@ from rocisa.instruction import (
     SAndSaveExecB64,
     SMovB32,
     SMovB64,
+    SMulHIU32,
     SNop,
     SWaitCnt,
     VAccvgprReadB32,
@@ -118,6 +119,14 @@ _INLINE_CONST_MAX = 64
 _FP8_E4M3_MAX = 448.0        # OCP FP8 e4m3.
 _FP8_E4M3_FNUZ_MAX = 240.0   # FNUZ FP8 e4m3.
 _BF8_E5M2_MAX = 57344.0      # FP8 e5m2 (bf8).
+
+
+# Returns (magic, postShift) for unsigned floor-division by constant d via SMulHIU32.
+# floor(x/d) = mulhi(x, magic) >> postShift; for ceil-div pre-add (d-1). Valid for d >= 2.
+def _ceilDivMagic(d: int):
+    p = (d - 1).bit_length()          # smallest p such that 2^p >= d.
+    magic = -(-( 1 << (32 + p - 1)) // d)  # ceil(2^(32+p-1) / d), using integer ceiling.
+    return magic & 0xFFFFFFFF, p - 1  # postShift = p-1 (mulhi already shifts by 32).
 
 
 class SubtilePartialRMSEmitter:
@@ -797,27 +806,41 @@ class SubtilePartialRMSEmitter:
         self.writer.vgprPool.checkIn(rgV)
 
     def _computeNTiles(self, module, dst: int) -> None:
-        # n_d = ceil(SizesFree0 / MT0). Tensile MacroTiles are always power-of-two,
-        # so the ceil-div is a single shift; no magic-division path is needed.
-        mt0 = self.macro_tile0
-        assert (mt0 & (mt0 - 1)) == 0, "macroTile0 must be a power of two"
+        # n_d = ceil(SizesFree0 / MT0).
         with self.writer.allocTmpSgpr(1, tag="pRMS_wF0NTilesS") as ntilesS:
             module.add(SAddU32(dst=sgpr(ntilesS.idx), src0=sgpr("SizesFree+0"),
-                               src1=mt0 - 1, comment=f"N_hidden + MT0-1 (MT0={mt0})"))
-            module.add(SLShiftRightB32(dst=sgpr(ntilesS.idx), shiftHex=hex(mt0.bit_length() - 1),
-                                       src=sgpr(ntilesS.idx),
-                                       comment=f"n_d = ceil(SizesFree0 / MT0={mt0})"))
+                               src1=self.macro_tile0 - 1,
+                               comment=f"N_hidden + MT0-1 (MT0={self.macro_tile0})"))
+            mt0 = self.macro_tile0
+            if mt0 & (mt0 - 1) == 0:
+                module.add(SLShiftRightB32(dst=sgpr(ntilesS.idx), shiftHex=hex(mt0.bit_length() - 1),
+                                           src=sgpr(ntilesS.idx),
+                                           comment=f"n_d = ceil(SizesFree0 / MT0={mt0})"))
+            else:
+                magic, postShift = _ceilDivMagic(mt0)
+                module.add(SMulHIU32(dst=sgpr(ntilesS.idx), src0=sgpr(ntilesS.idx), src1=hex(magic),
+                                     comment=f"n_d magic mul (divisor={mt0})"))
+                if postShift:
+                    module.add(SLShiftRightB32(dst=sgpr(ntilesS.idx), shiftHex=hex(postShift),
+                                               src=sgpr(ntilesS.idx),
+                                               comment=f"n_d >> {postShift} (magic post-shift)"))
             module.add(VMovB32(dst=vgpr(dst), src=sgpr(ntilesS.idx), comment="ntilesV = n_d"))
 
     def _computeMPadded(self, module, dst: int) -> None:
-        # Tensile MacroTiles are always power-of-two, so ceil(M/MT1) is a shift.
         mt1 = self.macro_tile1
-        assert (mt1 & (mt1 - 1)) == 0, "macroTile1 must be a power of two"
         with self.writer.allocTmpSgpr(1, tag="pRMS_mPaddedS") as s:
             module.add(SAddU32(dst=sgpr(s.idx), src0=sgpr("SizesFree+1"), src1=mt1 - 1,
                                comment=f"M + MT1-1 (MT1={mt1})"))
-            module.add(SLShiftRightB32(dst=sgpr(s.idx), shiftHex=hex(mt1.bit_length() - 1),
-                                       src=sgpr(s.idx), comment=f"mTiles = ceil(M/MT1={mt1})"))
+            if mt1 & (mt1 - 1) == 0:
+                module.add(SLShiftRightB32(dst=sgpr(s.idx), shiftHex=hex(mt1.bit_length() - 1),
+                                           src=sgpr(s.idx), comment=f"mTiles = ceil(M/MT1={mt1})"))
+            else:
+                magic, postShift = _ceilDivMagic(mt1)
+                module.add(SMulHIU32(dst=sgpr(s.idx), src0=sgpr(s.idx), src1=hex(magic),
+                                     comment=f"mTiles magic mul (divisor={mt1})"))
+                if postShift:
+                    module.add(SLShiftRightB32(dst=sgpr(s.idx), shiftHex=hex(postShift),
+                                               src=sgpr(s.idx), comment=f"mTiles >> {postShift}"))
             module.add(SMulI32(dst=sgpr(s.idx), src0=sgpr(s.idx), src1=mt1,
                                comment=f"M_padded = mTiles * MT1({mt1})"))
             module.add(VMovB32(dst=vgpr(dst), src=sgpr(s.idx), comment="M_paddedV = M_padded"))
