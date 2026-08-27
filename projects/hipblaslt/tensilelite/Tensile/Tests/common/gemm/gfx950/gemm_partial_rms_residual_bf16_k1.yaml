@@ -154,7 +154,7 @@ BenchmarkProblems:
         - ProblemSizes:
             - Exact: [128,  128, 1,  128]
             - Exact: [320,  320, 1,  128]
-            - Exact: [512,  512, 1,  512]
+            - Exact: [640, 640, 1,  512]
 
   ########################################
   # Main — DepthU=64, PGR=[0,1,2], MT1=192, WG0<=2
@@ -276,7 +276,7 @@ BenchmarkProblems:
         - ProblemSizes:
             - Exact: [256,  256, 1,  256]
             - Exact: [320,  320, 1,  128]
-            - Exact: [512,  512, 1,  512]
+            - Exact: [640, 640, 1,  512]
 
   ########################################
   # Main — DepthU=64, PGR=[0,1,2], MT1=320, WG0<=2
@@ -628,6 +628,7 @@ BenchmarkProblems:
         - ProblemSizes:
             - Exact: [512,  512, 1, 384]
             - Exact: [320,  320, 1, 384]
+            - Exact: [640, 640, 1,  512]
 
 
 

@@ -111,7 +111,7 @@ BenchmarkProblems:
         - ProblemSizes:
             - Exact: [128,  128, 1, 256]
             - Exact: [256,  128, 1, 256]
-            - Exact: [512,  128, 1, 256]
+            - Exact: [640, 640, 1, 256]
 
 LibraryLogic:
   ScheduleName: "mxfp8_dynquant_32x1_scaled_mxfp8_k1"
