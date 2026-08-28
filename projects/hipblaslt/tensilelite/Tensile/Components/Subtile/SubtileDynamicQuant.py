@@ -1053,31 +1053,37 @@ class SubtileMXFP8QuantEmitter(SubtileDynamicQuant):
                                comment=f"scaleByte[{slot}] = 0 if amax==0."))
         self.writer.sgprPool.checkIn(zeroMask)
 
-    def _tileByteOffset(self, module, addrV: int, tmpV: int, tmp2V: int, nQTN: int,
+    def _tileByteOffset(self, module, addrV: int, tmpV: int, tmp2V: int, nQTM: int,
                          qi: int, qj: int, waveM, waveN) -> None:
-        """Compute GFX950 pre-swizzled MXScale byte offset into addrV."""
+        """Compute GFX950 pre-swizzled MXScale byte offset into addrV.
+
+        The swizzle 32-row group is the free/token dim (WG1/N) and the 8-col group
+        is the kblock dim (WG0/M); the d0 stride uses the kblock tile count nQTM.
+        """
         nQTilesMPerWG = self.nQTilesM * self.wgM
         nQTilesNPerWG = self.nQTilesN * self.wgN
-        self._mulVgprBySgprConst(module, addrV, "WorkGroup0", nQTilesMPerWG,
-                                 "WG0 * nQTilesMPerWG.")
-        if waveM is not None:
-            module.add(VMulLOU32(dst=vgpr(tmp2V), src0=vgpr(waveM), src1=self.nQTilesM,
-                                 comment="waveM * nQTilesM."))
-            module.add(VAddU32(vgpr(addrV), vgpr(addrV), vgpr(tmp2V),
-                               comment="+ waveM * nQTilesM."))
-        if qi:
-            module.add(VAddU32(vgpr(addrV), vgpr(addrV), qi, comment=f"qTileRow += {qi}."))
-        self._mulVgprBySgprConst(module, tmpV, "WorkGroup1", nQTilesNPerWG,
+        # addrV = qTileFree (token, swizzle row) = WG1 * nQTilesNPerWG + waveN*nQTilesN + qj.
+        self._mulVgprBySgprConst(module, addrV, "WorkGroup1", nQTilesNPerWG,
                                  "WG1 * nQTilesNPerWG.")
         if waveN is not None:
             module.add(VMulLOU32(dst=vgpr(tmp2V), src0=vgpr(waveN), src1=self.nQTilesN,
                                  comment="waveN * nQTilesN."))
-            module.add(VAddU32(vgpr(tmpV), vgpr(tmpV), vgpr(tmp2V),
+            module.add(VAddU32(vgpr(addrV), vgpr(addrV), vgpr(tmp2V),
                                comment="+ waveN * nQTilesN."))
         if qj:
-            module.add(VAddU32(vgpr(tmpV), vgpr(tmpV), qj, comment=f"qTileCol += {qj}."))
-        # addrV = qTileRow, tmpV = qTileCol -> GFX950 pre-swizzled byte offset.
-        self._swizzleTileByteOffset(module, addrV, tmpV, nQTN)
+            module.add(VAddU32(vgpr(addrV), vgpr(addrV), qj, comment=f"qTileFree += {qj}."))
+        # tmpV = qTileKblk (kblock, swizzle col) = WG0 * nQTilesMPerWG + waveM*nQTilesM + qi.
+        self._mulVgprBySgprConst(module, tmpV, "WorkGroup0", nQTilesMPerWG,
+                                 "WG0 * nQTilesMPerWG.")
+        if waveM is not None:
+            module.add(VMulLOU32(dst=vgpr(tmp2V), src0=vgpr(waveM), src1=self.nQTilesM,
+                                 comment="waveM * nQTilesM."))
+            module.add(VAddU32(vgpr(tmpV), vgpr(tmpV), vgpr(tmp2V),
+                               comment="+ waveM * nQTilesM."))
+        if qi:
+            module.add(VAddU32(vgpr(tmpV), vgpr(tmpV), qi, comment=f"qTileKblk += {qi}."))
+        # addrV = qTileFree (row), tmpV = qTileKblk (col) -> GFX950 pre-swizzled byte offset.
+        self._swizzleTileByteOffset(module, addrV, tmpV, nQTM)
 
     def _swizzleRowBits(self, module, rowV: int, lowV: int, tmpV: int) -> None:
         """Write d2<<2 | d1 into lowV using rowV; clobbers tmpV. rowV is not modified."""
@@ -1152,43 +1158,50 @@ class SubtileMXFP8QuantEmitter(SubtileDynamicQuant):
         self.writer.vgprPool.checkIn(sLow)
 
     def _tileByteOffsetSubRow(self, module, addrV: int, tmpV: int, tmp2V: int,
-                               nQTN: int, m: int, kBlock: int, qj: int,
+                               nQTM: int, m: int, kBlock: int, qj: int,
                                rowGroup: int, waveM, waveN) -> None:
-        """Compute GFX950 pre-swizzled MXScale byte offset for sub-row tile (m, kBlock, qj) into addrV."""
+        """Compute GFX950 pre-swizzled MXScale byte offset for sub-row tile (m, kBlock, qj) into addrV.
+
+        The swizzle 32-row group is the free/token dim (WG1/N) and the 8-col group is
+        the kblock dim (WG0/M, sub-divided per rowGroup); the d0 stride uses nQTM.
+        """
         nQTilesMPerWG = self.nQTilesM * self.wgM
         nQTilesNPerWG = self.nQTilesN * self.wgN
         constRow = m * self.tilesPerMfmaM + kBlock
-        self._mulVgprBySgprConst(module, addrV, "WorkGroup0", nQTilesMPerWG,
-                                  "WG0 * nQTilesMPerWG.")
-        if waveM is not None:
-            module.add(VMulLOU32(dst=vgpr(tmp2V), src0=vgpr(waveM), src1=self.nQTilesM,
-                                 comment="waveM * nQTilesM."))
-            module.add(VAddU32(vgpr(addrV), vgpr(addrV), vgpr(tmp2V),
-                               comment="+ waveM * nQTilesM."))
-        module.add(VMulLOU32(dst=vgpr(tmp2V), src0=vgpr(rowGroup),
-                             src1=self.kBlocksPerLane,
-                             comment=f"rowGroup * kBlocksPerLane={self.kBlocksPerLane}."))
-        module.add(VAddU32(vgpr(addrV), vgpr(addrV), vgpr(tmp2V),
-                           comment="+ rowGroup * kBlocksPerLane."))
-        if constRow:
-            module.add(VAddU32(vgpr(addrV), vgpr(addrV), constRow,
-                               comment=f"qTileRow += constRow={constRow}."))
-        self._mulVgprBySgprConst(module, tmpV, "WorkGroup1", nQTilesNPerWG,
+        # addrV = qTileFree (token, swizzle row) = WG1 * nQTilesNPerWG + waveN*nQTilesN + qj.
+        self._mulVgprBySgprConst(module, addrV, "WorkGroup1", nQTilesNPerWG,
                                   "WG1 * nQTilesNPerWG.")
         if waveN is not None:
             module.add(VMulLOU32(dst=vgpr(tmp2V), src0=vgpr(waveN), src1=self.nQTilesN,
                                  comment="waveN * nQTilesN."))
-            module.add(VAddU32(vgpr(tmpV), vgpr(tmpV), vgpr(tmp2V),
+            module.add(VAddU32(vgpr(addrV), vgpr(addrV), vgpr(tmp2V),
                                comment="+ waveN * nQTilesN."))
         if qj:
-            module.add(VAddU32(vgpr(tmpV), vgpr(tmpV), qj, comment=f"qTileCol += {qj}."))
-        # addrV = qTileRow, tmpV = qTileCol -> GFX950 pre-swizzled byte offset.
-        self._swizzleTileByteOffset(module, addrV, tmpV, nQTN)
+            module.add(VAddU32(vgpr(addrV), vgpr(addrV), qj, comment=f"qTileFree += {qj}."))
+        # tmpV = qTileKblk (kblock, swizzle col) = WG0 * nQTilesMPerWG + waveM*nQTilesM
+        #        + rowGroup*kBlocksPerLane + constRow.
+        self._mulVgprBySgprConst(module, tmpV, "WorkGroup0", nQTilesMPerWG,
+                                  "WG0 * nQTilesMPerWG.")
+        if waveM is not None:
+            module.add(VMulLOU32(dst=vgpr(tmp2V), src0=vgpr(waveM), src1=self.nQTilesM,
+                                 comment="waveM * nQTilesM."))
+            module.add(VAddU32(vgpr(tmpV), vgpr(tmpV), vgpr(tmp2V),
+                               comment="+ waveM * nQTilesM."))
+        module.add(VMulLOU32(dst=vgpr(tmp2V), src0=vgpr(rowGroup),
+                             src1=self.kBlocksPerLane,
+                             comment=f"rowGroup * kBlocksPerLane={self.kBlocksPerLane}."))
+        module.add(VAddU32(vgpr(tmpV), vgpr(tmpV), vgpr(tmp2V),
+                           comment="+ rowGroup * kBlocksPerLane."))
+        if constRow:
+            module.add(VAddU32(vgpr(tmpV), vgpr(tmpV), constRow,
+                               comment=f"qTileKblk += constRow={constRow}."))
+        # addrV = qTileFree (row), tmpV = qTileKblk (col) -> GFX950 pre-swizzled byte offset.
+        self._swizzleTileByteOffset(module, addrV, tmpV, nQTM)
 
     def _writeTileStore(self, module, qi: int, qj: int, mxSrd: int,
                          quantMultVgprs: int, col: int, rowGroup: int,
                          savedExec: int, laneMask: int,
-                         addrV: int, tmpV: int, tmp2V: int, nQTN: int,
+                         addrV: int, tmpV: int, tmp2V: int, nQTN: int, nQTM: int,
                          waveM, waveN) -> None:
         """Predicated write of one MXScale byte for quant tile (qi, qj)."""
         lsc    = self.laneSgprCount
@@ -1200,7 +1213,7 @@ class SubtileMXFP8QuantEmitter(SubtileDynamicQuant):
                                  tmpV, tmp2V, waveN, qj, nQTN, laneMask)
         module.add(SAndSaveExecB64(dst=sgpr(savedExec, lsc), src=sgpr(laneMask, lsc),
                                    comment="save exec; set exec = write-lane mask."))
-        self._tileByteOffset(module, addrV, tmpV, tmp2V, nQTN, qi, qj, waveM, waveN)
+        self._tileByteOffset(module, addrV, tmpV, tmp2V, nQTM, qi, qj, waveM, waveN)
         scaleByteV = self.writer.vgprPool.checkOut(1, tag="mx_sbTmp")
         self._computeScaleByteInline(module, slot, quantMultVgprs, scaleByteV)
         module.add(BufferStoreB8(
@@ -1229,7 +1242,7 @@ class SubtileMXFP8QuantEmitter(SubtileDynamicQuant):
                                    tmpV, tmp2V, waveM, waveN, nQTN, nQTM, laneMask)
         module.add(SAndSaveExecB64(dst=sgpr(savedExec, lsc), src=sgpr(laneMask, lsc),
                                    comment="save exec; set exec = write-lane mask."))
-        self._tileByteOffsetSubRow(module, addrV, tmpV, tmp2V, nQTN,
+        self._tileByteOffsetSubRow(module, addrV, tmpV, tmp2V, nQTM,
                                    m, kBlock, qj, rowGroup, waveM, waveN)
         scaleByteV = self.writer.vgprPool.checkOut(1, tag="mx_sbTmp")
         self._computeScaleByteInline(module, slot, quantMultVgprs, scaleByteV)
@@ -1251,18 +1264,21 @@ class SubtileMXFP8QuantEmitter(SubtileDynamicQuant):
         tmpV  = self.writer.vgprPool.checkOut(1, tag="mx_wsTmp")
         tmp2V = self.writer.vgprPool.checkOut(1, tag="mx_wsTmp2")
         nQTN  = self.writer.vgprPool.checkOut(1, tag="mx_nQTN")
+        nQTM  = self.writer.vgprPool.checkOut(1, tag="mx_nQTM")
         self._computeTotalQTilesN(module, nQTN)
+        self._computeTotalQTilesM(module, nQTM)
         waveM, waveN = self._computeWaveIndices(module)
         for qj in range(self.nQTilesN):
             for qi in range(self.nQTilesM):
                 self._writeTileStore(module, qi, qj, mxSrd, quantMultVgprs,
                                      col, rowGroup, savedExec, laneMask,
-                                     addrV, tmpV, tmp2V, nQTN, waveM, waveN)
+                                     addrV, tmpV, tmp2V, nQTN, nQTM, waveM, waveN)
         module.add(SWaitCnt(vscnt=0, comment="wait MXScale stores."))
         if waveN is not None:
             self.writer.vgprPool.checkIn(waveN)
         if waveM is not None:
             self.writer.vgprPool.checkIn(waveM)
+        self.writer.vgprPool.checkIn(nQTM)
         self.writer.vgprPool.checkIn(nQTN)
         self.writer.vgprPool.checkIn(tmp2V)
         self.writer.vgprPool.checkIn(tmpV)
