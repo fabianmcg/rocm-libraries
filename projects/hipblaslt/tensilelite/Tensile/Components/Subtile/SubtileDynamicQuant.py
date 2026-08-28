@@ -1121,11 +1121,12 @@ class SubtileMXFP8QuantEmitter(SubtileDynamicQuant):
         module.add(VLShiftLeftB32(dst=vgpr(strideV), shiftHex=hex(8), src=vgpr(strideV),
                                   comment="d0 stride = colBlocks * 256."))
 
-    def _swizzleTileByteOffset(self, module, addrV: int, colV: int, nQTN: int,
+    def _swizzleTileByteOffset(self, module, addrV: int, colV: int, nColTiles: int,
                                 strideV: int = None, colLowV: int = None) -> None:
         """Overwrite addrV with the GFX950 pre-swizzled MXScale byte offset.
 
-        addrV holds qTileRow, colV holds qTileCol. When strideV is given it is a
+        addrV holds the free/token tile index (swizzle row bits d0/d1/d2) and colV holds
+        the kblock tile index (swizzle col bits d3/d4/d5). When strideV is given it is a
         persistent register holding the loop-invariant d0 stride and must not be clobbered.
         byteOff = d0*(colBlocks*256) + d3*256 + d5*64 + d2*4 + d4*2 + d1.
         When colLowV is given it holds the precomputed col-swizzle bits (invariant
@@ -1136,7 +1137,7 @@ class SubtileMXFP8QuantEmitter(SubtileDynamicQuant):
         ownStride = strideV is None
         if ownStride:
             strideV = self.writer.vgprPool.checkOut(1, tag="mx_swzStride")
-            self._computeSwizzleStride(module, strideV, nQTN)
+            self._computeSwizzleStride(module, strideV, nColTiles)
         # d0*stride survives the swizzle bit-mixing, so it needs a register the mixing does not touch.
         d0Prod = strideV if ownStride else self.writer.vgprPool.checkOut(1, tag="mx_swzD0")
         module.add(VLShiftRightB32(dst=vgpr(sTmp), shiftHex=hex(5), src=vgpr(addrV),
@@ -1220,7 +1221,7 @@ class SubtileMXFP8QuantEmitter(SubtileDynamicQuant):
             src=vgpr(scaleByteV), vaddr=vgpr(addrV),
             saddr=sgpr(mxSrd, 4), soffset=0,
             mubuf=MUBUFModifiers(offen=True),
-            comment=f"MXScale[qTileRow, qTileCol] byte (qi={qi}, qj={qj})."))
+            comment=f"MXScale[token=free, kblock] byte (qi={qi}, qj={qj})."))
         self.writer.vgprPool.checkIn(scaleByteV)
         module.add(SMovB64(dst=EXEC(), src=sgpr(savedExec, lsc),
                            comment="restore exec mask."))
