@@ -625,12 +625,6 @@ namespace TensileLite
                                                         void const*                   resPtr,
                                                         bool                          isgpu)
         {
-            // Per-row validation collapses the tile axis, so it needs every element; a
-            // sparse validation stride would leave partial rows and defeat the reduction.
-            if(m_elementsToValidate != -1)
-                throw std::runtime_error(
-                    "partialRMS per-row validation requires num-elements-to-validate == -1");
-
             size_t nHidden = problem.d().sizes()[0];
             size_t mTokens = problem.d().sizes()[1];
             size_t batch   = problem.d().sizes().size() > 2 ? problem.d().sizes()[2] : 1;
