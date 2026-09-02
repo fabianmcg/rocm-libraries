@@ -861,7 +861,12 @@ class SubtilePartialRMSEmitter:
         module.add(SWaitCnt(dscnt=0, comment="wait LDS writes."))
         module.add(self.writer._syncThreads(self.kernel, "partialRMS free0 cross-wave write."))
         self._crossWaveLoadReduce(module, readAddr, readTmp, arrays, strideW)
-        module.add(self.writer._syncThreads(self.kernel, "partialRMS free0 cross-wave done."))
+        # Non-quant epilogue has no further LDS use after this point, so the
+        # post-read WAR barrier is unnecessary; the next persistent-loop tile's
+        # main loop re-barriers before its own first LDS write.  The quant path
+        # retains it defensively because the amax epilogue could acquire LDS use.
+        if self.quant:
+            module.add(self.writer._syncThreads(self.kernel, "partialRMS free0 cross-wave done."))
         self.writer.vgprPool.checkIn(readTmp)
         self.writer.vgprPool.checkIn(readAddr)
         self.writer.vgprPool.checkIn(writeAddr)

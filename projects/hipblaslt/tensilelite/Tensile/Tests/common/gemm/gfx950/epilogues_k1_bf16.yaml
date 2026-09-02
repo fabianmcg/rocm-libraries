@@ -59,8 +59,6 @@ BenchmarkProblems:
       UsePartialRMS: True
       PartialRMSResidualAdd: True
       PartialRMSStoreBf16D: True
-      PartialRMSQuant: False
-      DQuantType: MXFP8
 
     ########################################
     # Size group 1 (idx 00): WG 1x1 and WG 2x1 tiles.

@@ -1,14 +1,15 @@
 # Copyright Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier: MIT
 
-# PartialRMS + ResidualAdd (K1), bf16 in / bf16 out: comprehensive tile/prefetch
-# coverage. The fused K1 epilogue computes h_eff = h1 + residual, writes
-# D = h_eff * gamma (bf16) and the per-row partial sum-of-squares partialBuf
-# (f32) in a single sweep; a second-stage kernel normalises D in place. No fp8
-# output and no MXFP8 dynamic quant — this is the pure bf16 RMSNorm variant.
+# Isolated top-performing solution from epilogues_bf16_k1.yaml on gfx950 for the
+# bf16-in / bf16-out PartialRMS + ResidualAdd RMSNorm epilogue (no fp8, no MXFP8
+# quant). The fused K1 epilogue computes h_eff = h1 + residual, writes
+# D = h_eff * gamma (bf16) and the per-row partial sum-of-squares partialBuf (f32).
 #
-# The tile sweep lives in ONE BenchmarkProblemSizeGroup under ONE ProblemType.
-# Results file is named "{ProblemType}_{sizeGroupIdx:02d}.csv".
+# Winner tile (full bf16 sweep at 8192x8192x1x8192): MT 384x256x64, MI 16x16x32,
+# MIWaveTile [12,8], MIWaveGroup [2,2], WorkGroup [32,8,1], PrefetchGlobalRead=2,
+# DepthU=64, StreamK=3 -> ~1,339,800 GFlops. KeepBuildTmp retains the generated
+# assembly for ASM comparison against the no-epilogue baseline.
 
 TestParameters:
   marks: [skip-gfx900, skip-gfx906, skip-gfx908, skip-gfx90a, skip-gfx940, skip-gfx941, skip-gfx942, skip-gfx1010, skip-gfx1011, skip-gfx1012, skip-gfx1030, skip-gfx1100, skip-gfx1101, skip-gfx1102, skip-gfx1200, skip-gfx1201, skip-gfx1250]
@@ -18,13 +19,11 @@ GlobalParameters:
   NumElementsToValidate: 0
   ExitOnFails: 0
   PrintSolutionRejectionReason: True
+  KernelTime: True
+  KeepBuildTmp: True
 
 BenchmarkProblems:
 
-  ########################################
-  # bf16 in, bf16 out — PartialRMS + ResidualAdd (no fp8, no MXFP8 quant)
-  # DepthU=64, PGR=[1,2].
-  ########################################
   -
     - # ProblemType — bf16 in, bf16 out, f32 compute, residual add
       OperationType: GEMM
@@ -46,27 +45,14 @@ BenchmarkProblems:
       Sparse: 0
       UsePartialRMS: True
       PartialRMSResidualAdd: True
+      PartialRMSStoreBf16D: True
 
     - InitialSolutionParameters:
       BenchmarkCommonParameters:
         - KernelLanguage: ["Assembly"]
       ForkParameters:
         - MatrixInstruction:
-            # WG 1x1
-            - [16, 16, 32, 1, 1,  4,  8, 1, 1]  # MT0=64   MT1=128
-            - [16, 16, 32, 1, 1,  8,  8, 1, 1]  # MT0=128  MT1=128
-            - [16, 16, 32, 1, 1, 12,  8, 1, 1]  # MT0=192  MT1=128
-            - [16, 16, 32, 1, 1, 16,  8, 1, 1]  # MT0=256  MT1=128
-            # WG 2x1
-            - [16, 16, 32, 1, 1,  2,  8, 2, 1]  # MT0=64   MT1=128
-            - [16, 16, 32, 1, 1,  4,  8, 2, 1]  # MT0=128  MT1=128
-            - [16, 16, 32, 1, 1,  6,  8, 2, 1]  # MT0=192  MT1=128
-            - [16, 16, 32, 1, 1,  8,  8, 2, 1]  # MT0=256  MT1=128
-            # WG 2x2
-            - [16, 16, 32, 1,  1, 8, 8,  2, 2]  # MT 256x256
-            - [16, 16, 32, 1,  1, 12, 8, 2, 2]  # MT 384x256 (large asymmetric)
-            - [16, 16, 32, 1,  1, 10, 10, 2, 2] # MT 320x320 (large symmetric)
-            - [16, 16, 32, 1,  1, 8, 12, 2, 2]  # MT 256x384 (large asymmetric)
+            - [16, 16, 32, 1,  1, 12, 8, 2, 2]  # MT 384x256 (winner)
         - PartialRMS: [True]
         - PartialRMSResidualAdd: [True]
         - StreamK: [3]
@@ -74,7 +60,7 @@ BenchmarkProblems:
         - StreamKAtomic: [0]
         - GlobalSplitU: [1]
         - ScheduleIterAlg: [3]
-        - PrefetchGlobalRead: [1, 2]
+        - PrefetchGlobalRead: [2]
         - PrefetchAcrossPersistent: [0]
         - DirectToLds: [1]
         - UseSubtileImpl: [True]
@@ -93,7 +79,7 @@ BenchmarkProblems:
             - Exact: [8192,  8192, 1, 8192]
 
 LibraryLogic:
-  ScheduleName: "partialrms_residualadd_bf16_comprehensive_k1"
+  ScheduleName: "partialrms_residualadd_bf16_winner_k1"
   DeviceNames: ["Device 75a0", "Device 75b0", "Device 75a2", "Device 75b2", "Device 75a3", "Device 75b3", "Device 75a8", "Device 75b8"]
   ArchitectureName: "gfx950"
   LibraryType: "Prediction"
