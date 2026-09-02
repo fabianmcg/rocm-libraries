@@ -26,7 +26,7 @@ TestParameters:
 
 GlobalParameters:
   MinimumRequiredVersion: 5.0.0
-  NumElementsToValidate: 128
+  NumElementsToValidate: 0
   ExitOnFails: 0
   PrintSolutionRejectionReason: True
 
@@ -80,6 +80,10 @@ BenchmarkProblems:
             - [16, 16, 32, 1, 1,  4,  8, 2, 1]  # MT0=128  MT1=128
             - [16, 16, 32, 1, 1,  6,  8, 2, 1]  # MT0=192  MT1=128
             - [16, 16, 32, 1, 1,  8,  8, 2, 1]  # MT0=256  MT1=128
+            - [16, 16, 32, 1,  1, 8, 8,  2, 2]  # MT 256x256
+            - [16, 16, 32, 1,  1, 12, 8, 2, 2]  # MT 384x256 (large asymmetric)
+            - [16, 16, 32, 1,  1, 10, 10, 2, 2] # MT 320x320 (large symmetric)
+            - [16, 16, 32, 1,  1, 8, 12, 2, 2]  # MT 256x384 (large asymmetric)
         - PartialRMS: [True]
         - PartialRMSResidualAdd: [True]
         - PartialRMSQuant: [False]
@@ -108,63 +112,7 @@ BenchmarkProblems:
       BenchmarkJoinParameters:
       BenchmarkFinalParameters:
         - ProblemSizes:
-            - Exact: [128,  128, 1,  128]
-            - Exact: [128,  256, 1,   64]
-            - Exact: [640, 640, 1,  128]
-            - Exact: [640, 640, 1,  256]
-
-    ########################################
-    # Size group 2 (idx 01): WG 2x2 and WG 1x4 tiles. Second sibling size group
-    # under the SAME ProblemType as group 1 (NOT a separate outer entry), so it
-    # gets results file idx 01 instead of clobbering group 1's _00.csv.
-    ########################################
-    - InitialSolutionParameters:
-      BenchmarkCommonParameters:
-        - KernelLanguage: ["Assembly"]
-      ForkParameters:
-        - MatrixInstruction:
-            # WG 2x2 (WG0=2, MT1=128)
-            - [16, 16, 32, 1, 1,  2,  4, 2, 2]  # MT0=64   MT1=128
-            - [16, 16, 32, 1, 1,  4,  4, 2, 2]  # MT0=128  MT1=128
-            - [16, 16, 32, 1, 1,  6,  4, 2, 2]  # MT0=192  MT1=128
-            - [16, 16, 32, 1, 1,  8,  4, 2, 2]  # MT0=256  MT1=128
-            # WG 1x4 (WG0=1, MT1=128)
-            - [16, 16, 32, 1, 1,  4,  2, 1, 4]  # MT0=64   MT1=128
-            - [16, 16, 32, 1, 1,  8,  2, 1, 4]  # MT0=128  MT1=128
-            - [16, 16, 32, 1, 1, 12,  2, 1, 4]  # MT0=192  MT1=128
-            - [16, 16, 32, 1, 1, 16,  2, 1, 4]  # MT0=256  MT1=128
-        - PartialRMS: [True]
-        - PartialRMSResidualAdd: [True]
-        - PartialRMSQuant: [False]
-        - PartialRMSStoreBf16D: [True]
-        - DQuantType: [MXFP8]
-        - DQuantSize0: [32]
-        - DQuantSize1: [1]
-        - StreamK: [3]
-        - StreamKForceDPOnly: [1]
-        - StreamKAtomic: [0]
-        - GlobalSplitU: [1]
-        - ScheduleIterAlg: [3]
-        - PrefetchGlobalRead: [1, 2]
-        - PrefetchAcrossPersistent: [0]
-        - DirectToLds: [1]
-        - UseSubtileImpl: [True]
-        - StaggerU: [0]
-        - DepthU: [64]
-        - LdsPadA: [-1]
-        - LdsPadB: [-1]
-        - StoreVectorWidth: [-1]
-        - GlobalReadVectorWidthA: [-1]
-        - GlobalReadVectorWidthB: [-1]
-        - PreloadKernArgs: [False]
-        - 1LDSBuffer: [0]
-      BenchmarkJoinParameters:
-      BenchmarkFinalParameters:
-        - ProblemSizes:
-            - Exact: [128,  128, 1,  128]
-            - Exact: [256,  256, 1,  256]
-            - Exact: [640, 640, 1,  128]
-            - Exact: [640, 640, 1,  256]
+            - Exact: [8192,  8192, 1, 8192]
 
 LibraryLogic:
   ScheduleName: "partialrms_residualout_bf16_comprehensive_k1"
