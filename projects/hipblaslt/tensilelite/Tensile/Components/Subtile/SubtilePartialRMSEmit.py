@@ -611,9 +611,9 @@ class SubtilePartialRMSEmitter:
         self.writer.vgprPool.checkIn(self._roTokenBase)
 
     def _computeBf16NhByte(self, module, m: int, k: int) -> None:
-        """Compute the nhidden byte offset and OOB mask for element (m, k)."""
-        self._free0RowPos(module, self._roNhByte, self._storeWgRowBase, self._storeRowGroupOff,
-                          m, k, self._roAddr)
+        """Compute the nhidden byte offset and OOB mask for element (m, k) from the shared nhBase."""
+        self._addImmU32(module, self._roNhByte, self._nhBaseV, k, self._roAddr,
+                        f"nhidden_pos = nhBase + {k} (m={m},k={k}).")
         module.add(VCmpLtU32(dst=sgpr(self._roOobMask, self.lane_sgpr_count),
                              src0=vgpr(self._roNhByte), src1=sgpr("SizesFree+0"),
                              comment="inRange = nhidden_pos < N_hidden."))
@@ -676,21 +676,18 @@ class SubtilePartialRMSEmitter:
                 self._storeBf16Elem(module, resBurst + n * self.rows_per_lane + k, n)
 
     def _setupBf16WideNhMask(self, module, m: int) -> None:
-        """Compute nhidden base, whole-group OOB mask, and nhByte for wide bf16 row m."""
+        """Compute whole-group OOB mask and nhByte for wide bf16 row m from the shared nhBase."""
         rpl = self.rows_per_lane
         lsc = self.lane_sgpr_count
-        # nhidden base for k=0 (rows_per_lane-aligned), shared by all n of this m.
-        self._free0RowPos(module, self._roNhByte, self._storeWgRowBase,
-                          self._storeRowGroupOff, m, 0, self._roAddr)
         # Whole-group nhidden mask: in range iff the last element (k=rpl-1) < N_hidden.
-        self._addImmU32(module, self._roAddr, self._roNhByte, rpl - 1, self._roAddr,
-                        f"nhiddenLast = nhiddenBase + {rpl - 1}.")
+        self._addImmU32(module, self._roAddr, self._nhBaseV, rpl - 1, self._roAddr,
+                        f"nhiddenLast = nhBase + {rpl - 1}.")
         module.add(VCmpLtU32(dst=sgpr(self._roOobMask, lsc), src0=vgpr(self._roAddr),
                              src1=sgpr("SizesFree+0"),
                              comment="group in range = nhiddenLast < N_hidden."))
         module.add(VLShiftLeftB32(dst=vgpr(self._roNhByte), shiftHex=hex(1),
-                                  src=vgpr(self._roNhByte),
-                                  comment="nhByte = nhiddenBase * 2 (bf16)."))
+                                  src=vgpr(self._nhBaseV),
+                                  comment="nhByte = nhBase * 2 (bf16)."))
 
     def _storeBf16WideElem(self, module, resBurst: int, m: int, n: int) -> None:
         """Pack and store rows_per_lane bf16 values for element (m, n) via buffer_store_dwordx2."""
@@ -1041,15 +1038,16 @@ class SubtilePartialRMSEmitter:
         return module
 
     def _issueGammaLoads(self, module, gammaSrd: int, gammaBurst: int, gammaByteVgpr: int,
-                         rowGroupOff: int, wgRowBase: int, scratch: int, m: int) -> None:
+                         m: int) -> None:
         """Issue all rows_per_lane gamma loads for tile row m (no wait; batched with residual)."""
         for k in range(self.rows_per_lane):
-            self._free0RowPos(module, gammaByteVgpr, wgRowBase, rowGroupOff, m, k, scratch)
+            self._addImmU32(module, gammaByteVgpr, self._nhBaseV, k, gammaByteVgpr,
+                            f"nhidden = nhBase + {k} (m={m},k={k}).")
             module.add(VLShiftLeftB32(dst=vgpr(gammaByteVgpr), shiftHex=hex(self.gammaLog2Bytes),
                                       src=vgpr(gammaByteVgpr),
-                                      comment="gammaByte = globalRow * gammaBytes."))
+                                      comment="gammaByte = nhidden * gammaBytes."))
             self._issueSideLoad(module, gammaBurst + k, gammaByteVgpr, gammaSrd,
-                                f"gamma[globalRow] (m={m},k={k}).", dtype=self.gammaType)
+                                f"gamma[nhidden] (m={m},k={k}).", dtype=self.gammaType)
 
     def _convertGammaRow(self, module, gammaBurst: int) -> None:
         for k in range(self.rows_per_lane):
@@ -1069,18 +1067,14 @@ class SubtilePartialRMSEmitter:
         module.add(VLShiftRightB32(dst=vgpr(self._resTokenBase), shiftHex=hex(self.log2ElemBytes),
                                    src=vgpr(self.colByte),
                                    comment="tokenBase = colByte >> log2ElemBytes."))
-        if self.useWideResidual:
-            self._resNBaseV = self.writer.vgprPool.checkOut(1, tag="pRMS_fusResNBase")
-        else:
+        if not self.useWideResidual:
             self._resOobV = self.writer.vgprPool.checkOut(1, tag="pRMS_fusResOob")
             module.add(VMovB32(dst=vgpr(self._resOobV), src="BufferOOB",
                                comment="OOB byte offset -> residual load returns 0."))
         return self._resBurst
 
     def _endResidual(self) -> None:
-        if self.useWideResidual:
-            self.writer.vgprPool.checkIn(self._resNBaseV)
-        else:
+        if not self.useWideResidual:
             self.writer.vgprPool.checkIn(self._resOobV)
         self.writer.sgprPool.checkIn(self._resOobMask)
         self.writer.vgprPool.checkIn(self._resTokenBase)
@@ -1105,11 +1099,10 @@ class SubtilePartialRMSEmitter:
     def _issueResidualLoadsWide(self, module, m: int, resBurst: int, wgRowBase: int,
                                 rowGroupOff: int, scratch: int) -> None:
         rpl = self.rows_per_lane
-        # nhidden base for k=0, kept in _resNBaseV for the convert OOB masks. It is
-        # 4-aligned (MT0, mfma_m, rows_per_lane are all multiples of 4 for the 16x16
-        # geometry), so each wide load reads 4 contiguous residual elements: fp8/bf8
-        # as one dword, bf16 as one dwordx2.
-        self._free0RowPos(module, self._resNBaseV, wgRowBase, rowGroupOff, m, 0, scratch)
+        # nhidden base for k=0 is in the shared _nhBaseV register; it is 4-aligned
+        # (MT0, mfma_m, rows_per_lane are all multiples of 4 for the 16x16 geometry),
+        # so each wide load reads 4 contiguous residual elements: fp8/bf8 as one dword,
+        # bf16 as one dwordx2.
         isBf16 = self.residualBytes == 2
         loadCls = BufferLoadB64 if isBf16 else BufferLoadB32
         chunkBytes = 4 << self.residualLog2Bytes
@@ -1117,14 +1110,14 @@ class SubtilePartialRMSEmitter:
             self._residualRowByteBase(module, self._resRowByteBase, self._resTokenBase, n, scratch)
             if isBf16:
                 module.add(VLShiftLeftB32(dst=vgpr(scratch), shiftHex=hex(self.residualLog2Bytes),
-                                          src=vgpr(self._resNBaseV),
-                                          comment="nhiddenByte = nhiddenBase * residualBytes."))
+                                          src=vgpr(self._nhBaseV),
+                                          comment="nhiddenByte = nhBase * residualBytes."))
                 module.add(VAddU32(vgpr(self.resAddr), vgpr(self._resRowByteBase), vgpr(scratch),
                                    comment=f"byteAddr = rowByteBase + nhiddenByte (m={m},n={n})."))
             else:
                 module.add(VAddU32(vgpr(self.resAddr), vgpr(self._resRowByteBase),
-                                   vgpr(self._resNBaseV),
-                                   comment=f"byteAddr = rowByteBase + nhiddenBase (m={m},n={n})."))
+                                   vgpr(self._nhBaseV),
+                                   comment=f"byteAddr = rowByteBase + nhBase (m={m},n={n})."))
             for c in range(rpl // 4):
                 addr = self.resAddr
                 # c > 0 is dead for rows_per_lane == 4; exists for rows_per_lane >= 8.
@@ -1181,10 +1174,10 @@ class SubtilePartialRMSEmitter:
         # Zero residual elements whose nhidden_pos >= N_hidden; mask depends only on (m,k).
         lsc = self.lane_sgpr_count
         for k in range(self.rows_per_lane):
-            nhpos = self._resNBaseV
+            nhpos = self._nhBaseV
             if k > 0:
-                self._addImmU32(module, self.resAddr, self._resNBaseV, k, self._resRowByteBase,
-                                f"nhidden_pos = nhiddenBase + {k}.")
+                self._addImmU32(module, self.resAddr, self._nhBaseV, k, self._resRowByteBase,
+                                f"nhidden_pos = nhBase + {k}.")
                 nhpos = self.resAddr
             module.add(VCmpLtU32(dst=sgpr(self._resOobMask, lsc), src0=vgpr(nhpos),
                                  src1=sgpr("SizesFree+0"),
@@ -1255,9 +1248,10 @@ class SubtilePartialRMSEmitter:
         wgRowBase = self.writer.vgprPool.checkOut(1, tag="pRMS_fusWgRowBase")
         self._computeRowGroupOff(module, rowGroupOff)
         self._computeFree0RowBase(module, wgRowBase)
+        # Shared nhidden base (k=0) per tile row; computed once and reused by gamma,
+        # residual, and the bf16 store instead of being recomputed in each.
+        self._nhBaseV = self.writer.vgprPool.checkOut(1, tag="pRMS_fusNhBase")
         if self.storeBf16D:
-            self._storeWgRowBase   = wgRowBase
-            self._storeRowGroupOff = rowGroupOff
             self._beginBf16Store(module)
         # Reuse globalAddr (scratchV) as the gamma-byte scratch; free until _writePartialsFree0.
         gammaByteVgpr = scratchV
@@ -1266,8 +1260,8 @@ class SubtilePartialRMSEmitter:
         gammaBurst = self.writer.vgprPool.checkOut(self.rows_per_lane, tag="pRMS_fusGammaBurst")
         resBurst = self._beginResidual(module) if self.residualAdd else None
         for m in range(self.mma_m):
-            self._issueGammaLoads(module, gammaSrd, gammaBurst, gammaByteVgpr,
-                                  rowGroupOff, wgRowBase, mBaseVgpr, m)
+            self._free0RowPos(module, self._nhBaseV, wgRowBase, rowGroupOff, m, 0, mBaseVgpr)
+            self._issueGammaLoads(module, gammaSrd, gammaBurst, gammaByteVgpr, m)
             if resBurst is not None:
                 self._issueResidualLoads(module, m, resBurst, wgRowBase, rowGroupOff, mBaseVgpr)
             waitComment = "gamma" + ("+residual" if resBurst is not None else "")
@@ -1284,6 +1278,7 @@ class SubtilePartialRMSEmitter:
         self.writer.vgprPool.checkIn(gammaBurst)
         self.writer.vgprPool.checkIn(accBurst)
         self.writer.vgprPool.checkIn(mBaseVgpr)
+        self.writer.vgprPool.checkIn(self._nhBaseV)
         self.writer.vgprPool.checkIn(wgRowBase)
         self.writer.vgprPool.checkIn(rowGroupOff)
         return module
