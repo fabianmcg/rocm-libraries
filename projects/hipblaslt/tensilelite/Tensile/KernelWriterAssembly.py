@@ -15295,6 +15295,10 @@ class KernelWriterAssembly(KernelWriter):
     if not vgprTiles:
       return module
     if kernel["PartialRMS"]:
+      if kernel["PartialRMSResidualAdd"] or kernel["PartialRMSStoreBf16D"]:
+        from .Components.Subtile.SubtileResidualAddEmit import SubtileResidualAddEmitter
+        module.addComment1("ResidualAdd: load residual, H = GEMM + residual, store ResidualOut bf16.")
+        module.add(SubtileResidualAddEmitter(self, kernel).emit(vgprTiles))
       from .Components.Subtile.SubtilePartialRMSEmit import SubtilePartialRMSEmitter
       module.addComment1("PartialRMS: fused partial sum-of-squares + gamma epilogue.")
       module.add(SubtilePartialRMSEmitter(self, kernel).emit(vgprTiles))
