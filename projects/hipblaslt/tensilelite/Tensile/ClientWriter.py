@@ -896,30 +896,23 @@ def writeClientConfig(
         anyStoreBf16D = bool(newSolution.originalSolution.get("PartialRMSStoreBf16D", False))
     else:
         if getattr(newSolution.problemType, 'usePartialRMS', False):
-            mt1Values = set()
             for sol in solutions:
                 mt0 = sol["MacroTile0"]
                 mt1 = sol["MacroTile1"]
                 minMT0 = mt0 if minMT0 == 0 else min(minMT0, mt0)
                 minMT1 = mt1 if minMT1 == 0 else min(minMT1, mt1)
-                mt1Values.add(mt1)
                 if sol.get("PartialRMSResidualAdd", False):
                     anyResidualAdd = True
                 if sol.get("PartialRMSQuant", False):
                     anyQuantFlag = True
                 if sol.get("PartialRMSStoreBf16D", False):
                     anyStoreBf16D = True
-            # PartialRMS kernels compute NTilesN = ceil(N/MT1) on-device using their
-            # compile-time MT1. All solutions in one benchmark pass must share the same
-            # MT1 so every kernel uses the same partialBuf row stride as the client
-            # allocation. Split solutions by MT1 into separate BenchmarkProblemSizeGroups
-            # if this fires.
-            if len(mt1Values) > 1:
-                raise ValueError(
-                    f"PartialRMS benchmark pass mixes solutions with different MT1 values "
-                    f"({sorted(mt1Values)}). Each BenchmarkProblemSizeGroup must contain "
-                    f"solutions with a single MT1. Use separate ForkParameters groups per tile."
-                )
+            # A PartialRMS benchmark group may mix solutions with different MT1. Each kernel
+            # writes ceil(M_tokens/MT1)*MT1 padded token rows into the shared partialBuf, so
+            # the client sizes that buffer conservatively (assuming a maximum macro tile of
+            # 512) to fit any MT1; see ClientProblemFactory. The column stride uses minMT0
+            # (the smallest tile size, giving the largest tile count), which every
+            # solution's ceil(N_hidden/MT0) fits within.
             # Similarly, PartialRMSResidualAdd must be uniform: the client reference and
             # buffer allocation differ between residual-add and non-residual paths.
             residualAddValues = set(bool(sol.get("PartialRMSResidualAdd", False)) for sol in solutions)
