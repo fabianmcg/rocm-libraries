@@ -2,14 +2,21 @@
 # SPDX-License-Identifier: MIT
 
 # Isolated top-performing solution from epilogues_bf16_k1.yaml on gfx950 for the
-# bf16-in / bf16-out PartialRMS + ResidualAdd RMSNorm epilogue (no fp8, no MXFP8
-# quant). The fused K1 epilogue computes h_eff = h1 + residual, writes
-# D = h_eff * gamma (bf16) and the per-row partial sum-of-squares partialBuf (f32).
+# bf16-in / bf16-out PartialRMS + ResidualAdd RMSNorm epilogue (no MXFP8 quant).
+# The fused K1 epilogue computes h_eff = h1 + residual and the per-row partial
+# sum-of-squares partialBuf (f32). PartialRMSStoreBf16D is enabled, which splits
+# the store into an RMS pass writing bf16 to ResidualOut plus the D store.
+#
+# NOTE: PartialRMSStoreBf16D MUST be set in BOTH the ProblemType block AND
+# ForkParameters. The solution-selection predicate is built from the ProblemType
+# field while the problem's store-bf16-d flag comes from the solutions; if it is
+# set in only one place the values disagree and the client rejects every solution
+# with DID_NOT_SATISFY_ASSERTS (kernel builds, but nothing benchmarks -> GFlops 0).
 #
 # Winner tile (full bf16 sweep at 8192x8192x1x8192): MT 384x256x64, MI 16x16x32,
 # MIWaveTile [12,8], MIWaveGroup [2,2], WorkGroup [32,8,1], PrefetchGlobalRead=2,
-# DepthU=64, StreamK=3 -> ~1,339,800 GFlops. KeepBuildTmp retains the generated
-# assembly for ASM comparison against the no-epilogue baseline.
+# DepthU=64, StreamK=3. KeepBuildTmp retains the generated assembly for ASM
+# comparison against the no-epilogue baseline.
 
 TestParameters:
   marks: [skip-gfx900, skip-gfx906, skip-gfx908, skip-gfx90a, skip-gfx940, skip-gfx941, skip-gfx942, skip-gfx1010, skip-gfx1011, skip-gfx1012, skip-gfx1030, skip-gfx1100, skip-gfx1101, skip-gfx1102, skip-gfx1200, skip-gfx1201, skip-gfx1250]
@@ -55,6 +62,7 @@ BenchmarkProblems:
             - [16, 16, 32, 1,  1, 12, 8, 2, 2]  # MT 384x256 (winner)
         - PartialRMS: [True]
         - PartialRMSResidualAdd: [True]
+        - PartialRMSStoreBf16D: [True]
         - StreamK: [3]
         - StreamKForceDPOnly: [1]
         - StreamKAtomic: [0]
