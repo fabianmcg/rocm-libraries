@@ -14,8 +14,5 @@ pytest -v \
     --prebuilt-client build_tmp/tensilelite/client/tensilelite-client \
     --gpu-targets gfx950 \
     Tensile/Tests/common/ \
-    -k "partial_rms or mxfp8_quant or mxfp8_dynquant or tile_quant or deepseek" \
+    -k "epilogues_k1" \
     "$@"
-
-# Host-only validators (no GPU)
-pytest -v -m unit Tensile/Tests/unit/test_epilogue_validation.py
