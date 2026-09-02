@@ -167,9 +167,10 @@ namespace TensileLite
                     }
                 }
 
-                // Always re-run for MX problems; also re-run when the partialBuf
+                // Re-run when DataInitialization refreshed MX inputs per solution
+                // (gfx950 solution-dependent preswizzle), or when the partialBuf
                 // layout changed for a PartialRMS solution.
-                if(isMXProblem(*gemm) || needsRerun)
+                if(m_dataInit->referenceNeedsPerSolutionRecompute(*gemm, solution) || needsRerun)
                 {
                     ScopedTimer timer("cpu_reference_gemm_per_solution");
                     SolveCPU(m_problem, m_referenceInputs.get(), m_elementsToValidate);

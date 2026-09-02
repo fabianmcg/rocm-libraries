@@ -2867,6 +2867,7 @@ namespace TensileLite
                     dPtr[dIndex] = SaturateCast<typename Inputs::DType>(resultD);
                 }
             }
+            } // end #pragma omp parallel
 
             if constexpr(notCmplxAmaxD)
             {
@@ -2874,7 +2875,6 @@ namespace TensileLite
                 computeTileQuant<Inputs, Accumulator>(problem, inputs);
                 computeMXFP8Quant<Inputs, Accumulator>(problem, inputs);
             }
-            } // end #pragma omp parallel
 
             if(problem.outputAmaxD())
             {
