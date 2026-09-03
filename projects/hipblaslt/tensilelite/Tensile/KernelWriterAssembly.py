@@ -15286,7 +15286,7 @@ class KernelWriterAssembly(KernelWriter):
     vgprActCopy: int = -1
     calleeLabelsByGwvw: Optional[Mapping[int, Tuple[str, ...]]] = None
 
-  def emitSubtileFusedEpilogue(self, kernel, cvtVgprStruct):
+  def emitSubtileFusedEpilogue(self, kernel):
     # Only complete-tile subtile waves reach here (StreamK Role C branched away earlier).
     module = Module("SubtileFusedEpilogue")
     if not kernel.get("UseSubtileImpl"):
@@ -15298,7 +15298,7 @@ class KernelWriterAssembly(KernelWriter):
       if kernel["PartialRMSResidualAdd"] or kernel["PartialRMSStoreBf16D"]:
         from .Components.Subtile.SubtileResidualAddEmit import SubtileResidualAddEmitter
         module.addComment1("ResidualAdd: load residual, H = GEMM + residual, store ResidualOut bf16.")
-        module.add(SubtileResidualAddEmitter(self, kernel).emit(vgprTiles, cvtVgprStruct))
+        module.add(SubtileResidualAddEmitter(self, kernel).emit(vgprTiles))
       from .Components.Subtile.SubtilePartialRMSEmit import SubtilePartialRMSEmitter
       module.addComment1("PartialRMS: fused partial sum-of-squares + gamma epilogue.")
       module.add(SubtilePartialRMSEmitter(self, kernel).emit(vgprTiles))
@@ -16009,7 +16009,7 @@ class KernelWriterAssembly(KernelWriter):
       # gsuLimitIdx==1 emits the real skStoreLabel. On SKFDPO1 / non-StreamK,
       # gsuLimit==1 so gsuLimitIdx==0 == gsuLimit-1 and the epilogue runs once.
       if gsuLimitIdx == gsuLimit - 1:
-        module.add(self.emitSubtileFusedEpilogue(kernel, cvtVgprStruct))
+        module.add(self.emitSubtileFusedEpilogue(kernel))
 
       # support dynamic MBSK/MB selection by checking synchronizer after bias write
       if kernel["AdaptiveGemmGSUA"] == 1:
