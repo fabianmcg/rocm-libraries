@@ -502,13 +502,37 @@ class SubtileResidualAddEmitter:
         module.add(VLShiftRightB32(dst=vgpr(self._resTokenBase), shiftHex=hex(self.log2ElemBytes),
                                    src=vgpr(self.colByte),
                                    comment="tokenBase = colByte >> log2ElemBytes."))
+        if self.useWideResidual:
+            self._beginResidualWideBase(module)
         if not self.useWideResidual:
             self._resOobV = self.writer.vgprPool.checkOut(1, tag="rAdd_fusResOob")
             module.add(VMovB32(dst=vgpr(self._resOobV), src="BufferOOB",
                                comment="OOB byte offset -> residual load returns 0."))
         return self._resBurst
 
+    def _beginResidualWideBase(self, module) -> None:
+        """Precompute the m-invariant residual row byte base and per-token stride.
+
+        base0 = tokenBase * SizesFree0 * residualBytes replaces the per-(m,n)
+        multiply; rowStride advances byteAddr by one MMA-tile of tokens per n.
+        """
+        self._resRowStrideS = self.writer.sgprPool.checkOut(1, tag="rAdd_fusResRowStride")
+        module.add(VMulLOU32(dst=vgpr(self._resTokenBase), src0=sgpr("SizesFree+0"),
+                             src1=vgpr(self._resTokenBase), comment="base0 = tokenBase * SizesFree0."))
+        if self.residualLog2Bytes:
+            module.add(VLShiftLeftB32(dst=vgpr(self._resTokenBase),
+                                      shiftHex=hex(self.residualLog2Bytes),
+                                      src=vgpr(self._resTokenBase), comment="base0 *= residualBytes."))
+        module.add(SMulI32(dst=sgpr(self._resRowStrideS), src0=sgpr("SizesFree+0"),
+                           src1=self.mfma_n, comment="rowStride = SizesFree0 * mfma_n."))
+        if self.residualLog2Bytes:
+            module.add(SLShiftLeftB32(dst=sgpr(self._resRowStrideS), src=sgpr(self._resRowStrideS),
+                                      shiftHex=hex(self.residualLog2Bytes),
+                                      comment="rowStride *= residualBytes."))
+
     def _endResidual(self) -> None:
+        if self.useWideResidual:
+            self.writer.sgprPool.checkIn(self._resRowStrideS)
         if not self.useWideResidual:
             self.writer.vgprPool.checkIn(self._resOobV)
         self.writer.sgprPool.checkIn(self._resOobMask)
@@ -534,25 +558,24 @@ class SubtileResidualAddEmitter:
     def _issueResidualLoadsWide(self, module, m: int, resBurst: int, wgRowBase: int,
                                 rowGroupOff: int, scratch: int) -> None:
         rpl = self.rows_per_lane
-        # nhidden base for k=0 is in the shared _nhBaseV register; it is 4-aligned
-        # (MT0, mfma_m, rows_per_lane are all multiples of 4 for the 16x16 geometry),
-        # so each wide load reads 4 contiguous residual elements: fp8/bf8 as one dword,
-        # bf16 as one dwordx2.
         isBf16 = self.residualBytes == 2
         loadCls = BufferLoadB64 if isBf16 else BufferLoadB32
         chunkBytes = 4 << self.residualLog2Bytes
+        # byteAddr for n=0 this m: base0 (token row) + nhidden byte offset.
+        if isBf16:
+            module.add(VLShiftLeftB32(dst=vgpr(scratch), shiftHex=hex(self.residualLog2Bytes),
+                                      src=vgpr(self._nhBaseV),
+                                      comment="nhiddenByte = nhBase * residualBytes."))
+            module.add(VAddU32(vgpr(self.resAddr), vgpr(self._resTokenBase), vgpr(scratch),
+                               comment=f"byteAddr = base0 + nhiddenByte (m={m},n=0)."))
+        else:
+            module.add(VAddU32(vgpr(self.resAddr), vgpr(self._resTokenBase), vgpr(self._nhBaseV),
+                               comment=f"byteAddr = base0 + nhBase (m={m},n=0)."))
         for n in range(self.mma_n):
-            self._residualRowByteBase(module, self._resRowByteBase, self._resTokenBase, n, scratch)
-            if isBf16:
-                module.add(VLShiftLeftB32(dst=vgpr(scratch), shiftHex=hex(self.residualLog2Bytes),
-                                          src=vgpr(self._nhBaseV),
-                                          comment="nhiddenByte = nhBase * residualBytes."))
-                module.add(VAddU32(vgpr(self.resAddr), vgpr(self._resRowByteBase), vgpr(scratch),
-                                   comment=f"byteAddr = rowByteBase + nhiddenByte (m={m},n={n})."))
-            else:
-                module.add(VAddU32(vgpr(self.resAddr), vgpr(self._resRowByteBase),
-                                   vgpr(self._nhBaseV),
-                                   comment=f"byteAddr = rowByteBase + nhBase (m={m},n={n})."))
+            if n > 0:
+                module.add(VAddU32(vgpr(self.resAddr), vgpr(self.resAddr),
+                                   sgpr(self._resRowStrideS),
+                                   comment=f"byteAddr += rowStride (advance to n={n})."))
             for c in range(rpl // 4):
                 addr = self.resAddr
                 # c > 0 is dead for rows_per_lane == 4; exists for rows_per_lane >= 8.
@@ -719,7 +742,11 @@ class SubtileResidualAddEmitter:
         accBurst  = vgprPool.checkOut(self.mma_n, tag="rAdd_accBurst")
         resBurst  = self._beginResidual(module) if self.residualAdd else None
         for m in range(self.mma_m):
-            self._free0RowPos(module, self._nhBaseV, wgRowBase, rowGroupOff, m, 0, mBaseVgpr)
+            if m == 0:
+                self._free0RowPos(module, self._nhBaseV, wgRowBase, rowGroupOff, 0, 0, mBaseVgpr)
+            else:
+                self._addImmU32(module, self._nhBaseV, self._nhBaseV, self.mfma_m, mBaseVgpr,
+                                f"nhBase += mfma_m (advance to m={m}).")
             if resBurst is not None:
                 self._issueResidualLoads(module, m, resBurst, wgRowBase, rowGroupOff, mBaseVgpr)
                 module.add(SWaitCnt(vlcnt=0, comment="wait residual row burst."))
