@@ -1675,6 +1675,39 @@ class GlobalWriteBatchWriter:
       module.add(SBranch(labelName=cvtEndLabel.getLabelName(), comment="Branch to GateCvtAll end"))
     module.add(cvtEndLabel)
 
+  def _emitSubtilePermuteAndLGDelta(self, module) -> None:
+    """Compute the ds_permute partner-lane address (vPermAddr) and the
+    lane_group*8 row-byte correction (vLGDelta) into cvtVgprStruct.
+
+    Shared by the D paired dwordx4 store and the ResidualOut write-back so
+    the two emit an identical lane-only sequence."""
+    vPermAddr = self.cvtVgprStruct.vgprPermAddr
+    vTmp = self.cvtVgprStruct.vgprBf16Temp  # reuse scratch temp before it's used for mask init.
+    vLGDelta = self.cvtVgprStruct.vgprLaneGroupDelta
+    module.addComment1("16bit dwordx4 UseSubtileImpl: compute ds_permute partner-lane address")
+    module.add(VAndB32(dst=vgpr(vTmp),     src0=self.kernel["WavefrontSize"]-1, src1=vgpr("Serial"), comment="lane_id & (WS-1)"))
+    module.add(VAndB32(dst=vgpr(vPermAddr), src0=self.kernel["WavefrontSize"]-1, src1=vgpr("Serial"), comment="copy of lane_id"))
+    module.add(VPermlane32SwapB32(dst=vgpr(vTmp), src=vgpr(vTmp), comment="lane XOR 32 swap"))
+    module.add(SNop(waitState=0, comment="delay after v_permlane32_swap"))
+    module.add(VPermlane16SwapB32(dst=vgpr(vTmp), src=vgpr(vTmp), comment="lane XOR 16 swap"))
+    # Exec mask: lanes where both XOR swaps changed the value (i.e., the 'first' half of each pair)
+    # selects lanes 0-15 and 32-47 within the wave.
+    stmp = self.parentWriter.sgprPool.checkOutAligned(2,2, tag="_emitSubtilePermute_stmp")
+    module.add(SMovB32(dst=sgpr(stmp), src="0x0000ffff", comment="select lanes 0-15, 32-47"))
+    module.add(SMovB32(dst=sgpr(stmp+1), src="0xffff0000"))
+    module.add(VCndMaskB32(dst=vgpr(vTmp), src0=vgpr(vTmp), src1=vgpr(vPermAddr), src2=sgpr(stmp,2), comment="restore original lane_id for selected lanes"))
+    self.parentWriter.sgprPool.checkIn(stmp)
+    module.add(VLShiftLeftB32(dst=vgpr(vPermAddr), shiftHex=2, src=vgpr(vTmp), comment="partner_lane * 4 = ds_permute byte addr"))
+    # Pre-compute lane_group*8 once; reused as the row-byte address correction in every
+    # paired dwordx4 store (addrDVgpr encodes lane_group*8 but we need lane_group*16).
+    module.addComment1("16bit dwordx4: pre-compute lane_group*8 row-byte correction")
+    module.add(VAndB32(dst=vgpr(vLGDelta), src0=self.kernel["WavefrontSize"]-1, src1=vgpr("Serial"),
+                       comment="lane_id = Serial & (WS-1)"))
+    module.add(VLShiftRightB32(dst=vgpr(vLGDelta), shiftHex=4, src=vgpr(vLGDelta),
+                               comment="lane_group = lane_id >> 4"))
+    module.add(VLShiftLeftB32(dst=vgpr(vLGDelta), shiftHex=3, src=vgpr(vLGDelta),
+                              comment="vgprLaneGroupDelta = lane_group * 8"))
+
   def _emitNonatomicAdd(self, module: Module):
     ########################################
     # Not Atomic
@@ -1751,37 +1784,7 @@ class GlobalWriteBatchWriter:
     if is16bitSubtile:
       assert self.kernel["BufferStore"], \
         "UseSubtileImpl 16bit optimized store requires BufferStore=1"
-      # Compute ds_permute partner-lane address for 16bit dwordx4 paired-subtile stores.
-      # vtmp1 = lane_id, vtmp2 = partner_lane_id (for ds_permute forward scatter)
-      # After v_permlane32_swap + v_permlane16_swap + exec masking:
-      #   each lane ends up with the lane_id of the partner that will scatter data to it.
-      # vPermAddr = partner_lane_id * 4  (byte address for ds_permute_b32)
-      vPermAddr = self.cvtVgprStruct.vgprPermAddr
-      vTmp = self.cvtVgprStruct.vgprBf16Temp  # reuse scratch temp before it's used for mask init
-      module.addComment1("16bit dwordx4 UseSubtileImpl: compute ds_permute partner-lane address")
-      module.add(VAndB32(dst=vgpr(vTmp),     src0=self.kernel["WavefrontSize"]-1, src1=vgpr("Serial"), comment="lane_id & (WS-1)"))
-      module.add(VAndB32(dst=vgpr(vPermAddr), src0=self.kernel["WavefrontSize"]-1, src1=vgpr("Serial"), comment="copy of lane_id"))
-      module.add(VPermlane32SwapB32(dst=vgpr(vTmp), src=vgpr(vTmp), comment="lane XOR 32 swap"))
-      module.add(SNop(waitState=0, comment="delay after v_permlane32_swap"))
-      module.add(VPermlane16SwapB32(dst=vgpr(vTmp), src=vgpr(vTmp), comment="lane XOR 16 swap"))
-      # Exec mask: lanes where both XOR swaps changed the value (i.e., the 'first' half of each pair)
-      # selects lanes 0-15 and 32-47 within the wave.
-      stmp = self.parentWriter.sgprPool.checkOutAligned(2,2, tag="_emitNonatomicAdd_stmp")
-      module.add(SMovB32(dst=sgpr(stmp), src="0x0000ffff", comment="select lanes 0-15, 32-47"))
-      module.add(SMovB32(dst=sgpr(stmp+1), src="0xffff0000"))
-      module.add(VCndMaskB32(dst=vgpr(vTmp), src0=vgpr(vTmp), src1=vgpr(vPermAddr), src2=sgpr(stmp,2), comment="restore original lane_id for selected lanes"))
-      self.parentWriter.sgprPool.checkIn(stmp)
-      module.add(VLShiftLeftB32(dst=vgpr(vPermAddr), shiftHex=2, src=vgpr(vTmp), comment="partner_lane * 4 = ds_permute byte addr"))
-      # Pre-compute lane_group*8 once; reused as the row-byte address correction in every
-      # paired dwordx4 store (addrDVgpr encodes lane_group*8 but we need lane_group*16).
-      vLGDelta = self.cvtVgprStruct.vgprLaneGroupDelta
-      module.addComment1("16bit dwordx4: pre-compute lane_group*8 row-byte correction")
-      module.add(VAndB32(dst=vgpr(vLGDelta), src0=self.kernel["WavefrontSize"]-1, src1=vgpr("Serial"),
-                         comment="lane_id = Serial & (WS-1)"))
-      module.add(VLShiftRightB32(dst=vgpr(vLGDelta), shiftHex=4, src=vgpr(vLGDelta),
-                                 comment="lane_group = lane_id >> 4"))
-      module.add(VLShiftLeftB32(dst=vgpr(vLGDelta), shiftHex=3, src=vgpr(vLGDelta),
-                                comment="vgprLaneGroupDelta = lane_group * 8"))
+      self._emitSubtilePermuteAndLGDelta(module)
       # Compute bpe scale shift once (compile-time constant); used inside
       # _emit16bitSubtilePairedStore to adjust addrDVgpr inline without
       # modifying it in place, so no restore loop is needed after the stores.
@@ -3591,6 +3594,119 @@ class GlobalWriteBatchWriter:
     module.add(nFullLabel)
     module.add(nMaskDone)
 
+  def _emit16bitPairedDwordx4Core(self, srcVc, vaddrVgpr: int, offset12: int, srd: str,
+                                   applyLGDeltaToAddr: bool, useAlign8: bool,
+                                   blockIdxM: int, blockIdxN: int,
+                                   isGlc: bool, isSlc: bool, isNT: bool, tt0: int = 0) -> Module:
+    """Core 16bit paired dwordx4 store, parameterized by source accessor and address mode.
+
+    Args:
+      srcVc:              callable(pair, vi) returning the rocisa f32 source operand
+                          for subtile group pair in {0,1} and value index vi in {0..3}.
+      vaddrVgpr:          per-lane byte-address VGPR to store to.
+      offset12:           MUBUF offset12 immediate.
+      srd:                SRD sgpr name (e.g. "SrdD").
+      applyLGDeltaToAddr: when True, scale vaddrVgpr by the bpe shift then add vLGDelta;
+                          when False, copy vaddrVgpr into vAddrScratch unchanged.
+      useAlign8:          emit the align8 exec mask guard around the store.
+      blockIdxM:          M block index (for align8 mask).
+      blockIdxN:          N block index (for align8 mask).
+      isGlc:              glc MUBUF modifier.
+      isSlc:              slc MUBUF modifier.
+      isNT:               nt MUBUF modifier.
+      tt0:                thread-tile M index (used in comments only).
+    """
+    module = Module("16bitSubtilePairedStore")
+    isFp16 = self.kernel["ProblemType"]["DestDataType"].isHalf()
+
+    # align8 exec mask uses scratch, not tmpS01 (primer).
+    tmpInrSgpr = self._epilogScratchSgpr(2*self.laneSGPRC)
+    # Reuse cvtVgprStruct.vgprBf16Temp..vgprBf16Inc (+0..+3) as 4 scratch vgprs.
+    # The cvtVgpr block is allocated with 2-alignment (64-bit aligned) in KWA so that
+    # vgprBf16Temp is at an even VGPR index, satisfying buffer_store_dwordx4's
+    # alignment requirement.  The +0..+3 slots are safely overwritten here as pack/perm
+    # staging for each pair.
+    vPack = self.cvtVgprStruct.vgprBf16Temp  # +0..3: packed 16bit dwords, 2-aligned
+
+    vPermAddr    = self.cvtVgprStruct.vgprPermAddr
+    vLGDelta     = self.cvtVgprStruct.vgprLaneGroupDelta
+    vAddrScratch = self.cvtVgprStruct.vgprAddrScratch
+
+    typeStr = "fp16" if isFp16 else "bf16"
+    VCvtPkF32to16 = VCvtPkF32toFP16 if isFp16 else VCvtPkF32toBF16
+    module.addComment1(f"{typeStr} paired dwordx4 store tt0={tt0} (sba=0+sba=1): pack 8 f32 accvgprs -> 4 {typeStr} dwords")
+
+    # Pack sba=0 subtile: ValuC+sumIdx0+{0,1} → vPack+0; ValuC+sumIdx0+{2,3} → vPack+1
+    # Pack sba=1 subtile: ValuC+sumIdx1+{0,1} → vPack+2; ValuC+sumIdx1+{2,3} → vPack+3
+    def packF32pair(dst, src0, src1, comment):
+      """Pack two f32 VGPRs into one dword of two 16bit values."""
+      module.add(VCvtPkF32to16(dst=vgpr(dst), src0=src0, src1=src1, comment=f"{comment} -> {typeStr}"))
+
+    packF32pair(vPack+0, srcVc(0,0), srcVc(0,1), f"sba=0 tt0={tt0}[0:1]")
+    packF32pair(vPack+1, srcVc(0,2), srcVc(0,3), f"sba=0 tt0={tt0}[2:3]")
+    packF32pair(vPack+2, srcVc(1,0), srcVc(1,1), f"sba=1 tt0={tt0}[0:1]")
+    packF32pair(vPack+3, srcVc(1,2), srcVc(1,3), f"sba=1 tt0={tt0}[2:3]")
+
+    # Compute adjusted address into vgprAddrScratch while ds_bpermute results are in-flight.
+    # addrDVgpr and vgprPermAddr are left unchanged — vgprAddrScratch is dedicated scratch
+    # for this purpose so no restore is needed.
+    bpeCurr = self.parentWriter.states.bpeCexternal
+    bpeDest = self.parentWriter.states.bpeCexternalGSU1
+    addrScaleShift = int(log2(bpeCurr // bpeDest)) if bpeCurr > bpeDest else 0
+
+    def emitAddrWhilePermuting(module):
+      """Callback emitted between ds_bpermute and s_waitcnt lgkmcnt(0).
+
+      The ds_bpermute has ~88 cycles of LDS latency.  We overlap SALU/VALU
+      work in this window to hide the cost:
+        1. Compute the adjusted D store address (VALU).
+        2. Compute the exec mask for partial M/N blocks (SALU) — this
+           suppresses OOB lanes at tile boundaries without adding any
+           latency to the critical path.
+      `module` is the permute Module, so instructions emitted here land
+      between the ds_bpermute issue and the s_waitcnt that consumes results."""
+      if applyLGDeltaToAddr:
+        if addrScaleShift:
+          module.add(VLShiftRightB32(dst=vgpr(vAddrScratch), shiftHex=addrScaleShift,
+                                     src=vgpr(vaddrVgpr), comment=f"scale addrDVgpr bpe {bpeCurr}->{bpeDest}"))
+          module.add(VAddU32(dst=vgpr(vAddrScratch), src0=vgpr(vAddrScratch), src1=vgpr(vLGDelta),
+                             comment="adjusted D addr = scaled addrDVgpr + lane_group*8"))
+        else:
+          module.add(VAddU32(dst=vgpr(vAddrScratch), src0=vgpr(vaddrVgpr), src1=vgpr(vLGDelta),
+                             comment="adjusted D addr = addrDVgpr + lane_group*8"))
+      else:
+        module.add(VMovB32(dst=vgpr(vAddrScratch), src=vgpr(vaddrVgpr), comment="addr scratch = vaddrVgpr"))
+      if useAlign8:
+        self._emitAlign8ExecMask(module, tmpInrSgpr, tmpInrSgpr+1*self.laneSGPRC, blockIdxM, blockIdxN,
+                                 mGuardOffset=2, rowScaleShift=1)
+
+    module.add(self._emitSubtilePackedPermute(vPack, vPermAddr, addrWhilePermuting=emitAddrWhilePermuting))
+
+    if useAlign8:
+      tmpS = tmpInrSgpr
+      module.add(self.getEdgeMovInstType()(EXEC(), sgpr(tmpS, self.laneSGPRC), "apply exec mask"))
+
+    module.addComment1("buffer_store_dwordx4: write 8 16bit values (4 dwords, 2-aligned src)")
+    module.add(BufferStoreB128(
+      src=vgpr(vPack, 4),
+      vaddr=vgpr(vAddrScratch),
+      saddr=sgpr(srd, 4),
+      soffset=0,
+      mubuf=MUBUFModifiers(offen=True, offset12=offset12, glc=isGlc, slc=isSlc, nt=isNT),
+      comment=f"16bit paired dwordx4 store tt0={tt0},{tt0+1}"
+    ))
+
+    if useAlign8:
+      module.add(self.getEdgeMovInstType()(EXEC(), -1, "restore exec"))
+
+    # WAR hazard: buffer_store_dwordx4 reads vPack[0:3] as source operands.
+    # The next paired store's v_cvt_pk_bf16_f32 will overwrite vPack.
+    # Insert nop to ensure the store has latched its source VGPRs.
+    module.add(SNop(waitState=0, comment="1 wait state: WAR hazard between store src and next pack dst"))
+
+    self._epilogScratchFree(tmpInrSgpr)
+    return module
+
   def _emit16bitSubtilePairedStore(self, addrCalc, sumIdx0: int, sumIdx1: int, prefixOffset: int, tt0: int = 0, blockIdxM: int = 0, blockIdxN: int = 0, forceSlc: bool = False) -> Module:
     """Emit a paired 16bit store combining sba=0 and sba=1 subtile data.
 
@@ -3615,108 +3731,24 @@ class GlobalWriteBatchWriter:
       tt0:          thread-tile M index (same for both sba=0 and sba=1).
       forceSlc:     force the slc bit regardless of NonTemporalD.
     """
-    module = Module("16bitSubtilePairedStore")
-    isFp16 = self.kernel["ProblemType"]["DestDataType"].isHalf()
-
     ntd = self.kernel["NonTemporalD"]
     isGlc = bool(ntd & 0x1)
     isSlc = bool((ntd & 0x2) or forceSlc)
     isNT  = bool(ntd & 0x4)
 
-    # align8 exec mask uses scratch, not tmpS01 (primer).
-    tmpInrSgpr = self._epilogScratchSgpr(2*self.laneSGPRC)
-    # Reuse cvtVgprStruct.vgprBf16Temp..vgprBf16Inc (+0..+3) as 4 scratch vgprs.
-    # The cvtVgpr block is allocated with 2-alignment (64-bit aligned) in KWA so that
-    # vgprBf16Temp is at an even VGPR index, satisfying buffer_store_dwordx4's
-    # alignment requirement.  The +0..+3 slots are safely overwritten here as pack/perm
-    # staging for each pair.
-    vPack = self.cvtVgprStruct.vgprBf16Temp  # +0..3: packed 16bit dwords, 2-aligned
-
-    vPermAddr    = self.cvtVgprStruct.vgprPermAddr
-    vLGDelta     = self.cvtVgprStruct.vgprLaneGroupDelta
-    vAddrScratch = self.cvtVgprStruct.vgprAddrScratch
-    addrDVgpr    = addrCalc.addrDVgpr
-
-    typeStr = "fp16" if isFp16 else "bf16"
-    VCvtPkF32to16 = VCvtPkF32toFP16 if isFp16 else VCvtPkF32toBF16
-    module.addComment1(f"{typeStr} paired dwordx4 store tt0={tt0} (sba=0+sba=1): pack 8 f32 accvgprs -> 4 {typeStr} dwords")
-
-    # Pack sba=0 subtile: ValuC+sumIdx0+{0,1} → vPack+0; ValuC+sumIdx0+{2,3} → vPack+1
-    # Pack sba=1 subtile: ValuC+sumIdx1+{0,1} → vPack+2; ValuC+sumIdx1+{2,3} → vPack+3
-    def vc(sumIdx, vi):
-      idx = sumIdx + vi - prefixOffset
-      return vgpr("ValuC+" + str(idx))
-
-    def packF32pair(dst, src0, src1, comment):
-      """Pack two f32 VGPRs into one dword of two 16bit values."""
-      module.add(VCvtPkF32to16(dst=vgpr(dst), src0=src0, src1=src1, comment=f"{comment} -> {typeStr}"))
-
-    packF32pair(vPack+0, vc(sumIdx0, 0), vc(sumIdx0, 1), f"sba=0 tt0={tt0}[0:1]")
-    packF32pair(vPack+1, vc(sumIdx0, 2), vc(sumIdx0, 3), f"sba=0 tt0={tt0}[2:3]")
-    packF32pair(vPack+2, vc(sumIdx1, 0), vc(sumIdx1, 1), f"sba=1 tt0={tt0}[0:1]")
-    packF32pair(vPack+3, vc(sumIdx1, 2), vc(sumIdx1, 3), f"sba=1 tt0={tt0}[2:3]")
-
-    # Compute adjusted D address into vgprAddrScratch while ds_bpermute results are in-flight.
-    # addrDVgpr holds the M-byte offset in bpeCexternal units; scale to bpeCexternalGSU1
-    # (16bit=2 bytes) then add lane_group*8 so the dwordx4 store lands at the correct row.
-    # addrDVgpr and vgprPermAddr are left unchanged — vgprAddrScratch is dedicated scratch
-    # for this purpose so no restore is needed.
     bpeCurr = self.parentWriter.states.bpeCexternal
     bpeDest = self.parentWriter.states.bpeCexternalGSU1
     globalOffset = addrCalc.globalOffset * bpeDest // bpeCurr
-    addrScaleShift = int(log2(bpeCurr // bpeDest)) if bpeCurr > bpeDest else 0
-
     useAlign8 = self.parentWriter.states.storeAlign8
 
-    def emitAddrWhilePermuting(module):
-      """Callback emitted between ds_bpermute and s_waitcnt lgkmcnt(0).
+    def srcVc(pair, vi):
+      idx = (sumIdx0 if pair == 0 else sumIdx1) + vi - prefixOffset
+      return vgpr("ValuC+" + str(idx))
 
-      The ds_bpermute has ~88 cycles of LDS latency.  We overlap SALU/VALU
-      work in this window to hide the cost:
-        1. Compute the adjusted D store address (VALU).
-        2. Compute the exec mask for partial M/N blocks (SALU) — this
-           suppresses OOB lanes at tile boundaries without adding any
-           latency to the critical path.
-      `module` is the permute Module, so instructions emitted here land
-      between the ds_bpermute issue and the s_waitcnt that consumes results."""
-      if addrScaleShift:
-        module.add(VLShiftRightB32(dst=vgpr(vAddrScratch), shiftHex=addrScaleShift,
-                                   src=vgpr(addrDVgpr), comment=f"scale addrDVgpr bpe {bpeCurr}->{bpeDest}"))
-        module.add(VAddU32(dst=vgpr(vAddrScratch), src0=vgpr(vAddrScratch), src1=vgpr(vLGDelta),
-                           comment="adjusted D addr = scaled addrDVgpr + lane_group*8"))
-      else:
-        module.add(VAddU32(dst=vgpr(vAddrScratch), src0=vgpr(addrDVgpr), src1=vgpr(vLGDelta),
-                           comment="adjusted D addr = addrDVgpr + lane_group*8"))
-      if useAlign8:
-        self._emitAlign8ExecMask(module, tmpInrSgpr, tmpInrSgpr+1*self.laneSGPRC, blockIdxM, blockIdxN,
-                                 mGuardOffset=2, rowScaleShift=1)
-
-    module.add(self._emitSubtilePackedPermute(vPack, vPermAddr, addrWhilePermuting=emitAddrWhilePermuting))
-
-    if useAlign8:
-      tmpS = tmpInrSgpr
-      module.add(self.getEdgeMovInstType()(EXEC(), sgpr(tmpS, self.laneSGPRC), "apply exec mask"))
-
-    module.addComment1("buffer_store_dwordx4: write 8 16bit values (4 dwords, 2-aligned src)")
-    module.add(BufferStoreB128(
-      src=vgpr(vPack, 4),
-      vaddr=vgpr(vAddrScratch),
-      saddr=sgpr("SrdD", 4),
-      soffset=0,
-      mubuf=MUBUFModifiers(offen=True, offset12=globalOffset, glc=isGlc, slc=isSlc, nt=isNT),
-      comment=f"16bit paired dwordx4 store tt0={tt0},{tt0+1}"
-    ))
-
-    if useAlign8:
-      module.add(self.getEdgeMovInstType()(EXEC(), -1, "restore exec"))
-
-    # WAR hazard: buffer_store_dwordx4 reads vPack[0:3] as source operands.
-    # The next paired store's v_cvt_pk_bf16_f32 will overwrite vPack.
-    # Insert nop to ensure the store has latched its source VGPRs.
-    module.add(SNop(waitState=0, comment="1 wait state: WAR hazard between store src and next pack dst"))
-
-    self._epilogScratchFree(tmpInrSgpr)
-    return module
+    return self._emit16bitPairedDwordx4Core(
+      srcVc, addrCalc.addrDVgpr, globalOffset, "SrdD",
+      applyLGDeltaToAddr=True, useAlign8=useAlign8, blockIdxM=blockIdxM,
+      blockIdxN=blockIdxN, isGlc=isGlc, isSlc=isSlc, isNT=isNT, tt0=tt0)
 
   def _emit16bitSubtileScalarStore(self, addrCalc, sumIdx0: int, prefixOffset: int, tt0: int = 0, blockIdxM: int = 0, blockIdxN: int = 0, forceSlc: bool = False) -> Module:
     """Emit a 16bit store for an orphan subtile element with no partner.
