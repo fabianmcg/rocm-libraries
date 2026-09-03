@@ -12,8 +12,9 @@ epilogue is lower than the old fused single-pass version.
 """
 
 import math
+import types
 
-from rocisa.code import Label, Module
+from rocisa.code import Module
 from rocisa.container import ContinuousRegister, MUBUFModifiers, accvgpr, sgpr, vgpr
 from rocisa.enum import HighBitSel
 from rocisa.functions import vectorStaticDivide
@@ -24,10 +25,6 @@ from rocisa.instruction import (
     BufferLoadD16U8,
     ECvtPkBF8toF32,
     ECvtPkFP8toF32,
-    SAndB32,
-    SBranch,
-    SCBranchSCC1,
-    SCmpEQU32,
     SLShiftLeftB32,
     SMovB32,
     SMovB64,
@@ -45,7 +42,6 @@ from rocisa.instruction import (
     VCvtBF8toF32,
     VCvtF16toF32,
     VCvtFP8toF32,
-    VCvtPkF32toBF16,
     VLShiftLeftB32,
     VLShiftRightB32,
     VMovB32,
@@ -103,11 +99,6 @@ class SubtileResidualAddEmitter:
                                 and (self.residualBytes == 1
                                      or (self.residualBytes == 2
                                          and not self.residualType.isHalf())))
-        # Wide bf16 store: pack rows_per_lane bf16 per (m,n) into one dwordx2;
-        # requires residualAdd (uses the residual burst as a packing buffer) and
-        # 4-aligned rows_per_lane.
-        self.useWideBf16Store = (self.storeBf16D and self.residualAdd
-                                 and self.rows_per_lane % 4 == 0)
 
     @staticmethod
     def _sideBytes(dtype):
@@ -287,16 +278,6 @@ class SubtileResidualAddEmitter:
         module.add(VLShiftLeftB32(dst=vgpr(dst), shiftHex=hex(self.residualLog2Bytes), src=vgpr(dst),
                                   comment="rowByteBase = token_n * SizesFree0 * residualBytes."))
 
-    def _residualOutRowByteBase(self, module, dst: int, tokenBase: int, n: int, scratch: int) -> None:
-        nOff = n * self.mfma_n
-        self._addImmU32(module, dst, tokenBase, nOff, scratch, f"token_n = tokenBase + {nOff} (n={n}).")
-        # token_n * SizesFree0 uses 32-bit VMulLOU32; valid while token_n * N_hidden
-        # stays below 2^32 (all currently supported tensor sizes).
-        module.add(VMulLOU32(dst=vgpr(dst), src0=sgpr("SizesFree+0"), src1=vgpr(dst),
-                             comment="token_n * SizesFree0."))
-        module.add(VLShiftLeftB32(dst=vgpr(dst), shiftHex=hex(1), src=vgpr(dst),
-                                  comment="roRowByteBase = token_n * SizesFree0 * 2 (bf16)."))
-
     def _residualElemAddr(self, module, resAddr: int, rowByteBase: int, nhiddenBase: int,
                           rowGroupOff: int, oobV: int, oobMask: int, scratch: int,
                           m: int, k: int) -> None:
@@ -312,181 +293,165 @@ class SubtileResidualAddEmitter:
                                src2=sgpr(oobMask, self.lane_sgpr_count),
                                comment="clamp OOB when nhidden_pos >= N_hidden"))
 
-    def _beginBf16Store(self, module) -> None:
-        """Build the ResidualOut SRD and precompute per-n row-byte bases for bf16 stores."""
+    def _residualOutAcquireScratch(self, cvtVgprStruct):
+        """Return (effectiveCvt, selfVgprs) for the ResidualOut permute/pack scratch.
+
+        Reuses cvtVgprStruct when it already has valid permute fields (bf16/fp16
+        D dest); otherwise self-allocates 7 scratch VGPRs so fp8/other D dest
+        can still emit the store. selfVgprs lists the allocated indices in
+        allocation order; the caller frees them after the store completes.
+        """
+        if (cvtVgprStruct is not None
+                and hasattr(cvtVgprStruct, 'vgprPermAddr')
+                and cvtVgprStruct.vgprPermAddr >= 0):
+            return cvtVgprStruct, []
+        vgprPool = self.writer.vgprPool
+        # 4 VGPRs, 2-aligned: satisfies buffer_store_dwordx4 src alignment.
+        packBase = vgprPool.checkOutAligned(4, 2, tag="rAdd_roPack")
+        permAddr = vgprPool.checkOut(1, tag="rAdd_roPermAddr")
+        lgDelta = vgprPool.checkOut(1, tag="rAdd_roLGDelta")
+        addrScratch = vgprPool.checkOut(1, tag="rAdd_roAddrScratch")
+        scratch = types.SimpleNamespace(
+            vgprBf16Temp=packBase,
+            vgprPermAddr=permAddr,
+            vgprLaneGroupDelta=lgDelta,
+            vgprAddrScratch=addrScratch,
+        )
+        return scratch, [packBase, permAddr, lgDelta, addrScratch]
+
+    def _residualOutSetupAddresses(self, module, gwbw, wgRowBase: int):
+        """Build ResidualOut SRD, permute state, guards, and per-n row-byte VGPRs.
+
+        Returns (roRowBase, lgByte, wgRowBase_bytes) checked out from the VGPR pool;
+        the caller frees them after the store loop.
+        """
         self._buildResidualOutSrd(module, self.residualOutSrd)
-        self._roTokenBase = self.writer.vgprPool.checkOut(1, tag="rAdd_roToken")
-        self._roRowBase   = self.writer.vgprPool.checkOut(self.mma_n, tag="rAdd_roRowBase")
-        self._roAddr      = self.writer.vgprPool.checkOut(1, tag="rAdd_roAddr")
-        self._roVal       = self.writer.vgprPool.checkOut(1, tag="rAdd_roVal")
-        self._roOobV      = self.writer.vgprPool.checkOut(1, tag="rAdd_roOob")
-        self._roNhByte    = self.writer.vgprPool.checkOut(1, tag="rAdd_roNhByte")
-        self._roOobMask   = self.writer.sgprPool.checkOutAligned(
-            self.lane_sgpr_count, self.lane_sgpr_count, tag="rAdd_roOobMask", preventOverflow=False)
-        # Single token-in-range mask slot; recomputed per-n in _storeBf16Elem to save
-        # (mma_n - 1) * lane_sgpr_count SGPRs vs the old per-n precomputed layout.
-        self._roTokenMask = self.writer.sgprPool.checkOutAligned(
-            self.lane_sgpr_count, self.lane_sgpr_count, tag="rAdd_roTokMask",
-            preventOverflow=False)
-        # Alignment remainder is computed once and kept for the whole store pass so
-        # _storeBf16RowWide can branch at runtime between wide and scalar paths.
-        self._roNAlignRem = self.writer.sgprPool.checkOut(1, tag="rAdd_roNAlignRem")
-        module.add(VLShiftRightB32(dst=vgpr(self._roTokenBase), shiftHex=hex(self.log2ElemBytes),
-                                   src=vgpr(self.colByte), comment="tokenBase = colByte >> log2ElemBytes."))
-        module.add(VMovB32(dst=vgpr(self._roOobV), src="BufferOOB",
-                           comment="OOB byte offset -> ResidualOut store dropped."))
-        module.add(SAndB32(dst=sgpr(self._roNAlignRem), src0=sgpr("SizesFree+0"),
-                           src1=self.rows_per_lane - 1,
-                           comment="N_hidden % rows_per_lane (rows_per_lane is pow2)."))
+        # Permute/LGDelta setup: fills vgprPermAddr and vgprLaneGroupDelta in cvtVgprStruct.
+        gwbw._emitSubtilePermuteAndLGDelta(module)
+        # Edge guards: populates SubtileMGuard, SubtileNGuard, and leaks a temp SGPR
+        # into self.writer.states.subtileTotalMOffsetSgpr (freed in the outer function).
+        self.writer._emitSubtileGuards(self.kernel, module)
+
+        vgprPool = self.writer.vgprPool
+        # Pre-compute per-n token row byte bases.
+        #   roRowBase[n] = (tokenBase + n*mfma_n) * SizesFree0 * 2.
+        tokenBase = vgprPool.checkOut(1, tag="rAdd_roMT_tokenBase")
+        module.add(VLShiftRightB32(dst=vgpr(tokenBase), shiftHex=hex(self.log2ElemBytes),
+                                    src=vgpr(self.colByte),
+                                    comment="tokenBase = colByte >> log2ElemBytes."))
+        roRowBase = vgprPool.checkOut(self.mma_n, tag="rAdd_roMT_roRow")
+        roScratch = vgprPool.checkOut(1, tag="rAdd_roMT_roScratch")
         for n in range(self.mma_n):
-            self._residualOutRowByteBase(module, self._roRowBase + n, self._roTokenBase, n,
-                                         self._roNhByte)
+            self._addImmU32(module, roRowBase + n, tokenBase, n * self.mfma_n, roScratch,
+                            f"token_n = tokenBase + {n * self.mfma_n} (n={n}).")
+            module.add(VMulLOU32(dst=vgpr(roRowBase + n), src0=sgpr("SizesFree+0"),
+                                 src1=vgpr(roRowBase + n),
+                                 comment=f"token_n * SizesFree0 (n={n})."))
+            module.add(VLShiftLeftB32(dst=vgpr(roRowBase + n), shiftHex=hex(1),
+                                       src=vgpr(roRowBase + n),
+                                       comment=f"roRowBase[{n}] = token_n * SizesFree0 * 2."))
+        vgprPool.checkIn(roScratch)
+        vgprPool.checkIn(tokenBase)
 
-    def _endBf16Store(self, module) -> None:
-        """Wait for all pending ResidualOut bf16 stores and free scratch registers."""
-        module.add(SWaitCnt(vscnt=0, comment="wait ResidualOut bf16 stores."))
-        self.writer.sgprPool.checkIn(self._roNAlignRem)
-        self.writer.sgprPool.checkIn(self._roTokenMask)
-        self.writer.sgprPool.checkIn(self._roOobMask)
-        self.writer.vgprPool.checkIn(self._roNhByte)
-        self.writer.vgprPool.checkIn(self._roOobV)
-        self.writer.vgprPool.checkIn(self._roVal)
-        self.writer.vgprPool.checkIn(self._roAddr)
-        self.writer.vgprPool.checkIn(self._roRowBase)
-        self.writer.vgprPool.checkIn(self._roTokenBase)
+        # lane_group*16 bytes; for wave64 with mfma_n=16: laneId & 0x30 = lane_group<<4.
+        lgByte = vgprPool.checkOut(1, tag="rAdd_roMT_lgByte")
+        module.add(VAndB32(dst=vgpr(lgByte), src0=vgpr(self.laneId), src1=0x30,
+                           comment="lgByte = lane_group*16 bytes = laneId & 0x30."))
+        # wgRowBase_bytes = wgRowBase * 2 (bf16, 2 bytes/element).
+        wgRowBase_bytes = vgprPool.checkOut(1, tag="rAdd_roMT_wgRowBaseB")
+        module.add(VLShiftLeftB32(dst=vgpr(wgRowBase_bytes), shiftHex=hex(1),
+                                   src=vgpr(wgRowBase),
+                                   comment="wgRowBase_bytes = wgRowBase * 2."))
+        return roRowBase, lgByte, wgRowBase_bytes
 
-    def _computeBf16NhByte(self, module, m: int, k: int) -> None:
-        """Compute the nhidden byte offset and OOB mask for element (m, k) from the shared nhBase."""
-        self._addImmU32(module, self._roNhByte, self._nhBaseV, k, self._roAddr,
-                        f"nhidden_pos = nhBase + {k} (m={m},k={k}).")
-        module.add(VCmpLtU32(dst=sgpr(self._roOobMask, self.lane_sgpr_count),
-                             src0=vgpr(self._roNhByte), src1=sgpr("SizesFree+0"),
-                             comment="inRange = nhidden_pos < N_hidden."))
-        module.add(VLShiftLeftB32(dst=vgpr(self._roNhByte), shiftHex=hex(1), src=vgpr(self._roNhByte),
-                                  comment="nhByte = nhidden_pos * 2 (bf16)."))
+    def _residualOutStoreLoop(self, module, gwbw, vgprTiles,
+                              roRowBase: int, lgByte: int, wgRowBase_bytes: int) -> None:
+        """Iterate over paired (m, m+1) / n tile positions and emit paired dwordx4 stores."""
+        useAlign8 = self.writer.states.storeAlign8
+        vgprPool = self.writer.vgprPool
+        vaddrVgpr = vgprPool.checkOut(1, tag="rAdd_roMT_vaddr")
+        nhBase_bytes = vgprPool.checkOut(1, tag="rAdd_roMT_nhBase")
+        # 2-aligned burst for 8 f32 values; satisfies buffer_store_dwordx4 src alignment.
+        burstBase = vgprPool.checkOutAligned(8, 2, tag="rAdd_roMT_burst")
 
-    def _emitResidualOutStore(self, module, srcVgpr: int, bps: int, addrVgpr: int, comment: str) -> None:
-        """Issue a ResidualOut buffer store via the shared vectorized-store selector."""
-        module.add(self.writer.chooseGlobalWrite(
-            self.kernel["BufferStore"], bps, srcVgpr, bps / self.writer.states.bpr,
-            vgpr(addrVgpr), sgpr(self.residualOutSrd, 4), 0, comment=comment))
+        def srcVc(pair, vi):
+            return vgpr(burstBase + pair * self.rows_per_lane + vi)
 
-    def _storeBf16Elem(self, module, accReg: int, n: int) -> None:
-        """Store bf16(accReg) to ResidualOut[token, nhidden], dropping OOB lanes."""
-        # Recompute token_n for this n into _roAddr (safe: _roAddr is overwritten next anyway).
-        nOff = n * self.mfma_n
-        self._addImmU32(module, self._roAddr, self._roTokenBase, nOff, self._roAddr,
-                        f"token_n = tokenBase + {nOff} (n={n}).")
-        module.add(VCmpLtU32(dst=sgpr(self._roTokenMask, self.lane_sgpr_count),
-                             src0=vgpr(self._roAddr), src1=sgpr("SizesFree+1"),
-                             comment="tokenInRange = token_n < M_tokens."))
-        module.add(VAddU32(dst=vgpr(self._roAddr), src0=vgpr(self._roRowBase + n),
-                           src1=vgpr(self._roNhByte),
-                           comment="byteAddr = roRowByteBase[n] + nhByte."))
-        # Clamp the full address so an OOB lane lands on exactly BufferOOB and is dropped.
-        module.add(VCndMaskB32(dst=vgpr(self._roAddr), src0=vgpr(self._roOobV),
-                               src1=vgpr(self._roAddr),
-                               src2=sgpr(self._roTokenMask, self.lane_sgpr_count),
-                               comment="clamp OOB when token_n >= M_tokens."))
-        module.add(VCndMaskB32(dst=vgpr(self._roAddr), src0=vgpr(self._roOobV),
-                               src1=vgpr(self._roAddr),
-                               src2=sgpr(self._roOobMask, self.lane_sgpr_count),
-                               comment="clamp OOB when nhidden_pos >= N_hidden."))
-        module.add(VCvtPkF32toBF16(dst=vgpr(self._roVal), src0=vgpr(accReg), src1=vgpr(accReg),
-                                   comment="H+residual f32 -> bf16 (low16)."))
-        self._emitResidualOutStore(module, self._roVal, 2, self._roAddr,
-                                   "ResidualOut[token, nhidden] = bf16(H+residual).")
-
-    def _storeBf16RowWide(self, module, resBurst: int, m: int) -> None:
-        """Dispatch bf16 H stores for tile row m: wide (aligned) or scalar (unaligned).
-
-        The wide dwordx2 path is taken only when N_hidden is a multiple of
-        rows_per_lane (checked at runtime); otherwise the per-element scalar path
-        preserves correctness for straddling groups.
-        """
-        alignedLabel = Label(self.writer.labels.getNameInc(f"rAdd_roWide_m{m}"), "")
-        endLabel     = Label(self.writer.labels.getNameInc(f"rAdd_roWideEnd_m{m}"), "")
-        module.add(SCmpEQU32(src0=sgpr(self._roNAlignRem), src1=0,
-                             comment="N_hidden aligned to rows_per_lane."))
-        module.add(SCBranchSCC1(labelName=alignedLabel.getLabelName(),
-                                comment="aligned -> wide dwordx2 store."))
-        self._storeBf16RowScalar(module, resBurst, m)
-        module.add(SBranch(labelName=endLabel.getLabelName(), comment="skip wide store."))
-        module.add(alignedLabel)
-        self._storeBf16RowWideAligned(module, resBurst, m)
-        module.add(endLabel)
-
-    def _storeBf16RowScalar(self, module, resBurst: int, m: int) -> None:
-        """Per-element bf16 H store fallback for N_hidden not aligned to rows_per_lane."""
-        for k in range(self.rows_per_lane):
-            self._computeBf16NhByte(module, m, k)
+        for m in range(0, self.mma_m, 2):
+            # nhBase_pair_bytes = (wgRowBase + m*mfma_m)*2 = wgRowBase_bytes + m*mfma_m*2.
+            mOff_bytes = m * self.mfma_m * 2
+            self._addImmU32(module, nhBase_bytes, wgRowBase_bytes, mOff_bytes, vaddrVgpr,
+                            f"nhBase_bytes = wgRowBase_bytes + {mOff_bytes} (m={m}).")
+            # Add lane_group*16 correction: after permute each LG has 8 contiguous nhidden rows.
+            module.add(VAddU32(vgpr(nhBase_bytes), vgpr(nhBase_bytes), vgpr(lgByte),
+                               comment=f"nhBase_bytes += lgByte (lane_group*16) (m={m})."))
             for n in range(self.mma_n):
-                self._storeBf16Elem(module, resBurst + n * self.rows_per_lane + k, n)
+                # Full per-lane byte address: token row base + nhidden byte base.
+                module.add(VAddU32(vgpr(vaddrVgpr), vgpr(roRowBase + n), vgpr(nhBase_bytes),
+                                   comment=f"vaddrVgpr = roRowBase[{n}] + nhBase_bytes (m={m},n={n})."))
+                # Read 8 H f32 values from acc: 4 from tile m then 4 from tile m+1.
+                coords = [(m, n, k) for k in range(self.rows_per_lane)] + \
+                         [(m + 1, n, k) for k in range(self.rows_per_lane)]
+                self._readAccBurst(module, burstBase, vgprTiles, coords,
+                                   f"read H burst for ResidualOut (m={m},{m+1},n={n}).")
+                module.add(gwbw._emit16bitPairedDwordx4Core(
+                    srcVc=srcVc, vaddrVgpr=vaddrVgpr, offset12=0,
+                    srd="SrdResidualOut", applyLGDeltaToAddr=False,
+                    useAlign8=useAlign8, blockIdxM=m, blockIdxN=n,
+                    isGlc=False, isSlc=False, isNT=False, tt0=m))
 
-    def _setupBf16WideNhMask(self, module, m: int) -> None:
-        """Compute whole-group OOB mask and nhByte for wide bf16 row m from the shared nhBase."""
-        rpl = self.rows_per_lane
-        lsc = self.lane_sgpr_count
-        # Whole-group nhidden mask: in range iff the last element (k=rpl-1) < N_hidden.
-        self._addImmU32(module, self._roAddr, self._nhBaseV, rpl - 1, self._roAddr,
-                        f"nhiddenLast = nhBase + {rpl - 1}.")
-        module.add(VCmpLtU32(dst=sgpr(self._roOobMask, lsc), src0=vgpr(self._roAddr),
-                             src1=sgpr("SizesFree+0"),
-                             comment="group in range = nhiddenLast < N_hidden."))
-        module.add(VLShiftLeftB32(dst=vgpr(self._roNhByte), shiftHex=hex(1),
-                                  src=vgpr(self._nhBaseV),
-                                  comment="nhByte = nhBase * 2 (bf16)."))
+        module.add(SWaitCnt(vscnt=0, comment="wait ResidualOut dwordx4 stores."))
+        vgprPool.checkIn(burstBase)
+        vgprPool.checkIn(nhBase_bytes)
+        vgprPool.checkIn(vaddrVgpr)
 
-    def _storeBf16WideElem(self, module, resBurst: int, m: int, n: int) -> None:
-        """Pack and store rows_per_lane bf16 values for element (m, n) via buffer_store_dwordx2."""
-        rpl = self.rows_per_lane
-        lsc = self.lane_sgpr_count
-        nOff = n * self.mfma_n
-        self._addImmU32(module, self._roAddr, self._roTokenBase, nOff, self._roAddr,
-                        f"token_n = tokenBase + {nOff} (n={n}).")
-        module.add(VCmpLtU32(dst=sgpr(self._roTokenMask, lsc), src0=vgpr(self._roAddr),
-                             src1=sgpr("SizesFree+1"),
-                             comment="tokenInRange = token_n < M_tokens."))
-        module.add(VAddU32(dst=vgpr(self._roAddr), src0=vgpr(self._roRowBase + n),
-                           src1=vgpr(self._roNhByte),
-                           comment="byteAddr = roRowByteBase[n] + nhByte(k=0)."))
-        module.add(VCndMaskB32(dst=vgpr(self._roAddr), src0=vgpr(self._roOobV),
-                               src1=vgpr(self._roAddr),
-                               src2=sgpr(self._roTokenMask, lsc),
-                               comment="clamp OOB when token_n >= M_tokens."))
-        module.add(VCndMaskB32(dst=vgpr(self._roAddr), src0=vgpr(self._roOobV),
-                               src1=vgpr(self._roAddr),
-                               src2=sgpr(self._roOobMask, lsc),
-                               comment="clamp OOB when nhidden group >= N_hidden."))
-        for c in range(rpl // 4):
-            # c > 0 is dead for rows_per_lane == 4; live only for rows_per_lane >= 8.
-            base = resBurst + n * rpl + 4 * c
-            # Pack in order: dword0 from k0,k1 into base+0, then dword1 from k2,k3
-            # into base+1. The first pack reads base+0,base+1 before clobbering base+0;
-            # the second pack reads base+2,base+3 before clobbering base+1.
-            module.add(VCvtPkF32toBF16(dst=vgpr(base + 0), src0=vgpr(base + 0),
-                                       src1=vgpr(base + 1),
-                                       comment="pack H k0,k1 -> bf16 dword."))
-            module.add(VCvtPkF32toBF16(dst=vgpr(base + 1), src0=vgpr(base + 2),
-                                       src1=vgpr(base + 3),
-                                       comment="pack H k2,k3 -> bf16 dword."))
-            stAddr = self._roAddr
-            if c > 0:
-                self._addImmU32(module, self._roVal, self._roAddr, 8 * c, self._roVal,
-                                f"chunk byte offset {8 * c}.")
-                stAddr = self._roVal
-            self._emitResidualOutStore(module, base + 0, 8, stAddr,
-                                       f"ResidualOut b64 [4 bf16] (m={m},n={n},c={c}).")
+    def _emitResidualOutMacroTileStore(self, module, vgprTiles, wgRowBase: int, cvtVgprStruct) -> None:
+        """Store H (in accumulator tiles) as bf16 to ResidualOut using paired buffer_store_dwordx4.
 
-    def _storeBf16RowWideAligned(self, module, resBurst: int, m: int) -> None:
-        """Store rows_per_lane bf16 H values per n with buffer_store_dwordx2.
+        Reuses _emit16bitPairedDwordx4Core from GlobalWriteBatchWriter.
+        Requires rows_per_lane == 4 (mfma_m=16, mfma_n=16, waveSize=64) and even mma_m.
 
-        Only called when N_hidden is a multiple of rows_per_lane, so a group of
-        rows_per_lane elements is either entirely in range or entirely OOB.
+        Address formula per pair (m, m+1) and token column n:
+          vaddrVgpr = roRowBase[n] + (wgRowBase + m*mfma_m)*2 + lane_group*16
+        where roRowBase[n] = (tokenBase + n*mfma_n)*SizesFree0*2
+        and lane_group*16 = laneId & 0x30 (the 8-row-per-LG byte correction after permute).
         """
-        self._setupBf16WideNhMask(module, m)
-        for n in range(self.mma_n):
-            self._storeBf16WideElem(module, resBurst, m, n)
+        assert self.storeBf16D, "residualOut store requires storeBf16D"
+        assert self.mma_m % 2 == 0, "mma_m must be even for paired dwordx4 ResidualOut store"
+        assert self.rows_per_lane == 4, "ResidualOut macro-tile dwordx4 store requires rows_per_lane == 4"
+
+        from Tensile.Components.GlobalWriteBatch import GlobalWriteBatchWriter
+
+        effectiveCvt, selfVgprs = self._residualOutAcquireScratch(cvtVgprStruct)
+
+        lsc = self.writer.states.laneSGPRCount
+        # Bare GlobalWriteBatchWriter shell giving access to the core store primitives.
+        # Attributes accessed by the called methods:
+        #   kernel, cvtVgprStruct, parentWriter, tmpSgpr.
+        gwbw = GlobalWriteBatchWriter.__new__(GlobalWriteBatchWriter)
+        gwbw.kernel = self.kernel
+        gwbw.cvtVgprStruct = effectiveCvt
+        gwbw.parentWriter = self.writer
+        tmpSgpr = self.writer.sgprPool.checkOutAligned(
+            2 * lsc, 2, tag="rAdd_roMT_tmpS", preventOverflow=False)
+        gwbw.tmpSgpr = tmpSgpr
+
+        roRowBase, lgByte, wgRowBase_bytes = self._residualOutSetupAddresses(module, gwbw, wgRowBase)
+        self._residualOutStoreLoop(module, gwbw, vgprTiles, roRowBase, lgByte, wgRowBase_bytes)
+
+        self.writer.vgprPool.checkIn(wgRowBase_bytes)
+        self.writer.vgprPool.checkIn(lgByte)
+        self.writer.vgprPool.checkIn(roRowBase)
+        for v in reversed(selfVgprs):
+            self.writer.vgprPool.checkIn(v)
+
+        # Return the leaked subtileTotalMOffsetSgpr so the later D-store batch can
+        # recompute its own guards byte-identically.
+        if self.writer.states.subtileTotalMOffsetSgpr is not None:
+            self.writer.sgprPool.checkIn(self.writer.states.subtileTotalMOffsetSgpr)
+            self.writer.states.subtileTotalMOffsetSgpr = None
+
+        self.writer.sgprPool.checkIn(tmpSgpr)
 
     def _beginResidual(self, module) -> int:
         """Build the residual SRD and check out per-m-row load scratch; returns the residual burst base."""
@@ -697,37 +662,20 @@ class SubtileResidualAddEmitter:
         return module
 
     def _residualAccElement(self, module, vgprTiles, accReg: int, resReg, m: int, n: int, k: int) -> None:
-        # When useWideBf16Store: H is left in resReg (the residual burst) for wide packing,
-        # then written back to the accumulator. When residualAdd is False but storeBf16D is
-        # True, the accumulator already holds H (= GEMM acc), so no writeback is needed.
-        if self.useWideBf16Store:
-            module.add(VAddF32(dst=vgpr(resReg), src0=vgpr(accReg), src1=vgpr(resReg),
-                               comment="H = GEMM + residual (kept in burst for wide store)."))
-            self._writeAccFrom(module, resReg, vgprTiles, m, n, k, f"write H back to acc (m={m},n={n},k={k}).")
-            return
         if resReg is not None:
             module.add(VAddF32(dst=vgpr(accReg), src0=vgpr(accReg), src1=vgpr(resReg),
                                comment="H = GEMM + residual."))
-        if self.storeBf16D:
-            self._storeBf16Elem(module, accReg, n)
-        if resReg is not None:
             self._writeAccFrom(module, accReg, vgprTiles, m, n, k, f"write H back to acc (m={m},n={n},k={k}).")
 
     def _residualAccRow(self, module, vgprTiles, accBurst: int, resBurst, m: int) -> None:
         for k in range(self.rows_per_lane):
             coords = [(m, n, k) for n in range(self.mma_n)]
             self._readAccBurst(module, accBurst, vgprTiles, coords, f"read acc m={m},k={k}.")
-            if self.storeBf16D and not self.useWideBf16Store:
-                self._computeBf16NhByte(module, m, k)
             for n in range(self.mma_n):
                 resReg = None if resBurst is None else resBurst + n * self.rows_per_lane + k
                 self._residualAccElement(module, vgprTiles, accBurst + n, resReg, m, n, k)
-        # Wide store packs (and clobbers) the residual burst in place, so the element
-        # loop writeback must complete before _storeBf16RowWide runs.
-        if self.useWideBf16Store:
-            self._storeBf16RowWide(module, resBurst, m)
 
-    def _residualPassFree0(self, vgprTiles) -> Module:
+    def _residualPassFree0(self, vgprTiles, cvtVgprStruct=None) -> Module:
         module = Module("ResidualAdd residualPassFree0")
         module.addComment1("ResidualAdd pass (free0): load residual, H = GEMM + residual, write H back, bf16 store")
         vgprPool = self.writer.vgprPool
@@ -736,8 +684,6 @@ class SubtileResidualAddEmitter:
         self._computeRowGroupOff(module, rowGroupOff)
         self._computeFree0RowBase(module, wgRowBase)
         self._nhBaseV = vgprPool.checkOut(1, tag="rAdd_nhBase")
-        if self.storeBf16D:
-            self._beginBf16Store(module)
         mBaseVgpr = vgprPool.checkOut(1, tag="rAdd_mBase")
         accBurst  = vgprPool.checkOut(self.mma_n, tag="rAdd_accBurst")
         resBurst  = self._beginResidual(module) if self.residualAdd else None
@@ -752,10 +698,11 @@ class SubtileResidualAddEmitter:
                 module.add(SWaitCnt(vlcnt=0, comment="wait residual row burst."))
                 self._convertResidualRow(module, resBurst)
             self._residualAccRow(module, vgprTiles, accBurst, resBurst, m)
-        if self.storeBf16D:
-            self._endBf16Store(module)
         if resBurst is not None:
             self._endResidual()
+        if self.storeBf16D:
+            # H is now in the accumulator tiles; emit the single macro-tile write-back.
+            self._emitResidualOutMacroTileStore(module, vgprTiles, wgRowBase, cvtVgprStruct)
         vgprPool.checkIn(accBurst)
         vgprPool.checkIn(mBaseVgpr)
         vgprPool.checkIn(self._nhBaseV)
@@ -763,11 +710,11 @@ class SubtileResidualAddEmitter:
         vgprPool.checkIn(rowGroupOff)
         return module
 
-    def emit(self, vgprTiles) -> Module:
+    def emit(self, vgprTiles, cvtVgprStruct=None) -> Module:
         module = Module("ResidualAdd epilogue")
         module.addComment1("ResidualAdd: load residual, H = GEMM + residual, store ResidualOut bf16")
         self._allocEpilogueRegs()
         module.add(self._setup(self.laneId, self.colByte))
-        module.add(self._residualPassFree0(vgprTiles))
+        module.add(self._residualPassFree0(vgprTiles, cvtVgprStruct))
         self._freeEpilogueRegs()
         return module
