@@ -22,6 +22,8 @@ from rocisa.instruction import (
     BufferLoadB64,
     BufferLoadD16B16,
     BufferLoadD16U8,
+    BufferStoreB16,
+    BufferStoreB64,
     ECvtPkBF8toF32,
     ECvtPkFP8toF32,
     SAndB32,
@@ -365,12 +367,6 @@ class SubtileResidualAddEmitter:
         module.add(VLShiftLeftB32(dst=vgpr(self._roNhByte), shiftHex=hex(1), src=vgpr(self._roNhByte),
                                   comment="nhByte = nhidden_pos * 2 (bf16)."))
 
-    def _emitResidualOutStore(self, module, srcVgpr: int, bps: int, addrVgpr: int, comment: str) -> None:
-        """Issue a ResidualOut buffer store via the shared vectorized-store selector."""
-        module.add(self.writer.chooseGlobalWrite(
-            self.kernel["BufferStore"], bps, srcVgpr, bps / self.writer.states.bpr,
-            vgpr(addrVgpr), sgpr(self.residualOutSrd, 4), 0, comment=comment))
-
     def _storeBf16Elem(self, module, accReg: int, n: int) -> None:
         """Store bf16(accReg) to ResidualOut[token, nhidden], dropping OOB lanes."""
         # Recompute token_n for this n into _roAddr (safe: _roAddr is overwritten next anyway).
@@ -394,8 +390,10 @@ class SubtileResidualAddEmitter:
                                comment="clamp OOB when nhidden_pos >= N_hidden."))
         module.add(VCvtPkF32toBF16(dst=vgpr(self._roVal), src0=vgpr(accReg), src1=vgpr(accReg),
                                    comment="H+residual f32 -> bf16 (low16)."))
-        self._emitResidualOutStore(module, self._roVal, 2, self._roAddr,
-                                   "ResidualOut[token, nhidden] = bf16(H+residual).")
+        module.add(BufferStoreB16(src=vgpr(self._roVal), vaddr=vgpr(self._roAddr),
+                                  saddr=sgpr(self.residualOutSrd, 4), soffset=0,
+                                  mubuf=MUBUFModifiers(offen=True),
+                                  comment="ResidualOut[token, nhidden] = bf16(H+residual)."))
 
     def _storeBf16RowWide(self, module, resBurst: int, m: int) -> None:
         """Dispatch bf16 H stores for tile row m: wide (aligned) or scalar (unaligned).
@@ -475,8 +473,10 @@ class SubtileResidualAddEmitter:
                 self._addImmU32(module, self._roVal, self._roAddr, 8 * c, self._roVal,
                                 f"chunk byte offset {8 * c}.")
                 stAddr = self._roVal
-            self._emitResidualOutStore(module, base + 0, 8, stAddr,
-                                       f"ResidualOut b64 [4 bf16] (m={m},n={n},c={c}).")
+            module.add(BufferStoreB64(src=vgpr(base + 0, 2), vaddr=vgpr(stAddr),
+                                      saddr=sgpr(self.residualOutSrd, 4), soffset=0,
+                                      mubuf=MUBUFModifiers(offen=True),
+                                      comment=f"ResidualOut b64 [4 bf16] (m={m},n={n},c={c})."))
 
     def _storeBf16RowWideAligned(self, module, resBurst: int, m: int) -> None:
         """Store rows_per_lane bf16 H values per n with buffer_store_dwordx2.
