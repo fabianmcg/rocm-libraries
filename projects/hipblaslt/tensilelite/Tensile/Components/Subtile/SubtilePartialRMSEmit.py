@@ -818,6 +818,38 @@ class SubtilePartialRMSEmitter:
                 self._fusedAccElement(module, vgprTiles, accBurst + n, gammaReg,
                                       partials, amaxPartials, absMask, m, n, k, first)
 
+    def _fusedAccBlock(self, module, vgprTiles, accBurst: int, gammaBurst: int,
+                       partials, amaxPartials, absMask, m: int) -> None:
+        """Convert one loaded gamma block to fp32 and fold it into acc row m."""
+        self._convertGammaRow(module, gammaBurst)
+        self._fusedAccRow(module, vgprTiles, accBurst, gammaBurst, partials,
+                          amaxPartials, absMask, m)
+
+    def _emitBlockPair(self, module, vgprTiles, accBurst: int, gammaBurst: int,
+                       gammaSrd: int, gammaByteVgpr: int, mBaseVgpr: int,
+                       wgRowBase: int, rowGroupOff: int, partials, amaxPartials,
+                       absMask, m: int) -> None:
+        """Pipeline blocks m and m+1: overlap block m+1's gamma loads with block m compute."""
+        rowsPerLane = self.rows_per_lane
+        paired = (m + 1) < self.mma_m
+        self._free0RowPos(module, self._nhBaseV, wgRowBase, rowGroupOff, m, 0, mBaseVgpr)
+        self._issueGammaLoads(module, gammaSrd, gammaBurst, gammaByteVgpr, m)
+        if paired:
+            self._addImmU32(module, self._nhBaseV, self._nhBaseV, self.mfma_m, mBaseVgpr,
+                            f"nhBase += mfma_m (advance to block {m + 1}).")
+            self._issueGammaLoads(module, gammaSrd, gammaBurst + rowsPerLane, gammaByteVgpr, m + 1)
+            module.add(SWaitCnt(vlcnt=rowsPerLane,
+                                comment="wait block m gamma; block m+1 still in flight."))
+        else:
+            module.add(SWaitCnt(vlcnt=0, comment="wait gamma row burst."))
+        self._fusedAccBlock(module, vgprTiles, accBurst, gammaBurst, partials,
+                            amaxPartials, absMask, m)
+        if not paired:
+            return
+        module.add(SWaitCnt(vlcnt=0, comment="wait block m+1 gamma."))
+        self._fusedAccBlock(module, vgprTiles, accBurst, gammaBurst + rowsPerLane, partials,
+                            amaxPartials, absMask, m + 1)
+
     def _fusedAccPassFree0(self, vgprTiles, gammaSrd: int, partials,
                            amaxPartials, absMask, scratchV: int) -> Module:
         module = Module("PartialRMS fusedAccPassFree0")
@@ -833,14 +865,11 @@ class SubtilePartialRMSEmitter:
         gammaByteVgpr = scratchV
         mBaseVgpr = self.writer.vgprPool.checkOut(1, tag="pRMS_fusMBase")
         accBurst = self.writer.vgprPool.checkOut(self.mma_n, tag="pRMS_fusAccBurst")
-        gammaBurst = self.writer.vgprPool.checkOut(self.rows_per_lane, tag="pRMS_fusGammaBurst")
-        for m in range(self.mma_m):
-            self._free0RowPos(module, self._nhBaseV, wgRowBase, rowGroupOff, m, 0, mBaseVgpr)
-            self._issueGammaLoads(module, gammaSrd, gammaBurst, gammaByteVgpr, m)
-            module.add(SWaitCnt(vlcnt=0, comment="wait gamma row burst."))
-            self._convertGammaRow(module, gammaBurst)
-            self._fusedAccRow(module, vgprTiles, accBurst, gammaBurst, partials,
-                              amaxPartials, absMask, m)
+        gammaBurst = self.writer.vgprPool.checkOut(2 * self.rows_per_lane, tag="pRMS_fusGammaBurst")
+        for m in range(0, self.mma_m, 2):
+            self._emitBlockPair(module, vgprTiles, accBurst, gammaBurst, gammaSrd,
+                                gammaByteVgpr, mBaseVgpr, wgRowBase, rowGroupOff,
+                                partials, amaxPartials, absMask, m)
         self.writer.vgprPool.checkIn(gammaBurst)
         self.writer.vgprPool.checkIn(accBurst)
         self.writer.vgprPool.checkIn(mBaseVgpr)
