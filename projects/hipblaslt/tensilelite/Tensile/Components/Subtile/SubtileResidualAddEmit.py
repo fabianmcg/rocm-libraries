@@ -524,7 +524,7 @@ class SubtileResidualAddEmitter:
             self._beginResidualWideBase(module)
         if self.useWideResidualPaired:
             self._setupPairedPermute(module)
-        if not self.useWideResidual:
+        if (not self.useWideResidual) or self.useWideResidualPaired:
             self._resOobV = self.writer.vgprPool.checkOut(1, tag="rAdd_fusResOob")
             module.add(VMovB32(dst=vgpr(self._resOobV), src="BufferOOB",
                                comment="OOB byte offset -> residual load returns 0."))
@@ -555,7 +555,7 @@ class SubtileResidualAddEmitter:
             self.writer.vgprPool.checkIn(self._permAddrV)
         if self.useWideResidual:
             self.writer.sgprPool.checkIn(self._resRowStrideS)
-        if not self.useWideResidual:
+        if (not self.useWideResidual) or self.useWideResidualPaired:
             self.writer.vgprPool.checkIn(self._resOobV)
         self.writer.sgprPool.checkIn(self._resOobMask)
         self.writer.vgprPool.checkIn(self._resTokenBase)
@@ -671,14 +671,18 @@ class SubtileResidualAddEmitter:
                                   comment="residual k=0 bf16(lo) -> f32."))
 
     def _pairedLoadPair(self, module, mm: int, resBurst: int, pairNhBaseV: int,
-                        scratch: int) -> None:
+                        scratch: int, clamp: bool = False) -> None:
         """Load, shuffle, and convert one tile-row pair (mm, mm+1) for all n.
 
         Each lane issues one buffer_load_dwordx4 per n covering the 8 contiguous
         nhidden of its lane-group's slot (pairNhBase = wgRowBase + mm*mfma_m + LG*8).
-        The inverse D-store shuffle (v_permlane32_swap x2 then ds_bpermute x4) routes
-        each lane's own rows for tile mm into dwords 0..1 and tile mm+1 into dwords 2..3.
+        When clamp is set (N_hidden % 8 == 0) the load address is clamped to BufferOOB
+        for out-of-range groups so hardware returns 0, replacing the post-load software
+        mask. The inverse D-store shuffle (v_permlane32_swap x2 then ds_bpermute x4)
+        then routes each lane's own rows for tile mm into dwords 0..1 and tile mm+1 into
+        dwords 2..3.
         """
+        lsc = self.lane_sgpr_count
         loBase = self._bufBase(resBurst, mm)       # tile mm buffer (also the load target).
         hiBase = self._bufBase(resBurst, mm + 1)   # tile mm+1 buffer.
         rpl = self.rows_per_lane
@@ -686,16 +690,31 @@ class SubtileResidualAddEmitter:
                                   comment="pairNhByte = pairNhBase * 2 (bf16)."))
         module.add(VAddU32(vgpr(self.resAddr), vgpr(self._resTokenBase), vgpr(scratch),
                            comment=f"byteAddr = base0 + pairNhByte (mm={mm},n=0)."))
+        if clamp:
+            self._addImmU32(module, scratch, pairNhBaseV, 2 * rpl - 1, scratch,
+                            f"pairNhBaseLast = pairNhBase + {2 * rpl - 1}.")
+            module.add(VCmpLtU32(dst=sgpr(self._resOobMask, lsc), src0=vgpr(scratch),
+                                 src1=sgpr("SizesFree+0"),
+                                 comment="group fully in range = pairNhBaseLast < N_hidden."))
         for n in range(self.mma_n):
             if n > 0:
                 module.add(VAddU32(vgpr(self.resAddr), vgpr(self.resAddr),
                                    sgpr(self._resRowStrideS),
                                    comment=f"byteAddr += rowStride (advance to n={n})."))
-            dstBase = loBase + n * rpl
-            module.add(BufferLoadB128(vgpr(dstBase, 4), vgpr(self.resAddr), sgpr(self.resSrd, 4), 0,
+            loadAddr = self.resAddr
+            if clamp:
+                module.add(VCndMaskB32(dst=vgpr(scratch), src0=vgpr(self._resOobV),
+                                       src1=vgpr(self.resAddr), src2=sgpr(self._resOobMask, lsc),
+                                       comment="clamp OOB group to BufferOOB (load returns 0)."))
+                loadAddr = scratch
+            module.add(BufferLoadB128(vgpr(loBase + n * rpl, 4), vgpr(loadAddr), sgpr(self.resSrd, 4), 0,
                                       MUBUFModifiers(offen=True),
                                       comment=f"R paired dwordx4 [8 bf16] (mm={mm},{mm + 1},n={n})."))
         module.add(SWaitCnt(vlcnt=0, comment="wait paired dwordx4 residual loads."))
+        self._pairedShuffleConvert(module, loBase, hiBase, rpl)
+
+    def _pairedShuffleConvert(self, module, loBase: int, hiBase: int, rpl: int) -> None:
+        """Inverse D-store shuffle then bf16->f32 convert for a loaded tile-row pair."""
         for n in range(self.mma_n):
             base = loBase + n * rpl
             module.add(VPermlane32SwapB32(dst=vgpr(base + 0), src=vgpr(base + 2),
@@ -895,28 +914,47 @@ class SubtileResidualAddEmitter:
                             wgRowBase: int, rowGroupOff: int, mBaseVgpr: int) -> None:
         """Paired dwordx4 load path: process tile rows in (mm, mm+1) pairs.
 
-        The dwordx4 residual load shuffles each lane's own rows into place and
-        residual masking after the shuffle zeroes OOB elements. Each tile row is
-        then stored independently with buffer_store_dwordx2 (no store-side shuffle);
-        _residualAccRow drives that store via _storeBf16RowWide.
+        When N_hidden % 8 == 0 each 8-wide lane-group is entirely in or out of range,
+        so the load address is clamped to BufferOOB for out-of-range groups (hardware
+        returns 0) and the post-load software mask is skipped. Otherwise the straddling
+        group is zeroed by _maskResidualOOB after the shuffle.
         """
         pairNhBaseV = self.writer.vgprPool.checkOut(1, tag="rAdd_pairNhBase")
+        alignedLabel = Label(self.writer.labels.getNameInc("rAdd_loadAligned"), "")
+        endLabel = Label(self.writer.labels.getNameInc("rAdd_loadEnd"), "")
+        with self.writer.allocTmpSgpr(1, tag="rAdd_loadRem") as remS:
+            module.add(SAndB32(dst=sgpr(remS.idx), src0=sgpr("SizesFree+0"), src1=7,
+                               comment="N_hidden % 8 (8 nhidden per dwordx4 group)."))
+            module.add(SCmpEQU32(src0=sgpr(remS.idx), src1=0, comment="N_hidden aligned to 8."))
+        module.add(SCBranchSCC1(labelName=alignedLabel.getLabelName(),
+                                comment="aligned -> clamp load address, skip software mask."))
+        self._emitPairedBody(module, vgprTiles, accBurst, resBurst, wgRowBase, rowGroupOff,
+                             mBaseVgpr, pairNhBaseV, clamp=False)
+        module.add(SBranch(labelName=endLabel.getLabelName(), comment="skip aligned path."))
+        module.add(alignedLabel)
+        self._emitPairedBody(module, vgprTiles, accBurst, resBurst, wgRowBase, rowGroupOff,
+                             mBaseVgpr, pairNhBaseV, clamp=True)
+        module.add(endLabel)
+        self.writer.vgprPool.checkIn(pairNhBaseV)
+
+    def _emitPairedBody(self, module, vgprTiles, accBurst: int, resBurst: int, wgRowBase: int,
+                        rowGroupOff: int, mBaseVgpr: int, pairNhBaseV: int, clamp: bool) -> None:
+        """One residual pass over all (mm, mm+1) pairs; clamp selects hardware vs software OOB."""
         for mm in range(0, self.mma_m, 2):
             # ownNhBase(mm) = wgRowBase + rowGroupOff + mm*mfma_m (the lane's own rows).
             self._free0RowPos(module, self._nhBaseV, wgRowBase, rowGroupOff, mm, 0, mBaseVgpr)
             # pairNhBase = ownNhBase(mm) + rowGroupOff; addresses the dwordx4 load.
             module.add(VAddU32(vgpr(pairNhBaseV), vgpr(self._nhBaseV), vgpr(rowGroupOff),
                                comment="pairNhBase = ownNhBase + rowGroupOff (LG*8)."))
-            self._pairedLoadPair(module, mm, resBurst, pairNhBaseV, mBaseVgpr)
-            # Consume tile mm: mask OOB then add + dwordx2 store at ownNhBase(mm).
-            self._maskResidualOOB(module, self._bufBase(resBurst, mm))
+            self._pairedLoadPair(module, mm, resBurst, pairNhBaseV, mBaseVgpr, clamp)
+            if not clamp:
+                self._maskResidualOOB(module, self._bufBase(resBurst, mm))
             self._residualAccRow(module, vgprTiles, accBurst, self._bufBase(resBurst, mm), mm)
-            # Consume tile mm+1: advance own nhBase by one MMA tile, then store.
             self._addImmU32(module, self._nhBaseV, self._nhBaseV, self.mfma_m, mBaseVgpr,
                             f"nhBase += mfma_m (advance to tile {mm + 1}).")
-            self._maskResidualOOB(module, self._bufBase(resBurst, mm + 1))
+            if not clamp:
+                self._maskResidualOOB(module, self._bufBase(resBurst, mm + 1))
             self._residualAccRow(module, vgprTiles, accBurst, self._bufBase(resBurst, mm + 1), mm + 1)
-        self.writer.vgprPool.checkIn(pairNhBaseV)
 
     def _residualPassFree0(self, vgprTiles) -> Module:
         module = Module("ResidualAdd residualPassFree0")
