@@ -14,7 +14,7 @@ epilogue is lower than the old fused single-pass version.
 import math
 
 from rocisa.code import Label, Module
-from rocisa.container import ContinuousRegister, MUBUFModifiers, accvgpr, sgpr, vgpr
+from rocisa.container import EXEC, ContinuousRegister, MUBUFModifiers, accvgpr, sgpr, vgpr
 from rocisa.enum import HighBitSel
 from rocisa.functions import vectorStaticDivide
 from rocisa.instruction import (
@@ -30,7 +30,9 @@ from rocisa.instruction import (
     ECvtPkBF8toF32,
     ECvtPkFP8toF32,
     SAndB32,
+    SAndN2B32,
     SBranch,
+    SCBranchExecZ,
     SCBranchSCC1,
     SCmpEQU32,
     SLShiftLeftB32,
@@ -127,8 +129,9 @@ class SubtileResidualAddEmitter:
         # Paired dwordx4 bf16 ResidualOut store: pack tile-row mm and mm+1 H values,
         # apply the forward D-store cross-lane shuffle, and store 8 contiguous nhidden
         # per lane-group via buffer_store_dwordx4. Rides on the paired load pipeline, so
-        # it inherits its guards (residualAdd, bf16, rows_per_lane == 4, even mma_m); the
-        # runtime N_hidden % 8 == 0 branch in _emitResidualBranched guarantees alignment.
+        # it inherits its guards (residualAdd, bf16, rows_per_lane == 4, even mma_m). Each
+        # lane-group is gated at store time: fully in-range groups use the dwordx4 store,
+        # while a straddling group falls back to per-element buffer_store_ushort.
         self.useWidePairedStore = self.storeBf16D and self.useWideResidualPaired
 
     @staticmethod
@@ -504,10 +507,10 @@ class SubtileResidualAddEmitter:
     def _pairedStoreAddr(self, module, n: int) -> None:
         """Compute the clamped ResidualOut byte address for paired store column n into _roAddr.
 
-        Reads the per-pair pairNhByte (self._roNhByte) and group OOB mask
-        (self._roOobMask) set by _storeBf16Paired; clamps to BufferOOB when the
-        token is past M_tokens or the 8-nhidden group is past N_hidden so the
-        dwordx4 store is dropped. Emitted inside the ds_bpermute latency window.
+        Reads the per-pair pairNhByte (self._roNhByte) and in-range group mask
+        (self._roOobMask) set by _pairedPackShuffle; clamps to BufferOOB when the
+        token is past M_tokens or the 8-nhidden group is not fully in range.
+        Emitted inside the ds_bpermute latency window.
         """
         lsc = self.lane_sgpr_count
         nOff = n * self.mfma_n
@@ -530,57 +533,134 @@ class SubtileResidualAddEmitter:
                          pairNhBaseV: int) -> None:
         """Store H for tile-row pair (mm, mm+1) via buffer_store_dwordx4.
 
-        For each n: pack tile mm's 4 f32 (loBurst) into dwords 0,1 and tile mm+1's
-        4 f32 (hiBurst) into dwords 2,3, apply the forward cross-lane shuffle
-        (ds_bpermute x4 then v_permlane32_swap x2 — inverse of the paired load
-        shuffle) to gather each lane-group's 8 own-rows into contiguous nhidden
-        order, then emit one buffer_store_dwordx4 to pairNhBase. Only reached inside
-        the paired pipeline, where N_hidden % 8 == 0 and pairNhBase is 8-aligned, so
-        each group is entirely in range or entirely OOB (whole-group address clamp).
+        Pass 1 packs each n's (mm, mm+1) pair, applies the forward cross-lane
+        shuffle (ds_bpermute x4 then v_permlane32_swap x2), and stores 8 contiguous
+        nhidden per lane-group with one buffer_store_dwordx4 at full exec; groups not
+        fully in range are dropped by the BufferOOB address clamp. Pass 2 adds a
+        per-element buffer_store_ushort fallback for a straddling lane-group and is
+        skipped entirely when N_hidden is a multiple of 8.
         """
         rpl = self.rows_per_lane
         lsc = self.lane_sgpr_count
         module.addComment1(f"paired dwordx4 ResidualOut store (mm={mm},{mm + 1})")
-        # Per-pair nhidden byte offset and whole-group OOB mask (same for all n).
         module.add(VLShiftLeftB32(dst=vgpr(self._roNhByte), shiftHex=hex(1), src=vgpr(pairNhBaseV),
                                   comment="pairNhByte = pairNhBase * 2 (bf16)."))
-        module.add(VCmpLtU32(dst=sgpr(self._roOobMask, lsc), src0=vgpr(pairNhBaseV),
+        # In-range group mask (n-independent): last element (pairNhBase + 2*rpl - 1) < N_hidden.
+        self._addImmU32(module, self._roAddr, pairNhBaseV, 2 * rpl - 1, self._roAddr,
+                        f"pairNhBaseLast = pairNhBase + {2 * rpl - 1}.")
+        module.add(VCmpLtU32(dst=sgpr(self._roOobMask, lsc), src0=vgpr(self._roAddr),
                              src1=sgpr("SizesFree+0"),
-                             comment="group in range = pairNhBase < N_hidden."))
+                             comment="group fully in range = pairNhBaseLast < N_hidden."))
         for n in range(self.mma_n):
-            loBase = loBurst + n * rpl   # vPack; 2-aligned (burst is 2-aligned, n*rpl even).
+            loBase = loBurst + n * rpl
             hiBase = hiBurst + n * rpl
-            # Pack tile mm -> dwords 0,1; tile mm+1 -> dwords 2,3. Read each source
-            # dword before it is overwritten (dword0 reads loBase+0,+1 then writes loBase+0).
-            module.add(VCvtPkF32toBF16(dst=vgpr(loBase + 0), src0=vgpr(loBase + 0),
-                                       src1=vgpr(loBase + 1),
-                                       comment="pack mm k0,k1 -> bf16 dword0."))
-            module.add(VCvtPkF32toBF16(dst=vgpr(loBase + 1), src0=vgpr(loBase + 2),
-                                       src1=vgpr(loBase + 3),
-                                       comment="pack mm k2,k3 -> bf16 dword1."))
-            module.add(VCvtPkF32toBF16(dst=vgpr(loBase + 2), src0=vgpr(hiBase + 0),
-                                       src1=vgpr(hiBase + 1),
-                                       comment="pack mm+1 k0,k1 -> bf16 dword2."))
-            module.add(VCvtPkF32toBF16(dst=vgpr(loBase + 3), src0=vgpr(hiBase + 2),
-                                       src1=vgpr(hiBase + 3),
-                                       comment="pack mm+1 k2,k3 -> bf16 dword3."))
-            # Forward shuffle step 1: ds_bpermute x4 (gather from partner lane-group).
-            for k in range(4):
-                module.add(DSBPermuteB32(dst=vgpr(loBase + k), src0=vgpr(self._permAddrV),
-                                         src1=vgpr(loBase + k),
-                                         comment=f"forward shuffle: ds_bpermute d{k} to partner lane."))
-            # Overlap the store-address arithmetic with the ds_bpermute LDS latency.
-            self._pairedStoreAddr(module, n)
-            module.add(SWaitCnt(dscnt=0, comment="wait ds_bpermute (lgkmcnt=0)."))
-            # Forward shuffle step 2: v_permlane32_swap x2 (swap across lane-32 boundary).
-            module.add(VPermlane32SwapB32(dst=vgpr(loBase + 0), src=vgpr(loBase + 2),
-                                          comment="forward shuffle: swap d0<->d2 across lane 32."))
-            module.add(VPermlane32SwapB32(dst=vgpr(loBase + 1), src=vgpr(loBase + 3),
-                                          comment="forward shuffle: swap d1<->d3 across lane 32."))
+            self._pairedPackShuffle(module, loBase, hiBase, n)
             module.add(BufferStoreB128(src=vgpr(loBase, 4), vaddr=vgpr(self._roAddr),
                                        saddr=sgpr(self.residualOutSrd, 4), soffset=0,
                                        mubuf=MUBUFModifiers(offen=True),
-                                       comment=f"ResidualOut paired dwordx4 [8 bf16] (mm={mm},{mm + 1},n={n})."))
+                                       comment=f"ResidualOut paired dwordx4 [8 bf16] (n={n})."))
+        self._pairedStraddlePass(module, loBurst, pairNhBaseV)
+
+    def _pairedPackShuffle(self, module, loBase: int, hiBase: int, n: int) -> None:
+        """Pack the (mm, mm+1) pair into loBase[0:3], compute the clamped store
+        address, and run the forward shuffle so loBase holds 8 contiguous nhidden."""
+        module.add(VCvtPkF32toBF16(dst=vgpr(loBase + 0), src0=vgpr(loBase + 0),
+                                   src1=vgpr(loBase + 1), comment="pack mm k0,k1 -> bf16 dword0."))
+        module.add(VCvtPkF32toBF16(dst=vgpr(loBase + 1), src0=vgpr(loBase + 2),
+                                   src1=vgpr(loBase + 3), comment="pack mm k2,k3 -> bf16 dword1."))
+        module.add(VCvtPkF32toBF16(dst=vgpr(loBase + 2), src0=vgpr(hiBase + 0),
+                                   src1=vgpr(hiBase + 1), comment="pack mm+1 k0,k1 -> bf16 dword2."))
+        module.add(VCvtPkF32toBF16(dst=vgpr(loBase + 3), src0=vgpr(hiBase + 2),
+                                   src1=vgpr(hiBase + 3), comment="pack mm+1 k2,k3 -> bf16 dword3."))
+        for k in range(4):
+            module.add(DSBPermuteB32(dst=vgpr(loBase + k), src0=vgpr(self._permAddrV),
+                                     src1=vgpr(loBase + k),
+                                     comment=f"forward shuffle: ds_bpermute d{k} to partner lane."))
+        self._pairedStoreAddr(module, n)
+        module.add(SWaitCnt(dscnt=0, comment="wait ds_bpermute (lgkmcnt=0)."))
+        module.add(VPermlane32SwapB32(dst=vgpr(loBase + 0), src=vgpr(loBase + 2),
+                                      comment="forward shuffle: swap d0<->d2 across lane 32."))
+        module.add(VPermlane32SwapB32(dst=vgpr(loBase + 1), src=vgpr(loBase + 3),
+                                      comment="forward shuffle: swap d1<->d3 across lane 32."))
+
+    def _pairedStraddlePass(self, module, loBurst: int, pairNhBaseV: int) -> None:
+        """Per-element bf16 fallback for a straddling lane-group.
+
+        Skipped entirely when N_hidden is a multiple of 8, since 8-aligned group
+        starts mean no group can straddle. Otherwise exec is narrowed to the
+        straddling lanes (start in range but group not fully in range) and each
+        in-range column is stored with buffer_store_ushort. Assumes _roOobMask still
+        holds the in-range group mask from pass 1.
+        """
+        rpl = self.rows_per_lane
+        lsc = self.lane_sgpr_count
+        endLabel = Label(self.writer.labels.getNameInc("rAdd_straddleEnd"), "")
+        with self.writer.allocTmpSgpr(1, tag="rAdd_nhRem") as remS:
+            module.add(SAndB32(dst=sgpr(remS.idx), src0=sgpr("SizesFree+0"), src1=7,
+                               comment="N_hidden % 8 (8 nhidden per dwordx4 group)."))
+            module.add(SCmpEQU32(src0=sgpr(remS.idx), src1=0, comment="N_hidden aligned to 8."))
+        module.add(SCBranchSCC1(labelName=endLabel.getLabelName(),
+                                comment="aligned -> no straddling group, skip fallback."))
+        with self.writer.allocTmpSgpr(4, alignment=2, tag="rAdd_straddleExec") as execS:
+            saveExec = execS.idx
+            straddle = execS.idx + 2
+            module.add(VCmpLtU32(dst=sgpr(straddle, lsc), src0=vgpr(pairNhBaseV),
+                                 src1=sgpr("SizesFree+0"), comment="startInRange = pairNhBase < N_hidden."))
+            module.add(SAndN2B32(dst=sgpr(straddle + 0), src0=sgpr(straddle + 0),
+                                 src1=sgpr(self._roOobMask + 0), comment="straddle lo = startInRange & ~fullyInRange."))
+            module.add(SAndN2B32(dst=sgpr(straddle + 1), src0=sgpr(straddle + 1),
+                                 src1=sgpr(self._roOobMask + 1), comment="straddle hi = startInRange & ~fullyInRange."))
+            module.add(SMovB64(dst=sgpr(saveExec, lsc), src=EXEC(), comment="save exec."))
+            module.add(SMovB64(dst=EXEC(), src=sgpr(straddle, lsc), comment="exec = straddling groups."))
+            skipLabel = Label(self.writer.labels.getNameInc("rAdd_noStraddleLane"), "")
+            module.add(SCBranchExecZ(labelName=skipLabel.getLabelName(),
+                                     comment="skip when no straddling lane in this wave."))
+            for n in range(self.mma_n):
+                self._storeBf16PairedStraddle(module, loBurst + n * rpl, n, pairNhBaseV)
+            module.add(skipLabel)
+            module.add(SMovB64(dst=EXEC(), src=sgpr(saveExec, lsc), comment="restore exec."))
+        module.add(endLabel)
+
+    def _storeBf16PairedStraddle(self, module, loBase: int, n: int, pairNhBaseV: int) -> None:
+        """Per-element bf16 store of the shuffled lane-group's in-range columns.
+
+        Runs under an exec mask restricted to straddling lane-groups; each column is
+        clamped to BufferOOB when its token or nhidden is out of range. Recomputes the
+        token mask for n, since pass 1 left only the last n's value.
+        """
+        lsc = self.lane_sgpr_count
+        nOff = n * self.mfma_n
+        self._addImmU32(module, self._roVal, self._roTokenBase, nOff, self._roVal,
+                        f"token_n = tokenBase + {nOff} (n={n}).")
+        module.add(VCmpLtU32(dst=sgpr(self._roTokenMask, lsc), src0=vgpr(self._roVal),
+                             src1=sgpr("SizesFree+1"), comment="tokenInRange = token_n < M_tokens."))
+        for c in range(2 * self.rows_per_lane):
+            dword = loBase + c // 2
+            self._addImmU32(module, self._roAddr, self._roNhByte, 2 * c, self._roAddr,
+                            f"nhByte(col {c}) = pairNhByte + {2 * c}.")
+            module.add(VAddU32(dst=vgpr(self._roAddr), src0=vgpr(self._roRowBase + n),
+                               src1=vgpr(self._roAddr),
+                               comment=f"byteAddr = roRowByteBase[n] + nhByte (col {c})."))
+            self._addImmU32(module, self._roVal, pairNhBaseV, c, self._roVal,
+                            f"nhidden_pos = pairNhBase + {c}.")
+            module.add(VCmpLtU32(dst=sgpr(self._roOobMask, lsc), src0=vgpr(self._roVal),
+                                 src1=sgpr("SizesFree+0"),
+                                 comment=f"col in range = nhidden_pos < N_hidden (col {c})."))
+            module.add(VCndMaskB32(dst=vgpr(self._roAddr), src0=vgpr(self._roOobV),
+                                   src1=vgpr(self._roAddr), src2=sgpr(self._roTokenMask, lsc),
+                                   comment="clamp OOB when token_n >= M_tokens."))
+            module.add(VCndMaskB32(dst=vgpr(self._roAddr), src0=vgpr(self._roOobV),
+                                   src1=vgpr(self._roAddr), src2=sgpr(self._roOobMask, lsc),
+                                   comment="clamp OOB when nhidden_pos >= N_hidden."))
+            srcReg = dword
+            if c % 2 == 1:
+                module.add(VLShiftRightB32(dst=vgpr(self._roVal), shiftHex=hex(16),
+                                           src=vgpr(dword), comment=f"extract bf16 hi half (col {c})."))
+                srcReg = self._roVal
+            module.add(BufferStoreB16(src=vgpr(srcReg), vaddr=vgpr(self._roAddr),
+                                      saddr=sgpr(self.residualOutSrd, 4), soffset=0,
+                                      mubuf=MUBUFModifiers(offen=True),
+                                      comment=f"ResidualOut straddle bf16 (n={n},col={c})."))
 
     def _storeBf16RowWideAligned(self, module, resBurst: int, m: int) -> None:
         """Store rows_per_lane bf16 H values per n with buffer_store_dwordx2.
@@ -986,9 +1066,9 @@ class SubtileResidualAddEmitter:
                             wgRowBase: int, rowGroupOff: int, mBaseVgpr: int) -> None:
         """Paired dwordx4 load path: process tile rows in (mm, mm+1) pairs.
 
-        Only valid when N_hidden is a multiple of 8 (checked at runtime by the
-        caller), so each lane's 8-nhidden group is entirely in range or entirely
-        out of range; residual masking after the shuffle zeroes OOB elements.
+        Residual masking after the shuffle zeroes OOB elements, and the paired
+        store gates each lane-group individually, so no N_hidden alignment is
+        required.
         """
         pairNhBaseV = self.writer.vgprPool.checkOut(1, tag="rAdd_pairNhBase")
         for mm in range(0, self.mma_m, 2):
@@ -1014,28 +1094,6 @@ class SubtileResidualAddEmitter:
                                       self._bufBase(resBurst, mm + 1), mm, pairNhBaseV)
         self.writer.vgprPool.checkIn(pairNhBaseV)
 
-    def _emitResidualBranched(self, module, vgprTiles, accBurst: int, resBurst: int,
-                              wgRowBase: int, rowGroupOff: int, mBaseVgpr: int,
-                              loadsPerRow: int) -> None:
-        """Branch at runtime between the paired dwordx4 path (N_hidden % 8 == 0) and
-        the per-row dwordx2 pipeline fallback (unaligned)."""
-        alignedLabel = Label(self.writer.labels.getNameInc("rAdd_pairedAligned"), "")
-        endLabel     = Label(self.writer.labels.getNameInc("rAdd_pairedEnd"), "")
-        with self.writer.allocTmpSgpr(1, tag="rAdd_pairedRem") as remS:
-            module.add(SAndB32(dst=sgpr(remS.idx), src0=sgpr("SizesFree+0"), src1=7,
-                               comment="N_hidden % 8 (8 nhidden per dwordx4 group)."))
-            module.add(SCmpEQU32(src0=sgpr(remS.idx), src1=0,
-                                 comment="N_hidden aligned to 8."))
-        module.add(SCBranchSCC1(labelName=alignedLabel.getLabelName(),
-                                comment="aligned -> paired dwordx4 load."))
-        self._emitRowPipeline(module, vgprTiles, accBurst, resBurst, wgRowBase, rowGroupOff,
-                              mBaseVgpr, loadsPerRow)
-        module.add(SBranch(labelName=endLabel.getLabelName(), comment="skip paired path."))
-        module.add(alignedLabel)
-        self._emitPairedPipeline(module, vgprTiles, accBurst, resBurst, wgRowBase, rowGroupOff,
-                                 mBaseVgpr)
-        module.add(endLabel)
-
     def _residualPassFree0(self, vgprTiles) -> Module:
         module = Module("ResidualAdd residualPassFree0")
         module.addComment1("ResidualAdd pass (free0): load residual, H = GEMM + residual, write H back, bf16 store")
@@ -1056,8 +1114,8 @@ class SubtileResidualAddEmitter:
             self._nhBaseLoadV = vgprPool.checkOut(1, tag="rAdd_nhBaseLoad")
             loadsPerRow = self._loadsPerRow()
         if usePaired:
-            self._emitResidualBranched(module, vgprTiles, accBurst, resBurst, wgRowBase,
-                                       rowGroupOff, mBaseVgpr, loadsPerRow)
+            self._emitPairedPipeline(module, vgprTiles, accBurst, resBurst, wgRowBase,
+                                     rowGroupOff, mBaseVgpr)
         else:
             self._emitRowPipeline(module, vgprTiles, accBurst, resBurst, wgRowBase,
                                   rowGroupOff, mBaseVgpr, loadsPerRow)
