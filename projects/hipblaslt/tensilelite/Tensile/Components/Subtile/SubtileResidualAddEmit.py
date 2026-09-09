@@ -76,6 +76,7 @@ class SubtileResidualAddEmitter:
         self.writer = writer
         self.kernel = kernel
         self.archCaps = writer.states.archCaps
+        self.asmCaps = writer.states.asmCaps
 
         self.mfma_m = kernel["MatrixInstM"]
         self.mfma_n = kernel["MatrixInstN"]
@@ -719,23 +720,37 @@ class SubtileResidualAddEmitter:
         self._pairedShuffleConvert(module, loBase, hiBase, rpl)
 
     def _pairedShuffleConvert(self, module, loBase: int, hiBase: int, rpl: int) -> None:
-        """Inverse D-store shuffle then bf16->f32 convert for a loaded tile-row pair."""
-        for n in range(self.mma_n):
-            base = loBase + n * rpl
-            module.add(VPermlane32SwapB32(dst=vgpr(base + 0), src=vgpr(base + 2),
-                                          comment="inverse shuffle: swap d0<->d2 across lane 32."))
-            module.add(VPermlane32SwapB32(dst=vgpr(base + 1), src=vgpr(base + 3),
-                                          comment="inverse shuffle: swap d1<->d3 across lane 32."))
+        """Inverse D-store shuffle then bf16->f32 convert for a loaded tile-row pair.
+
+        Permutes for independent n are issued in batches so several ds_bpermute
+        overlap behind a single lgkmcnt drain instead of exposing LDS latency once
+        per n. The batch keeps outstanding ds_bpermute within the LGKM/DS counter
+        limit (rpl permutes per n).
+        """
+        dsMax = self.asmCaps.get("MaxDscnt") or self.asmCaps.get("MaxLgkmcnt") or rpl
+        batchN = max(1, dsMax // rpl)
+        for nStart in range(0, self.mma_n, batchN):
+            nEnd = min(nStart + batchN, self.mma_n)
+            for n in range(nStart, nEnd):
+                base = loBase + n * rpl
+                module.add(VPermlane32SwapB32(dst=vgpr(base + 0), src=vgpr(base + 2),
+                                              comment="inverse shuffle: swap d0<->d2 across lane 32."))
+                module.add(VPermlane32SwapB32(dst=vgpr(base + 1), src=vgpr(base + 3),
+                                              comment="inverse shuffle: swap d1<->d3 across lane 32."))
             module.add(SNop(waitState=0, comment="wait state after v_permlane32_swap (gfx950)."))
-            for k in range(4):
-                module.add(DSBPermuteB32(dst=vgpr(base + k), src0=vgpr(self._permAddrV),
-                                         src1=vgpr(base + k),
-                                         comment=f"inverse shuffle: ds_bpermute d{k} from partner lane."))
+            for n in range(nStart, nEnd):
+                base = loBase + n * rpl
+                for k in range(4):
+                    module.add(DSBPermuteB32(dst=vgpr(base + k), src0=vgpr(self._permAddrV),
+                                             src1=vgpr(base + k),
+                                             comment=f"inverse shuffle: ds_bpermute d{k} from partner lane."))
             module.add(SWaitCnt(dscnt=0, comment="wait ds_bpermute (lgkmcnt=0)."))
-            # base+0,+1 hold tile mm (k0,1 / k2,3); base+2,+3 hold tile mm+1. Convert the
-            # mm+1 pair first (reads base+2,+3) before converting mm clobbers them in place.
-            self._convertPairedChunkBf16(module, base + 2, hiBase + n * rpl)
-            self._convertResidualChunkBf16(module, base)
+            # base+0,+1 hold tile mm; base+2,+3 hold tile mm+1. Convert the mm+1 pair
+            # first (reads base+2,+3) before converting mm clobbers them in place.
+            for n in range(nStart, nEnd):
+                base = loBase + n * rpl
+                self._convertPairedChunkBf16(module, base + 2, hiBase + n * rpl)
+                self._convertResidualChunkBf16(module, base)
 
     def _convertResidualRow(self, module, resBurst: int) -> None:
         if self.useWideResidual:
