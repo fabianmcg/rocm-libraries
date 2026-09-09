@@ -306,9 +306,15 @@ class SubtileResidualAddEmitter:
         module.add(VLShiftLeftB32(dst=vgpr(dst), shiftHex=hex(self.residualLog2Bytes), src=vgpr(dst),
                                   comment="rowByteBase = token_n * SizesFree0 * residualBytes."))
 
-    def _residualOutRowByteBase(self, module, dst: int, tokenBase: int, n: int, scratch: int) -> None:
+    def _residualOutRowByteBase(self, module, dst: int, tokenBase: int, n: int, scratch: int,
+                                tokenMask: int = None) -> None:
         nOff = n * self.mfma_n
         self._addImmU32(module, dst, tokenBase, nOff, scratch, f"token_n = tokenBase + {nOff} (n={n}).")
+        # Precompute the per-n tokenInRange mask while token_n is still live in dst.
+        if tokenMask is not None:
+            module.add(VCmpLtU32(dst=sgpr(tokenMask, self.lane_sgpr_count), src0=vgpr(dst),
+                                 src1=sgpr("SizesFree+1"),
+                                 comment="tokenInRange = token_n < M_tokens."))
         # token_n * SizesFree0 uses 32-bit VMulLOU32; valid while token_n * N_hidden
         # stays below 2^32 (all currently supported tensor sizes).
         module.add(VMulLOU32(dst=vgpr(dst), src0=sgpr("SizesFree+0"), src1=vgpr(dst),
@@ -342,10 +348,10 @@ class SubtileResidualAddEmitter:
         self._roNhByte    = self.writer.vgprPool.checkOut(1, tag="rAdd_roNhByte")
         self._roOobMask   = self.writer.sgprPool.checkOutAligned(
             self.lane_sgpr_count, self.lane_sgpr_count, tag="rAdd_roOobMask", preventOverflow=False)
-        # Single token-in-range mask slot; recomputed per-n in _storeBf16Elem to save
-        # (mma_n - 1) * lane_sgpr_count SGPRs vs the old per-n precomputed layout.
+        # Per-n tokenInRange masks precomputed once (token_n depends only on n,
+        # invariant across the tile-row m-loop); reused by every bf16 store.
         self._roTokenMask = self.writer.sgprPool.checkOutAligned(
-            self.lane_sgpr_count, self.lane_sgpr_count, tag="rAdd_roTokMask",
+            self.mma_n * self.lane_sgpr_count, self.lane_sgpr_count, tag="rAdd_roTokMask",
             preventOverflow=False)
         # Alignment remainder is computed once and kept for the whole store pass so
         # _storeBf16RowWide can branch at runtime between wide and scalar paths.
@@ -359,7 +365,8 @@ class SubtileResidualAddEmitter:
                            comment="N_hidden % rows_per_lane (rows_per_lane is pow2)."))
         for n in range(self.mma_n):
             self._residualOutRowByteBase(module, self._roRowBase + n, self._roTokenBase, n,
-                                         self._roNhByte)
+                                         self._roNhByte,
+                                         tokenMask=self._roTokenMask + n * self.lane_sgpr_count)
 
     def _endBf16Store(self, module) -> None:
         """Wait for all pending ResidualOut bf16 stores and free scratch registers."""
@@ -386,21 +393,15 @@ class SubtileResidualAddEmitter:
 
     def _storeBf16Elem(self, module, accReg: int, n: int) -> None:
         """Store bf16(accReg) to ResidualOut[token, nhidden], dropping OOB lanes."""
-        # Recompute token_n for this n into _roAddr (safe: _roAddr is overwritten next anyway).
-        nOff = n * self.mfma_n
-        self._addImmU32(module, self._roAddr, self._roTokenBase, nOff, self._roAddr,
-                        f"token_n = tokenBase + {nOff} (n={n}).")
-        module.add(VCmpLtU32(dst=sgpr(self._roTokenMask, self.lane_sgpr_count),
-                             src0=vgpr(self._roAddr), src1=sgpr("SizesFree+1"),
-                             comment="tokenInRange = token_n < M_tokens."))
+        tokenMask = self._roTokenMask + n * self.lane_sgpr_count
         module.add(VAddU32(dst=vgpr(self._roAddr), src0=vgpr(self._roRowBase + n),
                            src1=vgpr(self._roNhByte),
                            comment="byteAddr = roRowByteBase[n] + nhByte."))
         # Clamp the full address so an OOB lane lands on exactly BufferOOB and is dropped.
         module.add(VCndMaskB32(dst=vgpr(self._roAddr), src0=vgpr(self._roOobV),
                                src1=vgpr(self._roAddr),
-                               src2=sgpr(self._roTokenMask, self.lane_sgpr_count),
-                               comment="clamp OOB when token_n >= M_tokens."))
+                               src2=sgpr(tokenMask, self.lane_sgpr_count),
+                               comment="clamp OOB when token_n >= M_tokens (precomputed mask)."))
         module.add(VCndMaskB32(dst=vgpr(self._roAddr), src0=vgpr(self._roOobV),
                                src1=vgpr(self._roAddr),
                                src2=sgpr(self._roOobMask, self.lane_sgpr_count),
@@ -461,19 +462,14 @@ class SubtileResidualAddEmitter:
         """Pack and store rows_per_lane bf16 values for element (m, n) via buffer_store_dwordx2."""
         rpl = self.rows_per_lane
         lsc = self.lane_sgpr_count
-        nOff = n * self.mfma_n
-        self._addImmU32(module, self._roAddr, self._roTokenBase, nOff, self._roAddr,
-                        f"token_n = tokenBase + {nOff} (n={n}).")
-        module.add(VCmpLtU32(dst=sgpr(self._roTokenMask, lsc), src0=vgpr(self._roAddr),
-                             src1=sgpr("SizesFree+1"),
-                             comment="tokenInRange = token_n < M_tokens."))
+        tokenMask = self._roTokenMask + n * lsc
         module.add(VAddU32(dst=vgpr(self._roAddr), src0=vgpr(self._roRowBase + n),
                            src1=vgpr(self._roNhByte),
                            comment="byteAddr = roRowByteBase[n] + nhByte(k=0)."))
         module.add(VCndMaskB32(dst=vgpr(self._roAddr), src0=vgpr(self._roOobV),
                                src1=vgpr(self._roAddr),
-                               src2=sgpr(self._roTokenMask, lsc),
-                               comment="clamp OOB when token_n >= M_tokens."))
+                               src2=sgpr(tokenMask, lsc),
+                               comment="clamp OOB when token_n >= M_tokens (precomputed mask)."))
         module.add(VCndMaskB32(dst=vgpr(self._roAddr), src0=vgpr(self._roOobV),
                                src1=vgpr(self._roAddr),
                                src2=sgpr(self._roOobMask, lsc),
