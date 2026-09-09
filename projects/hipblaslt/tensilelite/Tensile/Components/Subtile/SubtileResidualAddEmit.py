@@ -411,13 +411,18 @@ class SubtileResidualAddEmitter:
                                   mubuf=MUBUFModifiers(offen=True),
                                   comment="ResidualOut[token, nhidden] = bf16(H+residual)."))
 
-    def _storeBf16RowWide(self, module, resBurst: int, m: int) -> None:
+    def _storeBf16RowWide(self, module, resBurst: int, m: int, forceWide: bool = False) -> None:
         """Dispatch bf16 H stores for tile row m: wide (aligned) or scalar (unaligned).
 
         The wide dwordx2 path is taken only when N_hidden is a multiple of
         rows_per_lane (checked at runtime); otherwise the per-element scalar path
-        preserves correctness for straddling groups.
+        preserves correctness for straddling groups. forceWide skips the runtime
+        check and scalar fallback when the caller already guarantees alignment
+        (N_hidden % 8 == 0 implies N_hidden % rows_per_lane == 0).
         """
+        if forceWide:
+            self._storeBf16RowWideAligned(module, resBurst, m)
+            return
         alignedLabel = Label(self.writer.labels.getNameInc(f"rAdd_roWide_m{m}"), "")
         endLabel     = Label(self.writer.labels.getNameInc(f"rAdd_roWideEnd_m{m}"), "")
         module.add(SCmpEQU32(src0=sgpr(self._roNAlignRem), src1=0,
@@ -856,7 +861,7 @@ class SubtileResidualAddEmitter:
         if resReg is not None:
             self._writeAccFrom(module, accReg, vgprTiles, m, n, k, f"write H back to acc (m={m},n={n},k={k}).")
 
-    def _residualAccRow(self, module, vgprTiles, accBurst: int, resBurst, m: int) -> None:
+    def _residualAccRow(self, module, vgprTiles, accBurst: int, resBurst, m: int, forceWide: bool = False) -> None:
         for k in range(self.rows_per_lane):
             coords = [(m, n, k) for n in range(self.mma_n)]
             srcRegs = self._readAccBurst(module, accBurst, vgprTiles, coords, f"read acc m={m},k={k}.")
@@ -868,7 +873,7 @@ class SubtileResidualAddEmitter:
         # Wide store packs (and clobbers) the residual burst in place, so the element
         # loop writeback must complete before _storeBf16RowWide runs.
         if self.useWideBf16Store:
-            self._storeBf16RowWide(module, resBurst, m)
+            self._storeBf16RowWide(module, resBurst, m, forceWide)
 
     def _pipelinedResidualRow(self, module, vgprTiles, accBurst: int, resBurst,
                               wgRowBase: int, rowGroupOff: int, mBaseVgpr: int,
@@ -949,12 +954,12 @@ class SubtileResidualAddEmitter:
             self._pairedLoadPair(module, mm, resBurst, pairNhBaseV, mBaseVgpr, clamp)
             if not clamp:
                 self._maskResidualOOB(module, self._bufBase(resBurst, mm))
-            self._residualAccRow(module, vgprTiles, accBurst, self._bufBase(resBurst, mm), mm)
+            self._residualAccRow(module, vgprTiles, accBurst, self._bufBase(resBurst, mm), mm, forceWide=clamp)
             self._addImmU32(module, self._nhBaseV, self._nhBaseV, self.mfma_m, mBaseVgpr,
                             f"nhBase += mfma_m (advance to tile {mm + 1}).")
             if not clamp:
                 self._maskResidualOOB(module, self._bufBase(resBurst, mm + 1))
-            self._residualAccRow(module, vgprTiles, accBurst, self._bufBase(resBurst, mm + 1), mm + 1)
+            self._residualAccRow(module, vgprTiles, accBurst, self._bufBase(resBurst, mm + 1), mm + 1, forceWide=clamp)
 
     def _residualPassFree0(self, vgprTiles) -> Module:
         module = Module("ResidualAdd residualPassFree0")
