@@ -5252,6 +5252,40 @@ inline auto getSolutions(
     return solutions;
 }
 
+// Drop StreamK split-K (StreamKForceDPOnly==0) solutions for PartialRMS/RMSNorm
+// problems: those kernels leave partialBuf (per-row sum of x^2) unwritten when a
+// tile is split across K, so the downstream RMS kernel divides by zero+eps and
+// scales D by ~316x. StreamKForceDPOnly==1 and non-StreamK solutions compute
+// every tile whole and write partialBuf correctly, so keep only those.
+static void filterStreamKSplitForPartialRMS(
+    std::vector<std::shared_ptr<TensileLite::ContractionSolution>>& solutions,
+    const RocblasltContractionProblem&                              prob)
+{
+    RocblasltFusedEpilogueInfo fInfo;
+    if(!rocblaslt_resolve_fused_epilogue(prob.fused_epilogue, fInfo))
+        return;
+    if(!(fInfo.hasRMSNorm || fInfo.hasPartialRMSStats))
+        return;
+
+    std::vector<std::shared_ptr<TensileLite::ContractionSolution>> kept;
+    kept.reserve(solutions.size());
+    for(const auto& solution : solutions)
+    {
+        if(solution->sizeMapping.streamK > 0 && solution->sizeMapping.streamKForceDPOnly == 0)
+            continue;
+        kept.push_back(solution);
+    }
+    // Never regress to "no solution": if every candidate was a split-K kernel,
+    // keep the original ranked list rather than returning empty.
+    if(kept.empty())
+    {
+        log_info(__func__,
+                 "only StreamK split-K solutions available for PartialRMS; partialBuf may be wrong");
+        return;
+    }
+    solutions.swap(kept);
+}
+
 std::vector<std::shared_ptr<TensileLite::ContractionSolution>>
     getBestRawSolutions(RocblasltContractionProblem const& prob,
                         rocblaslt_handle                   handle,
@@ -5287,6 +5321,8 @@ std::vector<std::shared_ptr<TensileLite::ContractionSolution>>
         solutions = getSolutions(
             prob, library, hardware, data->problem, enableEpilogue, requestedAlgoCount);
     }
+
+    filterStreamKSplitForPartialRMS(solutions, prob);
 
     return solutions;
 }
@@ -5337,6 +5373,8 @@ rocblaslt_status getBestSolutions(RocblasltContractionProblem const& prob,
         solutions = getSolutions(
             prob, library, hardware, data->problem, enableEpilogue, requestedAlgoCount);
     }
+
+    filterStreamKSplitForPartialRMS(solutions, prob);
 
     auto algoCount = min(static_cast<size_t>(requestedAlgoCount), solutions.size());
     memset(heuristicResultsArray, 0, sizeof(rocblaslt_matmul_heuristic_result) * algoCount);
@@ -5646,6 +5684,16 @@ rocblaslt_status isSolutionSupported(rocblaslt_handle       handle,
                 << " (solution missing from library map; check Tensile packaging or version "
                    "skew)";
             log_error(__func__, msg.str());
+            return rocblaslt_status_invalid_value;
+        }
+
+        // Reject StreamK split-K solutions for PartialRMS/RMSNorm problems: those
+        // kernels leave partialBuf unwritten on the split-K path, and an explicit-algo
+        // caller bypasses the heuristic filter that normally drops them.
+        if(tensile_prob.usePartialRMS() && solution->sizeMapping.streamK > 0
+           && solution->sizeMapping.streamKForceDPOnly != 1)
+        {
+            log_error(__func__, "solution rejected: StreamK split-K unsupported for PartialRMS");
             return rocblaslt_status_invalid_value;
         }
 
