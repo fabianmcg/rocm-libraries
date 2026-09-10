@@ -283,6 +283,18 @@ def _validateSubtileEpiloguePrereqs(state, printRejectionReason, epilogueName):
     reject(state, printRejectionReason,
            "%s requires MIArchVgpr=False (emitter uses AGPR read/write instructions)" % epilogueName)
     return False
+  # The subtile fused epilogues need the fully assembled macro tile in the
+  # accumulator. StreamK without StreamKForceDPOnly emits a deferred
+  # MultipleBuffer store path (gsuLimit==2 in globalWriteElements) whose
+  # finishing workgroups reduce through a workspace/conversion step, so the
+  # epilogue would run on an un-reduced partial tile. Reject; StreamKForceDPOnly=1
+  # (whole-tile DP dispatch) is the supported StreamK configuration.
+  if state.get("StreamK", 0) != 0 and not state.get("StreamKForceDPOnly", 0):
+    reject(state, printRejectionReason,
+           "%s does not support StreamK without StreamKForceDPOnly "
+           "(split-K emits a MultipleBuffer deferred store path that bypasses "
+           "the full-tile epilogue)" % epilogueName)
+    return False
   return True
 
 
