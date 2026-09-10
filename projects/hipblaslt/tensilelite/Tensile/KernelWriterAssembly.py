@@ -15299,13 +15299,14 @@ class KernelWriterAssembly(KernelWriter):
     if not vgprTiles:
       return module
     if kernel["PartialRMS"]:
-      if kernel["PartialRMSResidualAdd"] or kernel["PartialRMSStoreBf16D"]:
+      residualRan = kernel["PartialRMSResidualAdd"] or kernel["PartialRMSStoreBf16D"]
+      if residualRan:
         from .Components.Subtile.SubtileResidualAddEmit import SubtileResidualAddEmitter
         module.addComment1("ResidualAdd: load residual, H = GEMM + residual, store ResidualOut bf16.")
         module.add(SubtileResidualAddEmitter(self, kernel).emit(vgprTiles))
       from .Components.Subtile.SubtilePartialRMSEmit import SubtilePartialRMSEmitter
       module.addComment1("PartialRMS: fused partial sum-of-squares + gamma epilogue.")
-      module.add(SubtilePartialRMSEmitter(self, kernel).emit(vgprTiles))
+      module.add(SubtilePartialRMSEmitter(self, kernel, kernargDrained=residualRan).emit(vgprTiles))
     if kernel["DQuantType"] == "Tile":
       from .Components.Subtile.SubtileDynamicQuant import SubtileTileQuantEmitter
       module.addComment1("TileQuant: per-tile amax pre-scale for fp8 D output.")

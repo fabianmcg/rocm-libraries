@@ -134,10 +134,11 @@ class SubtilePartialRMSEmitter:
     configurable via PartialRMSGammaType.
     """
 
-    def __init__(self, writer, kernel):
+    def __init__(self, writer, kernel, kernargDrained: bool = False):
         self.writer = writer
         self.kernel = kernel
         self.archCaps = writer.states.archCaps
+        self.kernargDrained = kernargDrained
 
         # Derive all geometry from kernel params; no module-level constants.
         self.mfma_m = kernel["MatrixInstM"]
@@ -428,8 +429,9 @@ class SubtilePartialRMSEmitter:
 
     def _setup(self, gammaSrd: int, partialSrd: int, laneId: int, colByte: int) -> Module:
         module = Module("PartialRMS setup")
-        # Both passes must drain kernarg s_loads before reading kernel arguments.
-        module.add(SWaitCnt(kmcnt=0, comment="wait for PartialRMS kernarg s_load"))
+        # Drain kernarg s_loads only when no preceding epilogue already did so.
+        if not self.kernargDrained:
+            module.add(SWaitCnt(kmcnt=0, comment="wait for PartialRMS kernarg s_load"))
         self._buildBufferSrd(module, gammaSrd, "RMSNormGamma", "gamma")
         self._buildBufferSrd(module, partialSrd, "PartialBuf", "partialBuf")
         module.add(VAndB32(dst=vgpr(laneId), src0=vgpr("Serial"), src1=self.waveSize - 1,
