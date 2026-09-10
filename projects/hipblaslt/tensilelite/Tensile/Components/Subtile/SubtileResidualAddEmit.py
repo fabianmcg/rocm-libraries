@@ -788,7 +788,13 @@ class SubtileResidualAddEmitter:
                                   comment="residual k=0 bf16(lo) -> f32."))
 
     def _maskResidualOOB(self, module, resBurst: int) -> None:
-        # Zero residual elements whose nhidden_pos >= N_hidden; mask depends only on (m,k).
+        # Zero residual elements whose nhidden_pos >= N_hidden. Only the unaligned
+        # (straddle) load path reaches here: a wide load groups several contiguous
+        # nhidden under one address, and the residual is contiguous row-major
+        # [M_tokens, N_hidden], so an out-of-range element aliases the next token's
+        # row instead of returning buffer-OOB zero. Neither hardware OOB nor a
+        # per-element address clamp can mask one element inside the shared-address
+        # group, so software masking is required here. Mask depends only on (m,k).
         lsc = self.lane_sgpr_count
         for k in range(self.rows_per_lane):
             nhpos = self._nhBaseV
