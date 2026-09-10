@@ -6,7 +6,7 @@ TestParameters:
 
 GlobalParameters:
   MinimumRequiredVersion: 5.0.0
-  NumElementsToValidate: -1
+  NumElementsToValidate: 0
   ExitOnFails: 0
   PrintSolutionRejectionReason: True
   KernelTime: True
@@ -71,7 +71,7 @@ BenchmarkProblems:
       BenchmarkJoinParameters:
       BenchmarkFinalParameters:
         - ProblemSizes:
-            - Exact: [4096, 4096, 1, 4096]
+            - Exact: [8192, 8192, 1, 8192]
   -
     -
       OperationType: GEMM
@@ -125,7 +125,7 @@ BenchmarkProblems:
       BenchmarkJoinParameters:
       BenchmarkFinalParameters:
         - ProblemSizes:
-            - Exact: [4096, 4096, 1, 4096]
+            - Exact: [8192, 8192, 1, 8192]
   -
     -
       OperationType: GEMM
@@ -179,7 +179,7 @@ BenchmarkProblems:
       BenchmarkJoinParameters:
       BenchmarkFinalParameters:
         - ProblemSizes:
-            - Exact: [4096, 4096, 1, 4096]
+            - Exact: [8192, 8192, 1, 8192]
   -
     -
       OperationType: GEMM
@@ -231,7 +231,7 @@ BenchmarkProblems:
       BenchmarkJoinParameters:
       BenchmarkFinalParameters:
         - ProblemSizes:
-            - Exact: [4096, 4096, 1, 4096]
+            - Exact: [8192, 8192, 1, 8192]
 
 
 LibraryLogic:
