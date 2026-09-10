@@ -25,6 +25,7 @@ from rocisa.instruction import (
     BufferLoadD16U8,
     BufferStoreB16,
     BufferStoreB64,
+    BufferStoreB128,
     DSBPermuteB32,
     ECvtPkBF8toF32,
     ECvtPkFP8toF32,
@@ -506,6 +507,79 @@ class SubtileResidualAddEmitter:
         for n in range(self.mma_n):
             self._storeBf16WideElem(module, resBurst, m, n)
 
+    def _storeBf16PairWideAligned(self, module, bank0: int, bank1: int, mm: int,
+                                  pairNhBaseV: int) -> None:
+        """Store both tile rows of a pair as buffer_store_dwordx4 (128-bit).
+
+        Packs tile mm (bank0) and tile mm+1 (bank1) H values into four bf16 dwords
+        per n, applies the forward cross-lane shuffle (inverse of the paired load's
+        _pairedShuffleConvert) to assemble 8 contiguous nhidden in memory order, then
+        issues one buffer_store_dwordx4 per n. Only valid on the aligned paired path
+        (N_hidden % 8 == 0), so a group of 8 nhidden is entirely in or out of range;
+        the load address is clamped to BufferOOB for out-of-range groups (store
+        dropped) and token OOB is handled by the ResidualOut SRD bounds. Reuses the
+        residual burst (bank0) as the pack/shuffle buffer and self._permAddrV / the
+        base0+rowStride addressing already set up for the paired load -- no new VGPRs.
+        """
+        rpl = self.rows_per_lane
+        lsc = self.lane_sgpr_count
+        # Pack mm and mm+1 H into bank0[n*rpl .. n*rpl+3] as four bf16 dwords.
+        # Order avoids clobber: the two mm packs read bank0[n*rpl+2/+3] (mm k2,k3)
+        # before the mm+1 packs overwrite them.
+        for n in range(self.mma_n):
+            base = bank0 + n * rpl
+            hi = bank1 + n * rpl
+            module.add(VCvtPkF32toBF16(dst=vgpr(base + 0), src0=vgpr(base + 0), src1=vgpr(base + 1),
+                                       comment="pack mm H k0,k1 -> bf16 dword."))
+            module.add(VCvtPkF32toBF16(dst=vgpr(base + 1), src0=vgpr(base + 2), src1=vgpr(base + 3),
+                                       comment="pack mm H k2,k3 -> bf16 dword."))
+            module.add(VCvtPkF32toBF16(dst=vgpr(base + 2), src0=vgpr(hi + 0), src1=vgpr(hi + 1),
+                                       comment="pack mm+1 H k0,k1 -> bf16 dword."))
+            module.add(VCvtPkF32toBF16(dst=vgpr(base + 3), src0=vgpr(hi + 2), src1=vgpr(hi + 3),
+                                       comment="pack mm+1 H k2,k3 -> bf16 dword."))
+        # Forward shuffle in batches so several ds_bpermute overlap one dscnt drain.
+        dsMax = self.asmCaps.get("MaxDscnt") or self.asmCaps.get("MaxLgkmcnt") or rpl
+        batchN = max(1, dsMax // rpl)
+        for nStart in range(0, self.mma_n, batchN):
+            nEnd = min(nStart + batchN, self.mma_n)
+            for n in range(nStart, nEnd):
+                base = bank0 + n * rpl
+                for k in range(4):
+                    module.add(DSBPermuteB32(dst=vgpr(base + k), src0=vgpr(self._permAddrV),
+                                             src1=vgpr(base + k),
+                                             comment=f"forward shuffle: ds_bpermute d{k} to partner lane."))
+            module.add(SWaitCnt(dscnt=0, comment="wait ds_bpermute (lgkmcnt=0)."))
+            for n in range(nStart, nEnd):
+                base = bank0 + n * rpl
+                module.add(VPermlane32SwapB32(dst=vgpr(base + 0), src=vgpr(base + 2),
+                                              comment="forward shuffle: swap d0<->d2 across lane 32."))
+                module.add(VPermlane32SwapB32(dst=vgpr(base + 1), src=vgpr(base + 3),
+                                              comment="forward shuffle: swap d1<->d3 across lane 32."))
+            module.add(SNop(waitState=0, comment="wait state after v_permlane32_swap (gfx950)."))
+        # Address: byteAddr(n) = base0 + pairNhBase*2, advanced by rowStride per n.
+        # Group OOB clamp: drop the whole dwordx4 when pairNhBaseLast >= N_hidden.
+        module.add(VLShiftLeftB32(dst=vgpr(self._roNhByte), shiftHex=hex(1), src=vgpr(pairNhBaseV),
+                                  comment="pairNhByte = pairNhBase * 2 (bf16)."))
+        module.add(VAddU32(vgpr(self._roAddr), vgpr(self._resTokenBase), vgpr(self._roNhByte),
+                           comment="storeAddr = base0 + pairNhByte (mm-pair, n=0)."))
+        self._addImmU32(module, self._roNhByte, pairNhBaseV, 2 * rpl - 1, self._roVal,
+                        f"pairNhBaseLast = pairNhBase + {2 * rpl - 1}.")
+        module.add(VCmpLtU32(dst=sgpr(self._roOobMask, lsc), src0=vgpr(self._roNhByte),
+                             src1=sgpr("SizesFree+0"),
+                             comment="group fully in range = pairNhBaseLast < N_hidden."))
+        for n in range(self.mma_n):
+            base = bank0 + n * rpl
+            if n > 0:
+                module.add(VAddU32(vgpr(self._roAddr), vgpr(self._roAddr), sgpr(self._resRowStrideS),
+                                   comment=f"storeAddr += rowStride (advance to n={n})."))
+            module.add(VCndMaskB32(dst=vgpr(self._roVal), src0=vgpr(self._resOobV),
+                                   src1=vgpr(self._roAddr), src2=sgpr(self._roOobMask, lsc),
+                                   comment="clamp OOB group to BufferOOB (store dropped)."))
+            module.add(BufferStoreB128(src=vgpr(base, 4), vaddr=vgpr(self._roVal),
+                                       saddr=sgpr(self.residualOutSrd, 4), soffset=0,
+                                       mubuf=MUBUFModifiers(offen=True),
+                                       comment=f"ResidualOut dwordx4 [8 bf16] (mm={mm},{mm + 1},n={n})."))
+
     def _beginResidual(self, module) -> int:
         """Build the residual SRD and check out per-m-row load scratch; returns the residual burst base."""
         self._buildResidualSrd(module, self.resSrd)
@@ -878,7 +952,8 @@ class SubtileResidualAddEmitter:
         if resReg is not None:
             self._writeAccFrom(module, accReg, vgprTiles, m, n, k, f"write H back to acc (m={m},n={n},k={k}).")
 
-    def _residualAccRow(self, module, vgprTiles, accBurst: int, resBurst, m: int, forceWide: bool = False) -> None:
+    def _residualAccRow(self, module, vgprTiles, accBurst: int, resBurst, m: int,
+                        forceWide: bool = False, deferStore: bool = False) -> None:
         for k in range(self.rows_per_lane):
             coords = [(m, n, k) for n in range(self.mma_n)]
             srcRegs = self._readAccBurst(module, accBurst, vgprTiles, coords, f"read acc m={m},k={k}.")
@@ -889,7 +964,7 @@ class SubtileResidualAddEmitter:
                 self._residualAccElement(module, vgprTiles, srcRegs[n], resReg, m, n, k)
         # Wide store packs (and clobbers) the residual burst in place, so the element
         # loop writeback must complete before _storeBf16RowWide runs.
-        if self.useWideBf16Store:
+        if self.useWideBf16Store and not deferStore:
             self._storeBf16RowWide(module, resBurst, m, forceWide)
 
     def _pipelinedResidualRow(self, module, vgprTiles, accBurst: int, resBurst,
@@ -971,12 +1046,18 @@ class SubtileResidualAddEmitter:
             self._pairedLoadPair(module, mm, resBurst, pairNhBaseV, mBaseVgpr, clamp)
             if not clamp:
                 self._maskResidualOOB(module, self._bufBase(resBurst, mm))
-            self._residualAccRow(module, vgprTiles, accBurst, self._bufBase(resBurst, mm), mm, forceWide=clamp)
+            pairWideStore = clamp and self.useWideBf16Store
+            self._residualAccRow(module, vgprTiles, accBurst, self._bufBase(resBurst, mm), mm,
+                                 forceWide=clamp, deferStore=pairWideStore)
             self._addImmU32(module, self._nhBaseV, self._nhBaseV, self.mfma_m, mBaseVgpr,
                             f"nhBase += mfma_m (advance to tile {mm + 1}).")
             if not clamp:
                 self._maskResidualOOB(module, self._bufBase(resBurst, mm + 1))
-            self._residualAccRow(module, vgprTiles, accBurst, self._bufBase(resBurst, mm + 1), mm + 1, forceWide=clamp)
+            self._residualAccRow(module, vgprTiles, accBurst, self._bufBase(resBurst, mm + 1), mm + 1,
+                                 forceWide=clamp, deferStore=pairWideStore)
+            if pairWideStore:
+                self._storeBf16PairWideAligned(module, self._bufBase(resBurst, mm),
+                                               self._bufBase(resBurst, mm + 1), mm, pairNhBaseV)
 
     def _residualPassFree0(self, vgprTiles) -> Module:
         module = Module("ResidualAdd residualPassFree0")
