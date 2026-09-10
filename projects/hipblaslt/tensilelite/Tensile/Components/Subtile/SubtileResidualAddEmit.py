@@ -574,7 +574,7 @@ class SubtileResidualAddEmitter:
                                    comment=f"storeAddr += rowStride (advance to n={n})."))
             module.add(VCndMaskB32(dst=vgpr(self._roVal), src0=vgpr(self._resOobV),
                                    src1=vgpr(self._roAddr), src2=sgpr(self._roOobMask, lsc),
-                                   comment="clamp OOB group to BufferOOB (store dropped)."))
+                                   comment="clamp OOB group to BufferOOB (store dropped); _resOobV reused because it holds the same BufferOOB constant as _roOobV."))
             module.add(BufferStoreB128(src=vgpr(base, 4), vaddr=vgpr(self._roVal),
                                        saddr=sgpr(self.residualOutSrd, 4), soffset=0,
                                        mubuf=MUBUFModifiers(offen=True),
