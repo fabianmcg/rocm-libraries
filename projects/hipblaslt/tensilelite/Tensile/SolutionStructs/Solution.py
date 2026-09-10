@@ -327,7 +327,8 @@ def _validatePartialRMS(state, printRejectionReason):
   downstream store path writes D as bf16.
 
   Structural requirements:
-    - UseSubtileImpl, gfx950, bf16. StreamK with K-split (SKFDPO0) is supported.
+    - UseSubtileImpl, gfx950, bf16. StreamK requires StreamKForceDPOnly=1; split-K
+      (SKFDPO0) is rejected (its MultipleBuffer store path bypasses the full-tile epilogue).
     - MacroTile0 and MacroTile1 must be multiples of 64.
     - free0 = N_hidden (the reduced axis); free1 = M_tokens. Each WG reduces its
       own MT0-wide free0 tile and writes one partial per token to
