@@ -373,6 +373,11 @@ def _validatePartialRMS(state, printRejectionReason):
            "PartialRMS does not support MultipleBufferSingleKernel/AdaptiveGemmGSUA "
            "(kernarg layout conflict)")
     return
+  if state.get("_GlobalAccumulation") == "MultipleBuffer":
+    reject(state, printRejectionReason,
+           "PartialRMS does not support MultipleBuffer GSU "
+           "(conversion kernel bypasses GlobalWriteBatch epilogue)")
+    return
   if state["ProblemType"].get("GroupedGemm", False):
     reject(state, printRejectionReason,
            "PartialRMS does not support GroupedGemm")
