@@ -68,6 +68,7 @@ from rocisa.container import (
 from rocisa.functions import vectorStaticDivide
 from rocisa.instruction import (
     BufferLoadB32,
+    BufferLoadB64,
     BufferLoadD16B16,
     BufferLoadD16U8,
     BufferStoreB32,
@@ -175,6 +176,11 @@ class SubtilePartialRMSEmitter:
         # default, 's' f32).
         self.gammaType    = DataType(kernel.get("PartialRMSGammaType") or "b")
         self.gammaBytes,    self.gammaLog2Bytes    = self._sideBytes(self.gammaType)
+        # Wide gamma load: bf16 packs 4 per dwordx2; fp8/bf8 packs 4 per dword.
+        # Mirrors the residualAdd useWideResidual guard in SubtileResidualAddEmit.py.
+        self.useWideGamma = (self.rows_per_lane % 4 == 0
+                             and (self.gammaBytes == 1
+                                  or (self.gammaBytes == 2 and not self.gammaType.isHalf())))
 
     @staticmethod
     def _sideBytes(dtype):
@@ -617,14 +623,17 @@ class SubtilePartialRMSEmitter:
         # overlap load and compute. Deferred: needs a second readTmp buffer.
         numArrays = len(arrays)
         for j in range(self.wg_m):
-            for a in range(numArrays):
+            for a, (base, _op, _verb) in enumerate(arrays):
                 for i in range(self.numPartials):
                     off = (a * self.numPartials + i) * 4
-                    module.add(DSLoadB32(dst=vgpr(readTmp + a * self.numPartials + i),
-                                         src=vgpr(readAddr), ds=DSModifiers(offset=off),
+                    # For j==0 load directly into the accumulator base to avoid a
+                    # redundant VMovB32 copy; for j>0 use the temp buffer.
+                    dst = (base + i) if j == 0 else (readTmp + a * self.numPartials + i)
+                    module.add(DSLoadB32(dst=vgpr(dst), src=vgpr(readAddr), ds=DSModifiers(offset=off),
                                          comment=f"LDS load wave[{j}] arr[{a}] partial[{i}]."))
             module.add(SWaitCnt(dscnt=0, comment="wait LDS reads."))
-            self._crossWaveAccum(module, readTmp, arrays, j)
+            if j > 0:
+                self._crossWaveAccum(module, readTmp, arrays, j)
             if j < self.wg_m - 1:
                 with self.writer.allocTmpSgpr(1, tag="pRMS_xwF0Advance") as tmpSgprInfo:
                     module.add(SMovB32(dst=sgpr(tmpSgprInfo.idx), src=hex(strideW),
@@ -633,13 +642,10 @@ class SubtilePartialRMSEmitter:
                                        comment="advance readAddr to next sibling wave."))
 
     def _crossWaveAccum(self, module, readTmp: int, arrays, j: int) -> None:
+        # j==0 loads go directly into base+i (see _crossWaveLoadReduce); only j>0 reaches here.
         for a, (base, op, verb) in enumerate(arrays):
             for i in range(self.numPartials):
                 src = readTmp + a * self.numPartials + i
-                if j == 0:
-                    module.add(VMovB32(dst=vgpr(base + i), src=vgpr(src),
-                                       comment=f"arr[{a}] partial[{i}] = wave[0]."))
-                    continue
                 module.add(op(dst=vgpr(base + i), src0=vgpr(base + i), src1=vgpr(src),
                               comment=f"arr[{a}] partial[{i}] {verb} wave[{j}]."))
 
@@ -752,18 +758,22 @@ class SubtilePartialRMSEmitter:
             strideV = self.writer.vgprPool.checkOut(1, tag="pRMS_wF0Stride")
             module.add(VMulLOU32(dst=vgpr(strideV), src0=self.mfma_n, src1=vgpr(ntilesV),
                                  comment=f"stride = mfma_n({self.mfma_n}) * n_d"))
+        # Pre-compute byteAddr = (token*n_d + WG0) * 4 once, then stride by stride4 per n.
+        module.add(VAddU32(vgpr(globalAddr), vgpr(accumV), sgpr("WorkGroup0"),
+                           comment="token*n_d + WorkGroup0 (n=0)"))
+        module.add(VLShiftLeftB32(dst=vgpr(globalAddr), shiftHex=hex(2), src=vgpr(globalAddr),
+                                  comment="byteAddr = (token*n_d + WG0) * 4"))
+        if strideV is not None:
+            module.add(VLShiftLeftB32(dst=vgpr(strideV), shiftHex=hex(2), src=vgpr(strideV),
+                                      comment="stride4 = stride * 4"))
         for n in range(self.mma_n):
-            module.add(VAddU32(vgpr(globalAddr), vgpr(accumV), sgpr("WorkGroup0"),
-                               comment=f"token*n_d + WorkGroup0 (n={n})"))
-            module.add(VLShiftLeftB32(dst=vgpr(globalAddr), shiftHex=hex(2), src=vgpr(globalAddr),
-                                      comment="byteOff = (token*n_d + WG0) * 4"))
             module.add(BufferStoreB32(src=vgpr(partials + n), vaddr=vgpr(globalAddr),
                                       saddr=sgpr(partialSrd, 4), soffset=0,
                                       mubuf=MUBUFModifiers(offen=True),
                                       comment=f"partialBuf[token+n*{self.mfma_n}, WG0] = {label} (n={n})"))
             if n < self.mma_n - 1:
-                module.add(VAddU32(vgpr(accumV), vgpr(accumV), vgpr(strideV),
-                                   comment=f"accum += stride (advance to n={n + 1})"))
+                module.add(VAddU32(vgpr(globalAddr), vgpr(globalAddr), vgpr(strideV),
+                                   comment=f"byteAddr += stride4 (advance to n={n + 1})"))
         module.add(SWaitCnt(vscnt=0, comment="wait partialBuf stores"))
         module.add(SMovB64(dst=EXEC(), src=sgpr(savedExec, lsc), comment="restore exec mask"))
         if strideV is not None:
@@ -773,9 +783,36 @@ class SubtilePartialRMSEmitter:
         self.writer.vgprPool.checkIn(ntilesV)
         return module
 
+    def _gammaLoadsPerBlock(self) -> int:
+        """Number of buffer_load instructions issued per gamma block (one tile row)."""
+        return 1 if self.useWideGamma else self.rows_per_lane
+
+    def _convertGammaChunkBf16(self, module, base: int) -> None:
+        """Unpack 4 bf16 from dwords (base, base+1) into 4 f32 at base+0..3.
+
+        Mirrors _convertResidualChunkBf16 in SubtileResidualAddEmit.py.
+        High indices first so each source dword is fully read before overwritten.
+        """
+        module.add(VCvtBF16toFP32(vgpr(base + 3), vgpr(base + 1), None, 1,
+                                   comment="gamma k=3 bf16(hi) -> f32."))
+        module.add(VCvtBF16toFP32(vgpr(base + 2), vgpr(base + 1), None, 0,
+                                   comment="gamma k=2 bf16(lo) -> f32."))
+        module.add(VCvtBF16toFP32(vgpr(base + 1), vgpr(base + 0), None, 1,
+                                   comment="gamma k=1 bf16(hi) -> f32."))
+        module.add(VCvtBF16toFP32(vgpr(base + 0), vgpr(base + 0), None, 0,
+                                   comment="gamma k=0 bf16(lo) -> f32."))
+
     def _issueGammaLoads(self, module, gammaSrd: int, gammaBurst: int, gammaByteVgpr: int,
                          m: int) -> None:
         """Issue all rows_per_lane gamma loads for tile row m (no wait; batched)."""
+        if self.useWideGamma:
+            module.add(VLShiftLeftB32(dst=vgpr(gammaByteVgpr), shiftHex=hex(self.gammaLog2Bytes),
+                                      src=vgpr(self._nhBaseV),
+                                      comment="gammaByte = nhBase * gammaBytes."))
+            module.add(BufferLoadB64(vgpr(gammaBurst, 2), vgpr(gammaByteVgpr), sgpr(gammaSrd, 4), 0,
+                                     MUBUFModifiers(offen=True),
+                                     comment=f"gamma[nhBase..+3] dwordx2 (m={m})."))
+            return
         for k in range(self.rows_per_lane):
             r = self._addImmU32(module, gammaByteVgpr, self._nhBaseV, k, gammaByteVgpr,
                                 f"nhidden = nhBase + {k} (m={m},k={k}).")
@@ -786,6 +823,9 @@ class SubtilePartialRMSEmitter:
                                 f"gamma[nhidden] (m={m},k={k}).", dtype=self.gammaType)
 
     def _convertGammaRow(self, module, gammaBurst: int) -> None:
+        if self.useWideGamma:
+            self._convertGammaChunkBf16(module, gammaBurst)
+            return
         for k in range(self.rows_per_lane):
             self._convertSideElem(module, gammaBurst + k, f"gamma -> fp32 (k={k}).", dtype=self.gammaType)
 
@@ -845,7 +885,7 @@ class SubtilePartialRMSEmitter:
             self._addImmU32(module, self._nhBaseV, self._nhBaseV, self.mfma_m, mBaseVgpr,
                             f"nhBase += mfma_m (advance to block {m + 1}).")
             self._issueGammaLoads(module, gammaSrd, gammaBurst + rowsPerLane, gammaByteVgpr, m + 1)
-            module.add(SWaitCnt(vlcnt=rowsPerLane,
+            module.add(SWaitCnt(vlcnt=self._gammaLoadsPerBlock(),
                                 comment="wait block m gamma; block m+1 still in flight."))
         else:
             module.add(SWaitCnt(vlcnt=0, comment="wait gamma row burst."))
@@ -872,7 +912,7 @@ class SubtilePartialRMSEmitter:
         gammaByteVgpr = scratchV
         mBaseVgpr = self.writer.vgprPool.checkOut(1, tag="pRMS_fusMBase")
         accBurst = self.writer.vgprPool.checkOut(self.mma_n, tag="pRMS_fusAccBurst")
-        gammaBurst = self.writer.vgprPool.checkOut(2 * self.rows_per_lane, tag="pRMS_fusGammaBurst")
+        gammaBurst = self.writer.vgprPool.checkOutAligned(2 * self.rows_per_lane, 2, tag="pRMS_fusGammaBurst")
         for m in range(0, self.mma_m, 2):
             self._emitBlockPair(module, vgprTiles, accBurst, gammaBurst, gammaSrd,
                                 gammaByteVgpr, mBaseVgpr, wgRowBase, rowGroupOff,
