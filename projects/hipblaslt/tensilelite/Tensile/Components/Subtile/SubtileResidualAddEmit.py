@@ -543,7 +543,7 @@ class SubtileResidualAddEmitter:
         for n in range(self.mma_n):
             self._storeBf16WideElem(module, resBurst, m, n)
 
-    def _storeBf16PairWideAligned(self, module, bank0: int, bank1: int, mm: int,
+    def _storeBf16PairWideAligned(self, module, vgprTiles, bank0: int, bank1: int, mm: int,
                                   pairNhBaseV: int, nStart: int = 0, count: int = None) -> None:
         """Store both tile rows of a pair as buffer_store_dwordx4 (128-bit).
 
@@ -564,16 +564,24 @@ class SubtileResidualAddEmitter:
         # Order avoids clobber: the two mm packs read bank0[j*rpl+2/+3] (mm k2,k3)
         # before the mm+1 packs overwrite them.
         for j in range(count):
+            n = nStart + j
             base = bank0 + j * rpl
-            hi = bank1 + j * rpl
-            module.add(VCvtPkF32toBF16(dst=vgpr(base + 0), src0=vgpr(base + 0), src1=vgpr(base + 1),
-                                       comment="pack mm H k0,k1 -> bf16 dword."))
-            module.add(VCvtPkF32toBF16(dst=vgpr(base + 1), src0=vgpr(base + 2), src1=vgpr(base + 3),
-                                       comment="pack mm H k2,k3 -> bf16 dword."))
-            module.add(VCvtPkF32toBF16(dst=vgpr(base + 2), src0=vgpr(hi + 0), src1=vgpr(hi + 1),
-                                       comment="pack mm+1 H k0,k1 -> bf16 dword."))
-            module.add(VCvtPkF32toBF16(dst=vgpr(base + 3), src0=vgpr(hi + 2), src1=vgpr(hi + 3),
-                                       comment="pack mm+1 H k2,k3 -> bf16 dword."))
+            mmBurst = bank0 + j * rpl
+            hiBurst = bank1 + j * rpl
+            tileMm   = vgprTiles[n * self.mma_m + mm]
+            tileMmp1 = vgprTiles[n * self.mma_m + (mm + 1)]
+            def _hSrc(tile, burstBase, kk):
+                if tile.regList.pool == self.writer.vgprPool:
+                    return tile.regList.indices[kk]  # H is in the accumulator VGPR (packFromAcc).
+                return burstBase + kk                # H is in the residual burst (AGPR tile).
+            module.add(VCvtPkF32toBF16(dst=vgpr(base + 0), src0=vgpr(_hSrc(tileMm, mmBurst, 0)),
+                                       src1=vgpr(_hSrc(tileMm, mmBurst, 1)), comment="pack mm H k0,k1 -> bf16 dword."))
+            module.add(VCvtPkF32toBF16(dst=vgpr(base + 1), src0=vgpr(_hSrc(tileMm, mmBurst, 2)),
+                                       src1=vgpr(_hSrc(tileMm, mmBurst, 3)), comment="pack mm H k2,k3 -> bf16 dword."))
+            module.add(VCvtPkF32toBF16(dst=vgpr(base + 2), src0=vgpr(_hSrc(tileMmp1, hiBurst, 0)),
+                                       src1=vgpr(_hSrc(tileMmp1, hiBurst, 1)), comment="pack mm+1 H k0,k1 -> bf16 dword."))
+            module.add(VCvtPkF32toBF16(dst=vgpr(base + 3), src0=vgpr(_hSrc(tileMmp1, hiBurst, 2)),
+                                       src1=vgpr(_hSrc(tileMmp1, hiBurst, 3)), comment="pack mm+1 H k2,k3 -> bf16 dword."))
         # Forward shuffle in batches so several ds_bpermute overlap one dscnt drain.
         dsMax = self.asmCaps.get("MaxDscnt") or self.asmCaps.get("MaxLgkmcnt") or rpl
         batchN = max(1, dsMax // rpl)
@@ -985,11 +993,22 @@ class SubtileResidualAddEmitter:
                                comment="colByte += WorkGroup1 * MT1 * elemBytes"))
         return module
 
-    def _residualAccElement(self, module, vgprTiles, accReg: int, resReg, m: int, n: int, k: int) -> None:
+    def _residualAccElement(self, module, vgprTiles, accReg: int, resReg, m: int, n: int, k: int,
+                            packFromAcc: bool = False) -> None:
         # When useWideBf16Store: H is left in resReg (the residual burst) for wide packing,
         # then written back to the accumulator. When residualAdd is False but storeBf16D is
         # True, the accumulator already holds H (= GEMM acc), so no writeback is needed.
         if self.useWideBf16Store:
+            tile = vgprTiles[n * self.mma_m + m]
+            accVgpr = tile.regList.indices[k]
+            isVgprTile = tile.regList.pool == self.writer.vgprPool
+            if packFromAcc and isVgprTile:
+                # accReg IS accVgpr here (readAccBurst returns VGPR-pool tiles in place),
+                # so this adds H in place in the accumulator VGPR. No burst write and no
+                # write-back copy: the pair-wide store packs H directly from the accumulator.
+                module.add(VAddF32(dst=vgpr(accVgpr), src0=vgpr(accReg), src1=vgpr(resReg),
+                                   comment=f"H = GEMM + residual (in place in acc VGPR; wide store packs from acc) (m={m},n={n},k={k})."))
+                return
             module.add(VAddF32(dst=vgpr(resReg), src0=vgpr(accReg), src1=vgpr(resReg),
                                comment="H = GEMM + residual (kept in burst for wide store)."))
             self._writeAccFrom(module, resReg, vgprTiles, m, n, k, f"write H back to acc (m={m},n={n},k={k}).")
@@ -1016,7 +1035,8 @@ class SubtileResidualAddEmitter:
                 n = nStart + j
                 # Burst slot is group-local (j); accumulator coords use absolute n.
                 resReg = None if resBurst is None else resBurst + j * self.rows_per_lane + k
-                self._residualAccElement(module, vgprTiles, srcRegs[j], resReg, m, n, k)
+                self._residualAccElement(module, vgprTiles, srcRegs[j], resReg, m, n, k,
+                                         packFromAcc=deferStore)
         # Wide store packs (and clobbers) the residual burst in place, so the element
         # loop writeback must complete before _storeBf16RowWide runs.
         if self.useWideBf16Store and not deferStore:
@@ -1136,7 +1156,7 @@ class SubtileResidualAddEmitter:
                                      forceWide=clamp, deferStore=pairWideStore,
                                      nStart=nStart, count=count)
                 if pairWideStore:
-                    self._storeBf16PairWideAligned(module, loBase, hiBase, mm, pairNhBaseV,
+                    self._storeBf16PairWideAligned(module, vgprTiles, loBase, hiBase, mm, pairNhBaseV,
                                                    nStart=nStart, count=count)
 
     def _residualPassFree0(self, vgprTiles) -> Module:
