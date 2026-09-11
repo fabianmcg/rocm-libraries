@@ -203,18 +203,21 @@ class SubtileResidualAddEmitter:
             return
         module.add(VAccvgprWriteB32(accvgpr(reg), vgpr(src), comment=comment))
 
-    def _addImmU32(self, module, dst: int, src: int, imm: int, scratch: int, comment: str) -> None:
-        # imm == 0 is a no-op add; emit a copy only when the value must move registers.
+    def _addImmU32(self, module, dst: int, src: int, imm: int, scratch: int, comment: str) -> int:
+        """Compute src + imm; return the register holding the result.
+
+        When imm == 0 nothing is emitted and src is returned, so the caller reads
+        src directly instead of a redundant copy in dst.
+        """
         if imm == 0:
-            if dst != src:
-                module.add(VMovB32(dst=vgpr(dst), src=vgpr(src), comment=comment))
-            return
+            return src
         # Materialize the immediate in a VGPR when it exceeds the inline-literal range.
         if imm > _INLINE_CONST_MAX:
             module.add(VMovB32(dst=vgpr(scratch), src=imm, comment=f"imm={imm}"))
             module.add(VAddU32(vgpr(dst), vgpr(src), vgpr(scratch), comment=comment))
-            return
+            return dst
         module.add(VAddU32(vgpr(dst), vgpr(src), imm, comment=comment))
+        return dst
 
     def _computeWaveM(self, module, dst: int) -> None:
         # waveId is cached once in _setup (self.waveIdV); only callers with wg_m > 1
@@ -255,8 +258,8 @@ class SubtileResidualAddEmitter:
                      m: int, k: int, scratch: int) -> None:
         # free0 row = rowBase + rowGroupOff + (m*mfma_m + k).
         mBase = m * self.mfma_m + k
-        self._addImmU32(module, dst, rowBase, mBase, scratch, f"row = base + {mBase} (m={m},k={k})")
-        module.add(VAddU32(vgpr(dst), vgpr(dst), vgpr(rowGroupOff), comment="row += rowGroupOff"))
+        r = self._addImmU32(module, dst, rowBase, mBase, scratch, f"row = base + {mBase} (m={m},k={k})")
+        module.add(VAddU32(vgpr(dst), vgpr(r), vgpr(rowGroupOff), comment="row += rowGroupOff"))
 
     def _addWaveNColByte(self, module, colByte: int) -> None:
         if self.wg_n <= 1:
@@ -303,10 +306,10 @@ class SubtileResidualAddEmitter:
 
     def _residualRowByteBase(self, module, dst: int, tokenBase: int, n: int, scratch: int) -> None:
         nOff = n * self.mfma_n
-        self._addImmU32(module, dst, tokenBase, nOff, scratch, f"token_n = tokenBase + {nOff} (n={n})")
+        r = self._addImmU32(module, dst, tokenBase, nOff, scratch, f"token_n = tokenBase + {nOff} (n={n})")
         # token_n * SizesFree0 uses 32-bit VMulLOU32; valid while the element index
         # token_n * N_hidden stays below 2^32 (all currently supported tensor sizes).
-        module.add(VMulLOU32(dst=vgpr(dst), src0=sgpr("SizesFree+0"), src1=vgpr(dst),
+        module.add(VMulLOU32(dst=vgpr(dst), src0=sgpr("SizesFree+0"), src1=vgpr(r),
                              comment="token_n * SizesFree0"))
         module.add(VLShiftLeftB32(dst=vgpr(dst), shiftHex=hex(self.residualLog2Bytes), src=vgpr(dst),
                                   comment="rowByteBase = token_n * SizesFree0 * residualBytes."))
@@ -314,15 +317,15 @@ class SubtileResidualAddEmitter:
     def _residualOutRowByteBase(self, module, dst: int, tokenBase: int, n: int, scratch: int,
                                 tokenMask: int = None) -> None:
         nOff = n * self.mfma_n
-        self._addImmU32(module, dst, tokenBase, nOff, scratch, f"token_n = tokenBase + {nOff} (n={n}).")
-        # Precompute the per-n tokenInRange mask while token_n is still live in dst.
+        r = self._addImmU32(module, dst, tokenBase, nOff, scratch, f"token_n = tokenBase + {nOff} (n={n}).")
+        # Precompute the per-n tokenInRange mask while token_n is still live in r.
         if tokenMask is not None:
-            module.add(VCmpLtU32(dst=sgpr(tokenMask, self.lane_sgpr_count), src0=vgpr(dst),
+            module.add(VCmpLtU32(dst=sgpr(tokenMask, self.lane_sgpr_count), src0=vgpr(r),
                                  src1=sgpr("SizesFree+1"),
                                  comment="tokenInRange = token_n < M_tokens."))
         # token_n * SizesFree0 uses 32-bit VMulLOU32; valid while token_n * N_hidden
         # stays below 2^32 (all currently supported tensor sizes).
-        module.add(VMulLOU32(dst=vgpr(dst), src0=sgpr("SizesFree+0"), src1=vgpr(dst),
+        module.add(VMulLOU32(dst=vgpr(dst), src0=sgpr("SizesFree+0"), src1=vgpr(r),
                              comment="token_n * SizesFree0."))
         module.add(VLShiftLeftB32(dst=vgpr(dst), shiftHex=hex(1), src=vgpr(dst),
                                   comment="roRowByteBase = token_n * SizesFree0 * 2 (bf16)."))
@@ -378,11 +381,11 @@ class SubtileResidualAddEmitter:
         module.add(SLShiftLeftB32(dst=sgpr(self._roRowStrideS), src=sgpr(self._roRowStrideS),
                                   shiftHex=hex(1), comment="roRowStride *= 2 (bf16)."))
         for n in range(self.mma_n):
-            self._addImmU32(module, self._roNhByte, self._roTokenBase, n * self.mfma_n, self._roAddr,
-                            f"token_n = tokenBase + {n * self.mfma_n} (n={n}).")
+            r = self._addImmU32(module, self._roNhByte, self._roTokenBase, n * self.mfma_n, self._roAddr,
+                                f"token_n = tokenBase + {n * self.mfma_n} (n={n}).")
             module.add(VCmpLtU32(
                 dst=sgpr(self._roTokenMask + n * self.lane_sgpr_count, self.lane_sgpr_count),
-                src0=vgpr(self._roNhByte), src1=sgpr("SizesFree+1"),
+                src0=vgpr(r), src1=sgpr("SizesFree+1"),
                 comment="tokenInRange = token_n < M_tokens."))
 
     def _endBf16Store(self, module) -> None:
@@ -401,31 +404,34 @@ class SubtileResidualAddEmitter:
 
     def _computeBf16NhByte(self, module, m: int, k: int) -> None:
         """Compute the nhidden byte offset and OOB mask for element (m, k) from the shared nhBase."""
-        self._addImmU32(module, self._roNhByte, self._nhBaseV, k, self._roAddr,
-                        f"nhidden_pos = nhBase + {k} (m={m},k={k}).")
+        r = self._addImmU32(module, self._roNhByte, self._nhBaseV, k, self._roAddr,
+                            f"nhidden_pos = nhBase + {k} (m={m},k={k}).")
         module.add(VCmpLtU32(dst=sgpr(self._roOobMask, self.lane_sgpr_count),
-                             src0=vgpr(self._roNhByte), src1=sgpr("SizesFree+0"),
+                             src0=vgpr(r), src1=sgpr("SizesFree+0"),
                              comment="inRange = nhidden_pos < N_hidden."))
-        module.add(VLShiftLeftB32(dst=vgpr(self._roNhByte), shiftHex=hex(1), src=vgpr(self._roNhByte),
+        module.add(VLShiftLeftB32(dst=vgpr(self._roNhByte), shiftHex=hex(1), src=vgpr(r),
                                   comment="nhByte = nhidden_pos * 2 (bf16)."))
 
-    def _emitRoRowByteBase(self, module, dstVgpr: int, n: int) -> None:
-        """Write ResidualOut row byte base for column n = base0 + n*rowStride into dstVgpr."""
+    def _emitRoRowByteBase(self, module, dstVgpr: int, n: int) -> int:
+        """Return the VGPR holding roRowByteBase[n] = base0 + n*rowStride, emitting code if needed.
+
+        When n == 0 the base is already in self._roBase0 so nothing is emitted and
+        that register is returned directly, avoiding a redundant copy.
+        """
         if n == 0:
-            module.add(VMovB32(dst=vgpr(dstVgpr), src=vgpr(self._roBase0),
-                               comment="roRowByteBase[0] = base0."))
-            return
+            return self._roBase0
         with self.writer.allocTmpSgpr(1, tag="rAdd_roRowN") as tmp:
             module.add(SMulI32(dst=sgpr(tmp.idx), src0=sgpr(self._roRowStrideS), src1=n,
                                comment=f"n*rowStride (n={n})."))
             module.add(VAddU32(vgpr(dstVgpr), vgpr(self._roBase0), sgpr(tmp.idx),
                                comment=f"roRowByteBase[{n}] = base0 + n*rowStride."))
+        return dstVgpr
 
     def _storeBf16Elem(self, module, accReg: int, n: int) -> None:
         """Store bf16(accReg) to ResidualOut[token, nhidden], dropping OOB lanes."""
         tokenMask = self._roTokenMask + n * self.lane_sgpr_count
-        self._emitRoRowByteBase(module, self._roAddr, n)
-        module.add(VAddU32(dst=vgpr(self._roAddr), src0=vgpr(self._roAddr),
+        rowBase = self._emitRoRowByteBase(module, self._roAddr, n)
+        module.add(VAddU32(dst=vgpr(self._roAddr), src0=vgpr(rowBase),
                            src1=vgpr(self._roNhByte),
                            comment="byteAddr = roRowByteBase[n] + nhByte."))
         # Clamp the full address so an OOB lane lands on exactly BufferOOB and is dropped.
@@ -480,9 +486,9 @@ class SubtileResidualAddEmitter:
         rpl = self.rows_per_lane
         lsc = self.lane_sgpr_count
         # Whole-group nhidden mask: in range iff the last element (k=rpl-1) < N_hidden.
-        self._addImmU32(module, self._roAddr, self._nhBaseV, rpl - 1, self._roAddr,
-                        f"nhiddenLast = nhBase + {rpl - 1}.")
-        module.add(VCmpLtU32(dst=sgpr(self._roOobMask, lsc), src0=vgpr(self._roAddr),
+        r = self._addImmU32(module, self._roAddr, self._nhBaseV, rpl - 1, self._roAddr,
+                            f"nhiddenLast = nhBase + {rpl - 1}.")
+        module.add(VCmpLtU32(dst=sgpr(self._roOobMask, lsc), src0=vgpr(r),
                              src1=sgpr("SizesFree+0"),
                              comment="group in range = nhiddenLast < N_hidden."))
         module.add(VLShiftLeftB32(dst=vgpr(self._roNhByte), shiftHex=hex(1),
@@ -494,8 +500,8 @@ class SubtileResidualAddEmitter:
         rpl = self.rows_per_lane
         lsc = self.lane_sgpr_count
         tokenMask = self._roTokenMask + n * lsc
-        self._emitRoRowByteBase(module, self._roAddr, n)
-        module.add(VAddU32(dst=vgpr(self._roAddr), src0=vgpr(self._roAddr),
+        rowBase = self._emitRoRowByteBase(module, self._roAddr, n)
+        module.add(VAddU32(dst=vgpr(self._roAddr), src0=vgpr(rowBase),
                            src1=vgpr(self._roNhByte),
                            comment="byteAddr = roRowByteBase[n] + nhByte(k=0)."))
         module.add(VCndMaskB32(dst=vgpr(self._roAddr), src0=vgpr(self._roOobV),
@@ -520,9 +526,8 @@ class SubtileResidualAddEmitter:
                                        comment="pack H k2,k3 -> bf16 dword."))
             stAddr = self._roAddr
             if c > 0:
-                self._addImmU32(module, self._roVal, self._roAddr, 8 * c, self._roVal,
-                                f"chunk byte offset {8 * c}.")
-                stAddr = self._roVal
+                stAddr = self._addImmU32(module, self._roVal, self._roAddr, 8 * c, self._roVal,
+                                         f"chunk byte offset {8 * c}.")
             module.add(BufferStoreB64(src=vgpr(base + 0, 2), vaddr=vgpr(stAddr),
                                       saddr=sgpr(self.residualOutSrd, 4), soffset=0,
                                       mubuf=MUBUFModifiers(offen=True),
@@ -588,11 +593,10 @@ class SubtileResidualAddEmitter:
                 module.add(VPermlane32SwapB32(dst=vgpr(base + 1), src=vgpr(base + 3),
                                               comment="forward shuffle: swap d1<->d3 across lane 32."))
             module.add(SNop(waitState=0, comment="wait state after v_permlane32_swap (gfx950)."))
-        # Address: byteAddr(n) = base0 + pairNhBase*2 + nStart*rowStride, advanced per j.
-        # Group OOB clamp: drop the whole dwordx4 when pairNhBaseLast >= N_hidden.
-        module.add(VLShiftLeftB32(dst=vgpr(self._roNhByte), shiftHex=hex(1), src=vgpr(pairNhBaseV),
-                                  comment="pairNhByte = pairNhBase * 2 (bf16)."))
-        module.add(VAddU32(vgpr(self._roAddr), vgpr(self._resTokenBase), vgpr(self._roNhByte),
+        # Address: byteAddr(n) = base0 + pairNhByte + nStart*rowStride, advanced per j.
+        # pairNhBaseV already holds pairNhByte (hoisted by _emitPairedBody).
+        # _resOobMask already holds the group OOB predicate (also hoisted by _emitPairedBody).
+        module.add(VAddU32(vgpr(self._roAddr), vgpr(self._resTokenBase), vgpr(pairNhBaseV),
                            comment="storeAddr = base0 + pairNhByte (mm-pair, n=0)."))
         if nStart > 0:
             with self.writer.allocTmpSgpr(1, tag="rAdd_storeNStartOff") as tmp:
@@ -600,11 +604,6 @@ class SubtileResidualAddEmitter:
                                    comment=f"nStart*rowStride (nStart={nStart})."))
                 module.add(VAddU32(vgpr(self._roAddr), vgpr(self._roAddr), sgpr(tmp.idx),
                                    comment=f"storeAddr += nStart*rowStride."))
-        self._addImmU32(module, self._roNhByte, pairNhBaseV, 2 * rpl - 1, self._roVal,
-                        f"pairNhBaseLast = pairNhBase + {2 * rpl - 1}.")
-        module.add(VCmpLtU32(dst=sgpr(self._roOobMask, lsc), src0=vgpr(self._roNhByte),
-                             src1=sgpr("SizesFree+0"),
-                             comment="group fully in range = pairNhBaseLast < N_hidden."))
         for j in range(count):
             n = nStart + j
             base = bank0 + j * rpl
@@ -612,8 +611,8 @@ class SubtileResidualAddEmitter:
                 module.add(VAddU32(vgpr(self._roAddr), vgpr(self._roAddr), sgpr(self._resRowStrideS),
                                    comment=f"storeAddr += rowStride (advance to n={n})."))
             module.add(VCndMaskB32(dst=vgpr(self._roVal), src0=vgpr(self._resOobV),
-                                   src1=vgpr(self._roAddr), src2=sgpr(self._roOobMask, lsc),
-                                   comment="clamp OOB group to BufferOOB (store dropped); _resOobV reused because it holds the same BufferOOB constant as _roOobV."))
+                                   src1=vgpr(self._roAddr), src2=sgpr(self._resOobMask, lsc),
+                                   comment="clamp OOB group to BufferOOB (store dropped); _resOobMask shared with load."))
             module.add(BufferStoreB128(src=vgpr(base, 4), vaddr=vgpr(self._roVal),
                                        saddr=sgpr(self.residualOutSrd, 4), soffset=0,
                                        mubuf=MUBUFModifiers(offen=True),
@@ -734,9 +733,8 @@ class SubtileResidualAddEmitter:
                 addr = self.resAddr
                 # c > 0 is dead for rows_per_lane == 4; exists for rows_per_lane >= 8.
                 if c > 0:
-                    self._addImmU32(module, scratch, self.resAddr, chunkBytes * c, scratch,
-                                    f"chunk byte offset {chunkBytes * c}.")
-                    addr = scratch
+                    addr = self._addImmU32(module, scratch, self.resAddr, chunkBytes * c, scratch,
+                                          f"chunk byte offset {chunkBytes * c}.")
                 dstBase = resBurst + n * rpl + 4 * c
                 dst = vgpr(dstBase, 2) if isBf16 else vgpr(dstBase)
                 module.add(loadCls(dst, vgpr(addr), sgpr(self.resSrd, 4), 0,
@@ -802,12 +800,11 @@ class SubtileResidualAddEmitter:
         if count is None:
             count = self.mma_n
         lsc = self.lane_sgpr_count
+        rpl = self.rows_per_lane
         loBase = self._bufBase(resBurst, mm)       # tile mm buffer (also the load target).
         hiBase = self._bufBase(resBurst, mm + 1)   # tile mm+1 buffer.
-        rpl = self.rows_per_lane
-        module.add(VLShiftLeftB32(dst=vgpr(scratch), shiftHex=hex(1), src=vgpr(pairNhBaseV),
-                                  comment="pairNhByte = pairNhBase * 2 (bf16)."))
-        module.add(VAddU32(vgpr(self.resAddr), vgpr(self._resTokenBase), vgpr(scratch),
+        # pairNhBaseV already holds pairNhByte (hoisted by _emitPairedBody).
+        module.add(VAddU32(vgpr(self.resAddr), vgpr(self._resTokenBase), vgpr(pairNhBaseV),
                            comment=f"byteAddr = base0 + pairNhByte (mm={mm},n=0)."))
         if nStart > 0:
             with self.writer.allocTmpSgpr(1, tag="rAdd_nStartStride") as tmp:
@@ -815,12 +812,7 @@ class SubtileResidualAddEmitter:
                                    comment=f"nStart*rowStride (nStart={nStart})."))
                 module.add(VAddU32(vgpr(self.resAddr), vgpr(self.resAddr), sgpr(tmp.idx),
                                    comment=f"byteAddr += nStart*rowStride."))
-        if clamp:
-            self._addImmU32(module, scratch, pairNhBaseV, 2 * rpl - 1, scratch,
-                            f"pairNhBaseLast = pairNhBase + {2 * rpl - 1}.")
-            module.add(VCmpLtU32(dst=sgpr(self._resOobMask, lsc), src0=vgpr(scratch),
-                                 src1=sgpr("SizesFree+0"),
-                                 comment="group fully in range = pairNhBaseLast < N_hidden."))
+        # When clamp is set, _resOobMask was pre-hoisted by _emitPairedBody; reuse it.
         for j in range(count):
             n = nStart + j
             if j > 0:
@@ -932,9 +924,8 @@ class SubtileResidualAddEmitter:
         for k in range(self.rows_per_lane):
             nhpos = self._nhBaseV
             if k > 0:
-                self._addImmU32(module, self.resAddr, self._nhBaseV, k, self._resRowByteBase,
-                                f"nhidden_pos = nhBase + {k}.")
-                nhpos = self.resAddr
+                nhpos = self._addImmU32(module, self.resAddr, self._nhBaseV, k, self._resRowByteBase,
+                                        f"nhidden_pos = nhBase + {k}.")
             module.add(VCmpLtU32(dst=sgpr(self._resOobMask, lsc), src0=vgpr(nhpos),
                                  src1=sgpr("SizesFree+0"),
                                  comment=f"inRange = nhidden_pos < N_hidden (k={k})."))
@@ -1105,6 +1096,8 @@ class SubtileResidualAddEmitter:
         The mma_n columns are processed in groups of _colGroupSize so the residual
         burst holds one group instead of the full pair (halving the VGPR peak).
         """
+        rpl = self.rows_per_lane
+        lsc = self.lane_sgpr_count
         count = self._colGroupSize
         pairWideStore = clamp and self.useWideBf16Store
         for mm in range(0, self.mma_m, 2):
@@ -1113,6 +1106,15 @@ class SubtileResidualAddEmitter:
             # pairNhBase = ownNhBase(mm) + rowGroupOff; addresses the dwordx4 load.
             module.add(VAddU32(vgpr(pairNhBaseV), vgpr(self._nhBaseV), vgpr(rowGroupOff),
                                comment="pairNhBase = ownNhBase + rowGroupOff (LG*8)."))
+            # Hoist pair-invariant group-OOB mask and pairNhByte once per pair (column-group independent).
+            if clamp:
+                lastR = self._addImmU32(module, mBaseVgpr, pairNhBaseV, 2 * rpl - 1, mBaseVgpr,
+                                        f"pairNhBaseLast = pairNhBase + {2 * rpl - 1}.")
+                module.add(VCmpLtU32(dst=sgpr(self._resOobMask, lsc), src0=vgpr(lastR),
+                                     src1=sgpr("SizesFree+0"),
+                                     comment="group fully in range = pairNhBaseLast < N_hidden."))
+            module.add(VLShiftLeftB32(dst=vgpr(pairNhBaseV), shiftHex=hex(1), src=vgpr(pairNhBaseV),
+                                      comment="pairNhByte = pairNhBase * 2 (reuse reg for load+store)."))
             for nStart in range(0, self.mma_n, count):
                 loBase = self._bufBase(resBurst, mm)
                 hiBase = self._bufBase(resBurst, mm + 1)

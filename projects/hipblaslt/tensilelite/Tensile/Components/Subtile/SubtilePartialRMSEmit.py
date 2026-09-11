@@ -268,18 +268,21 @@ class SubtilePartialRMSEmitter:
         module.add(SMovB32(dst=sgpr(srd + 2), src="BufferOOB", comment=f"{name} SRD limit"))
         module.add(SMovB32(dst=sgpr(srd + 3), src="Srd127_96", comment=f"{name} SRD flags"))
 
-    def _addImmU32(self, module, dst: int, src: int, imm: int, scratch: int, comment: str) -> None:
-        # imm == 0 is a no-op add; emit a copy only when the value must move registers.
+    def _addImmU32(self, module, dst: int, src: int, imm: int, scratch: int, comment: str) -> int:
+        """Compute src + imm; return the register holding the result.
+
+        When imm == 0 nothing is emitted and src is returned, so the caller reads
+        src directly instead of a redundant copy in dst.
+        """
         if imm == 0:
-            if dst != src:
-                module.add(VMovB32(dst=vgpr(dst), src=vgpr(src), comment=comment))
-            return
+            return src
         # Materialize the immediate in a VGPR when it exceeds the inline-literal range.
         if imm > _INLINE_CONST_MAX:
             module.add(VMovB32(dst=vgpr(scratch), src=imm, comment=f"imm={imm}"))
             module.add(VAddU32(vgpr(dst), vgpr(src), vgpr(scratch), comment=comment))
-            return
+            return dst
         module.add(VAddU32(vgpr(dst), vgpr(src), imm, comment=comment))
+        return dst
 
     def _computeWaveM(self, module, dst: int) -> None:
         # waveId is cached once in _setup (self.waveIdV); only callers with wg_m > 1
@@ -320,8 +323,8 @@ class SubtilePartialRMSEmitter:
                      m: int, k: int, scratch: int) -> None:
         # free0 row = rowBase + rowGroupOff + (m*mfma_m + k).
         mBase = m * self.mfma_m + k
-        self._addImmU32(module, dst, rowBase, mBase, scratch, f"row = base + {mBase} (m={m},k={k})")
-        module.add(VAddU32(vgpr(dst), vgpr(dst), vgpr(rowGroupOff), comment="row += rowGroupOff"))
+        r = self._addImmU32(module, dst, rowBase, mBase, scratch, f"row = base + {mBase} (m={m},k={k})")
+        module.add(VAddU32(vgpr(dst), vgpr(r), vgpr(rowGroupOff), comment="row += rowGroupOff"))
 
     def emit(self, vgprTiles) -> Module:
         # vgprTiles is dtileInfo.vgprTiles, the per-tile allocator records for the D accumulator.
@@ -774,10 +777,10 @@ class SubtilePartialRMSEmitter:
                          m: int) -> None:
         """Issue all rows_per_lane gamma loads for tile row m (no wait; batched)."""
         for k in range(self.rows_per_lane):
-            self._addImmU32(module, gammaByteVgpr, self._nhBaseV, k, gammaByteVgpr,
-                            f"nhidden = nhBase + {k} (m={m},k={k}).")
+            r = self._addImmU32(module, gammaByteVgpr, self._nhBaseV, k, gammaByteVgpr,
+                                f"nhidden = nhBase + {k} (m={m},k={k}).")
             module.add(VLShiftLeftB32(dst=vgpr(gammaByteVgpr), shiftHex=hex(self.gammaLog2Bytes),
-                                      src=vgpr(gammaByteVgpr),
+                                      src=vgpr(r),
                                       comment="gammaByte = nhidden * gammaBytes."))
             self._issueSideLoad(module, gammaBurst + k, gammaByteVgpr, gammaSrd,
                                 f"gamma[nhidden] (m={m},k={k}).", dtype=self.gammaType)
