@@ -22,7 +22,7 @@ Sub-emitter roles:
 
 import math
 
-from rocisa.code import Module
+from rocisa.code import Label, Module
 from rocisa.container import ContinuousRegister, MUBUFModifiers, sgpr, vgpr
 from rocisa.functions import vectorStaticDivide
 from rocisa.instruction import (
@@ -30,6 +30,10 @@ from rocisa.instruction import (
     BufferLoadB64,
     BufferStoreB16,
     BufferStoreB32,
+    SAndB32,
+    SBranch,
+    SCBranchSCC1,
+    SCmpEQU32,
     SMulI32,
     SWaitCnt,
     VAddF32,
@@ -119,6 +123,7 @@ class MegaFusedCtx:
         self.resOobV        = None
         self.resBurst       = None
         self.resOobMask     = None
+        self.nhOddS         = None
 
 
 class SubtileMegaFusedEmitter:
@@ -352,6 +357,9 @@ class SubtileMegaFusedEmitter:
         ctx.resBurst       = writer.vgprPool.checkOutAligned(ctx.rowsPerLane, 2, tag="mf_resBurst")
         ctx.resOobMask     = writer.sgprPool.checkOutAligned(
             res.lane_sgpr_count, res.lane_sgpr_count, tag="mf_resOobMask", preventOverflow=False)
+        ctx.nhOddS = writer.sgprPool.checkOut(1, tag="mf_nhOddS")
+        module.add(SAndB32(dst=sgpr(ctx.nhOddS), src0=sgpr("SizesFree+0"), src1=1,
+                           comment="nhOdd = N_hidden & 1 (odd -> pair store may straddle)."))
         # resTokenBase = colByte >> log2ElemBytes; used by residual loads and bf16 store.
         module.add(VLShiftRightB32(dst=vgpr(ctx.resTokenBase),
                                    shiftHex=hex(res.log2ElemBytes),
@@ -366,6 +374,7 @@ class SubtileMegaFusedEmitter:
         writer = ctx.writer
         if res.storeBf16D:
             module.add(SWaitCnt(vscnt=0, comment="wait ResidualOut bf16 stores."))
+        writer.sgprPool.checkIn(ctx.nhOddS)
         writer.sgprPool.checkIn(ctx.resOobMask)
         writer.vgprPool.checkIn(ctx.resBurst)
         writer.vgprPool.checkIn(ctx.resOobV)
@@ -586,42 +595,54 @@ class SubtileMegaFusedEmitter:
                                comment=f"rmsSum[{n}] += H² (m={m},n={n},k={k})."))
 
     def _pass2StoreBf16(self, module, ctx, srcRegs, m, n, rpl, useWidePair) -> None:
-        """Store bf16(H) to ResidualOut before gamma is applied."""
+        """Store bf16(H) to ResidualOut before gamma is applied.
+
+        The paired dword store is only safe when N_hidden is even; an odd N_hidden
+        makes the boundary pair straddle N_hidden, so the valid low element would be
+        dropped.  Branch at runtime on parity: even -> pair store, odd -> per-element
+        half-word store.
+        """
         if not ctx.res.storeBf16D:
             return
-        if useWidePair:
-            for k in range(0, rpl, 2):
-                self._storeBf16PairInline(module, ctx, srcRegs[k], srcRegs[k + 1], m, n, k)
-        else:
+        if not useWidePair:
             for k in range(rpl):
                 self._storeBf16ElemInline(module, ctx, srcRegs[k], m, n, k)
+            return
+        pairLabel = Label(ctx.writer.labels.getNameInc(f"mf_roPair_m{m}n{n}"), "")
+        endLabel  = Label(ctx.writer.labels.getNameInc(f"mf_roPairEnd_m{m}n{n}"), "")
+        module.add(SCmpEQU32(src0=sgpr(ctx.nhOddS), src1=0,
+                             comment="N_hidden even -> paired dword store is safe."))
+        module.add(SCBranchSCC1(labelName=pairLabel.getLabelName(),
+                                comment="even -> wide paired bf16 store."))
+        for k in range(rpl):
+            self._storeBf16ElemInline(module, ctx, srcRegs[k], m, n, k)
+        module.add(SBranch(labelName=endLabel.getLabelName(), comment="skip paired store."))
+        module.add(pairLabel)
+        for k in range(0, rpl, 2):
+            self._storeBf16PairInline(module, ctx, srcRegs[k], srcRegs[k + 1], m, n, k)
+        module.add(endLabel)
 
     def _pass3GammaAmax(self, module, ctx, srcRegs, vgprTiles, gammaBank, blkAmaxJ,
-                        accBank, bankBase, mi, m, n, rpl) -> None:
-        """Apply gamma; for MXFP8 fold |H*gamma| into blkAmax and stage to accBank.
+                        mi, m, n, rpl) -> None:
+        """Apply gamma, fold |H*gamma| into blkAmax for MXFP8, and write the result back to acc.
 
-        Without MXFP8 the gamma-scaled result is the final bf16 D value, so it is
-        written straight back to the accumulator for the standard global store.
+        The gamma-scaled value is written to the accumulator on both paths so the
+        deferred MXFP8 tail can re-read it instead of a per-group staging bank.
         """
         for k in range(rpl):
             acc = srcRegs[k]
             gammaReg = gammaBank + mi * rpl + k
             module.add(VMulF32(dst=vgpr(acc), src0=vgpr(acc), src1=vgpr(gammaReg),
                                comment=f"acc = H * gamma (m={m},n={n},k={k})."))
-            if not ctx.useMxfp8:
-                ctx.rms._writeAccFrom(module, acc, vgprTiles, m, n, k,
-                                      f"write H*gamma back to acc (m={m},n={n},k={k}).")
-                continue
-            module.add(VAndB32(dst=vgpr(ctx.mx._scAccTmp), src0=vgpr(acc),
-                               src1=vgpr(ctx.mx._scAbsMask),
-                               comment=f"|H*gamma| (m={m},n={n},k={k})."))
-            module.add(VMaxF32(dst=vgpr(blkAmaxJ), src0=vgpr(blkAmaxJ),
-                               src1=vgpr(ctx.mx._scAccTmp),
-                               comment=f"blkAmax = max(blkAmax, |H*gamma|)."))
-            bankReg = accBank + bankBase + k
-            if acc != bankReg:
-                module.add(VMovB32(dst=vgpr(bankReg), src=vgpr(acc),
-                                   comment=f"stage H*gamma to accBank (m={m},n={n},k={k})."))
+            if ctx.useMxfp8:
+                module.add(VAndB32(dst=vgpr(ctx.mx._scAccTmp), src0=vgpr(acc),
+                                   src1=vgpr(ctx.mx._scAbsMask),
+                                   comment=f"|H*gamma| (m={m},n={n},k={k})."))
+                module.add(VMaxF32(dst=vgpr(blkAmaxJ), src0=vgpr(blkAmaxJ),
+                                   src1=vgpr(ctx.mx._scAccTmp),
+                                   comment="blkAmax = max(blkAmax, |H*gamma|)."))
+            ctx.rms._writeAccFrom(module, acc, vgprTiles, m, n, k,
+                                  f"write H*gamma back to acc (m={m},n={n},k={k}).")
 
     def _fusedElementLoop(self, module, ctx, vgprTiles, accBank, gammaBank,
                           blkAmax, qi, nBase, g) -> None:
@@ -653,66 +674,69 @@ class SubtileMegaFusedEmitter:
                     self._loadResidualRow(module, ctx, m, n, mBaseV)
                 self._pass1AccResRms(module, ctx, srcRegs, m, n, rpl)
                 self._pass2StoreBf16(module, ctx, srcRegs, m, n, rpl, useWidePair)
-                blkAmaxJ = (blkAmax + j) if ctx.useMxfp8 else None
+                blkAmaxJ = (blkAmax + n) if ctx.useMxfp8 else None
                 self._pass3GammaAmax(module, ctx, srcRegs, vgprTiles, gammaBank, blkAmaxJ,
-                                     accBank, bankBase, mi, m, n, rpl)
+                                     mi, m, n, rpl)
         ctx.writer.vgprPool.checkIn(mBaseV)
 
-    def _fusedGroup(self, ctx, vgprTiles, gammaBank, qi, nBase, g) -> Module:
-        """Emit the fused element loop and inline MXFP8 tail for one (qi, nBase) N-group.
+    def _initBlkAmax(self, ctx, blkAmax) -> Module:
+        """Zero the per-qi persistent blkAmax bank (one f32 per absolute N column)."""
+        module = Module("MegaFused initBlkAmax")
+        for n in range(ctx.mmaN):
+            module.add(VMovB32(dst=vgpr(blkAmax + n), src=0, comment=f"blkAmax[{n}] = 0."))
+        return module
 
-        Checks out an accumulator staging bank and a per-N-column amax bank, runs
-        the element loop (which folds |H*gamma| into blkAmax), then calls _mxFusedTail
-        to butterfly-reduce, compute e8m0 scales, apply, and store MXScale bytes.
+    def _fusedFrontHalf(self, ctx, vgprTiles, gammaBank, blkAmax, qi, nBase, g) -> Module:
+        """Emit one N-group's element loop (residual add, bf16 store, rmsSum, gamma).
+
+        For MXFP8 the gamma-scaled result is written back to the accumulator and
+        |H*gamma| is folded into the persistent blkAmax bank; the group's MXFP8 tail
+        is deferred and emitted later by _mxDeferredTail.
         """
-        module = Module(f"MegaFused fusedGroup qi={qi} nBase={nBase}")
+        module = Module(f"MegaFused frontHalf qi={qi} nBase={nBase}")
         vgprPool = ctx.writer.vgprPool
         bankSize = g * ctx.tilesPerBlockM * ctx.rowsPerLane
         accBank = vgprPool.checkOut(bankSize, tag="mf_accBank")
-        # blkAmax and the MXFP8 tail only exist on the quantized path.
-        blkAmax = None
-        if ctx.useMxfp8:
-            blkAmax = vgprPool.checkOut(g, tag="mf_blkAmax")
-            for j in range(g):
-                module.add(VMovB32(dst=vgpr(blkAmax + j), src=0, comment=f"blkAmax[{j}] = 0."))
         self._fusedElementLoop(module, ctx, vgprTiles, accBank, gammaBank,
                                blkAmax, qi, nBase, g)
-        if ctx.useMxfp8:
-            self._mxFusedTail(module, ctx, vgprTiles, accBank, blkAmax, qi, nBase, g)
-            vgprPool.checkIn(blkAmax)
         vgprPool.checkIn(accBank)
         return module
 
-    def _mxFusedTail(self, module, ctx, vgprTiles, accBank, blkAmax,
-                     qi, nBase, g) -> None:
-        """Butterfly reduce blkAmax, compute e8m0 scales, apply to accBank, store MXScale bytes.
+    def _mxDeferredTail(self, ctx, vgprTiles, blkAmax, qi, nBase, g) -> Module:
+        """Deferred MXFP8 tail for one N-group: butterfly-reduce blkAmax, compute e8m0
+        scales, re-read the accumulator to apply alpha*quantMult, and store MXScale bytes.
 
-        After this call, the AGPR holds the final alpha*quantMult-scaled fp8 value and
-        the MXScale buffer holds the e8m0 scale byte for each N-group column j.
+        blkAmax is the persistent mmaN bank; this group owns the slice [nBase, nBase+g).
         """
+        module = Module(f"MegaFused mxDeferredTail qi={qi} nBase={nBase}")
         vgprPool = ctx.writer.vgprPool
+        amaxSlice = blkAmax + nBase
         addrBf = vgprPool.checkOut(1, tag="mf_addrBf")
         tmpBf = vgprPool.checkOut(g, tag="mf_tmpBf")
         for r in range(2):
-            ctx.mx._butterflyRound(module, addrBf, tmpBf, blkAmax, g, ctx.laneId,
+            ctx.mx._butterflyRound(module, addrBf, tmpBf, amaxSlice, g, ctx.laneId,
                                    ctx.mfmaN << r)
         vgprPool.checkIn(tmpBf)
         vgprPool.checkIn(addrBf)
         # Alpha fold: blkAmax[j] = |alpha * blkAmax[j]|, matching _streamSubColGroup.
         for j in range(g):
-            module.add(VMulF32(dst=vgpr(blkAmax + j), src0=vgpr(blkAmax + j),
-                               src1=sgpr("Alpha"), comment=f"blkAmax[{j}] *= alpha."))
-            module.add(VAndB32(dst=vgpr(blkAmax + j), src0=vgpr(blkAmax + j),
+            module.add(VMulF32(dst=vgpr(amaxSlice + j), src0=vgpr(amaxSlice + j),
+                               src1=sgpr("Alpha"), comment=f"blkAmax[{nBase + j}] *= alpha."))
+            module.add(VAndB32(dst=vgpr(amaxSlice + j), src0=vgpr(amaxSlice + j),
                                src1=vgpr(ctx.mx._scAbsMask),
-                               comment=f"blkAmax[{j}] = |alpha*blkAmax|."))
-        # _computeSubColScales overwrites blkAmax with alpha*quantMult (the apply multiplier).
-        scaleByteBank = ctx.mx._computeSubColScales(module, blkAmax, qi, nBase, g)
+                               comment=f"blkAmax[{nBase + j}] = |alpha*blkAmax|."))
+        # _computeSubColScales overwrites the slice with alpha*quantMult (the apply multiplier).
+        scaleByteBank = ctx.mx._computeSubColScales(module, amaxSlice, qi, nBase, g)
+        applyScratch = vgprPool.checkOut(ctx.rowsPerLane, tag="mf_applyScratch")
         mStart = qi * ctx.tilesPerBlockM
         mEnd = (qi + 1) * ctx.tilesPerBlockM
-        ctx.mx._subColApply(module, vgprTiles, accBank, blkAmax, mStart, mEnd, nBase, g)
+        ctx.mx._subColApplyFromAcc(module, vgprTiles, amaxSlice, applyScratch,
+                                   mStart, mEnd, nBase, g)
+        vgprPool.checkIn(applyScratch)
         ctx.mx._subColStoreGroup(module, ctx.mxSrd, scaleByteBank, ctx.col, ctx.rowGroup,
                                  ctx.savedExec, ctx.laneMask, qi, nBase, g)
         vgprPool.checkIn(scaleByteBank)
+        return module
 
     def _reduceAndWriteRms(self, ctx) -> Module:
         """Finalise rmsSum: reduce across row groups and waves, then write to partialBuf.
@@ -758,9 +782,20 @@ class SubtileMegaFusedEmitter:
 
         for qi in range(ctx.nQTilesM):
             module.add(self._loadGammaBlock(ctx, gammaBank, qi))
+            blkAmax = None
+            if ctx.useMxfp8:
+                # Persist blkAmax across the qi's N-groups so the MXFP8 tails can be
+                # deferred until every group's residual/RMS/gamma work is done.
+                blkAmax = ctx.writer.vgprPool.checkOut(ctx.mmaN, tag="mf_blkAmax")
+                module.add(self._initBlkAmax(ctx, blkAmax))
             for nBase in range(0, ctx.mmaN, ctx.streamGroup):
                 g = min(ctx.streamGroup, ctx.mmaN - nBase)
-                module.add(self._fusedGroup(ctx, vgprTiles, gammaBank, qi, nBase, g))
+                module.add(self._fusedFrontHalf(ctx, vgprTiles, gammaBank, blkAmax, qi, nBase, g))
+            if ctx.useMxfp8:
+                for nBase in range(0, ctx.mmaN, ctx.streamGroup):
+                    g = min(ctx.streamGroup, ctx.mmaN - nBase)
+                    module.add(self._mxDeferredTail(ctx, vgprTiles, blkAmax, qi, nBase, g))
+                ctx.writer.vgprPool.checkIn(blkAmax)
 
         if ctx.useMxfp8:
             ctx.mx._endStreamContext()

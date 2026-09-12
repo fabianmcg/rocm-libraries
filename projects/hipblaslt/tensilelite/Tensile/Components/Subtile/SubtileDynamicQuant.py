@@ -1365,6 +1365,28 @@ class SubtileMXFP8QuantEmitter(SubtileDynamicQuant):
                     self._writeAccFrom(module, accBank + base + k, vgprTiles, m, n, k,
                                        f"write acc[m={m},n={n},k={k}].")
 
+    def _subColApplyFromAcc(self, module, vgprTiles, applyMult: int, accScratch: int,
+                            mStart: int, mEnd: int, nBase: int, g: int) -> None:
+        """Re-read each group tile from the accumulator, scale by applyMult[j], write back.
+
+        Used by the fused epilogue's deferred tail: the gamma-scaled value already
+        lives in the accumulator, so no per-group staging bank is retained. accScratch
+        is a rowsPerLane-sized read buffer, reused per tile column.
+        """
+        module.add(SNop(waitState=1, comment="hazard guard: accvgpr_write in element loop -> accvgpr_read here (gfx950)."))
+        for j in range(g):
+            n = nBase + j
+            for m in range(mStart, mEnd):
+                coords = [(m, n, k) for k in range(self.rowsPerLane)]
+                self._readAccBurst(module, accScratch, vgprTiles, coords,
+                                   f"reread acc[m={m},n={n}].")
+                for k in range(self.rowsPerLane):
+                    module.add(VMulF32(dst=vgpr(accScratch + k), src0=vgpr(accScratch + k),
+                                       src1=vgpr(applyMult + j),
+                                       comment=f"acc *= alpha*quantMult[j={j}] (m={m},n={n},k={k})."))
+                    self._writeAccFrom(module, accScratch + k, vgprTiles, m, n, k,
+                                       f"write acc[m={m},n={n},k={k}].")
+
     def _buildSubColGroupMask(self, module, rowGroup: int, kblkV: int) -> int:
         """Group sub-mask rowGroup==0 AND kblkV<totalKBlocks, shared by all g stores.
 

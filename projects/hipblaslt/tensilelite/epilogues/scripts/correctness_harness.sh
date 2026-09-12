@@ -2,5 +2,20 @@
 
 export TENSILE_DISABLE_HELPER_CACHE=1
 cd /home/fmoracor/rocm-libraries/projects/hipblaslt/tensilelite
+
+# bf16 MegaFused path (PartialRMS + ResidualAdd + StoreBf16D).
 rm -rf /tmp/fused-harness
 ./Tensile/bin/Tensile /home/fmoracor/rocm-libraries/projects/hipblaslt/tensilelite/epilogues/YAMLs/fused.yaml /tmp/fused-harness
+FUSED_RC=$?
+
+# MXFP8 MegaFused path (PartialRMS + ResidualAdd + MXFP8 DynQuant + StoreBf16D).
+rm -rf /tmp/fused-mxfp8-harness
+./Tensile/bin/Tensile /home/fmoracor/rocm-libraries/projects/hipblaslt/tensilelite/epilogues/YAMLs/correctness_mxfp8_mega_fused.yaml /tmp/fused-mxfp8-harness
+MXFP8_RC=$?
+
+# Non-zero if either path failed so callers can gate on a single exit code.
+if [[ $FUSED_RC -ne 0 || $MXFP8_RC -ne 0 ]]; then
+  echo "correctness_harness FAILED: fused_rc=$FUSED_RC mxfp8_rc=$MXFP8_RC"
+  exit 1
+fi
+echo "correctness_harness PASSED: fused and mxfp8 mega-fused configs both OK"
