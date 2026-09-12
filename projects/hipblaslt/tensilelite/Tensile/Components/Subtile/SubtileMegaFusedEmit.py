@@ -121,7 +121,6 @@ class MegaFusedCtx:
         self.resRowByteBase = None
         self.resAddr        = None
         self.resOobV        = None
-        self.resBurst       = None
         self.resOobMask     = None
         self.nhOddS         = None
 
@@ -353,8 +352,6 @@ class SubtileMegaFusedEmitter:
         ctx.resRowByteBase = writer.vgprPool.checkOut(1, tag="mf_resRowByteBase")
         ctx.resAddr        = writer.vgprPool.checkOut(1, tag="mf_resAddr")
         ctx.resOobV        = writer.vgprPool.checkOut(1, tag="mf_resOobV")
-        # BufferLoadB64 requires a 2-aligned VGPR destination.
-        ctx.resBurst       = writer.vgprPool.checkOutAligned(ctx.rowsPerLane, 2, tag="mf_resBurst")
         ctx.resOobMask     = writer.sgprPool.checkOutAligned(
             res.lane_sgpr_count, res.lane_sgpr_count, tag="mf_resOobMask", preventOverflow=False)
         ctx.nhOddS = writer.sgprPool.checkOut(1, tag="mf_nhOddS")
@@ -376,7 +373,6 @@ class SubtileMegaFusedEmitter:
             module.add(SWaitCnt(vscnt=0, comment="wait ResidualOut bf16 stores."))
         writer.sgprPool.checkIn(ctx.nhOddS)
         writer.sgprPool.checkIn(ctx.resOobMask)
-        writer.vgprPool.checkIn(ctx.resBurst)
         writer.vgprPool.checkIn(ctx.resOobV)
         writer.vgprPool.checkIn(ctx.resAddr)
         writer.vgprPool.checkIn(ctx.resRowByteBase)
@@ -493,7 +489,7 @@ class SubtileMegaFusedEmitter:
         ctx.writer.vgprPool.checkIn(valV)
         ctx.writer.vgprPool.checkIn(addrV)
 
-    def _issueResidualWide(self, module, ctx, m, n) -> None:
+    def _issueResidualWide(self, module, ctx, m, n, burstBase) -> None:
         """Issue wide residual load(s) for tile (m, n); caller must SWaitCnt(vlcnt=0) after.
 
         ctx.nhBase holds wgRowBase + rowGroupOff + m*mfmaM (set by _free0RowPos).
@@ -522,7 +518,7 @@ class SubtileMegaFusedEmitter:
                 addr = ctx.writer.vgprPool.checkOut(1, tag="mf_wideChunkAddr")
                 res._addImmU32(module, addr, ctx.resAddr, chunkBytes * c, ctx.resRowByteBase,
                                f"chunk byte offset {chunkBytes * c}.")
-            dstBase = ctx.resBurst + 4 * c
+            dstBase = burstBase + 4 * c
             dst = vgpr(dstBase, 2) if isBf16 else vgpr(dstBase)
             module.add(loadCls(dst, vgpr(addr), sgpr(ctx.resSrd, 4), 0,
                                MUBUFModifiers(offen=True),
@@ -530,7 +526,7 @@ class SubtileMegaFusedEmitter:
             if c > 0:
                 ctx.writer.vgprPool.checkIn(addr)
 
-    def _maskWideResidualOOB(self, module, ctx) -> None:
+    def _maskWideResidualOOB(self, module, ctx, burstBase) -> None:
         """Software-mask wide residual elements where nhBase+k >= N_hidden.
 
         Wide loads read rows_per_lane contiguous nhidden positions from nhBase.
@@ -546,49 +542,60 @@ class SubtileMegaFusedEmitter:
             module.add(VCmpLtU32(dst=sgpr(ctx.resOobMask, lsc), src0=vgpr(nhR),
                                  src1=sgpr("SizesFree+0"),
                                  comment=f"inRange = nhPos < N_hidden (k={k})."))
-            module.add(VCndMaskB32(dst=vgpr(ctx.resBurst + k), src0=0,
-                                   src1=vgpr(ctx.resBurst + k),
+            module.add(VCndMaskB32(dst=vgpr(burstBase + k), src0=0,
+                                   src1=vgpr(burstBase + k),
                                    src2=sgpr(ctx.resOobMask, lsc),
                                    comment=f"residual = inRange ? residual : 0 (k={k})."))
 
-    def _loadResidualRow(self, module, ctx, m, n, mBaseV) -> None:
-        """Load, wait, convert, and mask residual for tile (m, n).
+    def _issueResidualTile(self, module, ctx, m, n, burstBase, mBaseV) -> int:
+        """Issue residual loads for tile (m, n) into burstBase; return #loads issued.
 
-        ctx.nhBase holds wgRowBase + rowGroupOff + m*mfmaM (set before this call).
-        ctx.resRowByteBase holds token_n * N_hidden * residualBytes (set per n column).
-        Wide path: one BufferLoad per chunk of 4 elements, software OOB masking.
-        Scalar path: one BufferLoad per element with per-element address clamping.
+        No wait/convert here: loads are drained and converted later in the compute
+        pass so the whole N-group's loads stay in flight together (GWB-style).
+        Wide path: one BufferLoad per 4-element chunk. Scalar path: one per element.
         """
         res = ctx.res
         rpl = res.rows_per_lane
         if res.useWideResidual:
-            self._issueResidualWide(module, ctx, m, n)
-            module.add(SWaitCnt(vlcnt=0, comment="wait wide residual load."))
-            if res.residualBytes == 2:
-                res._convertResidualChunkBf16(module, ctx.resBurst)
-            else:
-                res._convertResidualChunkFp8(module, ctx.resBurst)
-            self._maskWideResidualOOB(module, ctx)
-            return
+            ctx.rms._free0RowPos(module, ctx.nhBase, ctx.wgRowBase,
+                                 ctx.rowGroupOff, m, 0, mBaseV)
+            self._issueResidualWide(module, ctx, m, n, burstBase)
+            return rpl // 4
         for k in range(rpl):
             res._residualElemAddr(module, ctx.resAddr, ctx.resRowByteBase,
                                   ctx.wgRowBase, ctx.rowGroupOff,
                                   ctx.resOobV, ctx.resOobMask, mBaseV, m, k)
-            res._issueSideLoad(module, ctx.resBurst + k, ctx.resAddr, ctx.resSrd,
+            res._issueSideLoad(module, burstBase + k, ctx.resAddr, ctx.resSrd,
                                f"R[m={m},n={n},k={k}].", dtype=res.residualType)
-        module.add(SWaitCnt(vlcnt=0, comment="wait residual loads."))
+        return rpl
+
+    def _finishResidualTile(self, module, ctx, burstBase) -> None:
+        """Convert (and, for wide loads, software-mask) an already-loaded residual tile.
+
+        ctx.nhBase must hold this tile's row position (set by _free0RowPos in the
+        compute pass) before calling, because the wide OOB mask reads nhBase.
+        """
+        res = ctx.res
+        rpl = res.rows_per_lane
+        if res.useWideResidual:
+            if res.residualBytes == 2:
+                res._convertResidualChunkBf16(module, burstBase)
+            else:
+                res._convertResidualChunkFp8(module, burstBase)
+            self._maskWideResidualOOB(module, ctx, burstBase)
+            return
         for k in range(rpl):
-            res._convertSideElem(module, ctx.resBurst + k,
+            res._convertSideElem(module, burstBase + k,
                                  f"residual->fp32 (k={k}).", dtype=res.residualType)
 
-    def _pass1AccResRms(self, module, ctx, srcRegs, m, n, rpl) -> None:
+    def _pass1AccResRms(self, module, ctx, srcRegs, burstBase, m, n, rpl) -> None:
         """Fuse residual add and rmsSum accumulation: H = acc + R, rmsSum[n] += H²."""
         res = ctx.res
         for k in range(rpl):
             acc = srcRegs[k]
             if res.residualAdd:
                 module.add(VAddF32(dst=vgpr(acc), src0=vgpr(acc),
-                                   src1=vgpr(ctx.resBurst + k),
+                                   src1=vgpr(burstBase + k),
                                    comment=f"H = acc + residual (m={m},n={n},k={k})."))
             module.add(VFmaF32(dst=vgpr(ctx.rmsSum + n), src0=vgpr(acc),
                                src1=vgpr(acc), src2=vgpr(ctx.rmsSum + n),
@@ -644,12 +651,15 @@ class SubtileMegaFusedEmitter:
             ctx.rms._writeAccFrom(module, acc, vgprTiles, m, n, k,
                                   f"write H*gamma back to acc (m={m},n={n},k={k}).")
 
-    def _fusedElementLoop(self, module, ctx, vgprTiles, accBank, gammaBank,
+    def _fusedElementLoop(self, module, ctx, vgprTiles, accBank, resBank, gammaBank,
                           blkAmax, qi, nBase, g) -> None:
-        """Emit the three-pass fused loop (residual add, bf16 store, gamma/amax) per tile.
+        """Emit the fused loop as a GWB-style split: a load prolog then a compute pass.
 
-        Row byte base is hoisted before the tile-row mi loop because it depends
-        only on n, not on m.
+        Prolog issues every residual load for the N-group into resBank so the loads
+        overlap. The compute pass drains them per tile and runs residual add, bf16
+        store, rmsSum, and gamma/amax. loadsCumulative[t] is the number of residual
+        loads issued up to and including tile t (issue order == compute order); it
+        drives the per-tile decreasing vlcnt in the compute pass.
         """
         res = ctx.res
         rms = ctx.rms
@@ -657,26 +667,46 @@ class SubtileMegaFusedEmitter:
         tpb = ctx.tilesPerBlockM
         useWidePair = res.storeBf16D and rpl % 2 == 0
         mBaseV = ctx.writer.vgprPool.checkOut(1, tag="mf_mBase")
-        for j in range(g):
-            n = nBase + j
-            if res.residualAdd:
+        # Prolog: issue all residual loads for this N-group into resBank.
+        loadsCumulative = []
+        issued = 0
+        if res.residualAdd:
+            for j in range(g):
+                n = nBase + j
                 res._residualRowByteBase(module, ctx.resRowByteBase,
                                          ctx.resTokenBase, n, ctx.resAddr)
+                for mi in range(tpb):
+                    m = qi * tpb + mi
+                    burstBase = resBank + (j * tpb + mi) * rpl
+                    issued += self._issueResidualTile(module, ctx, m, n, burstBase, mBaseV)
+                    loadsCumulative.append(issued)
+        totalIssued = issued
+        # Compute: drain per tile, then residual add / bf16 store / rms / gamma.
+        t = 0
+        for j in range(g):
+            n = nBase + j
             for mi in range(tpb):
                 m = qi * tpb + mi
                 bankBase = (j * tpb + mi) * rpl
+                burstBase = (resBank + bankBase) if res.residualAdd else None
                 coords = [(m, n, k) for k in range(rpl)]
                 srcRegs = rms._readAccBurst(module, accBank + bankBase, vgprTiles,
                                             coords, f"acc m={m},n={n}.")
                 rms._free0RowPos(module, ctx.nhBase, ctx.wgRowBase,
                                  ctx.rowGroupOff, m, 0, mBaseV)
                 if res.residualAdd:
-                    self._loadResidualRow(module, ctx, m, n, mBaseV)
-                self._pass1AccResRms(module, ctx, srcRegs, m, n, rpl)
+                    # Wait only for THIS tile's residual load; later tiles' loads
+                    # stay in flight (GWB decreasing-vlcnt schedule).
+                    remaining = totalIssued - loadsCumulative[t]
+                    module.add(SWaitCnt(vlcnt=remaining,
+                                        comment=f"wait residual tile {t}: vlcnt={totalIssued}-{loadsCumulative[t]}."))
+                    self._finishResidualTile(module, ctx, burstBase)
+                self._pass1AccResRms(module, ctx, srcRegs, burstBase, m, n, rpl)
                 self._pass2StoreBf16(module, ctx, srcRegs, m, n, rpl, useWidePair)
                 blkAmaxJ = (blkAmax + n) if ctx.useMxfp8 else None
                 self._pass3GammaAmax(module, ctx, srcRegs, vgprTiles, gammaBank, blkAmaxJ,
                                      mi, m, n, rpl)
+                t += 1
         ctx.writer.vgprPool.checkIn(mBaseV)
 
     def _initBlkAmax(self, ctx, blkAmax) -> Module:
@@ -697,8 +727,14 @@ class SubtileMegaFusedEmitter:
         vgprPool = ctx.writer.vgprPool
         bankSize = g * ctx.tilesPerBlockM * ctx.rowsPerLane
         accBank = vgprPool.checkOut(bankSize, tag="mf_accBank")
-        self._fusedElementLoop(module, ctx, vgprTiles, accBank, gammaBank,
+        # Whole-N-group residual bank so all residual loads overlap (2-aligned for
+        # the wide BufferLoadB64 path).
+        resBank = vgprPool.checkOutAligned(bankSize, 2, tag="mf_resBank") \
+            if ctx.res.residualAdd else None
+        self._fusedElementLoop(module, ctx, vgprTiles, accBank, resBank, gammaBank,
                                blkAmax, qi, nBase, g)
+        if resBank is not None:
+            vgprPool.checkIn(resBank)
         vgprPool.checkIn(accBank)
         return module
 
