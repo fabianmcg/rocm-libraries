@@ -23,18 +23,19 @@ Sub-emitter roles:
 import math
 
 from rocisa.code import Label, Module
-from rocisa.container import ContinuousRegister, MUBUFModifiers, sgpr, vgpr
+from rocisa.container import ContinuousRegister, EXEC, MUBUFModifiers, sgpr, vgpr
 from rocisa.functions import vectorStaticDivide
 from rocisa.instruction import (
     BufferLoadB32,
     BufferLoadB64,
     BufferStoreB16,
-    BufferStoreB32,
-    SAndB32,
-    SBranch,
-    SCBranchSCC1,
-    SCmpEQU32,
+    BufferStoreB64,
+    SAndB64,
+    SAndN2B32,
+    SAndSaveExecB64,
+    SCBranchSCC0,
     SMulI32,
+    SMovB64,
     SWaitCnt,
     VAddF32,
     VAddU32,
@@ -122,7 +123,6 @@ class MegaFusedCtx:
         self.resAddr        = None
         self.resOobV        = None
         self.resOobMask     = None
-        self.nhOddS         = None
 
 
 class SubtileMegaFusedEmitter:
@@ -354,9 +354,6 @@ class SubtileMegaFusedEmitter:
         ctx.resOobV        = writer.vgprPool.checkOut(1, tag="mf_resOobV")
         ctx.resOobMask     = writer.sgprPool.checkOutAligned(
             res.lane_sgpr_count, res.lane_sgpr_count, tag="mf_resOobMask", preventOverflow=False)
-        ctx.nhOddS = writer.sgprPool.checkOut(1, tag="mf_nhOddS")
-        module.add(SAndB32(dst=sgpr(ctx.nhOddS), src0=sgpr("SizesFree+0"), src1=1,
-                           comment="nhOdd = N_hidden & 1 (odd -> pair store may straddle)."))
         # resTokenBase = colByte >> log2ElemBytes; used by residual loads and bf16 store.
         module.add(VLShiftRightB32(dst=vgpr(ctx.resTokenBase),
                                    shiftHex=hex(res.log2ElemBytes),
@@ -371,7 +368,6 @@ class SubtileMegaFusedEmitter:
         writer = ctx.writer
         if res.storeBf16D:
             module.add(SWaitCnt(vscnt=0, comment="wait ResidualOut bf16 stores."))
-        writer.sgprPool.checkIn(ctx.nhOddS)
         writer.sgprPool.checkIn(ctx.resOobMask)
         writer.vgprPool.checkIn(ctx.resOobV)
         writer.vgprPool.checkIn(ctx.resAddr)
@@ -408,6 +404,148 @@ class SubtileMegaFusedEmitter:
                                src2=sgpr(tokMaskIdx, lsc),
                                comment="clamp OOB when token_n >= M_tokens."))
 
+    def _computeResidualOutOobMask(self, module, ctx, n, tokMaskSgpr) -> None:
+        """Build the per-lane token(N) OOB mask for ResidualOut stores at column n.
+
+        Mirrors GWB's align8 N-mask / _emitSubtileOobGuard N-guard, but derives the
+        bound locally from SizesFree+1 (M_tokens) because the subtile guard SGPRs are
+        not populated when the MegaFusedEpilogue emits.  token_n is the free1 index
+        owned by each lane and is constant across all m and k within the N-group, so
+        callers compute this mask once per n and reuse it around each tile's store.
+        Lanes whose token_n >= M_tokens are cleared so their whole dwordx2 store drops.
+        """
+        res = ctx.res
+        lsc = res.lane_sgpr_count
+        nOff = n * res.mfma_n
+        tokV = ctx.writer.vgprPool.checkOut(1, tag="mf_roTokV")
+        scratch = ctx.writer.vgprPool.checkOut(1, tag="mf_roTokScratch")
+        r = res._addImmU32(module, tokV, ctx.resTokenBase, nOff, scratch,
+                           f"token_n = resTokenBase + {nOff} (n={n}).")
+        module.add(VCmpLtU32(dst=sgpr(tokMaskSgpr, lsc), src0=vgpr(r),
+                             src1=sgpr("SizesFree+1"),
+                             comment="tokenInRange = token_n < M_tokens (ResidualOut N mask)."))
+        ctx.writer.vgprPool.checkIn(scratch)
+        ctx.writer.vgprPool.checkIn(tokV)
+
+    def _packResidualOutRow(self, module, ctx, srcRegs, packBank) -> None:
+        """Pack rpl bf16(H) values into packBank (rpl/2 dwords, 2-aligned) for a dwordx2 store."""
+        rpl = ctx.rowsPerLane
+        for p in range(rpl // 2):
+            module.add(VCvtPkF32toBF16(dst=vgpr(packBank + p),
+                                       src0=vgpr(srcRegs[2 * p]), src1=vgpr(srcRegs[2 * p + 1]),
+                                       comment=f"pack H[{2 * p}] lo16, H[{2 * p + 1}] hi16 -> bf16x2."))
+
+    def _residualOutRowAddr(self, module, ctx, n, addrV, scratchV) -> None:
+        """Compute byte address (token_n * N_hidden + nhBase) * 2 for the dwordx2 store.
+
+        scratchV must be distinct from addrV (needed by _addImmU32 when n*mfma_n > 64).
+        """
+        res = ctx.res
+        nOff = n * res.mfma_n
+        r = res._addImmU32(module, addrV, ctx.resTokenBase, nOff, scratchV,
+                           f"token_n = resTokenBase + {nOff} (n={n}).")
+        module.add(VMulLOU32(dst=vgpr(addrV), src0=sgpr("SizesFree+0"), src1=vgpr(r),
+                             comment="base0 = token_n * N_hidden."))
+        module.add(VAddU32(dst=vgpr(addrV), src0=vgpr(addrV), src1=vgpr(ctx.nhBase),
+                           comment="elemIdx = base0 + nhBase."))
+        module.add(VLShiftLeftB32(dst=vgpr(addrV), shiftHex=hex(1), src=vgpr(addrV),
+                                  comment="byteAddr = elemIdx * 2 (bf16)."))
+
+    def _storeResidualOutRow(self, module, ctx, srcRegs, tokMaskSgpr, m, n) -> None:
+        """Store rpl bf16(H) to ResidualOut as one dwordx2 for nhidden-interior lanes.
+
+        Interior lanes use BufferStoreB64 under the per-lane token-OOB exec mask;
+        straddling lanes fall back to per-element masked stores via _storeBf16ElemInline.
+        A scalar SCC branch skips the fallback when no lane straddles (the common case
+        for multiple-of-rpl N_hidden).  Exec is fully restored before returning.
+        """
+        res = ctx.res
+        rpl = ctx.rowsPerLane
+        assert rpl % 2 == 0, "rpl must be even for dwordx2 bf16 packing"
+        lsc = res.lane_sgpr_count
+        # gfx950 is wave64-only for this path; HasWave32 excludes gfx9,
+        # _validateSubtileEpiloguePrereqs rejects non-gfx950.
+        assert lsc == 2, "storeResidualOutRow hardcodes wave64 b64 exec ops"
+        vgprPool = ctx.writer.vgprPool
+        sgprPool = ctx.writer.sgprPool
+        packBank = vgprPool.checkOutAligned(rpl // 2, 2, tag="mf_roPack")
+        addrV    = vgprPool.checkOut(1, tag="mf_roAddr")
+        scratchV = vgprPool.checkOut(1, tag="mf_roScratch")
+        nhTopV   = vgprPool.checkOut(1, tag="mf_roNhTop")
+        self._residualOutRowAddr(module, ctx, n, addrV, scratchV)
+        self._packResidualOutRow(module, ctx, srcRegs, packBank)
+        safe  = sgprPool.checkOutAligned(lsc, lsc, tag="mf_roSafe",     preventOverflow=False)
+        saved = sgprPool.checkOutAligned(lsc, lsc, tag="mf_roSaveExec", preventOverflow=False)
+        self._issueResidualOutWide(module, ctx, tokMaskSgpr, m, n, addrV, packBank,
+                                   nhTopV, scratchV, safe, saved)
+        self._issueResidualOutStraddle(module, ctx, tokMaskSgpr, m, n, srcRegs, safe, saved)
+        sgprPool.checkIn(saved)
+        sgprPool.checkIn(safe)
+        vgprPool.checkIn(nhTopV)
+        vgprPool.checkIn(scratchV)
+        vgprPool.checkIn(addrV)
+        vgprPool.checkIn(packBank)
+
+    def _issueResidualOutWide(self, module, ctx, tokMaskSgpr, m, n, addrV, packBank,
+                               nhTopV, scratchV, safeIdx, savedIdx) -> None:
+        """Narrow exec to interior+valid lanes and issue the dwordx2 store.
+
+        safeIdx receives the narrow mask (tokMask AND b64Safe); it is consumed
+        unchanged by _issueResidualOutStraddle to compute the straddle subset.
+        savedIdx receives the pre-narrow full exec, restored by _issueResidualOutStraddle.
+        """
+        res = ctx.res
+        rpl = ctx.rowsPerLane
+        lsc = res.lane_sgpr_count
+        nhTop = res._addImmU32(module, nhTopV, ctx.nhBase, rpl - 1, scratchV,
+                               f"nhTop = nhBase + {rpl - 1}.")
+        module.add(VCmpLtU32(dst=sgpr(safeIdx, lsc), src0=vgpr(nhTop),
+                             src1=sgpr("SizesFree+0"),
+                             comment="b64Safe = nhBase+rpl-1 < N_hidden (no straddle)."))
+        # Narrow to interior-AND-token-valid lanes; result goes back into safe.
+        module.add(SAndB64(dst=sgpr(safeIdx, lsc), src0=sgpr(tokMaskSgpr, lsc),
+                           src1=sgpr(safeIdx, lsc),
+                           comment="narrow = tokMask AND b64Safe."))
+        # Save full exec; narrow exec to interior+valid lanes for the wide store.
+        module.add(SAndSaveExecB64(dst=sgpr(savedIdx, lsc), src=sgpr(safeIdx, lsc),
+                                   comment="save exec; exec = narrow (interior+valid lanes)."))
+        module.add(BufferStoreB64(src=vgpr(packBank, 2), vaddr=vgpr(addrV),
+                                  saddr=sgpr(res.residualOutSrd, 4), soffset=0,
+                                  mubuf=MUBUFModifiers(offen=True),
+                                  comment=f"ResidualOut dwordx2 (m={m},n={n})."))
+
+    def _issueResidualOutStraddle(self, module, ctx, tokMaskSgpr, m, n, srcRegs,
+                                   safeIdx, savedIdx) -> None:
+        """Set exec to the straddle subset and run the per-element fallback.
+
+        safeIdx on entry holds the narrow mask from _issueResidualOutWide and is
+        overwritten with the straddle mask (tokMask AND NOT b64Safe).  savedIdx holds
+        the saved full exec; it is restored before returning so subsequent VALU runs
+        with all lanes active.
+        """
+        res = ctx.res
+        lsc = res.lane_sgpr_count
+        # Straddle exec: tokMask AND NOT narrow (= tokMask AND NOT b64Safe).
+        # Two SAndN2B32 reuse the safe register pair; SAndB64 sets SCC for the branch.
+        module.add(SAndN2B32(dst=sgpr(safeIdx), src0=sgpr(tokMaskSgpr), src1=sgpr(safeIdx),
+                             comment="straddle_lo = tokMask_lo & ~narrow_lo."))
+        module.add(SAndN2B32(dst=sgpr(safeIdx + 1), src0=sgpr(tokMaskSgpr + 1),
+                             src1=sgpr(safeIdx + 1),
+                             comment="straddle_hi = tokMask_hi & ~narrow_hi."))
+        module.add(SAndB64(dst=sgpr(safeIdx, lsc), src0=sgpr(safeIdx, lsc),
+                           src1=sgpr(safeIdx, lsc),
+                           comment="SCC = (straddle != 0); safe still holds straddle mask."))
+        module.add(SMovB64(dst=EXEC(), src=sgpr(safeIdx, lsc),
+                           comment="exec = straddle lanes (SCC unchanged by SMovB64)."))
+        skipLabel = Label(ctx.writer.labels.getNameInc(f"mf_roStraddleEnd_m{m}n{n}"), "")
+        module.add(SCBranchSCC0(labelName=skipLabel.getLabelName(),
+                                comment="no straddle lanes -> skip per-element fallback."))
+        for k in range(ctx.rowsPerLane):
+            self._storeBf16ElemInline(module, ctx, srcRegs[k], m, n, k)
+        module.add(skipLabel)
+        module.add(SMovB64(dst=EXEC(), src=sgpr(savedIdx, lsc),
+                           comment="restore full exec before gamma/amax VALU."))
+
     def _storeBf16ElemInline(self, module, ctx, accReg, m, n, k) -> None:
         """Store bf16(accReg) to ResidualOut[token_n, nhidden_pos] with inline masking."""
         res = ctx.res
@@ -426,65 +564,6 @@ class SubtileMegaFusedEmitter:
                                           saddr=sgpr(res.residualOutSrd, 4), soffset=0,
                                           mubuf=MUBUFModifiers(offen=True),
                                           comment=f"ResidualOut bf16(H) (m={m},n={n},k={k})."))
-        ctx.writer.vgprPool.checkIn(nhByteV)
-        ctx.writer.vgprPool.checkIn(valV)
-        ctx.writer.vgprPool.checkIn(addrV)
-
-    def _computeBf16PairAddr(self, module, ctx, n, k, addrV, valV, nhByteV, tokMaskIdx, nhMaskIdx) -> None:
-        """Compute clamped byte address for a wide bf16 pair store at (n, k) and k+1.
-
-        OOB check uses nhPos at k+1 conservatively: if k+1 is in range, k is too,
-        matching the wide-store convention in the residual emitter.
-        """
-        res = ctx.res
-        lsc = res.lane_sgpr_count
-        nOff = n * res.mfma_n
-        r = res._addImmU32(module, addrV, ctx.resTokenBase, nOff, valV,
-                           f"token_n = resTokenBase + {nOff} (n={n}).")
-        module.add(VCmpLtU32(dst=sgpr(tokMaskIdx, lsc), src0=vgpr(r),
-                             src1=sgpr("SizesFree+1"),
-                             comment="tokenInRange = token_n < M_tokens."))
-        module.add(VMulLOU32(dst=vgpr(addrV), src0=sgpr("SizesFree+0"), src1=vgpr(r),
-                             comment="base0 = token_n * N_hidden."))
-        module.add(VLShiftLeftB32(dst=vgpr(addrV), shiftHex=hex(1), src=vgpr(addrV),
-                                  comment="base0 *= 2 (bf16)."))
-        nh1 = res._addImmU32(module, nhByteV, ctx.nhBase, k + 1, valV,
-                             f"nhPos1 = nhBase + {k + 1} (k={k}).")
-        module.add(VCmpLtU32(dst=sgpr(nhMaskIdx, lsc), src0=vgpr(nh1),
-                             src1=sgpr("SizesFree+0"),
-                             comment="pairInRange = nhPos1 < N_hidden."))
-        # nhByte for k is the lower address of the pair.
-        nh0 = res._addImmU32(module, nhByteV, ctx.nhBase, k, valV,
-                             f"nhPos0 = nhBase + {k} (k={k}).")
-        module.add(VLShiftLeftB32(dst=vgpr(nhByteV), shiftHex=hex(1), src=vgpr(nh0),
-                                  comment="nhByte = nhPos0 * 2 (bf16)."))
-        module.add(VAddU32(vgpr(addrV), vgpr(addrV), vgpr(nhByteV),
-                           comment="byteAddr = base0 + nhByte(k)."))
-        module.add(VCndMaskB32(dst=vgpr(addrV), src0=vgpr(ctx.resOobV), src1=vgpr(addrV),
-                               src2=sgpr(nhMaskIdx, lsc),
-                               comment="clamp OOB when nhPos1 >= N_hidden."))
-        module.add(VCndMaskB32(dst=vgpr(addrV), src0=vgpr(ctx.resOobV), src1=vgpr(addrV),
-                               src2=sgpr(tokMaskIdx, lsc),
-                               comment="clamp OOB when token_n >= M_tokens."))
-
-    def _storeBf16PairInline(self, module, ctx, acc0, acc1, m, n, k) -> None:
-        """Pack and store bf16(acc0), bf16(acc1) with one BufferStoreB32."""
-        res = ctx.res
-        lsc = res.lane_sgpr_count
-        addrV   = ctx.writer.vgprPool.checkOut(1, tag="mf_bf16Addr")
-        valV    = ctx.writer.vgprPool.checkOut(1, tag="mf_bf16Val")
-        nhByteV = ctx.writer.vgprPool.checkOut(1, tag="mf_nhByte")
-        with ctx.writer.allocTmpSgpr(lsc, tag="mf_tokMask") as tokMask:
-            with ctx.writer.allocTmpSgpr(lsc, tag="mf_nhMask") as nhMask:
-                self._computeBf16PairAddr(module, ctx, n, k, addrV, valV, nhByteV,
-                                          tokMask.idx, nhMask.idx)
-                # src0=acc0 -> lo16 = bf16(H[k]); src1=acc1 -> hi16 = bf16(H[k+1]).
-                module.add(VCvtPkF32toBF16(dst=vgpr(valV), src0=vgpr(acc0), src1=vgpr(acc1),
-                                            comment="pack H[k] lo16, H[k+1] hi16 -> bf16x2."))
-                module.add(BufferStoreB32(src=vgpr(valV), vaddr=vgpr(addrV),
-                                          saddr=sgpr(res.residualOutSrd, 4), soffset=0,
-                                          mubuf=MUBUFModifiers(offen=True),
-                                          comment=f"ResidualOut bf16x2 (m={m},n={n},k={k})."))
         ctx.writer.vgprPool.checkIn(nhByteV)
         ctx.writer.vgprPool.checkIn(valV)
         ctx.writer.vgprPool.checkIn(addrV)
@@ -601,34 +680,6 @@ class SubtileMegaFusedEmitter:
                                src1=vgpr(acc), src2=vgpr(ctx.rmsSum + n),
                                comment=f"rmsSum[{n}] += H² (m={m},n={n},k={k})."))
 
-    def _pass2StoreBf16(self, module, ctx, srcRegs, m, n, rpl, useWidePair) -> None:
-        """Store bf16(H) to ResidualOut before gamma is applied.
-
-        The paired dword store is only safe when N_hidden is even; an odd N_hidden
-        makes the boundary pair straddle N_hidden, so the valid low element would be
-        dropped.  Branch at runtime on parity: even -> pair store, odd -> per-element
-        half-word store.
-        """
-        if not ctx.res.storeBf16D:
-            return
-        if not useWidePair:
-            for k in range(rpl):
-                self._storeBf16ElemInline(module, ctx, srcRegs[k], m, n, k)
-            return
-        pairLabel = Label(ctx.writer.labels.getNameInc(f"mf_roPair_m{m}n{n}"), "")
-        endLabel  = Label(ctx.writer.labels.getNameInc(f"mf_roPairEnd_m{m}n{n}"), "")
-        module.add(SCmpEQU32(src0=sgpr(ctx.nhOddS), src1=0,
-                             comment="N_hidden even -> paired dword store is safe."))
-        module.add(SCBranchSCC1(labelName=pairLabel.getLabelName(),
-                                comment="even -> wide paired bf16 store."))
-        for k in range(rpl):
-            self._storeBf16ElemInline(module, ctx, srcRegs[k], m, n, k)
-        module.add(SBranch(labelName=endLabel.getLabelName(), comment="skip paired store."))
-        module.add(pairLabel)
-        for k in range(0, rpl, 2):
-            self._storeBf16PairInline(module, ctx, srcRegs[k], srcRegs[k + 1], m, n, k)
-        module.add(endLabel)
-
     def _pass3GammaAmax(self, module, ctx, srcRegs, vgprTiles, gammaBank, blkAmaxJ,
                         mi, m, n, rpl) -> None:
         """Apply gamma, fold |H*gamma| into blkAmax for MXFP8, and write the result back to acc.
@@ -651,62 +702,103 @@ class SubtileMegaFusedEmitter:
             ctx.rms._writeAccFrom(module, acc, vgprTiles, m, n, k,
                                   f"write H*gamma back to acc (m={m},n={n},k={k}).")
 
-    def _fusedElementLoop(self, module, ctx, vgprTiles, accBank, resBank, gammaBank,
-                          blkAmax, qi, nBase, g) -> None:
-        """Emit the fused loop as a GWB-style split: a load prolog then a compute pass.
+    def _prologResidualLoads(self, module, ctx, resBank, mBaseV, qi, nBase, g):
+        """Issue every residual load for the N-group into resBank so loads overlap.
 
-        Prolog issues every residual load for the N-group into resBank so the loads
-        overlap. The compute pass drains them per tile and runs residual add, bf16
-        store, rmsSum, and gamma/amax. loadsCumulative[t] is the number of residual
-        loads issued up to and including tile t (issue order == compute order); it
-        drives the per-tile decreasing vlcnt in the compute pass.
+        Returns (loadsCumulative, totalIssued): loadsCumulative[t] is the number
+        of residual loads issued up to and including tile t (issue order equals
+        compute order), which drives the per-tile decreasing vlcnt in the compute
+        pass.
         """
+        res = ctx.res
+        rpl = ctx.rowsPerLane
+        tpb = ctx.tilesPerBlockM
+        loadsCumulative = []
+        issued = 0
+        if not res.residualAdd:
+            return loadsCumulative, issued
+        for j in range(g):
+            n = nBase + j
+            res._residualRowByteBase(module, ctx.resRowByteBase,
+                                     ctx.resTokenBase, n, ctx.resAddr)
+            for mi in range(tpb):
+                m = qi * tpb + mi
+                burstBase = resBank + (j * tpb + mi) * rpl
+                issued += self._issueResidualTile(module, ctx, m, n, burstBase, mBaseV)
+                loadsCumulative.append(issued)
+        return loadsCumulative, issued
+
+    def _computePassTile(self, module, ctx, vgprTiles, accBank, resBank, gammaBank,
+                         blkAmax, loadsCumulative, totalIssued, mBaseV, tokMaskSgpr,
+                         qi, nBase, j, mi, t) -> int:
+        """Emit instructions for one (mi, j) tile in the compute pass; returns updated t."""
         res = ctx.res
         rms = ctx.rms
         rpl = ctx.rowsPerLane
         tpb = ctx.tilesPerBlockM
-        useWidePair = res.storeBf16D and rpl % 2 == 0
-        mBaseV = ctx.writer.vgprPool.checkOut(1, tag="mf_mBase")
-        # Prolog: issue all residual loads for this N-group into resBank.
-        loadsCumulative = []
-        issued = 0
+        m = qi * tpb + mi
+        n = nBase + j
+        bankBase = (j * tpb + mi) * rpl
+        burstBase = (resBank + bankBase) if res.residualAdd else None
+        coords = [(m, n, k) for k in range(rpl)]
+        srcRegs = rms._readAccBurst(module, accBank + bankBase, vgprTiles,
+                                    coords, f"acc m={m},n={n}.")
+        rms._free0RowPos(module, ctx.nhBase, ctx.wgRowBase,
+                         ctx.rowGroupOff, m, 0, mBaseV)
         if res.residualAdd:
-            for j in range(g):
-                n = nBase + j
-                res._residualRowByteBase(module, ctx.resRowByteBase,
-                                         ctx.resTokenBase, n, ctx.resAddr)
-                for mi in range(tpb):
-                    m = qi * tpb + mi
-                    burstBase = resBank + (j * tpb + mi) * rpl
-                    issued += self._issueResidualTile(module, ctx, m, n, burstBase, mBaseV)
-                    loadsCumulative.append(issued)
-        totalIssued = issued
-        # Compute: drain per tile, then residual add / bf16 store / rms / gamma.
+            # Wait only for THIS tile's residual load; later tiles' loads
+            # stay in flight (GWB decreasing-vlcnt schedule).
+            remaining = totalIssued - loadsCumulative[t]
+            module.add(SWaitCnt(vlcnt=remaining,
+                                comment=f"wait residual tile {t}: vlcnt={totalIssued}-{loadsCumulative[t]}."))
+            self._finishResidualTile(module, ctx, burstBase)
+        self._pass1AccResRms(module, ctx, srcRegs, burstBase, m, n, rpl)
+        if res.storeBf16D:
+            self._storeResidualOutRow(module, ctx, srcRegs, tokMaskSgpr, m, n)
+        blkAmaxJ = (blkAmax + n) if ctx.useMxfp8 else None
+        self._pass3GammaAmax(module, ctx, srcRegs, vgprTiles, gammaBank, blkAmaxJ,
+                             mi, m, n, rpl)
+        return t + 1
+
+    def _computePass(self, module, ctx, vgprTiles, accBank, resBank, gammaBank,
+                     blkAmax, loadsCumulative, totalIssued, mBaseV, qi, nBase, g) -> None:
+        """Drain residual loads per tile, then run residual add, bf16 store, rmsSum, gamma/amax.
+
+        Uses a GWB decreasing-vlcnt schedule: each tile waits only for its own
+        residual load so later tiles' loads stay in flight.
+        """
+        res = ctx.res
+        lsc = res.lane_sgpr_count
+        tpb = ctx.tilesPerBlockM
         t = 0
         for j in range(g):
             n = nBase + j
+            # Compute the token(N) OOB mask once per column n; reused across all tpb tiles.
+            tokMaskSgpr = None
+            if res.storeBf16D:
+                tokMaskSgpr = ctx.writer.sgprPool.checkOutAligned(lsc, lsc, tag="mf_roTokMask",
+                                                                   preventOverflow=False)
+                self._computeResidualOutOobMask(module, ctx, n, tokMaskSgpr)
             for mi in range(tpb):
-                m = qi * tpb + mi
-                bankBase = (j * tpb + mi) * rpl
-                burstBase = (resBank + bankBase) if res.residualAdd else None
-                coords = [(m, n, k) for k in range(rpl)]
-                srcRegs = rms._readAccBurst(module, accBank + bankBase, vgprTiles,
-                                            coords, f"acc m={m},n={n}.")
-                rms._free0RowPos(module, ctx.nhBase, ctx.wgRowBase,
-                                 ctx.rowGroupOff, m, 0, mBaseV)
-                if res.residualAdd:
-                    # Wait only for THIS tile's residual load; later tiles' loads
-                    # stay in flight (GWB decreasing-vlcnt schedule).
-                    remaining = totalIssued - loadsCumulative[t]
-                    module.add(SWaitCnt(vlcnt=remaining,
-                                        comment=f"wait residual tile {t}: vlcnt={totalIssued}-{loadsCumulative[t]}."))
-                    self._finishResidualTile(module, ctx, burstBase)
-                self._pass1AccResRms(module, ctx, srcRegs, burstBase, m, n, rpl)
-                self._pass2StoreBf16(module, ctx, srcRegs, m, n, rpl, useWidePair)
-                blkAmaxJ = (blkAmax + n) if ctx.useMxfp8 else None
-                self._pass3GammaAmax(module, ctx, srcRegs, vgprTiles, gammaBank, blkAmaxJ,
-                                     mi, m, n, rpl)
-                t += 1
+                t = self._computePassTile(module, ctx, vgprTiles, accBank, resBank, gammaBank,
+                                          blkAmax, loadsCumulative, totalIssued, mBaseV,
+                                          tokMaskSgpr, qi, nBase, j, mi, t)
+            if res.storeBf16D:
+                ctx.writer.sgprPool.checkIn(tokMaskSgpr)
+
+    def _fusedElementLoop(self, module, ctx, vgprTiles, accBank, resBank, gammaBank,
+                          blkAmax, qi, nBase, g) -> None:
+        """Emit the fused loop as a GWB-style split: a load prolog then a compute pass.
+
+        The prolog issues every residual load for the N-group into resBank so the
+        loads overlap; the compute pass drains them per tile and runs residual add,
+        bf16 store, rmsSum, and gamma/amax.
+        """
+        mBaseV = ctx.writer.vgprPool.checkOut(1, tag="mf_mBase")
+        loadsCumulative, totalIssued = self._prologResidualLoads(
+            module, ctx, resBank, mBaseV, qi, nBase, g)
+        self._computePass(module, ctx, vgprTiles, accBank, resBank, gammaBank,
+                          blkAmax, loadsCumulative, totalIssued, mBaseV, qi, nBase, g)
         ctx.writer.vgprPool.checkIn(mBaseV)
 
     def _initBlkAmax(self, ctx, blkAmax) -> Module:
