@@ -38,6 +38,7 @@ from rocisa.instruction import (
     SMovB64,
     SWaitCnt,
     VAddF32,
+    VAddPKF32,
     VAddU32,
     VAndB32,
     VCmpLtU32,
@@ -50,6 +51,7 @@ from rocisa.instruction import (
     VMovB32,
     VMulF32,
     VMulLOU32,
+    VMulPKF32,
 )
 
 from .SubtileResidualAddEmit import SubtileResidualAddEmitter
@@ -143,6 +145,11 @@ class SubtileMegaFusedEmitter:
         """Construct the shared context from the sub-emitter instances."""
         return MegaFusedCtx(self.writer, self.kernel, self.residualEmitter,
                             self.rmsEmitter, self.quantEmitter, self.useMxfp8)
+
+    @staticmethod
+    def _isPackPair(a, b):
+        """True when a,b are a consecutive even-aligned VGPR pair for packed VALU."""
+        return (a % 2 == 0) and (b == a + 1)
 
     def _allocSharedRegs(self, ctx) -> None:
         """Check out shared VGPRs that stay live for the whole emission.
@@ -670,37 +677,91 @@ class SubtileMegaFusedEmitter:
     def _pass1AccResRms(self, module, ctx, srcRegs, burstBase, m, n, rpl) -> None:
         """Fuse residual add and rmsSum accumulation: H = acc + R, rmsSum[n] += H²."""
         res = ctx.res
-        for k in range(rpl):
-            acc = srcRegs[k]
-            if res.residualAdd:
-                module.add(VAddF32(dst=vgpr(acc), src0=vgpr(acc),
+        if not res.residualAdd:
+            for k in range(rpl):
+                module.add(VFmaF32(dst=vgpr(ctx.rmsSum + n), src0=vgpr(srcRegs[k]),
+                                   src1=vgpr(srcRegs[k]), src2=vgpr(ctx.rmsSum + n),
+                                   comment=f"rmsSum[{n}] += H² (m={m},n={n},k={k})."))
+            return
+        # Use packed add for aligned acc pairs; adds come before both squares so
+        # the FMAs read the post-add values, matching the original per-element order.
+        for k in range(0, rpl - rpl % 2, 2):
+            sk0, sk1 = srcRegs[k], srcRegs[k + 1]
+            if self._isPackPair(sk0, sk1):
+                module.add(VAddPKF32(dst=vgpr(sk0, 2), src0=vgpr(sk0, 2),
+                                     src1=vgpr(burstBase + k, 2),
+                                     comment=f"H = acc + residual (packed k={k},{k+1})."))
+            else:
+                module.add(VAddF32(dst=vgpr(sk0), src0=vgpr(sk0),
                                    src1=vgpr(burstBase + k),
                                    comment=f"H = acc + residual (m={m},n={n},k={k})."))
-            module.add(VFmaF32(dst=vgpr(ctx.rmsSum + n), src0=vgpr(acc),
-                               src1=vgpr(acc), src2=vgpr(ctx.rmsSum + n),
+                module.add(VAddF32(dst=vgpr(sk1), src0=vgpr(sk1),
+                                   src1=vgpr(burstBase + k + 1),
+                                   comment=f"H = acc + residual (m={m},n={n},k={k+1})."))
+            module.add(VFmaF32(dst=vgpr(ctx.rmsSum + n), src0=vgpr(sk0),
+                               src1=vgpr(sk0), src2=vgpr(ctx.rmsSum + n),
                                comment=f"rmsSum[{n}] += H² (m={m},n={n},k={k})."))
+            module.add(VFmaF32(dst=vgpr(ctx.rmsSum + n), src0=vgpr(sk1),
+                               src1=vgpr(sk1), src2=vgpr(ctx.rmsSum + n),
+                               comment=f"rmsSum[{n}] += H² (m={m},n={n},k={k+1})."))
+        # Defensive odd tail (rpl is even in practice).
+        if rpl % 2 == 1:
+            k = rpl - 1
+            module.add(VAddF32(dst=vgpr(srcRegs[k]), src0=vgpr(srcRegs[k]),
+                               src1=vgpr(burstBase + k),
+                               comment=f"H = acc + residual (m={m},n={n},k={k})."))
+            module.add(VFmaF32(dst=vgpr(ctx.rmsSum + n), src0=vgpr(srcRegs[k]),
+                               src1=vgpr(srcRegs[k]), src2=vgpr(ctx.rmsSum + n),
+                               comment=f"rmsSum[{n}] += H² (m={m},n={n},k={k})."))
+
+    def _amaxAndWriteAcc(self, module, ctx, sk, vgprTiles, blkAmaxJ, m, n, ki) -> None:
+        """Fold |H*gamma| into blkAmax (MXFP8 only) and write sk back to the accumulator.
+
+        Must be called once per k element after the multiply so the amax fold and
+        accumulator writeback remain scalar (per-k) even when the multiply was packed.
+        """
+        if ctx.useMxfp8:
+            module.add(VAndB32(dst=vgpr(ctx.mx._scAccTmp), src0=vgpr(sk),
+                               src1=vgpr(ctx.mx._scAbsMask),
+                               comment=f"|H*gamma| (m={m},n={n},k={ki})."))
+            module.add(VMaxF32(dst=vgpr(blkAmaxJ), src0=vgpr(blkAmaxJ),
+                               src1=vgpr(ctx.mx._scAccTmp),
+                               comment="blkAmax = max(blkAmax, |H*gamma|)."))
+        ctx.rms._writeAccFrom(module, sk, vgprTiles, m, n, ki,
+                              f"write H*gamma back to acc (m={m},n={n},k={ki}).")
 
     def _pass3GammaAmax(self, module, ctx, srcRegs, vgprTiles, gammaBank, blkAmaxJ,
                         mi, m, n, rpl) -> None:
         """Apply gamma, fold |H*gamma| into blkAmax for MXFP8, and write the result back to acc.
 
-        The gamma-scaled value is written to the accumulator on both paths so the
-        deferred MXFP8 tail can re-read it instead of a per-group staging bank.
+        The gamma-scaled value is written to the accumulator so the deferred MXFP8
+        tail can re-read it. The amax fold and writeAccFrom MUST stay scalar per-k;
+        only the multiply is packed.
         """
-        for k in range(rpl):
+        for k in range(0, rpl - rpl % 2, 2):
+            sk0, sk1 = srcRegs[k], srcRegs[k + 1]
+            # gammaBank is 2-aligned; when rpl % 2 == 0 (production gfx950 config),
+            # mi*rpl+k is even so gk is 2-aligned by construction.
+            gk = gammaBank + mi * rpl + k
+            if self._isPackPair(sk0, sk1):
+                module.add(VMulPKF32(dst=vgpr(sk0, 2), src0=vgpr(sk0, 2),
+                                     src1=vgpr(gk, 2),
+                                     comment=f"acc = H * gamma (packed k={k},{k+1})."))
+            else:
+                module.add(VMulF32(dst=vgpr(sk0), src0=vgpr(sk0), src1=vgpr(gk),
+                                   comment=f"acc = H * gamma (m={m},n={n},k={k})."))
+                module.add(VMulF32(dst=vgpr(sk1), src0=vgpr(sk1), src1=vgpr(gk + 1),
+                                   comment=f"acc = H * gamma (m={m},n={n},k={k+1})."))
+            self._amaxAndWriteAcc(module, ctx, sk0, vgprTiles, blkAmaxJ, m, n, k)
+            self._amaxAndWriteAcc(module, ctx, sk1, vgprTiles, blkAmaxJ, m, n, k + 1)
+        # Defensive odd tail (rpl is even in practice).
+        if rpl % 2 == 1:
+            k = rpl - 1
             acc = srcRegs[k]
             gammaReg = gammaBank + mi * rpl + k
             module.add(VMulF32(dst=vgpr(acc), src0=vgpr(acc), src1=vgpr(gammaReg),
                                comment=f"acc = H * gamma (m={m},n={n},k={k})."))
-            if ctx.useMxfp8:
-                module.add(VAndB32(dst=vgpr(ctx.mx._scAccTmp), src0=vgpr(acc),
-                                   src1=vgpr(ctx.mx._scAbsMask),
-                                   comment=f"|H*gamma| (m={m},n={n},k={k})."))
-                module.add(VMaxF32(dst=vgpr(blkAmaxJ), src0=vgpr(blkAmaxJ),
-                                   src1=vgpr(ctx.mx._scAccTmp),
-                                   comment="blkAmax = max(blkAmax, |H*gamma|)."))
-            ctx.rms._writeAccFrom(module, acc, vgprTiles, m, n, k,
-                                  f"write H*gamma back to acc (m={m},n={n},k={k}).")
+            self._amaxAndWriteAcc(module, ctx, acc, vgprTiles, blkAmaxJ, m, n, k)
 
     def _prologResidualLoads(self, module, ctx, resBank, mBaseV, qi, nBase, g):
         """Issue every residual load for the N-group into resBank so loads overlap.
@@ -818,7 +879,8 @@ class SubtileMegaFusedEmitter:
         module = Module(f"MegaFused frontHalf qi={qi} nBase={nBase}")
         vgprPool = ctx.writer.vgprPool
         bankSize = g * ctx.tilesPerBlockM * ctx.rowsPerLane
-        accBank = vgprPool.checkOut(bankSize, tag="mf_accBank")
+        # 2-aligned so AGPR-staged acc pairs are packed-VALU eligible.
+        accBank = vgprPool.checkOutAligned(bankSize, 2, tag="mf_accBank")
         # Whole-N-group residual bank so all residual loads overlap (2-aligned for
         # the wide BufferLoadB64 path).
         resBank = vgprPool.checkOutAligned(bankSize, 2, tag="mf_resBank") \

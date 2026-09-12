@@ -86,6 +86,7 @@ from rocisa.instruction import (
     SWaitCnt,
     VAccvgprReadB32,
     VAccvgprWriteB32,
+    VAdd3U32,
     VAddF32,
     VAddU32,
     VAndB32,
@@ -327,10 +328,23 @@ class SubtilePartialRMSEmitter:
 
     def _free0RowPos(self, module, dst: int, rowBase: int, rowGroupOff: int,
                      m: int, k: int, scratch: int) -> None:
-        # free0 row = rowBase + rowGroupOff + (m*mfma_m + k).
+        # free0 row = rowBase + rowGroupOff + (m*mfma_m + k). One v_add3_u32 folds
+        # the row-base, the m/k immediate, and rowGroupOff into a single VALU op.
         mBase = m * self.mfma_m + k
-        r = self._addImmU32(module, dst, rowBase, mBase, scratch, f"row = base + {mBase} (m={m},k={k})")
-        module.add(VAddU32(vgpr(dst), vgpr(r), vgpr(rowGroupOff), comment="row += rowGroupOff"))
+        if mBase == 0:
+            module.add(VAddU32(vgpr(dst), vgpr(rowBase), vgpr(rowGroupOff),
+                               comment=f"row = base + rowGroupOff (m={m},k={k})"))
+            return
+        if mBase <= _INLINE_CONST_MAX:
+            module.add(VAdd3U32(dst=vgpr(dst), src0=vgpr(rowBase), src1=vgpr(rowGroupOff),
+                                src2=mBase,
+                                comment=f"row = base + {mBase} + rowGroupOff (m={m},k={k})"))
+            return
+        # mBase exceeds the inline-constant range: materialize it, then fold in one add3.
+        module.add(VMovB32(dst=vgpr(scratch), src=mBase, comment=f"imm={mBase}"))
+        module.add(VAdd3U32(dst=vgpr(dst), src0=vgpr(rowBase), src1=vgpr(rowGroupOff),
+                            src2=vgpr(scratch),
+                            comment=f"row = base + {mBase} + rowGroupOff (m={m},k={k})"))
 
     def emit(self, vgprTiles) -> Module:
         # vgprTiles is dtileInfo.vgprTiles, the per-tile allocator records for the D accumulator.
