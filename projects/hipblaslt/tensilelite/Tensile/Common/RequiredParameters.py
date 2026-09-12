@@ -177,6 +177,7 @@ def getRequiredParametersMin() -> set:
         'DQuantType',
         'DQuantSize0',
         'DQuantSize1',
+        'MegaFusedEpilogue',
         'UseDeepseekScaleA',
         'UseDeepseekScaleB',
         'DeepseekScaleAq0',

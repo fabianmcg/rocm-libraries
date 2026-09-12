@@ -559,6 +559,7 @@ validParameters = { # we need to make sure this matches develop
     "DQuantType": ["None", "Tile", "MXFP8"],
     "DQuantSize0": -1,  # Scalar; -1/0 = whole MacroTile0. Real validation in _resolveDQuantSize.
     "DQuantSize1": -1,  # Scalar; -1/0 = whole MacroTile1. Real validation in _resolveDQuantSize.
+    "MegaFusedEpilogue": [False, True],
     "UseDeepseekScaleA": [False, True],
     "UseDeepseekScaleB": [False, True],
     "DeepseekScaleAq0": list(range(1, 1025)),

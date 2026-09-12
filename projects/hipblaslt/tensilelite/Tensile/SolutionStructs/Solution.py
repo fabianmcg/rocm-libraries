@@ -543,6 +543,44 @@ def _validatePartialRMSMXFP8Combo(state, printRejectionReason):
     return
 
 
+def _validateMegaFusedEpilogue(state, printRejectionReason):
+  """Validate MegaFusedEpilogue — the combined PartialRMS+ResidualAdd+MXFP8 fused epilogue.
+
+  Called after the individual sub-validators so that _DQuantSize0/_DQuantSize1
+  are already resolved. Checks that every required sub-flag is active and that
+  the quantization tile shape matches the one fixed shape the emitter supports.
+  """
+  if not state.get("MegaFusedEpilogue", False):
+    return
+  if not state.get("PartialRMS", False):
+    reject(state, printRejectionReason, "megaFusedEpilogue requires PartialRMS=True")
+    return
+  if not state.get("PartialRMSResidualAdd", False):
+    reject(state, printRejectionReason, "megaFusedEpilogue requires PartialRMSResidualAdd=True")
+    return
+  if not state.get("PartialRMSStoreBf16D", False):
+    reject(state, printRejectionReason, "megaFusedEpilogue requires PartialRMSStoreBf16D=True")
+    return
+  if state.get("DQuantType", "None") != "MXFP8":
+    reject(state, printRejectionReason, "megaFusedEpilogue requires DQuantType=MXFP8")
+    return
+  if state.get("_DQuantSize0") != 32:
+    reject(state, printRejectionReason, "megaFusedEpilogue requires _DQuantSize0=32")
+    return
+  if state.get("_DQuantSize1") != 1:
+    reject(state, printRejectionReason, "megaFusedEpilogue requires _DQuantSize1=1")
+    return
+  if not state["ProblemType"]["DestDataType"].isFloat8():
+    reject(state, printRejectionReason, "megaFusedEpilogue requires DestDataType=F8")
+    return
+  if not state["ProblemType"]["HighPrecisionAccumulate"]:
+    reject(state, printRejectionReason, "megaFusedEpilogue requires HighPrecisionAccumulate=True")
+    return
+  if not (state.get("MatrixInstM") == 16 and state.get("MatrixInstN") == 16):
+    reject(state, printRejectionReason, "megaFusedEpilogue requires MatrixInst 16x16")
+    return
+
+
 def _validateTileQuant(state, printRejectionReason):
   """Validate TileQuant fused epilogue constraints (feature flags, type, shape)."""
   if state.get("DQuantType", "None") != "Tile":
@@ -1737,6 +1775,11 @@ class Solution(collections.abc.Mapping):
     _validatePartialRMSMXFP8Combo(state, printRejectionReason)
     if not state["Valid"]:
       return
+
+    if state.get("MegaFusedEpilogue", False):
+      _validateMegaFusedEpilogue(state, printRejectionReason)
+      if not state["Valid"]:
+        return
 
     if state.get("UseDeepseekScaleA", False) or state.get("UseDeepseekScaleB", False):
       _validateDeepseekScale(state, printRejectionReason)

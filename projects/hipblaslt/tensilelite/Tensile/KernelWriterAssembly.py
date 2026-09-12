@@ -15298,6 +15298,10 @@ class KernelWriterAssembly(KernelWriter):
     vgprTiles = self.states.d.tileInfo.vgprTiles
     if not vgprTiles:
       return module
+    if kernel.get("MegaFusedEpilogue"):
+      from .Components.Subtile.SubtileMegaFusedEmit import SubtileMegaFusedEmitter
+      module.add(SubtileMegaFusedEmitter(self, kernel).emit(vgprTiles))
+      return module
     if kernel["PartialRMS"]:
       residualRan = kernel["PartialRMSResidualAdd"] or kernel["PartialRMSStoreBf16D"]
       if residualRan:

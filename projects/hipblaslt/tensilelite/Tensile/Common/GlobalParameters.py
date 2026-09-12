@@ -516,6 +516,7 @@ defaultBenchmarkCommonParameters = [
     {"DQuantType": ["None"]},
     {"DQuantSize0": [-1]},
     {"DQuantSize1": [-1]},
+    {"MegaFusedEpilogue": [False]},
     {"UseDeepseekScaleA": [False]},
     {"UseDeepseekScaleB": [False]},
     {"DeepseekScaleAq0": [128]},

@@ -426,6 +426,7 @@ _defaultProblemType = {
     "UseBeta": True,  # =True use beta parameter (asm will check for B=0 and optimize the write for that), =False don't use beta parameter
     "UseE": False,  # =True use output E to output gemm results before activation
     "UsePartialRMS":         False,
+    "UseMegaFusedEpilogue":  False,
     "PartialRMSResidualAdd": False,
     "PartialRMSQuant":       False,
     "PartialRMSStoreBf16D":  False,
@@ -1368,6 +1369,8 @@ class ProblemType(Mapping):
         name.append("RA")
       if self["PartialRMSQuant"]:
         name.append("Q")
+    if self["UseMegaFusedEpilogue"]:
+      name.append("MFE")
     if self["Sparse"]:
       if self["Sparse"] == 2:
         name.append("SPBML%d"%(self["MetadataLayout"]))
