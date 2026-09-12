@@ -60,7 +60,7 @@ class MegaFusedCtx:
     tiling arithmetic in each helper.
     """
 
-    def _initGeometry(self, kernel, mx):
+    def _initGeometry(self, kernel, mx, useMxfp8):
         """Derive tile geometry constants from kernel parameters."""
         mfmaM    = kernel["MatrixInstM"]
         mfmaN    = kernel["MatrixInstN"]
@@ -72,19 +72,27 @@ class MegaFusedCtx:
         self.rowsPerLane = (mfmaM * mfmaN) // waveSize
         self.mmaN        = (kernel["MacroTile1"] // mfmaN) // wgN
         self.wgM         = wgM
-        # tilesPerBlockM is live only on the subColQuant path.
-        self.tilesPerBlockM = mx.tilesPerBlockM if mx.subColQuant else 2
-        self.nQTilesM    = mx.nQTilesM
         # streamGroup controls peak VGPR pressure in the N-sweep.
-        self.streamGroup = mx.streamGroup if mx.subColQuant else 4
+        self.streamGroup = 4
+        if useMxfp8:
+            # tilesPerBlockM is live only on the subColQuant path.
+            self.tilesPerBlockM = mx.tilesPerBlockM if mx.subColQuant else 2
+            self.nQTilesM       = mx.nQTilesM
+            self.streamGroup    = mx.streamGroup if mx.subColQuant else 4
+            return
+        # No MXFP8: sweep every tile row in blocks matching the gamma-load batching.
+        mmaM = (kernel["MacroTile0"] // mfmaM) // wgM
+        self.tilesPerBlockM = 2 if mmaM % 2 == 0 else 1
+        self.nQTilesM       = mmaM // self.tilesPerBlockM
 
-    def __init__(self, writer, kernel, res, rms, mx):
+    def __init__(self, writer, kernel, res, rms, mx, useMxfp8):
         self.writer = writer
         self.kernel = kernel
         self.res    = res
         self.rms    = rms
         self.mx     = mx
-        self._initGeometry(kernel, mx)
+        self.useMxfp8 = useMxfp8
+        self._initGeometry(kernel, mx, useMxfp8)
 
         # Shared VGPRs — allocated for the whole emission by _allocSharedRegs.
         self.laneId      = None
@@ -119,15 +127,18 @@ class SubtileMegaFusedEmitter:
     def __init__(self, writer, kernel):
         self.writer = writer
         self.kernel = kernel
+        # MXFP8 dynamic quant is optional; without it the fused epilogue emits bf16 D.
+        self.useMxfp8 = kernel.get("DQuantType") == "MXFP8"
         self.residualEmitter = SubtileResidualAddEmitter(writer, kernel)
         # ResidualAdd drains the kernarg pointer first, so PartialRMS must not drain it again.
         self.rmsEmitter = SubtilePartialRMSEmitter(writer, kernel, kernargDrained=True)
-        self.quantEmitter = SubtileMXFP8QuantEmitter(writer, kernel)
+        # The quant emitter reads _DQuantSize0/1, which are absent without MXFP8.
+        self.quantEmitter = SubtileMXFP8QuantEmitter(writer, kernel) if self.useMxfp8 else None
 
     def _buildCtx(self) -> MegaFusedCtx:
-        """Construct the shared context from the three sub-emitter instances."""
-        return MegaFusedCtx(self.writer, self.kernel,
-                            self.residualEmitter, self.rmsEmitter, self.quantEmitter)
+        """Construct the shared context from the sub-emitter instances."""
+        return MegaFusedCtx(self.writer, self.kernel, self.residualEmitter,
+                            self.rmsEmitter, self.quantEmitter, self.useMxfp8)
 
     def _allocSharedRegs(self, ctx) -> None:
         """Check out shared VGPRs that stay live for the whole emission.
@@ -228,9 +239,11 @@ class SubtileMegaFusedEmitter:
         ctx.gammaSrd  = sgprPool.checkOutAligned(4, 4, tag="mf_gammaSrd", preventOverflow=False)
         ctx.savedExec = sgprPool.checkOutAligned(lsc, lsc, tag="mf_savedExec", preventOverflow=False)
         ctx.laneMask  = sgprPool.checkOutAligned(lsc, lsc, tag="mf_laneMask", preventOverflow=False)
-        ctx.mxSrd     = sgprPool.checkOutAligned(4, 4, tag="mf_mxSrd", preventOverflow=False)
         ctx.rms._buildBufferSrd(module, ctx.gammaSrd, "RMSNormGamma", "gamma")
-        ctx.mx._buildBufferSrd(module, ctx.mxSrd, "MXScale", "mxScale")
+        # MXScale SRD is only needed when MXFP8 dynamic quant is active.
+        if ctx.useMxfp8:
+            ctx.mxSrd = sgprPool.checkOutAligned(4, 4, tag="mf_mxSrd", preventOverflow=False)
+            ctx.mx._buildBufferSrd(module, ctx.mxSrd, "MXScale", "mxScale")
 
     def _bindSubEmitters(self, ctx) -> None:
         """Assign shared register indices to sub-emitter attributes.
@@ -583,14 +596,22 @@ class SubtileMegaFusedEmitter:
             for k in range(rpl):
                 self._storeBf16ElemInline(module, ctx, srcRegs[k], m, n, k)
 
-    def _pass3GammaAmax(self, module, ctx, srcRegs, gammaBank, blkAmaxJ,
+    def _pass3GammaAmax(self, module, ctx, srcRegs, vgprTiles, gammaBank, blkAmaxJ,
                         accBank, bankBase, mi, m, n, rpl) -> None:
-        """Apply gamma, fold |H*gamma| into blkAmax[j], and stage result to accBank."""
+        """Apply gamma; for MXFP8 fold |H*gamma| into blkAmax and stage to accBank.
+
+        Without MXFP8 the gamma-scaled result is the final bf16 D value, so it is
+        written straight back to the accumulator for the standard global store.
+        """
         for k in range(rpl):
             acc = srcRegs[k]
             gammaReg = gammaBank + mi * rpl + k
             module.add(VMulF32(dst=vgpr(acc), src0=vgpr(acc), src1=vgpr(gammaReg),
                                comment=f"acc = H * gamma (m={m},n={n},k={k})."))
+            if not ctx.useMxfp8:
+                ctx.rms._writeAccFrom(module, acc, vgprTiles, m, n, k,
+                                      f"write H*gamma back to acc (m={m},n={n},k={k}).")
+                continue
             module.add(VAndB32(dst=vgpr(ctx.mx._scAccTmp), src0=vgpr(acc),
                                src1=vgpr(ctx.mx._scAbsMask),
                                comment=f"|H*gamma| (m={m},n={n},k={k})."))
@@ -632,7 +653,8 @@ class SubtileMegaFusedEmitter:
                     self._loadResidualRow(module, ctx, m, n, mBaseV)
                 self._pass1AccResRms(module, ctx, srcRegs, m, n, rpl)
                 self._pass2StoreBf16(module, ctx, srcRegs, m, n, rpl, useWidePair)
-                self._pass3GammaAmax(module, ctx, srcRegs, gammaBank, blkAmax + j,
+                blkAmaxJ = (blkAmax + j) if ctx.useMxfp8 else None
+                self._pass3GammaAmax(module, ctx, srcRegs, vgprTiles, gammaBank, blkAmaxJ,
                                      accBank, bankBase, mi, m, n, rpl)
         ctx.writer.vgprPool.checkIn(mBaseV)
 
@@ -647,13 +669,17 @@ class SubtileMegaFusedEmitter:
         vgprPool = ctx.writer.vgprPool
         bankSize = g * ctx.tilesPerBlockM * ctx.rowsPerLane
         accBank = vgprPool.checkOut(bankSize, tag="mf_accBank")
-        blkAmax = vgprPool.checkOut(g, tag="mf_blkAmax")
-        for j in range(g):
-            module.add(VMovB32(dst=vgpr(blkAmax + j), src=0, comment=f"blkAmax[{j}] = 0."))
+        # blkAmax and the MXFP8 tail only exist on the quantized path.
+        blkAmax = None
+        if ctx.useMxfp8:
+            blkAmax = vgprPool.checkOut(g, tag="mf_blkAmax")
+            for j in range(g):
+                module.add(VMovB32(dst=vgpr(blkAmax + j), src=0, comment=f"blkAmax[{j}] = 0."))
         self._fusedElementLoop(module, ctx, vgprTiles, accBank, gammaBank,
                                blkAmax, qi, nBase, g)
-        self._mxFusedTail(module, ctx, vgprTiles, accBank, blkAmax, qi, nBase, g)
-        vgprPool.checkIn(blkAmax)
+        if ctx.useMxfp8:
+            self._mxFusedTail(module, ctx, vgprTiles, accBank, blkAmax, qi, nBase, g)
+            vgprPool.checkIn(blkAmax)
         vgprPool.checkIn(accBank)
         return module
 
@@ -709,7 +735,8 @@ class SubtileMegaFusedEmitter:
 
     def emit(self, vgprTiles):
         ctx = self._buildCtx()
-        assert ctx.mx.subColQuant, "megaFused requires subColQuant (q1 < mfmaN)"
+        assert not ctx.useMxfp8 or ctx.mx.subColQuant, \
+            "megaFused MXFP8 requires subColQuant (q1 < mfmaN)"
         module = Module("SubtileMegaFusedEpilogue")
         self._allocSharedRegs(ctx)
         module.add(self._setupShared(ctx))
@@ -725,8 +752,9 @@ class SubtileMegaFusedEmitter:
         gammaBank = ctx.writer.vgprPool.checkOutAligned(
             ctx.tilesPerBlockM * ctx.rowsPerLane, 2, tag="mf_gamma")
         self._beginResidualScratch(module, ctx)
-        # Stream context must be live for the entire fused sweep so _fusedGroup helpers work.
-        ctx.mx._beginStreamContext(module)
+        # The MXFP8 stream context must be live for the whole sweep; skip it without quant.
+        if ctx.useMxfp8:
+            ctx.mx._beginStreamContext(module)
 
         for qi in range(ctx.nQTilesM):
             module.add(self._loadGammaBlock(ctx, gammaBank, qi))
@@ -734,7 +762,8 @@ class SubtileMegaFusedEmitter:
                 g = min(ctx.streamGroup, ctx.mmaN - nBase)
                 module.add(self._fusedGroup(ctx, vgprTiles, gammaBank, qi, nBase, g))
 
-        ctx.mx._endStreamContext()
+        if ctx.useMxfp8:
+            ctx.mx._endStreamContext()
         # One vscnt=0 drains both MXScale stores (from _subColStoreGroup) and ResidualOut stores.
         module.add(SWaitCnt(vscnt=0, comment="drain MXScale and ResidualOut stores."))
         self._endResidualScratch(module, ctx)

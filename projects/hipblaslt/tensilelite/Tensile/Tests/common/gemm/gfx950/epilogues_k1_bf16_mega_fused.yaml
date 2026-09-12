@@ -1,0 +1,90 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+
+# MegaFusedEpilogue, bf16-output (no MXFP8) mode: a single
+# SubtileMegaFusedEmitter runs PartialRMS + ResidualAdd + bf16 ResidualOut and
+# writes the gamma-scaled result straight back for the standard bf16 D store.
+# This exercises the fused path with DQuantType unset, so the MXFP8 block
+# (blkAmax, stream context, MXScale SRD, _mxFusedTail) is gated off at codegen.
+# Numerics must match the flag-off chain covered by benchmark.yaml.
+
+TestParameters:
+  marks: [skip-gfx900, skip-gfx906, skip-gfx908, skip-gfx90a, skip-gfx940, skip-gfx941, skip-gfx942, skip-gfx1010, skip-gfx1011, skip-gfx1012, skip-gfx1030, skip-gfx1100, skip-gfx1101, skip-gfx1102, skip-gfx1200, skip-gfx1201, skip-gfx1250]
+
+GlobalParameters:
+  MinimumRequiredVersion: 5.0.0
+  NumElementsToValidate: -1
+  ExitOnFails: 0
+  PrintLevel: 3
+  KernelTime: True
+  PrintSolutionRejectionReason: True
+
+BenchmarkProblems:
+
+  ########################################
+  # MegaFusedEpilogue: bf16 in, bf16 out — PartialRMS + ResidualAdd, no MXFP8 quant.
+  ########################################
+  -
+    - # ProblemType — bf16 in/out, f32 compute, residual add, bf16 ResidualOut.
+      OperationType: GEMM
+      DataType: b
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: True
+      TransposeB: False
+      UseBeta: False
+      Batched: True
+      StridedBatched: True
+      GroupedGemm: False
+      UseBias: 0
+      UseScaleAB: ""
+      UseScaleCD: False
+      UseScaleAlphaVec: 0
+      UseScaleD: False
+      Sparse: 0
+      UsePartialRMS: True
+      UseMegaFusedEpilogue: True
+      PartialRMSResidualAdd: True
+      PartialRMSStoreBf16D: True
+      PartialRMSQuant: False
+
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+            # WG 1x1 (WG0=1, WG1=1)
+            - [16, 16, 32, 1, 1,  8,  8, 1, 1]  # MT0=128  MT1=128
+            # WG 2x1 (WG0=2, WG1=1)
+            - [16, 16, 32, 1, 1,  4,  8, 2, 1]  # MT0=128  MT1=128
+            # WG 2x2 (WG0=2, WG1=2)
+            - [16, 16, 32, 1, 1,  4,  4, 2, 2]  # MT0=128  MT1=128
+        - PartialRMS: [True]
+        - PartialRMSResidualAdd: [True]
+        - PartialRMSQuant: [False]
+        - PartialRMSStoreBf16D: [True]
+        - MegaFusedEpilogue: [True]
+        - StreamK: [3]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0]
+        - GlobalSplitU: [1]
+        - ScheduleIterAlg: [3]
+        - PrefetchGlobalRead: [1, 2]
+        - PrefetchAcrossPersistent: [0]
+        - DirectToLds: [1]
+        - UseSubtileImpl: [True]
+        - StaggerU: [0]
+        - DepthU: [64]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - PreloadKernArgs: [False]
+        - 1LDSBuffer: [0]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+            - Exact: [768, 768, 1, 768]
+            - Exact: [513, 513, 1, 544]

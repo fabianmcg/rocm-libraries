@@ -544,11 +544,12 @@ def _validatePartialRMSMXFP8Combo(state, printRejectionReason):
 
 
 def _validateMegaFusedEpilogue(state, printRejectionReason):
-  """Validate MegaFusedEpilogue — the combined PartialRMS+ResidualAdd+MXFP8 fused epilogue.
+  """Validate MegaFusedEpilogue — fused PartialRMS+ResidualAdd with optional MXFP8.
 
   Called after the individual sub-validators so that _DQuantSize0/_DQuantSize1
-  are already resolved. Checks that every required sub-flag is active and that
-  the quantization tile shape matches the one fixed shape the emitter supports.
+  are already resolved. The PartialRMS+ResidualAdd+StoreBf16D triad and MI 16x16
+  geometry are always required; the MXFP8 quantization preconditions are only
+  enforced when DQuantType=MXFP8, so the bf16-output (no-quant) mode is supported.
   """
   if not state.get("MegaFusedEpilogue", False):
     return
@@ -561,23 +562,24 @@ def _validateMegaFusedEpilogue(state, printRejectionReason):
   if not state.get("PartialRMSStoreBf16D", False):
     reject(state, printRejectionReason, "megaFusedEpilogue requires PartialRMSStoreBf16D=True")
     return
-  if state.get("DQuantType", "None") != "MXFP8":
-    reject(state, printRejectionReason, "megaFusedEpilogue requires DQuantType=MXFP8")
-    return
-  if state.get("_DQuantSize0") != 32:
-    reject(state, printRejectionReason, "megaFusedEpilogue requires _DQuantSize0=32")
-    return
-  if state.get("_DQuantSize1") != 1:
-    reject(state, printRejectionReason, "megaFusedEpilogue requires _DQuantSize1=1")
-    return
-  if not state["ProblemType"]["DestDataType"].isFloat8():
-    reject(state, printRejectionReason, "megaFusedEpilogue requires DestDataType=F8")
-    return
-  if not state["ProblemType"]["HighPrecisionAccumulate"]:
-    reject(state, printRejectionReason, "megaFusedEpilogue requires HighPrecisionAccumulate=True")
-    return
   if not (state.get("MatrixInstM") == 16 and state.get("MatrixInstN") == 16):
     reject(state, printRejectionReason, "megaFusedEpilogue requires MatrixInst 16x16")
+    return
+  # MXFP8 quantization preconditions apply only when dynamic quant is requested;
+  # without it the fused epilogue emits the bf16-output path.
+  if state.get("DQuantType", "None") != "MXFP8":
+    return
+  if state.get("_DQuantSize0") != 32:
+    reject(state, printRejectionReason, "megaFusedEpilogue MXFP8 requires _DQuantSize0=32")
+    return
+  if state.get("_DQuantSize1") != 1:
+    reject(state, printRejectionReason, "megaFusedEpilogue MXFP8 requires _DQuantSize1=1")
+    return
+  if not state["ProblemType"]["DestDataType"].isFloat8():
+    reject(state, printRejectionReason, "megaFusedEpilogue MXFP8 requires DestDataType=F8")
+    return
+  if not state["ProblemType"]["HighPrecisionAccumulate"]:
+    reject(state, printRejectionReason, "megaFusedEpilogue MXFP8 requires HighPrecisionAccumulate=True")
     return
 
 
