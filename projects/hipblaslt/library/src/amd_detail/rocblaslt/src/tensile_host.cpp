@@ -1965,10 +1965,10 @@ namespace
         // Fused RMSNorm: K1 transposes so free0 = N_hidden (transposeForPartialRMS); K3 swaps its
         // A/B operands so the token axis lands on free1 (transposeForScaleApply).
         const bool _prmsSwap       = partialRMSNeedsTranspose(probIn);
-        const bool _scaleApplySwap = scaleApplyNeedsTranspose(probIn);
+        const bool scaleApplySwap = scaleApplyNeedsTranspose(probIn);
         RocblasltContractionProblem probStorage
             = _prmsSwap       ? transposeForPartialRMS(probIn)
-              : _scaleApplySwap ? transposeForScaleApply(probIn)
+              : scaleApplySwap ? transposeForScaleApply(probIn)
                                 : probIn;
         const RocblasltContractionProblem& prob = probStorage;
 
@@ -2343,10 +2343,10 @@ namespace
         // Fused RMSNorm: K1 transposes so free0 = N_hidden (transposeForPartialRMS); K3 swaps its
         // A/B operands so the token axis lands on free1 (transposeForScaleApply).
         const bool _prmsSwap       = partialRMSNeedsTranspose(probIn);
-        const bool _scaleApplySwap = scaleApplyNeedsTranspose(probIn);
+        const bool scaleApplySwap = scaleApplyNeedsTranspose(probIn);
         RocblasltContractionProblem probStorage
             = _prmsSwap       ? transposeForPartialRMS(probIn)
-              : _scaleApplySwap ? transposeForScaleApply(probIn)
+              : scaleApplySwap ? transposeForScaleApply(probIn)
                                 : probIn;
         const RocblasltContractionProblem& prob = probStorage;
 
@@ -2726,10 +2726,10 @@ namespace
         // Fused RMSNorm: swap A/B pointers to match the transposed problem. K1 (transposeForPartialRMS)
         // arranges free0 = N_hidden; K3 (transposeForScaleApply) moves the token axis to free1.
         const bool _prmsSwap       = partialRMSNeedsTranspose(probIn);
-        const bool _scaleApplySwap = scaleApplyNeedsTranspose(probIn);
+        const bool scaleApplySwap = scaleApplyNeedsTranspose(probIn);
         RocblasltContractionProblem probStorage
             = _prmsSwap       ? transposeForPartialRMS(probIn)
-              : _scaleApplySwap ? transposeForScaleApply(probIn)
+              : scaleApplySwap ? transposeForScaleApply(probIn)
                                 : probIn;
         const RocblasltContractionProblem& prob = probStorage;
 
