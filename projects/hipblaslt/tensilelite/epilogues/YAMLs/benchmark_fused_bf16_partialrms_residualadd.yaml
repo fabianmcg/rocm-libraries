@@ -122,4 +122,4 @@ LibraryLogic:
   ScheduleName: "bench_fused_bf16_partialrms_residualadd"
   DeviceNames: ["Device 75a0", "Device 75b0", "Device 75a2", "Device 75b2", "Device 75a3", "Device 75b3", "Device 75a8", "Device 75b8"]
   ArchitectureName: "gfx950"
-  LibraryType: "Prediction"
+  LibraryType: "Equality"
