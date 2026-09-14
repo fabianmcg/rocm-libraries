@@ -127,6 +127,9 @@ class MegaFusedCtx:
         # Per-N-column ResidualOut row base = token_n * N_hidden (element index),
         # precomputed once per n and reused across all mi tiles and straddle-fallback k.
         self.roRowBase      = None
+        # Per-N-column ResidualOut byte base = (token_n*N_hidden + wgRowBase + rowGroupOff) * 2,
+        # precomputed once per n; per-tile row offset (m*mfma_m*2) is folded into the store offset12.
+        self.roColByteBase  = None
 
 
 class SubtileMegaFusedEmitter:
@@ -413,7 +416,7 @@ class SubtileMegaFusedEmitter:
         token_n is the free1 index owned by each lane and is constant across all m and k
         within the N-group, so both the mask and the row base are computed once per n and
         reused. Mirrors beta*C's GWB store, which computes its address base once rather than
-        multiplying per tile. ctx.roRowBase must be checked out by the caller.
+        multiplying per tile. ctx.roRowBase and ctx.roColByteBase must be checked out by the caller.
         """
         res = ctx.res
         lsc = res.lane_sgpr_count
@@ -427,6 +430,17 @@ class SubtileMegaFusedEmitter:
                              comment="tokenInRange = token_n < M_tokens (ResidualOut N mask)."))
         module.add(VMulLOU32(dst=vgpr(ctx.roRowBase), src0=sgpr("SizesFree+0"), src1=vgpr(r),
                              comment=f"roRowBase = token_n * N_hidden (n={n}); reused across m,k."))
+        # Fold the per-lane invariant row origin into a byte base so the per-tile
+        # store only needs a compile-time offset12 (no per-tile address VALU).
+        module.add(VAddU32(dst=vgpr(ctx.roColByteBase), src0=vgpr(ctx.roRowBase),
+                           src1=vgpr(ctx.wgRowBase),
+                           comment="roColBase = token_n*N_hidden + wgRowBase."))
+        module.add(VAddU32(dst=vgpr(ctx.roColByteBase), src0=vgpr(ctx.roColByteBase),
+                           src1=vgpr(ctx.rowGroupOff),
+                           comment="roColBase += rowGroupOff (per-lane row origin)."))
+        module.add(VLShiftLeftB32(dst=vgpr(ctx.roColByteBase), shiftHex=hex(1),
+                                  src=vgpr(ctx.roColByteBase),
+                                  comment="roColByteBase = roColBase * 2 (bf16)."))
         ctx.writer.vgprPool.checkIn(scratch)
         ctx.writer.vgprPool.checkIn(tokV)
 
@@ -437,17 +451,6 @@ class SubtileMegaFusedEmitter:
             module.add(VCvtPkF32toBF16(dst=vgpr(packBank + p),
                                        src0=vgpr(srcRegs[2 * p]), src1=vgpr(srcRegs[2 * p + 1]),
                                        comment=f"pack H[{2 * p}] lo16, H[{2 * p + 1}] hi16 -> bf16x2."))
-
-    def _residualOutRowAddr(self, module, ctx, n, addrV, scratchV) -> None:
-        """Compute byte address (roRowBase + nhBase) * 2 for the dwordx2 store.
-
-        roRowBase = token_n * N_hidden is precomputed once per N-column
-        (_computeResidualOutRowBaseAndMask), so no per-tile integer multiply is needed here.
-        """
-        module.add(VAddU32(dst=vgpr(addrV), src0=vgpr(ctx.roRowBase), src1=vgpr(ctx.nhBase),
-                           comment="elemIdx = roRowBase + nhBase."))
-        module.add(VLShiftLeftB32(dst=vgpr(addrV), shiftHex=hex(1), src=vgpr(addrV),
-                                  comment="byteAddr = elemIdx * 2 (bf16)."))
 
     def _storeResidualOutRow(self, module, ctx, srcRegs, tokMaskSgpr, m, n) -> None:
         """Store rpl bf16(H) to ResidualOut as one dwordx2 for nhidden-interior lanes.
@@ -467,36 +470,31 @@ class SubtileMegaFusedEmitter:
         vgprPool = ctx.writer.vgprPool
         sgprPool = ctx.writer.sgprPool
         packBank = vgprPool.checkOutAligned(rpl // 2, 2, tag="mf_roPack")
-        addrV    = vgprPool.checkOut(1, tag="mf_roAddr")
-        scratchV = vgprPool.checkOut(1, tag="mf_roScratch")
         nhTopV   = vgprPool.checkOut(1, tag="mf_roNhTop")
-        self._residualOutRowAddr(module, ctx, n, addrV, scratchV)
         self._packResidualOutRow(module, ctx, srcRegs, packBank)
         safe  = sgprPool.checkOutAligned(lsc, lsc, tag="mf_roSafe",     preventOverflow=False)
         saved = sgprPool.checkOutAligned(lsc, lsc, tag="mf_roSaveExec", preventOverflow=False)
-        self._issueResidualOutWide(module, ctx, m, n, addrV, packBank,
-                                   nhTopV, scratchV, safe, saved)
+        self._issueResidualOutWide(module, ctx, m, n, packBank, nhTopV, safe, saved)
         self._issueResidualOutStraddle(module, ctx, tokMaskSgpr, m, n, srcRegs, safe, saved)
         sgprPool.checkIn(saved)
         sgprPool.checkIn(safe)
         vgprPool.checkIn(nhTopV)
-        vgprPool.checkIn(scratchV)
-        vgprPool.checkIn(addrV)
         vgprPool.checkIn(packBank)
 
-    def _issueResidualOutWide(self, module, ctx, m, n, addrV, packBank,
-                               nhTopV, scratchV, safeIdx, savedIdx) -> None:
+    def _issueResidualOutWide(self, module, ctx, m, n, packBank,
+                               nhTopV, safeIdx, savedIdx) -> None:
         """Narrow exec to interior lanes and issue the dwordx2 store.
 
         safeIdx receives b64Safe (nhTop < N_hidden); it is consumed unchanged by
         _issueResidualOutStraddle to compute the straddle subset. Token-OOB lanes
         are silently dropped by the ResidualOut SRD bounds (no token mask folded here).
         savedIdx receives the pre-narrow full exec, restored by _issueResidualOutStraddle.
+        The per-tile row offset m*mfma_m*2 is a compile-time constant folded into offset12.
         """
         res = ctx.res
         rpl = ctx.rowsPerLane
         lsc = res.lane_sgpr_count
-        nhTop = res._addImmU32(module, nhTopV, ctx.nhBase, rpl - 1, scratchV,
+        nhTop = res._addImmU32(module, nhTopV, ctx.nhBase, rpl - 1, nhTopV,
                                f"nhTop = nhBase + {rpl - 1}.")
         # b64Safe = interior lanes whose whole rpl-group is < N_hidden (no straddle).
         # Token-OOB lanes are dropped by the ResidualOut SRD bounds, so no token mask
@@ -509,10 +507,12 @@ class SubtileMegaFusedEmitter:
                            comment="save full exec (plain s_mov, no exec RMW)."))
         module.add(SMovB64(dst=EXEC(), src=sgpr(safeIdx, lsc),
                            comment="exec = b64Safe (interior lanes); SRD drops token-OOB."))
-        module.add(BufferStoreB64(src=vgpr(packBank, 2), vaddr=vgpr(addrV),
+        rowOff = m * res.mfma_m * 2
+        assert rowOff < 4096, f"residualOut row offset {rowOff} exceeds MUBUF offset12 range"
+        module.add(BufferStoreB64(src=vgpr(packBank, 2), vaddr=vgpr(ctx.roColByteBase),
                                   saddr=sgpr(res.residualOutSrd, 4), soffset=0,
-                                  mubuf=MUBUFModifiers(offen=True),
-                                  comment=f"ResidualOut dwordx2 (m={m},n={n})."))
+                                  mubuf=MUBUFModifiers(offen=True, offset12=rowOff),
+                                  comment=f"ResidualOut dwordx2 (m={m},n={n}) off={rowOff}."))
 
     def _issueResidualOutStraddle(self, module, ctx, tokMaskSgpr, m, n, srcRegs,
                                    safeIdx, savedIdx) -> None:
@@ -831,12 +831,15 @@ class SubtileMegaFusedEmitter:
                 tokMaskSgpr = ctx.writer.sgprPool.checkOutAligned(lsc, lsc, tag="mf_roTokMask",
                                                                    preventOverflow=False)
                 ctx.roRowBase = ctx.writer.vgprPool.checkOut(1, tag="mf_roRowBase")
+                ctx.roColByteBase = ctx.writer.vgprPool.checkOut(1, tag="mf_roColByteBase")
                 self._computeResidualOutRowBaseAndMask(module, ctx, n, tokMaskSgpr)
             for mi in range(tpb):
                 t = self._computePassTile(module, ctx, vgprTiles, accBank, resBank, gammaBank,
                                           blkAmax, loadsCumulative, totalIssued, mBaseV,
                                           tokMaskSgpr, qi, nBase, j, mi, t)
             if res.storeBf16D:
+                ctx.writer.vgprPool.checkIn(ctx.roColByteBase)
+                ctx.roColByteBase = None
                 ctx.writer.vgprPool.checkIn(ctx.roRowBase)
                 ctx.roRowBase = None
                 ctx.writer.sgprPool.checkIn(tokMaskSgpr)
