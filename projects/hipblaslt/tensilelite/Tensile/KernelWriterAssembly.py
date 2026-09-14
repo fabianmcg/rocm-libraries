@@ -15302,14 +15302,6 @@ class KernelWriterAssembly(KernelWriter):
       from .Components.Subtile.SubtileMegaFusedEmit import SubtileMegaFusedEmitter
       module.add(SubtileMegaFusedEmitter(self, kernel).emit(vgprTiles))
       return module
-    if kernel["DQuantType"] == "Tile":
-      from .Components.Subtile.SubtileDynamicQuant import SubtileTileQuantEmitter
-      module.addComment1("TileQuant: per-tile amax pre-scale for fp8 D output.")
-      module.add(SubtileTileQuantEmitter(self, kernel).emit(vgprTiles))
-    if kernel["DQuantType"] == "MXFP8":
-      from .Components.Subtile.SubtileDynamicQuant import SubtileMXFP8QuantEmitter
-      module.addComment1("MXFP8Quant: per-block e8m0 dynamic quant for fp8 D output.")
-      module.add(SubtileMXFP8QuantEmitter(self, kernel).emit(vgprTiles))
     return module
 
   def globalWriteElements(self, kernel, tPA, tPB, vectorWidths_2, vectorWidths_1, elements_2, elements_1,
