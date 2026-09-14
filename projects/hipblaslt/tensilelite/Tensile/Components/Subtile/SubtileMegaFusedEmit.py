@@ -32,7 +32,6 @@ from rocisa.instruction import (
     BufferStoreB64,
     SAndB64,
     SAndN2B32,
-    SAndSaveExecB64,
     SCBranchSCC0,
     SMulI32,
     SMovB64,
@@ -384,16 +383,15 @@ class SubtileMegaFusedEmitter:
         writer.vgprPool.checkIn(ctx.resRowByteBase)
         writer.vgprPool.checkIn(ctx.resTokenBase)
 
-    def _computeBf16Addr(self, module, ctx, n, k, addrV, valV, nhByteV, tokMaskIdx, nhMaskIdx) -> None:
-        """Compute clamped byte address for ResidualOut[token_n, nhPos] at column (n, k)."""
+    def _computeBf16Addr(self, module, ctx, n, k, addrV, valV, nhByteV, nhMaskIdx) -> None:
+        """Compute clamped byte address for ResidualOut[token_n, nhPos] at column (n, k).
+
+        Token-OOB lanes are dropped by the ResidualOut SRD bounds, so no explicit
+        token mask is applied here; only nhPos-straddle elements are clamped to
+        BufferOOB to avoid aliasing the next token's row.
+        """
         res = ctx.res
         lsc = res.lane_sgpr_count
-        nOff = n * res.mfma_n
-        r = res._addImmU32(module, valV, ctx.resTokenBase, nOff, addrV,
-                           f"token_n = resTokenBase + {nOff} (n={n}).")
-        module.add(VCmpLtU32(dst=sgpr(tokMaskIdx, lsc), src0=vgpr(r),
-                             src1=sgpr("SizesFree+1"),
-                             comment="tokenInRange = token_n < M_tokens."))
         module.add(VLShiftLeftB32(dst=vgpr(addrV), shiftHex=hex(1), src=vgpr(ctx.roRowBase),
                                   comment="base0 = roRowBase * 2 (bf16); token_n*N_hidden reused."))
         nh = res._addImmU32(module, nhByteV, ctx.nhBase, k, valV,
@@ -408,9 +406,6 @@ class SubtileMegaFusedEmitter:
         module.add(VCndMaskB32(dst=vgpr(addrV), src0=vgpr(ctx.resOobV), src1=vgpr(addrV),
                                src2=sgpr(nhMaskIdx, lsc),
                                comment="clamp OOB when nhPos >= N_hidden."))
-        module.add(VCndMaskB32(dst=vgpr(addrV), src0=vgpr(ctx.resOobV), src1=vgpr(addrV),
-                               src2=sgpr(tokMaskIdx, lsc),
-                               comment="clamp OOB when token_n >= M_tokens."))
 
     def _computeResidualOutRowBaseAndMask(self, module, ctx, n, tokMaskSgpr) -> None:
         """Per-N-column setup: token(N) OOB mask and roRowBase = token_n * N_hidden.
@@ -457,7 +452,7 @@ class SubtileMegaFusedEmitter:
     def _storeResidualOutRow(self, module, ctx, srcRegs, tokMaskSgpr, m, n) -> None:
         """Store rpl bf16(H) to ResidualOut as one dwordx2 for nhidden-interior lanes.
 
-        Interior lanes use BufferStoreB64 under the per-lane token-OOB exec mask;
+        Interior lanes use BufferStoreB64 under the b64Safe exec mask (token-OOB lanes are dropped by the ResidualOut SRD bounds);
         straddling lanes fall back to per-element masked stores via _storeBf16ElemInline.
         A scalar SCC branch skips the fallback when no lane straddles (the common case
         for multiple-of-rpl N_hidden).  Exec is fully restored before returning.
@@ -479,7 +474,7 @@ class SubtileMegaFusedEmitter:
         self._packResidualOutRow(module, ctx, srcRegs, packBank)
         safe  = sgprPool.checkOutAligned(lsc, lsc, tag="mf_roSafe",     preventOverflow=False)
         saved = sgprPool.checkOutAligned(lsc, lsc, tag="mf_roSaveExec", preventOverflow=False)
-        self._issueResidualOutWide(module, ctx, tokMaskSgpr, m, n, addrV, packBank,
+        self._issueResidualOutWide(module, ctx, m, n, addrV, packBank,
                                    nhTopV, scratchV, safe, saved)
         self._issueResidualOutStraddle(module, ctx, tokMaskSgpr, m, n, srcRegs, safe, saved)
         sgprPool.checkIn(saved)
@@ -489,12 +484,13 @@ class SubtileMegaFusedEmitter:
         vgprPool.checkIn(addrV)
         vgprPool.checkIn(packBank)
 
-    def _issueResidualOutWide(self, module, ctx, tokMaskSgpr, m, n, addrV, packBank,
+    def _issueResidualOutWide(self, module, ctx, m, n, addrV, packBank,
                                nhTopV, scratchV, safeIdx, savedIdx) -> None:
-        """Narrow exec to interior+valid lanes and issue the dwordx2 store.
+        """Narrow exec to interior lanes and issue the dwordx2 store.
 
-        safeIdx receives the narrow mask (tokMask AND b64Safe); it is consumed
-        unchanged by _issueResidualOutStraddle to compute the straddle subset.
+        safeIdx receives b64Safe (nhTop < N_hidden); it is consumed unchanged by
+        _issueResidualOutStraddle to compute the straddle subset. Token-OOB lanes
+        are silently dropped by the ResidualOut SRD bounds (no token mask folded here).
         savedIdx receives the pre-narrow full exec, restored by _issueResidualOutStraddle.
         """
         res = ctx.res
@@ -502,16 +498,17 @@ class SubtileMegaFusedEmitter:
         lsc = res.lane_sgpr_count
         nhTop = res._addImmU32(module, nhTopV, ctx.nhBase, rpl - 1, scratchV,
                                f"nhTop = nhBase + {rpl - 1}.")
+        # b64Safe = interior lanes whose whole rpl-group is < N_hidden (no straddle).
+        # Token-OOB lanes are dropped by the ResidualOut SRD bounds, so no token mask
+        # is folded into the exec narrow here (relies on SRD OOB clamping).
         module.add(VCmpLtU32(dst=sgpr(safeIdx, lsc), src0=vgpr(nhTop),
                              src1=sgpr("SizesFree+0"),
                              comment="b64Safe = nhBase+rpl-1 < N_hidden (no straddle)."))
-        # Narrow to interior-AND-token-valid lanes; result goes back into safe.
-        module.add(SAndB64(dst=sgpr(safeIdx, lsc), src0=sgpr(tokMaskSgpr, lsc),
-                           src1=sgpr(safeIdx, lsc),
-                           comment="narrow = tokMask AND b64Safe."))
-        # Save full exec; narrow exec to interior+valid lanes for the wide store.
-        module.add(SAndSaveExecB64(dst=sgpr(savedIdx, lsc), src=sgpr(safeIdx, lsc),
-                                   comment="save exec; exec = narrow (interior+valid lanes)."))
+        # Save full exec with a plain s_mov, then set exec = b64Safe for the wide store.
+        module.add(SMovB64(dst=sgpr(savedIdx, lsc), src=EXEC(),
+                           comment="save full exec (plain s_mov, no exec RMW)."))
+        module.add(SMovB64(dst=EXEC(), src=sgpr(safeIdx, lsc),
+                           comment="exec = b64Safe (interior lanes); SRD drops token-OOB."))
         module.add(BufferStoreB64(src=vgpr(packBank, 2), vaddr=vgpr(addrV),
                                   saddr=sgpr(res.residualOutSrd, 4), soffset=0,
                                   mubuf=MUBUFModifiers(offen=True),
@@ -531,10 +528,10 @@ class SubtileMegaFusedEmitter:
         # Straddle exec: tokMask AND NOT narrow (= tokMask AND NOT b64Safe).
         # Two SAndN2B32 reuse the safe register pair; SAndB64 sets SCC for the branch.
         module.add(SAndN2B32(dst=sgpr(safeIdx), src0=sgpr(tokMaskSgpr), src1=sgpr(safeIdx),
-                             comment="straddle_lo = tokMask_lo & ~narrow_lo."))
+                             comment="straddle_lo = tokMask_lo & ~b64Safe_lo."))
         module.add(SAndN2B32(dst=sgpr(safeIdx + 1), src0=sgpr(tokMaskSgpr + 1),
                              src1=sgpr(safeIdx + 1),
-                             comment="straddle_hi = tokMask_hi & ~narrow_hi."))
+                             comment="straddle_hi = tokMask_hi & ~b64Safe_hi."))
         module.add(SAndB64(dst=sgpr(safeIdx, lsc), src0=sgpr(safeIdx, lsc),
                            src1=sgpr(safeIdx, lsc),
                            comment="SCC = (straddle != 0); safe still holds straddle mask."))
@@ -556,17 +553,15 @@ class SubtileMegaFusedEmitter:
         addrV   = ctx.writer.vgprPool.checkOut(1, tag="mf_bf16Addr")
         valV    = ctx.writer.vgprPool.checkOut(1, tag="mf_bf16Val")
         nhByteV = ctx.writer.vgprPool.checkOut(1, tag="mf_nhByte")
-        with ctx.writer.allocTmpSgpr(lsc, tag="mf_tokMask") as tokMask:
-            with ctx.writer.allocTmpSgpr(lsc, tag="mf_nhMask") as nhMask:
-                self._computeBf16Addr(module, ctx, n, k, addrV, valV, nhByteV,
-                                      tokMask.idx, nhMask.idx)
-                module.add(VCvtPkF32toBF16(dst=vgpr(valV), src0=vgpr(accReg),
-                                            src1=vgpr(accReg),
-                                            comment="H -> bf16 (low 16 bits)."))
-                module.add(BufferStoreB16(src=vgpr(valV), vaddr=vgpr(addrV),
-                                          saddr=sgpr(res.residualOutSrd, 4), soffset=0,
-                                          mubuf=MUBUFModifiers(offen=True),
-                                          comment=f"ResidualOut bf16(H) (m={m},n={n},k={k})."))
+        with ctx.writer.allocTmpSgpr(lsc, tag="mf_nhMask") as nhMask:
+            self._computeBf16Addr(module, ctx, n, k, addrV, valV, nhByteV, nhMask.idx)
+            module.add(VCvtPkF32toBF16(dst=vgpr(valV), src0=vgpr(accReg),
+                                        src1=vgpr(accReg),
+                                        comment="H -> bf16 (low 16 bits)."))
+            module.add(BufferStoreB16(src=vgpr(valV), vaddr=vgpr(addrV),
+                                      saddr=sgpr(res.residualOutSrd, 4), soffset=0,
+                                      mubuf=MUBUFModifiers(offen=True),
+                                      comment=f"ResidualOut bf16(H) (m={m},n={n},k={k})."))
         ctx.writer.vgprPool.checkIn(nhByteV)
         ctx.writer.vgprPool.checkIn(valV)
         ctx.writer.vgprPool.checkIn(addrV)
