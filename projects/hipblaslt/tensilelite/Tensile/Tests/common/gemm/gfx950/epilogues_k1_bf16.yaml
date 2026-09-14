@@ -1,19 +1,17 @@
 # Copyright Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier: MIT
 
-# PartialRMS + ResidualAdd + MXFP8 DynQuant 32x1 + bf16 ResidualOut (K1):
-# comprehensive tile/prefetch coverage. PartialRMSStoreBf16D=True splits the
-# store into two passes: RMS pass writes bf16 to ResidualOut, quant pass
-# writes fp8 to D. Constraints: MT1==128, MT0%64==0, WG0<=2,
-# DQuantSize0(=32) <= MT0/WG0. NumElementsToValidate enables in-pipeline
-# correctness checking across a range of problem sizes.
+# RMSEpilogue + PartialRMSQuant + MXFP8 DynQuant 32x1 + bf16 ResidualOut (K1):
+# comprehensive tile/prefetch coverage. UseRMSEpilogue=True selects the single
+# fused path (internally enables PartialRMS + ResidualAdd + StoreBf16D);
+# PartialRMSQuant=True + DQuantType=MXFP8 enables the MXFP8 dynamic-quant output.
+# Constraints: MT1==128, MT0%64==0, WG0<=2, DQuantSize0(=32) <= MT0/WG0.
+# NumElementsToValidate enables in-pipeline correctness checking.
 #
-# The ProblemType MUST set PartialRMSStoreBf16D: True. The solution-selection
-# predicate UsePartialRMSStoreBf16D is built from the ProblemType field, while the
-# client sets the problem's store-bf16-d flag from the solutions (ForkParameters
-# request it). Omitting it from the ProblemType makes the predicate value 0 while
-# the problem value is 1, so every solution is rejected (DID_NOT_SATISFY_ASSERTS)
-# and no benchmark data is produced.
+# The ProblemType sets UseRMSEpilogue: True (which internally enables PartialRMS +
+# ResidualAdd + StoreBf16D) and PartialRMSQuant: True + DQuantType: MXFP8 for the
+# fp8 output path. PartialRMSStoreBf16D and UsePartialRMSStoreBf16D are internal
+# derived state and must NOT be set in YAML.
 #
 # The tile sweep spans three BenchmarkProblemSizeGroups under ONE ProblemType. They
 # MUST be sibling size groups, not separate outer BenchmarkProblems entries: each
@@ -56,9 +54,9 @@ BenchmarkProblems:
       UseScaleAlphaVec: 0
       UseScaleD: False
       Sparse: 0
-      UsePartialRMS: True
-      PartialRMSResidualAdd: True
-      PartialRMSStoreBf16D: True
+      UseRMSEpilogue: True
+      PartialRMSQuant: True
+      DQuantType: MXFP8
 
     ########################################
     # Size group 1 (idx 00): WG 1x1 and WG 2x1 tiles.
@@ -85,10 +83,11 @@ BenchmarkProblems:
             - [16, 16, 32, 1, 1, 16,  4, 1, 2]  # MT0=256  MT1=128
             # Larger tile (WG 2x1, MT0=320) — added coverage
             - [16, 16, 32, 1, 1, 10,  8, 2, 1]  # MT0=320  MT1=128
-        - PartialRMS: [True]
-        - PartialRMSResidualAdd: [True]
-        - PartialRMSQuant: [False]
-        - PartialRMSStoreBf16D: [True]
+        - RMSEpilogue: [True]
+        - PartialRMSQuant: [True]
+        - DQuantType: [MXFP8]
+        - DQuantSize0: [32]
+        - DQuantSize1: [1]
         - StreamK: [3]
         - StreamKForceDPOnly: [0, 1]
         - StreamKAtomic: [0]
@@ -138,10 +137,11 @@ BenchmarkProblems:
             - [16, 16, 32, 1, 1, 10,  4, 2, 2]  # MT0=320  MT1=128 (WG 2x2)
             - [16, 16, 32, 1, 1, 12,  4, 2, 2]  # MT0=384  MT1=128 (WG 2x2)
             - [16, 16, 32, 1, 1, 20,  2, 1, 4]  # MT0=320  MT1=128 (WG 1x4)
-        - PartialRMS: [True]
-        - PartialRMSResidualAdd: [True]
-        - PartialRMSQuant: [False]
-        - PartialRMSStoreBf16D: [True]
+        - RMSEpilogue: [True]
+        - PartialRMSQuant: [True]
+        - DQuantType: [MXFP8]
+        - DQuantSize0: [32]
+        - DQuantSize1: [1]
         - StreamK: [3]
         - StreamKForceDPOnly: [0, 1]
         - StreamKAtomic: [0]

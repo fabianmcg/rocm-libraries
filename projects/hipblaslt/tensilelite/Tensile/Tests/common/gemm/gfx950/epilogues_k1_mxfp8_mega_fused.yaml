@@ -1,10 +1,9 @@
 # Copyright Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier: MIT
 
-# MegaFusedEpilogue: PartialRMS + ResidualAdd + MXFP8 DynQuant via a single
-# SubtileMegaFusedEmitter that delegates to the three existing sub-emitters in
-# sequence (Milestone 1 behavioral clone). Numerics must match the flag-off path
-# covered by epilogues_k1_mxfp8.yaml.
+# RMSEpilogue: PartialRMS + ResidualAdd + MXFP8 DynQuant via a single
+# SubtileMegaFusedEmitter. Numerics must match the flag-off path covered by
+# epilogues_k1_mxfp8.yaml.
 
 TestParameters:
   marks: [skip-gfx900, skip-gfx906, skip-gfx908, skip-gfx90a, skip-gfx940, skip-gfx941, skip-gfx942, skip-gfx1010, skip-gfx1011, skip-gfx1012, skip-gfx1030, skip-gfx1100, skip-gfx1101, skip-gfx1102, skip-gfx1200, skip-gfx1201, skip-gfx1250]
@@ -27,10 +26,10 @@ GlobalParameters:
 BenchmarkProblems:
 
   ########################################
-  # MegaFusedEpilogue: MX-scaled fp8 in, fp8 out — representative tile sweep.
+  # RMSEpilogue: MX-scaled fp8 in, fp8 out — representative tile sweep.
   ########################################
   -
-    - # ProblemType — identical to epilogues_k1_mxfp8.yaml but with UseMegaFusedEpilogue=True
+    - # ProblemType — identical to epilogues_k1_mxfp8.yaml but with UseRMSEpilogue=True
       OperationType: GEMM
       DataType: F8
       DestDataType: F8
@@ -50,11 +49,8 @@ BenchmarkProblems:
       UseScaleAlphaVec: 0
       UseScaleD: False
       Sparse: 0
-      UsePartialRMS: True
-      UseMegaFusedEpilogue: True
-      PartialRMSResidualAdd: True
-      PartialRMSStoreBf16D: True
-      PartialRMSQuant: False
+      UseRMSEpilogue: True
+      PartialRMSQuant: True
       DQuantType: MXFP8
 
     - InitialSolutionParameters:
@@ -68,14 +64,11 @@ BenchmarkProblems:
             - [16, 16, 128, 1, 1,  4,  4, 1, 2]  # MT0=64   MT1=128
             # WG 2x2 (WG0=2, WG1=2, MIWT_N=4)
             - [16, 16, 128, 1, 1,  4,  4, 2, 2]  # MT0=128  MT1=128
-        - PartialRMS: [True]
-        - PartialRMSResidualAdd: [True]
-        - PartialRMSQuant: [False]
-        - PartialRMSStoreBf16D: [True]
+        - RMSEpilogue: [True]
+        - PartialRMSQuant: [True]
         - DQuantType: [MXFP8]
         - DQuantSize0: [32]
         - DQuantSize1: [1]
-        - MegaFusedEpilogue: [True]
         - StreamK: [3]
         - StreamKForceDPOnly: [1]
         - StreamKAtomic: [0]

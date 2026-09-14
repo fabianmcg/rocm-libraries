@@ -45,9 +45,7 @@ BenchmarkProblems:
       UseScaleAlphaVec: 0
       UseScaleD: False
       Sparse: 0
-      UsePartialRMS: True
-      PartialRMSResidualAdd: True
-      PartialRMSStoreBf16D: True
+      UseRMSEpilogue: True
 
     - InitialSolutionParameters:
       BenchmarkCommonParameters:
@@ -86,9 +84,7 @@ BenchmarkProblems:
             - [16, 16, 32, 1, 1, 12,  4, 2, 2]  # MT0=384  MT1=128 (WG 2x2)
             - [16, 16, 32, 1, 1, 20,  2, 1, 4]  # MT0=320  MT1=128 (WG 1x4)
             - [16, 16, 32, 1,  1, 12, 8, 2, 2]  # MT 384x256 (winner)
-        - PartialRMS: [True]
-        - PartialRMSResidualAdd: [True]
-        - PartialRMSStoreBf16D: [True]
+        - RMSEpilogue: [True]
         - StreamK: [3]
         - StreamKForceDPOnly: [1]
         - StreamKAtomic: [0]

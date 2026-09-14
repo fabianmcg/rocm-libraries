@@ -138,8 +138,9 @@ class SubtileMegaFusedEmitter:
     def __init__(self, writer, kernel):
         self.writer = writer
         self.kernel = kernel
-        # MXFP8 dynamic quant is optional; without it the fused epilogue emits bf16 D.
-        self.useMxfp8 = kernel.get("DQuantType") == "MXFP8"
+        # PartialRMSQuant is the public MXFP8 routing flag; DQuantType=MXFP8 stays set in
+        # the solution to keep the MXScale/DQuantSize/Signature machinery intact.
+        self.useMxfp8 = bool(kernel.get("PartialRMSQuant", False))
         self.residualEmitter = SubtileResidualAddEmitter(writer, kernel)
         # ResidualAdd drains the kernarg pointer first, so PartialRMS must not drain it again.
         self.rmsEmitter = SubtilePartialRMSEmitter(writer, kernel, kernargDrained=True)

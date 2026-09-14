@@ -1,9 +1,8 @@
 # Copyright Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier: MIT
 #
-# Fused: bf16 PartialRMS+ResidualAdd+StoreBf16D — MegaFusedEpilogue path.
-# UseMegaFusedEpilogue enables the fused problem type; MegaFusedEpilogue=True
-# selects the fused code path in the solution.
+# Fused: bf16 PartialRMS+ResidualAdd+StoreBf16D — RMSEpilogue path.
+# UseRMSEpilogue enables the fused problem type and selects the fused code path.
 
 TestParameters:
   marks: [skip-gfx900, skip-gfx906, skip-gfx908, skip-gfx90a, skip-gfx940, skip-gfx941, skip-gfx942, skip-gfx1010, skip-gfx1011, skip-gfx1012, skip-gfx1030, skip-gfx1100, skip-gfx1101, skip-gfx1102, skip-gfx1200, skip-gfx1201, skip-gfx1250]
@@ -20,7 +19,7 @@ BenchmarkProblems:
 
   ########################################
   # bf16 in, bf16 out — PartialRMS + ResidualAdd + StoreBf16D
-  # Fused path (MegaFusedEpilogue=True). Winner tile MT 384x256.
+  # Fused path (RMSEpilogue=True). Winner tile MT 384x256.
   ########################################
   -
     -
@@ -41,11 +40,7 @@ BenchmarkProblems:
       UseScaleAlphaVec: 0
       UseScaleD: False
       Sparse: 0
-      UsePartialRMS: True
-      UseMegaFusedEpilogue: True
-      PartialRMSResidualAdd: True
-      PartialRMSStoreBf16D: True
-      PartialRMSQuant: False
+      UseRMSEpilogue: True
 
     - InitialSolutionParameters:
       BenchmarkCommonParameters:
@@ -90,11 +85,7 @@ BenchmarkProblems:
           - [16, 16, 32, 1,  1, 23, 4, 1, 4]  # MT 368x256 (156KB)
           - [16, 16, 32, 1,  1, 24, 4, 1, 4]  # MT 384x256 (160KB)
           - [16, 16, 32, 1,  1, 32, 2, 1, 4]  # MT 512x128 (160KB)
-        - PartialRMS: [True]
-        - PartialRMSResidualAdd: [True]
-        - PartialRMSStoreBf16D: [True]
-        - PartialRMSQuant: [False]
-        - MegaFusedEpilogue: [True]
+        - RMSEpilogue: [True]
         - StreamK: [3]
         - StreamKForceDPOnly: [1]
         - StreamKAtomic: [0]

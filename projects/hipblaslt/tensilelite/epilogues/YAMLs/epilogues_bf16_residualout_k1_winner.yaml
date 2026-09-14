@@ -44,9 +44,7 @@ BenchmarkProblems:
       UseScaleAlphaVec: 0
       UseScaleD: False
       Sparse: 0
-      UsePartialRMS: True
-      PartialRMSResidualAdd: True
-      PartialRMSStoreBf16D: True
+      UseRMSEpilogue: True
 
     - InitialSolutionParameters:
       BenchmarkCommonParameters:
@@ -54,9 +52,7 @@ BenchmarkProblems:
       ForkParameters:
         - MatrixInstruction:
             - [16, 16, 32, 1,  1, 12, 8, 2, 2]  # MT 384x256 (winner)
-        - PartialRMS: [True]
-        - PartialRMSResidualAdd: [True]
-        - PartialRMSStoreBf16D: [True]
+        - RMSEpilogue: [True]
         - StreamK: [3]
         - StreamKForceDPOnly: [1]
         - StreamKAtomic: [0]

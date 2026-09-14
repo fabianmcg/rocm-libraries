@@ -77,10 +77,8 @@ BenchmarkProblems:
       UseScaleAlphaVec: 0
       UseScaleD: False
       Sparse: 0
-      UsePartialRMS: True
-      PartialRMSResidualAdd: True
-      PartialRMSStoreBf16D: True
-      PartialRMSQuant: False
+      UseRMSEpilogue: True
+      PartialRMSQuant: True
       DQuantType: MXFP8
 
     ########################################
@@ -120,10 +118,8 @@ BenchmarkProblems:
             - [16, 16, 128, 1, 1, 10,  4, 2, 2]  # MT0=320  MT1=128
             # WG 2x4 (WG0=2, WG1=4) REMOVED: 8-wave partialBuf sum-of-squares
             # miscompute under full CPU validation (PARTIALRMS_WG2X4_KNOWN_ISSUE.md).
-        - PartialRMS: [True]
-        - PartialRMSResidualAdd: [True]
-        - PartialRMSQuant: [False]
-        - PartialRMSStoreBf16D: [True]
+        - RMSEpilogue: [True]
+        - PartialRMSQuant: [True]
         - DQuantType: [MXFP8]
         - DQuantSize0: [32]
         - DQuantSize1: [1]
@@ -169,10 +165,8 @@ BenchmarkProblems:
             - [16, 16, 128, 1, 1, 16,  4, 1, 4]  # MT0=256  MT1=256
             # WG 2x2, MT0=320, MT1=256 — added coverage
             - [16, 16, 128, 1, 1, 10,  8, 2, 2]  # MT0=320  MT1=256
-        - PartialRMS: [True]
-        - PartialRMSResidualAdd: [True]
-        - PartialRMSQuant: [False]
-        - PartialRMSStoreBf16D: [True]
+        - RMSEpilogue: [True]
+        - PartialRMSQuant: [True]
         - DQuantType: [MXFP8]
         - DQuantSize0: [32]
         - DQuantSize1: [1]

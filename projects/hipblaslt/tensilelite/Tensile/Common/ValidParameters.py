@@ -550,6 +550,7 @@ validParameters = { # we need to make sure this matches develop
     # Enable subtile-based kernel implementation for MX FP4 (gfx950 only).
     # When True, uses a subtile scheduling strategy with DTL global reads and
     # an optimized storeD path. Automatically forced False on non-gfx950.
+    "RMSEpilogue": [False, True],
     "PartialRMS": [False, True],
     "PartialRMSQuant": [False, True],
     "PartialRMSResidualAdd": [False, True],
@@ -559,7 +560,6 @@ validParameters = { # we need to make sure this matches develop
     "DQuantType": ["None", "Tile", "MXFP8"],
     "DQuantSize0": -1,  # Scalar; -1/0 = whole MacroTile0. Real validation in _resolveDQuantSize.
     "DQuantSize1": -1,  # Scalar; -1/0 = whole MacroTile1. Real validation in _resolveDQuantSize.
-    "MegaFusedEpilogue": [False, True],
     "UseDeepseekScaleA": [False, True],
     "UseDeepseekScaleB": [False, True],
     "DeepseekScaleAq0": list(range(1, 1025)),

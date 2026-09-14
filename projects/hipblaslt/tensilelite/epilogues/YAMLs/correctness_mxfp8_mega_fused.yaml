@@ -1,14 +1,14 @@
 # Copyright Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier: MIT
 #
-# Correctness config for the single-pass MegaFusedEpilogue on the MXFP8 dynamic-quant
-# path. Mirrors epilogues_mxfp8_k1.yaml (MX-scaled fp8 A/B in, OCP fp8 e4m3 D out,
-# f32 compute, residual add, bf16 ResidualOut) but selects the fused emitter via
-# UseMegaFusedEpilogue/MegaFusedEpilogue=True so the MegaFused MXFP8 code path gets
-# real CPU-validated correctness coverage (the benchmark configs do not validate it).
+# Correctness config for the RMSEpilogue on the MXFP8 dynamic-quant path.
+# Mirrors epilogues_mxfp8_k1.yaml (MX-scaled fp8 A/B in, OCP fp8 e4m3 D out,
+# f32 compute, residual add, bf16 ResidualOut) but with RMSEpilogue=True, giving
+# the RMSEpilogue MXFP8 code path real CPU-validated correctness coverage
+# (the benchmark configs do not validate it).
 #
 # Constraints (combined PartialRMS + MXFP8 mode): DestDataType=F8, UseBeta=False,
-# MXFP8Quant owns quantization (PartialRMSQuant=False), MT0%64==0, WG0<=2,
+# PartialRMSQuant=True selects the MXFP8 dynamic-quant output path, MT0%64==0, WG0<=2,
 # DQuantSize0(=32) <= MT0/WG0, q1(=DQuantSize1=1) < mfmaN so subColQuant holds.
 #
 # Two WG2x2 tiles (MT0 in {256,384}, MT1=256) and two shapes: an even N_hidden
@@ -37,7 +37,7 @@ BenchmarkProblems:
 
   ########################################
   # MX-scaled fp8 in, OCP fp8 e4m3 out — PartialRMS + ResidualAdd + MXFP8 + StoreBf16D.
-  # Single-pass MegaFusedEpilogue (MegaFusedEpilogue=True). WG2x2, MT1=256.
+  # Single-pass RMSEpilogue (RMSEpilogue=True). WG2x2, MT1=256.
   ########################################
   -
     - # ProblemType — MX-scaled fp8 in, OCP fp8 e4m3 out, f32 compute, residual add, bf16 ResidualOut
@@ -60,11 +60,8 @@ BenchmarkProblems:
       UseScaleAlphaVec: 0
       UseScaleD: False
       Sparse: 0
-      UsePartialRMS: True
-      UseMegaFusedEpilogue: True
-      PartialRMSResidualAdd: True
-      PartialRMSStoreBf16D: True
-      PartialRMSQuant: False
+      UseRMSEpilogue: True
+      PartialRMSQuant: True
       DQuantType: MXFP8
 
     - InitialSolutionParameters:
@@ -74,11 +71,8 @@ BenchmarkProblems:
         - MatrixInstruction:
             - [16, 16, 128, 1, 1,  8,  8, 2, 2]  # MT0=256 MT1=256: mmaN=8 -> two streamGroups/qi
             - [16, 16, 128, 1, 1,  6,  4, 2, 2]  # MT0=192 MT1=128: mmaN=4 -> one streamGroup/qi
-        - PartialRMS: [True]
-        - PartialRMSResidualAdd: [True]
-        - PartialRMSQuant: [False]
-        - PartialRMSStoreBf16D: [True]
-        - MegaFusedEpilogue: [True]
+        - RMSEpilogue: [True]
+        - PartialRMSQuant: [True]
         - DQuantType: [MXFP8]
         - DQuantSize0: [32]
         - DQuantSize1: [1]

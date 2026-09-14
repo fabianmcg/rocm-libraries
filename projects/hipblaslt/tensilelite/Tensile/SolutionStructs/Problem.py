@@ -426,7 +426,7 @@ _defaultProblemType = {
     "UseBeta": True,  # =True use beta parameter (asm will check for B=0 and optimize the write for that), =False don't use beta parameter
     "UseE": False,  # =True use output E to output gemm results before activation
     "UsePartialRMS":         False,
-    "UseMegaFusedEpilogue":  False,
+    "UseRMSEpilogue":        False,
     "PartialRMSResidualAdd": False,
     "PartialRMSQuant":       False,
     "PartialRMSStoreBf16D":  False,
@@ -866,6 +866,13 @@ class ProblemType(Mapping):
         srcFile=srcFile,
         raiseOnMismatch=raiseOnTypeMismatch,
     )
+
+    # Derive internal ProblemType flags from UseRMSEpilogue; the split keys remain as
+    # internal derived state that downstream code (Contractions, predicates) reads.
+    if self.state.get("UseRMSEpilogue", False):
+      self.state["UsePartialRMS"]         = True
+      self.state["PartialRMSResidualAdd"] = True
+      self.state["PartialRMSStoreBf16D"]  = True
 
     # adjusting all data types
     if "DataType" in config:
@@ -1369,8 +1376,8 @@ class ProblemType(Mapping):
         name.append("RA")
       if self["PartialRMSQuant"]:
         name.append("Q")
-    if self["UseMegaFusedEpilogue"]:
-      name.append("MFE")
+    if self["UseRMSEpilogue"]:
+      name.append("RMSE")
     if self["Sparse"]:
       if self["Sparse"] == 2:
         name.append("SPBML%d"%(self["MetadataLayout"]))

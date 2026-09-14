@@ -7,7 +7,9 @@ import pytest
 pytestmark = pytest.mark.unit
 
 from Tensile.Common.DataType import DataType
-from Tensile.SolutionStructs.Solution import _validatePartialRMS, _validateTileQuant
+from Tensile.SolutionStructs.Solution import (
+    _validatePartialRMS, _validateTileQuant, _validateRMSEpilogue,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -231,3 +233,62 @@ def test_tilequant_reject_subrow_q1_below_mfma_n():
     state = _makeTileQuantState(1, 8)
     _validateTileQuant(state, False)
     assert not state["Valid"]
+
+
+# ---------------------------------------------------------------------------
+# _validateRMSEpilogue tests
+# ---------------------------------------------------------------------------
+
+def _makeRMSEpilogueState(dest="B", quant=False, dquant="None", mi=16):
+    return {
+        "RMSEpilogue": True,
+        "PartialRMS": True,
+        "PartialRMSQuant": quant,
+        "MatrixInstM": mi,
+        "MatrixInstN": 16,
+        "DQuantType": dquant,
+        "_DQuantSize0": 32,
+        "_DQuantSize1": 1,
+        "ProblemType": {
+            "DestDataType": DataType(dest),
+            "HighPrecisionAccumulate": True,
+        },
+        "Valid": True,
+    }
+
+
+def test_rmsepilogue_mi16x16_accepted():
+    state = _makeRMSEpilogueState(dest="B", quant=False, mi=16)
+    _validateRMSEpilogue(state, False)
+    assert state.get("Valid") is True
+
+
+def test_rmsepilogue_wrong_mi_rejected():
+    state = _makeRMSEpilogueState(dest="B", quant=False, mi=32)
+    _validateRMSEpilogue(state, False)
+    assert state.get("Valid") is False
+
+
+def test_partialrmsquant_without_rmsepilogue_rejected():
+    state = _makeRMSEpilogueState(dest="F8", quant=True, dquant="MXFP8", mi=16)
+    state["RMSEpilogue"] = False
+    _validateRMSEpilogue(state, False)
+    assert state.get("Valid") is False
+
+
+def test_rmsepilogue_mxfp8_quant_accepted():
+    state = _makeRMSEpilogueState(dest="F8", quant=True, dquant="MXFP8", mi=16)
+    _validateRMSEpilogue(state, False)
+    assert state.get("Valid") is True
+
+
+def test_rmsepilogue_quant_non_fp8_dest_rejected():
+    state = _makeRMSEpilogueState(dest="B", quant=True, dquant="MXFP8", mi=16)
+    _validateRMSEpilogue(state, False)
+    assert state.get("Valid") is False
+
+
+def test_rmsepilogue_quant_wrong_dquanttype_rejected():
+    state = _makeRMSEpilogueState(dest="F8", quant=True, dquant="Tile", mi=16)
+    _validateRMSEpilogue(state, False)
+    assert state.get("Valid") is False

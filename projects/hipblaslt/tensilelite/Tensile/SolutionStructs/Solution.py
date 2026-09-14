@@ -319,6 +319,20 @@ def _resolvePartialRMSSideType(state, printRejectionReason, key, mustValidate):
   return True
 
 
+def _expandRMSEpilogue(state):
+  """Expand the public RMSEpilogue knob into the internal derived solution keys.
+
+  RMSEpilogue is the single user-facing epilogue knob; the split PartialRMS /
+  ResidualAdd / StoreBf16D keys remain as internal derived state (frozen C++ ABI)
+  and are force-set here so downstream codegen and serialization are unchanged.
+  """
+  if not state.get("RMSEpilogue", False):
+    return
+  state["PartialRMS"]            = True
+  state["PartialRMSResidualAdd"] = True
+  state["PartialRMSStoreBf16D"]  = True
+
+
 def _validatePartialRMS(state, printRejectionReason):
   """Validate PartialRMS fused epilogue constraints.
 
@@ -418,9 +432,7 @@ def _validatePartialRMS(state, printRejectionReason):
              "PartialRMS cross-wave reduction requires MIWaveGroup[0] power of two")
       return
     mma_n = (state["MacroTile1"] // mfma_n) // wg[1]
-    # Quant mode reduces two arrays (Σx² and amax) jointly in one LDS pass, so its
-    # scratch is twice as wide per lane slot.
-    numArrays = 2 if state.get("PartialRMSQuant", False) else 1
+    numArrays = 1  # RMS reduction is single-array; MegaFused owns MXFP8 amax.
     ldsBytes = numArrays * wg[0] * wg[1] * state["WavefrontSize"] * mma_n * 4
     if state["MaxLDS"] > 0 and ldsBytes > state["MaxLDS"]:
       reject(state, printRejectionReason,
@@ -529,10 +541,6 @@ def _validatePartialRMSMXFP8Combo(state, printRejectionReason):
   """
   if not (state.get("PartialRMS", False) and state.get("DQuantType", "None") == "MXFP8"):
     return
-  if state.get("PartialRMSQuant", False):
-    reject(state, printRejectionReason,
-           "combined PartialRMS+MXFP8Quant mode: PartialRMSQuant must be False (MXFP8Quant owns quantization)")
-    return
   if not state["ProblemType"]["DestDataType"].isFloat8():
     reject(state, printRejectionReason,
            "combined PartialRMS+MXFP8Quant mode requires DestDataType=F8 (fp8 e4m3 D output)")
@@ -543,43 +551,43 @@ def _validatePartialRMSMXFP8Combo(state, printRejectionReason):
     return
 
 
-def _validateMegaFusedEpilogue(state, printRejectionReason):
-  """Validate MegaFusedEpilogue — fused PartialRMS+ResidualAdd with optional MXFP8.
+def _validateRMSEpilogue(state, printRejectionReason):
+  """Validate the RMSEpilogue fused epilogue (always routed through MegaFused).
 
-  Called after the individual sub-validators so that _DQuantSize0/_DQuantSize1
-  are already resolved. The PartialRMS+ResidualAdd+StoreBf16D triad and MI 16x16
-  geometry are always required; the MXFP8 quantization preconditions are only
-  enforced when DQuantType=MXFP8, so the bf16-output (no-quant) mode is supported.
+  RMSEpilogue expands to PartialRMS + ResidualAdd + StoreBf16D and requires
+  MI 16x16. PartialRMSQuant selects the MXFP8 dynamic-quant output path and
+  requires the MXFP8 preconditions.
   """
-  if not state.get("MegaFusedEpilogue", False):
+  quant = state.get("PartialRMSQuant", False)
+  # PartialRMS-family keys are internal; they may only be enabled via RMSEpilogue.
+  if state.get("PartialRMS", False) and not state.get("RMSEpilogue", False):
+    reject(state, printRejectionReason,
+           "PartialRMS is internal derived state; enable RMSEpilogue instead")
     return
-  if not state.get("PartialRMS", False):
-    reject(state, printRejectionReason, "megaFusedEpilogue requires PartialRMS=True")
+  if quant and not state.get("RMSEpilogue", False):
+    reject(state, printRejectionReason, "PartialRMSQuant requires RMSEpilogue=True")
     return
-  if not state.get("PartialRMSResidualAdd", False):
-    reject(state, printRejectionReason, "megaFusedEpilogue requires PartialRMSResidualAdd=True")
-    return
-  if not state.get("PartialRMSStoreBf16D", False):
-    reject(state, printRejectionReason, "megaFusedEpilogue requires PartialRMSStoreBf16D=True")
+  if not state.get("RMSEpilogue", False):
     return
   if not (state.get("MatrixInstM") == 16 and state.get("MatrixInstN") == 16):
-    reject(state, printRejectionReason, "megaFusedEpilogue requires MatrixInst 16x16")
+    reject(state, printRejectionReason, "RMSEpilogue requires MatrixInst 16x16")
     return
-  # MXFP8 quantization preconditions apply only when dynamic quant is requested;
-  # without it the fused epilogue emits the bf16-output path.
-  if state.get("DQuantType", "None") != "MXFP8":
-    return
-  if state.get("_DQuantSize0") != 32:
-    reject(state, printRejectionReason, "megaFusedEpilogue MXFP8 requires _DQuantSize0=32")
-    return
-  if state.get("_DQuantSize1") != 1:
-    reject(state, printRejectionReason, "megaFusedEpilogue MXFP8 requires _DQuantSize1=1")
+  if not quant:
     return
   if not state["ProblemType"]["DestDataType"].isFloat8():
-    reject(state, printRejectionReason, "megaFusedEpilogue MXFP8 requires DestDataType=F8")
+    reject(state, printRejectionReason, "PartialRMSQuant requires DestDataType=F8")
     return
   if not state["ProblemType"]["HighPrecisionAccumulate"]:
-    reject(state, printRejectionReason, "megaFusedEpilogue MXFP8 requires HighPrecisionAccumulate=True")
+    reject(state, printRejectionReason, "PartialRMSQuant requires HighPrecisionAccumulate=True")
+    return
+  if state.get("DQuantType", "None") != "MXFP8":
+    reject(state, printRejectionReason, "PartialRMSQuant requires DQuantType=MXFP8")
+    return
+  if state.get("_DQuantSize0") != 32:
+    reject(state, printRejectionReason, "PartialRMSQuant requires _DQuantSize0=32")
+    return
+  if state.get("_DQuantSize1") != 1:
+    reject(state, printRejectionReason, "PartialRMSQuant requires _DQuantSize1=1")
     return
 
 
@@ -1762,6 +1770,8 @@ class Solution(collections.abc.Mapping):
       reject(state, printRejectionReason,
               "Currently ClusterDim = 16x1 and 1x16 are not supported")
 
+    _expandRMSEpilogue(state)
+
     _validatePartialRMS(state, printRejectionReason)
     if not state["Valid"]:
       return
@@ -1778,10 +1788,9 @@ class Solution(collections.abc.Mapping):
     if not state["Valid"]:
       return
 
-    if state.get("MegaFusedEpilogue", False):
-      _validateMegaFusedEpilogue(state, printRejectionReason)
-      if not state["Valid"]:
-        return
+    _validateRMSEpilogue(state, printRejectionReason)
+    if not state["Valid"]:
+      return
 
     if state.get("UseDeepseekScaleA", False) or state.get("UseDeepseekScaleB", False):
       _validateDeepseekScale(state, printRejectionReason)
@@ -6543,9 +6552,7 @@ class Solution(collections.abc.Mapping):
       # into the per-lane partial sums before the LDS stage, so it must not
       # appear here. This mirrors the early check in _validatePartialRMS.
       mma_n_prms         = (state["MacroTile1"] // state["MatrixInstN"]) // wg[1]
-      # Quant mode fuses Σx² and amax into one cross-wave pass, doubling the per-lane
-      # slot width; keep this in sync with SubtilePartialRMSEmit._crossWaveReduceFree0.
-      numArrays          = 2 if state.get("PartialRMSQuant", False) else 1
+      numArrays          = 1  # RMS reduction is single-array; MegaFused owns MXFP8 amax.
       partialRMSLdsBytes = numArrays * wg[0] * wg[1] * state["WavefrontSize"] * mma_n_prms * 4
       state["LdsNumBytes"] = max(state["LdsNumBytes"], partialRMSLdsBytes)
 

@@ -163,7 +163,9 @@ class SubtilePartialRMSEmitter:
 
         # laneSGPRCount: 1 for wave32, 2 for wave64.
         self.lane_sgpr_count = writer.states.laneSGPRCount
-        self.quant = bool(kernel.get("PartialRMSQuant", False))
+        # The standalone amax-second-half quant path is retired with the split dispatch;
+        # MegaFused owns MXFP8 amax, so this sub-emitter never runs the quant reduction.
+        self.quant = False
 
         dt = kernel["ProblemType"]["DataType"]
         # Quant output type selects the fp8 max used to scale amax (see _quantOutMax).
