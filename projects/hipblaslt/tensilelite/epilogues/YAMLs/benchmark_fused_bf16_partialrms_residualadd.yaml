@@ -103,6 +103,67 @@ BenchmarkProblems:
       UseScaleAlphaVec: 0
       UseScaleD: False
       Sparse: 0
+      UsePartialRMS: True
+      UseMegaFusedEpilogue: True
+      PartialRMSResidualAdd: True
+      PartialRMSStoreBf16D: True
+      PartialRMSQuant: False
+
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+            - [16, 16, 32, 1,  1, 12, 8, 4, 1]  # MT 384x256 (winner)
+            - [16, 16, 32, 1, 1, 10, 10, 4, 1] # MT0=320  MT1=320
+            - [16, 16, 32, 1, 1, 8, 8, 4, 1]   # MT0=256  MT1=256
+            - [16, 16, 32, 1, 1, 6, 6, 4, 1]   # MT0=192  256=192
+        - PartialRMS: [True]
+        - PartialRMSResidualAdd: [True]
+        - PartialRMSStoreBf16D: [True]
+        - PartialRMSQuant: [False]
+        - MegaFusedEpilogue: [True]
+        - StreamK: [3]
+        - StreamKForceDPOnly: [1]
+        - StreamKAtomic: [0]
+        - GlobalSplitU: [1]
+        - ScheduleIterAlg: [3]
+        - PrefetchGlobalRead: [2]
+        - PrefetchAcrossPersistent: [0]
+        - DirectToLds: [1]
+        - UseSubtileImpl: [True]
+        - StaggerU: [0]
+        - DepthU: [64]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - PreloadKernArgs: [False]
+        - 1LDSBuffer: [0]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+            - Exact: [8192, 8192, 1, 8192]
+  -
+    -
+      OperationType: GEMM
+      DataType: b
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: True
+      TransposeB: False
+      UseBeta: False
+      Batched: True
+      StridedBatched: True
+      GroupedGemm: False
+      UseBias: 0
+      UseScaleAB: ""
+      UseScaleCD: False
+      UseScaleAlphaVec: 0
+      UseScaleD: False
+      Sparse: 0
 
     - InitialSolutionParameters:
       BenchmarkCommonParameters:
