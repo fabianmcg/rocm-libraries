@@ -1861,10 +1861,22 @@ namespace
         RocblasltFusedEpilogueInfo fInfo;
         // Both the full RMSNorm flow and the decomposed producer (partial stats) run the K1
         // PartialRMS GEMM, which reduces over free0 -> the problem must be transposed so
-        // free0 = N_hidden. The decomposed consumer (scale-apply / K3) does NOT reduce and
-        // keeps the normal orientation, so it is excluded here.
+        // free0 = N_hidden. The decomposed consumer (scale-apply / K3) does not reduce, so it is
+        // excluded here; its own operand swap is handled by transposeForScaleApply.
         return rocblaslt_resolve_fused_epilogue(p.fused_epilogue, fInfo)
                && (fInfo.hasRMSNorm || fInfo.hasPartialRMSStats);
+    }
+
+    // The decomposed consumer (K3, RMSNorm scale-apply) is issued by the caller as a normal TN
+    // GEMM whose per-token rstd is indexed by the M rows. To scale through the N-direction
+    // ScaleAlphaVec (UseScaleAlphaVec=2), the token axis must land on free1 (N), so K3 computes
+    // the transposed GEMM via transposeForScaleApply (swap A/B, flip transposes, swap m<->n, and
+    // take the transposed view of the same C/D buffer). Mutually exclusive with the K1 path above.
+    static bool scaleApplyNeedsTranspose(const RocblasltContractionProblem& p)
+    {
+        RocblasltFusedEpilogueInfo fInfo;
+        return rocblaslt_resolve_fused_epilogue(p.fused_epilogue, fInfo)
+               && fInfo.hasRMSNormScaleApply;
     }
 
     static bool partialRMSFullRequant(const RocblasltContractionProblem& p)
@@ -1918,12 +1930,46 @@ namespace
         return t;
     }
 
+    // K3 (RMSNorm scale-apply) transpose: compute D^T = op(B)^T * op(A)^T so the token axis lands
+    // on free1 (N). Swap A/B operands and flip both transposes (TN stays TN); swap m<->n; and take
+    // the transposed view of the SAME C/D buffer by swapping each tensor's row/col strides, which
+    // keeps the output in the caller's [M, N] layout (unlike the K1 PartialRMS re-layout).
+    static RocblasltContractionProblem transposeForScaleApply(const RocblasltContractionProblem& p)
+    {
+        RocblasltContractionProblem t = p; // copy scalars, epilogue, workspace, scale ptr, etc.
+        t.trans_a = flipTransOp(p.trans_b);
+        t.trans_b = flipTransOp(p.trans_a);
+        t.m       = p.n; // free0 <- N_out
+        t.n       = p.m; // free1 <- M (tokens); the N-direction rstd now scales per token.
+
+        // A <- original B
+        t.a_type = p.b_type;   t.A = p.B;   t.batch_A = p.batch_B;
+        t.row_stride_a = p.row_stride_b; t.col_stride_a = p.col_stride_b;
+        t.batch_stride_a = p.batch_stride_b;
+        t.scaleA = p.scaleB; t.scaleAType = p.scaleBType; t.swizzleA = p.swizzleB;
+        // B <- original A
+        t.b_type = p.a_type;   t.B = p.A;   t.batch_B = p.batch_A;
+        t.row_stride_b = p.row_stride_a; t.col_stride_b = p.col_stride_a;
+        t.batch_stride_b = p.batch_stride_a;
+        t.scaleB = p.scaleA; t.scaleBType = p.scaleAType; t.swizzleB = p.swizzleA;
+
+        // Transposed view of the same C/D buffer: swap row/col strides so the output stays in the
+        // caller's [M, N] layout.
+        t.row_stride_c = p.col_stride_c; t.col_stride_c = p.row_stride_c;
+        t.row_stride_d = p.col_stride_d; t.col_stride_d = p.row_stride_d;
+        return t;
+    }
+
     auto ConstructTensileProblem(const RocblasltContractionProblem& probIn)
     {
-        // Fused RMSNorm: transpose so free0 = N_hidden (see transposeForPartialRMS).
-        const bool _prmsSwap = partialRMSNeedsTranspose(probIn);
+        // Fused RMSNorm: K1 transposes so free0 = N_hidden (transposeForPartialRMS); K3 swaps its
+        // A/B operands so the token axis lands on free1 (transposeForScaleApply).
+        const bool _prmsSwap       = partialRMSNeedsTranspose(probIn);
+        const bool _scaleApplySwap = scaleApplyNeedsTranspose(probIn);
         RocblasltContractionProblem probStorage
-            = _prmsSwap ? transposeForPartialRMS(probIn) : probIn;
+            = _prmsSwap       ? transposeForPartialRMS(probIn)
+              : _scaleApplySwap ? transposeForScaleApply(probIn)
+                                : probIn;
         const RocblasltContractionProblem& prob = probStorage;
 
         auto a_type       = hipDataType_to_tensile_type(prob.a_type);
@@ -2232,14 +2278,16 @@ namespace
                 tensileProblem.setUsePartialRMS(true);
                 tensileProblem.setPartialRMSResidualAdd(fusedInfo.hasResidualAdd);
             }
-            // Decomposed consumer (Kernel 3 RstdScale): apply the per-row rstd to GEMM2's
-            // output via ScaleAlphaVec. Normal orientation (per-M-row scale, no reduction),
-            // so no transpose. Re-issue setScaleAlphaVec after enabling the flag because the
-            // earlier setScaleAlphaVec call ran while useScaleAlphaVec was still false.
+            // Decomposed consumer (Kernel 3 RstdScale): apply the per-token rstd to GEMM2's
+            // output via ScaleAlphaVec. transposeForScaleApply has swapped A/B and m<->n so the
+            // token axis is now free1 (N); the per-token rstd therefore runs along the N-direction.
+            // Use UseScaleAlphaVec=2 with the column-vector length d.sizes()[1] (= M tokens =
+            // rstd length). Re-issue setScaleAlphaVec after enabling the flag because the earlier
+            // setScaleAlphaVec call ran while useScaleAlphaVec was still false.
             if(fusedInfo.hasRMSNormScaleApply)
             {
-                tensileProblem.setUseScaleAlphaVec(1);
-                tensileProblem.setScaleAlphaVec(compute_type, d.sizes()[0]);
+                tensileProblem.setUseScaleAlphaVec(2);
+                tensileProblem.setScaleAlphaVec(compute_type, d.sizes()[1]);
             }
             // MX block-scale dequant: wire DQuantType::MXFP8 and the scale tensor dimensions.
             // The 32-element block runs along N_hidden, which is free0 only after the
@@ -2292,10 +2340,14 @@ namespace
     void updateTensileProblem(const RocblasltContractionProblem&   probIn,
                               TensileLite::ContractionProblemGemm& tensileProblem)
     {
-        // Fused RMSNorm: transpose so free0 = N_hidden (see transposeForPartialRMS).
-        const bool _prmsSwap = partialRMSNeedsTranspose(probIn);
+        // Fused RMSNorm: K1 transposes so free0 = N_hidden (transposeForPartialRMS); K3 swaps its
+        // A/B operands so the token axis lands on free1 (transposeForScaleApply).
+        const bool _prmsSwap       = partialRMSNeedsTranspose(probIn);
+        const bool _scaleApplySwap = scaleApplyNeedsTranspose(probIn);
         RocblasltContractionProblem probStorage
-            = _prmsSwap ? transposeForPartialRMS(probIn) : probIn;
+            = _prmsSwap       ? transposeForPartialRMS(probIn)
+              : _scaleApplySwap ? transposeForScaleApply(probIn)
+                                : probIn;
         const RocblasltContractionProblem& prob = probStorage;
 
         auto a_type       = hipDataType_to_tensile_type(prob.a_type);
@@ -2561,12 +2613,14 @@ namespace
                     tensileProblem.setPartialRMSResidualAdd(fusedInfo.hasResidualAdd);
                 }
                 // Decomposed consumer (Kernel 3 RstdScale): enable ScaleAlphaVec so selection
-                // routes to a per-row-scaling solution. Re-issue setScaleAlphaVec after enabling
-                // the flag (see the companion block in ConstructTensileProblem).
+                // routes to an N-direction (per-column) scaling solution. transposeForScaleApply
+                // has moved the token axis to free1 (N), so the per-token rstd runs along N. Use
+                // UseScaleAlphaVec=2 with the column-vector length d.sizes()[1] (= M tokens = rstd
+                // length). Re-issue setScaleAlphaVec after enabling (see ConstructTensileProblem).
                 if(fusedInfo.hasRMSNormScaleApply)
                 {
-                    tensileProblem.setUseScaleAlphaVec(1);
-                    tensileProblem.setScaleAlphaVec(compute_type, d.sizes()[0]);
+                    tensileProblem.setUseScaleAlphaVec(2);
+                    tensileProblem.setScaleAlphaVec(compute_type, d.sizes()[1]);
                 }
                 // MX block-scale dequant: refresh dimensions each call (same logic as
                 // ConstructTensileProblem) so selection sees the correct scale-tensor shape.
@@ -2669,11 +2723,14 @@ namespace
  ***************************************************************/
     auto GetTensileInputs(const RocblasltContractionProblem& probIn)
     {
-        // Fused RMSNorm: swap A/B pointers to match the transposed problem so the
-        // kernel receives operands consistent with free0 = N_hidden.
-        const bool _prmsSwap = partialRMSNeedsTranspose(probIn);
+        // Fused RMSNorm: swap A/B pointers to match the transposed problem. K1 (transposeForPartialRMS)
+        // arranges free0 = N_hidden; K3 (transposeForScaleApply) moves the token axis to free1.
+        const bool _prmsSwap       = partialRMSNeedsTranspose(probIn);
+        const bool _scaleApplySwap = scaleApplyNeedsTranspose(probIn);
         RocblasltContractionProblem probStorage
-            = _prmsSwap ? transposeForPartialRMS(probIn) : probIn;
+            = _prmsSwap       ? transposeForPartialRMS(probIn)
+              : _scaleApplySwap ? transposeForScaleApply(probIn)
+                                : probIn;
         const RocblasltContractionProblem& prob = probStorage;
 
         auto compute_type = roc2TensileType(prob.compute_type, false);
