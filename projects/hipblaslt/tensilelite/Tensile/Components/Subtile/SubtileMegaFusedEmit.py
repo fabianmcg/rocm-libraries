@@ -118,9 +118,9 @@ class SubtileMegaFusedEmitter:
     def __init__(self, writer, kernel):
         self.writer = writer
         self.kernel = kernel
-        # PartialRMSQuant is the public MXFP8 routing flag; DQuantType=MXFP8 stays set in
-        # the solution to keep the MXScale/DQuantSize/Signature machinery intact.
-        self.useMxfp8 = bool(kernel.get("PartialRMSQuant", False))
+        # MXFP8 quant is derived: RMSEpilogue active and D output is F8 (OCP e4m3).
+        self.useMxfp8 = (bool(kernel.get("RMSEpilogue", False))
+                         and kernel["ProblemType"]["DestDataType"].isFloat8())
 
         # ---- Residual/RMS shared geometry (snake_case) ----
         self.mfma_m = kernel["MatrixInstM"]
@@ -146,7 +146,7 @@ class SubtileMegaFusedEmitter:
         # Residual side input. RMSEpilogue is the single public knob and always fuses
         # residual-add plus the bf16 ResidualOut store (both forced on by
         # _expandRMSEpilogue), so they are unconditional here, not optional.
-        self.residualType = DataType(kernel.get("PartialRMSResidualType") or "b")
+        self.residualType = DataType(kernel.get("RMSEpilogueResidualType") or "b")
         self.residualBytes, self.residualLog2Bytes = self._sideBytes(self.residualType)
         # Wide residual load: fp8/bf8 packs 4 per dword, bf16 packs 4 per dwordx2.
         self.useWideResidual = ((self.rows_per_lane % 4 == 0)
@@ -155,7 +155,7 @@ class SubtileMegaFusedEmitter:
                                          and not self.residualType.isHalf())))
 
         # Gamma side input.
-        self.gammaType = DataType(kernel.get("PartialRMSGammaType") or "b")
+        self.gammaType = DataType(kernel.get("RMSEpilogueGammaType") or "b")
         self.gammaBytes, self.gammaLog2Bytes = self._sideBytes(self.gammaType)
         # Wide gamma load: bf16 packs 4 per dwordx2; fp8/bf8 packs 4 per dword.
         self.useWideGamma = (self.rows_per_lane % 4 == 0
@@ -173,8 +173,8 @@ class SubtileMegaFusedEmitter:
             self.mmaM = (kernel["MacroTile0"] // self.mfmaM) // self.wgM
             self.mmaN = (kernel["MacroTile1"] // self.mfmaN) // self.wgN
             self.macroTile1 = kernel["MacroTile1"]
-            self.q0 = kernel["_DQuantSize0"]
-            self.q1 = kernel["_DQuantSize1"]
+            self.q0 = 32  # MXFP8 block shape is always 32x1.
+            self.q1 = 1
             self.laneSgprCount = writer.states.laneSGPRCount
             self.nQTilesM = (self.mmaM * self.mfmaM) // self.q0
             # subCol quant (q1 < mfmaN) is the only MXFP8 mode megaFused emits; subRow

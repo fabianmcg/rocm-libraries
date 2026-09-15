@@ -8563,7 +8563,7 @@ class KernelWriterAssembly(KernelWriter):
       self.defineSgpr("SrdC", 4, 4)
       module.add(RegSet("s", "sgprSrdC", self.sgprs["SrdC"]))
       module.add(RegSet("s", "sgprSrdD", self.sgprs["SrdD"]))
-      if kernel["PartialRMSStoreBf16D"]:
+      if kernel["RMSEpilogue"]:
         if not kernel["ProblemType"]["UseBeta"]:
           # SrdC is unused when beta=0; alias SrdResidualOut to the same physical
           # SGPR range to avoid exceeding the 106-SGPR hardware limit.
@@ -14576,8 +14576,8 @@ class KernelWriterAssembly(KernelWriter):
     # print("len(elements)= ", len(elements_1))
     noGSUBranch = (kernel["GlobalSplitU"] == 0 and (not self.states.streamK.requiresWorkspaceReductionStorePath or kernel["StreamKForceDPOnly"]))
     module = Module("notLocalSplitUGlobalWrite")
-    # TileQuant and MXFP8Quant apply alpha and handle beta=0 in their epilogues.
-    ownsEpilogue = kernel.get("DQuantType", "None") != "None"
+    # The MXFP8 epilogue (RMSEpilogue + F8 dest) applies alpha and handles beta=0 itself.
+    ownsEpilogue = kernel["RMSEpilogue"] and kernel["ProblemType"]["DestDataType"].isFloat8()
     applyAlpha = not ownsEpilogue
     betas = [False] if ownsEpilogue else None
 

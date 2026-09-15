@@ -425,12 +425,7 @@ _defaultProblemType = {
     # in:f32, intermediate:xf32, out:f32. f32 = xf32(f32) * xf32(f32)
     "UseBeta": True,  # =True use beta parameter (asm will check for B=0 and optimize the write for that), =False don't use beta parameter
     "UseE": False,  # =True use output E to output gemm results before activation
-    "UsePartialRMS":         False,
     "UseRMSEpilogue":        False,
-    "PartialRMSResidualAdd": False,
-    "PartialRMSQuant":       False,
-    "PartialRMSStoreBf16D":  False,
-    "DQuantType":            "None",
     "UseDeepseekScaleA":     False,
     "UseDeepseekScaleB":     False,
     "DeepseekScaleAq0":      128,  # M-dimension quantization block size for scaleA
@@ -866,13 +861,6 @@ class ProblemType(Mapping):
         srcFile=srcFile,
         raiseOnMismatch=raiseOnTypeMismatch,
     )
-
-    # Derive internal ProblemType flags from UseRMSEpilogue; the split keys remain as
-    # internal derived state that downstream code (Contractions, predicates) reads.
-    if self.state.get("UseRMSEpilogue", False):
-      self.state["UsePartialRMS"]         = True
-      self.state["PartialRMSResidualAdd"] = True
-      self.state["PartialRMSStoreBf16D"]  = True
 
     # adjusting all data types
     if "DataType" in config:
@@ -1370,12 +1358,6 @@ class ProblemType(Mapping):
       name.append("AmaxD")
     if self["FusedGemmA2A"]:
       name.append("FusedA2A")
-    if self["UsePartialRMS"]:
-      name.append("PRMS")
-      if self["PartialRMSResidualAdd"]:
-        name.append("RA")
-      if self["PartialRMSQuant"]:
-        name.append("Q")
     if self["UseRMSEpilogue"]:
       name.append("RMSE")
     if self["Sparse"]:

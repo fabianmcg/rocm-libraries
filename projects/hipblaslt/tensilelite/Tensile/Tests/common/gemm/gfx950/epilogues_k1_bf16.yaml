@@ -1,17 +1,16 @@
 # Copyright Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier: MIT
 
-# RMSEpilogue + PartialRMSQuant + MXFP8 DynQuant 32x1 + bf16 ResidualOut (K1):
+# RMSEpilogue + MXFP8 DynQuant 32x1 + bf16 ResidualOut (K1):
 # comprehensive tile/prefetch coverage. UseRMSEpilogue=True selects the single
-# fused path (internally enables PartialRMS + ResidualAdd + StoreBf16D);
-# PartialRMSQuant=True + DQuantType=MXFP8 enables the MXFP8 dynamic-quant output.
-# Constraints: MT1==128, MT0%64==0, WG0<=2, DQuantSize0(=32) <= MT0/WG0.
+# fused path (always fuses residual-add + bf16 ResidualOut store). When
+# DestDataType is F8, the MXFP8 quant path is activated automatically (32x1 block).
+# Constraints: MT1==128, MT0%64==0, WG0<=2.
 # NumElementsToValidate enables in-pipeline correctness checking.
 #
-# The ProblemType sets UseRMSEpilogue: True (which internally enables PartialRMS +
-# ResidualAdd + StoreBf16D) and PartialRMSQuant: True + DQuantType: MXFP8 for the
-# fp8 output path. PartialRMSStoreBf16D and UsePartialRMSStoreBf16D are internal
-# derived state and must NOT be set in YAML.
+# The ProblemType sets UseRMSEpilogue: True for the fp8 output path; MXFP8
+# quant is derived from DestDataType=F8. Residual-add and bf16 residual-out
+# are implied by UseRMSEpilogue.
 #
 # The tile sweep spans three BenchmarkProblemSizeGroups under ONE ProblemType. They
 # MUST be sibling size groups, not separate outer BenchmarkProblems entries: each
@@ -55,8 +54,6 @@ BenchmarkProblems:
       UseScaleD: False
       Sparse: 0
       UseRMSEpilogue: True
-      PartialRMSQuant: True
-      DQuantType: MXFP8
 
     ########################################
     # Size group 1 (idx 00): WG 1x1 and WG 2x1 tiles.
@@ -84,10 +81,6 @@ BenchmarkProblems:
             # Larger tile (WG 2x1, MT0=320) — added coverage
             - [16, 16, 32, 1, 1, 10,  8, 2, 1]  # MT0=320  MT1=128
         - RMSEpilogue: [True]
-        - PartialRMSQuant: [True]
-        - DQuantType: [MXFP8]
-        - DQuantSize0: [32]
-        - DQuantSize1: [1]
         - StreamK: [3]
         - StreamKForceDPOnly: [0, 1]
         - StreamKAtomic: [0]
@@ -138,10 +131,6 @@ BenchmarkProblems:
             - [16, 16, 32, 1, 1, 12,  4, 2, 2]  # MT0=384  MT1=128 (WG 2x2)
             - [16, 16, 32, 1, 1, 20,  2, 1, 4]  # MT0=320  MT1=128 (WG 1x4)
         - RMSEpilogue: [True]
-        - PartialRMSQuant: [True]
-        - DQuantType: [MXFP8]
-        - DQuantSize0: [32]
-        - DQuantSize1: [1]
         - StreamK: [3]
         - StreamKForceDPOnly: [0, 1]
         - StreamKAtomic: [0]
@@ -182,10 +171,6 @@ BenchmarkProblems:
     #         # WG 2x2, MT1=320 (WG0=2, WG1=2, MIWT_N=10)
     #         # FAILS: VGPR overflow (occupancy limit, vgprs=275)
     #         # - [16, 16, 32, 1, 1, 10, 10, 2, 2]  # MT0=320  MT1=320
-    #     - PartialRMS: [True]
-    #     - PartialRMSResidualAdd: [True]
-    #     - PartialRMSQuant: [False]
-    #     - PartialRMSStoreBf16D: [True]
     #     - StreamK: [3]
     #     - StreamKForceDPOnly: [0, 1]
     #     - StreamKAtomic: [0]

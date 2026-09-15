@@ -7,9 +7,9 @@
 # the RMSEpilogue MXFP8 code path real CPU-validated correctness coverage
 # (the benchmark configs do not validate it).
 #
-# Constraints (combined PartialRMS + MXFP8 mode): DestDataType=F8, UseBeta=False,
-# PartialRMSQuant=True selects the MXFP8 dynamic-quant output path, MT0%64==0, WG0<=2,
-# DQuantSize0(=32) <= MT0/WG0, q1(=DQuantSize1=1) < mfmaN so subColQuant holds.
+# MXFP8 quant is derived from DestDataType=F8 + UseRMSEpilogue (block shape always 32x1).
+# Constraints: DestDataType=F8, UseBeta=False, MT0%64==0, WG0<=2,
+# q1(=1) < mfmaN so subColQuant holds.
 #
 # Two WG2x2 tiles (MT0 in {256,384}, MT1=256) and two shapes: an even N_hidden
 # (SizesFree0) and an odd N_hidden that straddles the bf16 ResidualOut pair-store
@@ -61,8 +61,6 @@ BenchmarkProblems:
       UseScaleD: False
       Sparse: 0
       UseRMSEpilogue: True
-      PartialRMSQuant: True
-      DQuantType: MXFP8
 
     - InitialSolutionParameters:
       BenchmarkCommonParameters:
@@ -72,10 +70,6 @@ BenchmarkProblems:
             - [16, 16, 128, 1, 1,  8,  8, 2, 2]  # MT0=256 MT1=256: mmaN=8 -> two streamGroups/qi
             - [16, 16, 128, 1, 1,  6,  4, 2, 2]  # MT0=192 MT1=128: mmaN=4 -> one streamGroup/qi
         - RMSEpilogue: [True]
-        - PartialRMSQuant: [True]
-        - DQuantType: [MXFP8]
-        - DQuantSize0: [32]
-        - DQuantSize1: [1]
         - StreamK: [3]
         - StreamKForceDPOnly: [1]
         - StreamKAtomic: [0]

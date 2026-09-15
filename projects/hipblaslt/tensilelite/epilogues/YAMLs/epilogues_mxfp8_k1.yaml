@@ -4,11 +4,11 @@
 # PartialRMS + ResidualAdd + MXFP8 DynQuant 32x1 + bf16 ResidualOut store (K1),
 # MX-scaled fp8 input path. Combines MX-scaled fp8 A/B (MXBlockA=32, MXBlockB=32)
 # with the RMSEpilogue path: UseRMSEpilogue=True enables the fused PartialRMS +
-# ResidualAdd + StoreBf16D path; PartialRMSQuant=True selects MXFP8 dynamic-quant
-# output (OCP fp8 e4m3 to D). Constraints (combined PartialRMS + MXFP8 mode):
-# DestDataType=F8, UseBeta=False, PartialRMSQuant=True selects the MXFP8 output path,
+# ResidualAdd + StoreBf16D path. MXFP8 quant (OCP fp8 e4m3 to D) is derived
+# automatically when DestDataType=F8 (block shape always 32x1).
+# Constraints: DestDataType=F8, UseBeta=False,
 # MT1 a multiple of 64 (MT1==128 for groups 1-2; MT1==256 for group 3),
-# MT0%64==0, WG0<=2, DQuantSize0(=32) <= MT0/WG0. Realistic LLM-inference shapes.
+# MT0%64==0, WG0<=2. Realistic LLM-inference shapes.
 #
 # Three BenchmarkProblemSizeGroups under one ProblemType (ClientWriter enforces
 # uniform MT1 per benchmark pass; sibling groups get distinct idx so results files
@@ -78,8 +78,6 @@ BenchmarkProblems:
       UseScaleD: False
       Sparse: 0
       UseRMSEpilogue: True
-      PartialRMSQuant: True
-      DQuantType: MXFP8
 
     - InitialSolutionParameters:
       BenchmarkCommonParameters:
@@ -122,10 +120,7 @@ BenchmarkProblems:
             # WG 2x2, MT0=320, MT1=256 — added coverage
             - [16, 16, 128, 1, 1, 10,  8, 2, 2]  # MT0=320  MT1=256
         - RMSEpilogue: [True]
-        - PartialRMSQuant: [True]
-        - DQuantType: [MXFP8]
-        - DQuantSize0: [32]
-        - DQuantSize1: [1]
+
         - StreamK: [3]
         - StreamKForceDPOnly: [1]
         - StreamKAtomic: [0]

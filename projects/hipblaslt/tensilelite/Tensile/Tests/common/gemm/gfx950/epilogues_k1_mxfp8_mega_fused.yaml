@@ -50,8 +50,6 @@ BenchmarkProblems:
       UseScaleD: False
       Sparse: 0
       UseRMSEpilogue: True
-      PartialRMSQuant: True
-      DQuantType: MXFP8
 
     - InitialSolutionParameters:
       BenchmarkCommonParameters:
@@ -65,10 +63,6 @@ BenchmarkProblems:
             # WG 2x2 (WG0=2, WG1=2, MIWT_N=4)
             - [16, 16, 128, 1, 1,  4,  4, 2, 2]  # MT0=128  MT1=128
         - RMSEpilogue: [True]
-        - PartialRMSQuant: [True]
-        - DQuantType: [MXFP8]
-        - DQuantSize0: [32]
-        - DQuantSize1: [1]
         - StreamK: [3]
         - StreamKForceDPOnly: [1]
         - StreamKAtomic: [0]
