@@ -2000,13 +2000,14 @@ namespace
         assignAlphaBeta(compute_type, a_type, prob.alpha, prob.beta, &alpha, &beta);
         auto k = prob.k && alpha ? prob.k : 0;
 
-        // All PartialRMS producer (K1) solutions are compiled with UseBeta=False
-        // (BetaZero=True). The BetaZero predicate requires m_beta==0.0 in the
-        // Tensile problem. Heuristic paths default to beta=1.0, so override here.
+        // All PartialRMS producer (K1) and RMSNorm scale-apply consumer (K3) solutions are
+        // compiled with UseBeta=False (BetaZero=True). The BetaZero predicate requires
+        // m_beta==0.0 in the Tensile problem. Heuristic paths default to beta=1.0, so override
+        // here. K3 applies D = scaleAlphaVec (alpha*A*B) with no beta*C term, so beta is always 0.
         {
             RocblasltFusedEpilogueInfo mxInfo;
             if(rocblaslt_resolve_fused_epilogue(prob.fused_epilogue, mxInfo)
-               && (mxInfo.hasRMSNorm || mxInfo.hasPartialRMSStats
+               && (mxInfo.hasRMSNorm || mxInfo.hasPartialRMSStats || mxInfo.hasRMSNormScaleApply
                    || (mxInfo.hasRequant
                        && mxInfo.requantGranularity == HIPBLASLT_REQUANT_SCALE_PER_BLOCK_MX)))
                 beta = 0.0;
@@ -2438,13 +2439,14 @@ namespace
         double alpha = 0, beta = 0;
         assignAlphaBeta(compute_type, a_type, prob.alpha, prob.beta, &alpha, &beta);
 
-        // All PartialRMS producer (K1) solutions are compiled with UseBeta=False
-        // (BetaZero=True). The BetaZero predicate requires m_beta==0.0 in the
-        // Tensile problem. Heuristic paths default to beta=1.0, so override here.
+        // All PartialRMS producer (K1) and RMSNorm scale-apply consumer (K3) solutions are
+        // compiled with UseBeta=False (BetaZero=True). The BetaZero predicate requires
+        // m_beta==0.0 in the Tensile problem. Heuristic paths default to beta=1.0, so override
+        // here. K3 applies D = scaleAlphaVec (alpha*A*B) with no beta*C term, so beta is always 0.
         {
             RocblasltFusedEpilogueInfo mxInfo;
             if(rocblaslt_resolve_fused_epilogue(probIn.fused_epilogue, mxInfo)
-               && (mxInfo.hasRMSNorm || mxInfo.hasPartialRMSStats
+               && (mxInfo.hasRMSNorm || mxInfo.hasPartialRMSStats || mxInfo.hasRMSNormScaleApply
                    || (mxInfo.hasRequant
                        && mxInfo.requantGranularity == HIPBLASLT_REQUANT_SCALE_PER_BLOCK_MX)))
                 beta = 0.0;

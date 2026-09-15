@@ -79,6 +79,7 @@ BenchmarkProblems:
       BenchmarkFinalParameters:
         - ProblemSizes:
             - Exact: [16384, 2048, 1, 2048]
+            - Exact: [64, 256, 1, 2048]
 
 LibraryLogic:
   ScheduleName: "alphavec2_sweep_mxfp8_k1"

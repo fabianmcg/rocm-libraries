@@ -100,6 +100,8 @@ BenchmarkProblems:
       BenchmarkFinalParameters:
         - ProblemSizes:
             - Exact: [16384, 2048, 1, 2048]
+            - Exact: [64, 256, 1, 64]
+            - Exact: [64, 1024, 1, 1024]
 
   ########## GROUP 2: UseScaleAlphaVec=1 (M-direction, old/wrong K3) ##########
   -
