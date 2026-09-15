@@ -1931,9 +1931,10 @@ namespace
     }
 
     // K3 (RMSNorm scale-apply) transpose: compute D^T = op(B)^T * op(A)^T so the token axis lands
-    // on free1 (N). Swap A/B operands and flip both transposes (TN stays TN); swap m<->n; and take
-    // the transposed view of the SAME C/D buffer by swapping each tensor's row/col strides, which
-    // keeps the output in the caller's [M, N] layout (unlike the K1 PartialRMS re-layout).
+    // on free1 (N). Swap A/B operands and flip both transposes (TN stays TN); swap m<->n; and use
+    // natural col-major strides for the swapped [N_out, M_tokens] shape (free0 contiguous, ld =
+    // N_out). The output is row-major [M, N_out]; the consumer path reads it in that transposed
+    // layout.
     static RocblasltContractionProblem transposeForScaleApply(const RocblasltContractionProblem& p)
     {
         RocblasltContractionProblem t = p; // copy scalars, epilogue, workspace, scale ptr, etc.
@@ -1953,10 +1954,13 @@ namespace
         t.batch_stride_b = p.batch_stride_a;
         t.scaleB = p.scaleA; t.scaleBType = p.scaleAType; t.swizzleB = p.swizzleA;
 
-        // Transposed view of the same C/D buffer: swap row/col strides so the output stays in the
-        // caller's [M, N] layout.
-        t.row_stride_c = p.col_stride_c; t.col_stride_c = p.row_stride_c;
-        t.row_stride_d = p.col_stride_d; t.col_stride_d = p.row_stride_d;
+        // Natural col-major output for the swapped [N_out, M_tokens] shape: free0 (N_out) is
+        // contiguous (stride 1), free1 (M tokens) has ld = N_out (= p.n). Tensile stores col-major
+        // with a unit free0 stride, so a non-unit free0 stride garbles the output. The result is
+        // the transpose of the caller's [M, N] buffer (row-major [M, N_out]); the fused-RMSNorm
+        // consumer path and its reference consume it in that transposed layout.
+        t.row_stride_c = 1; t.col_stride_c = p.n;
+        t.row_stride_d = 1; t.col_stride_d = p.n;
         return t;
     }
 
