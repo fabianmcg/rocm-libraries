@@ -603,10 +603,15 @@ class SubtileMegaFusedEmitter:
 
 
     def _endResidualScratch(self, module) -> None:
-        """Wait for pending ResidualOut stores and free residual scratch registers."""
-        module.addComment1("MF begin _endResidualScratch: drain ResidualOut stores, free scratch registers.")
+        """Drain all pending epilogue stores and free residual scratch registers.
+
+        This vscnt=0 is the sole teardown store drain (vmcnt(0) on gfx950, a global
+        load/store drain): it fences both the ResidualOut bf16 stores and, for MXFP8,
+        the MXScale stores before the cross-wave reduction that follows.
+        """
+        module.addComment1("MF begin _endResidualScratch: drain all epilogue stores, free scratch registers.")
         writer = self.writer
-        module.add(SWaitCnt(vscnt=0, comment="wait ResidualOut bf16 stores."))
+        module.add(SWaitCnt(vscnt=0, comment="drain ResidualOut (and MXScale for MXFP8) stores before cross-wave reduce."))
         writer.sgprPool.checkIn(self.resOobMask)
         writer.vgprPool.checkIn(self.resOobV)
         writer.vgprPool.checkIn(self.resAddr)
@@ -1854,12 +1859,14 @@ class SubtileMegaFusedEmitter:
 
 
     def _emitTeardown(self, module) -> None:
-        """End stream context and drain stores; still fences the cross-wave LDS+barrier phase that follows."""
+        """End stream context and drain stores; still fences the cross-wave LDS+barrier phase that follows.
+
+        The single store drain is emitted by _endResidualScratch (called below); _endStreamContext
+        only returns registers and emits no stores, so no separate drain is needed here.
+        """
         module.addComment1("MF begin _emitTeardown: drain stores, free residual scratch.")
         if self.useMxfp8:
             self._endStreamContext()
-        # One vscnt=0 drains both MXScale stores (from _subColStoreGroup) and ResidualOut stores.
-        module.add(SWaitCnt(vscnt=0, comment="drain MXScale and ResidualOut stores."))
         self._endResidualScratch(module)
         module.addComment1("MF end _emitTeardown.")
 
