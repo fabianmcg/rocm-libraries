@@ -269,6 +269,9 @@ class SubtileMegaFusedEmitter:
         self.gammaLdsReadAddr = None
         self.gammaSoffsetSgpr = None
         self.gammaM0Base = None
+        # Set when gamma LDS broadcast reads are in flight but not yet waited/converted;
+        # the wait+convert is deferred to the first gammaBank consumer for latency hiding.
+        self._gammaReadPending = False
 
     def _initGeometry(self, kernel):
         """Derive MegaFused tile geometry (camelBack) shared by orchestration."""
@@ -1227,6 +1230,9 @@ class SubtileMegaFusedEmitter:
         if tailWide:
             self.writer.sgprPool.checkIn(self.nhInRangeMask)
             self.nhInRangeMask = None
+        # Complete any deferred gamma LDS read right before its first consumer so the
+        # LDS-read latency overlaps the residual-add/RMS/store work above.
+        self._completeGammaRead(module, gammaBank)
         blkAmaxJ = (blkAmax + n) if self.useMxfp8 else None
         self._pass3GammaAmax(module, srcRegs, vgprTiles, gammaBank, blkAmaxJ,
                              mi, m, n, rpl)
@@ -1594,25 +1600,41 @@ class SubtileMegaFusedEmitter:
         module.addComment1("MF end _stageGammaToLds.")
 
 
-    def _ldsReadGammaBlock(self, module, gammaBank, qi, bufIdx) -> None:
-        """Broadcast-read staged gamma from LDS; convert bf16 to f32 in place.
+    def _ldsReadGammaBlockIssue(self, module, gammaBank, qi, bufIdx) -> None:
+        """Issue the broadcast LDS reads for staged gamma; do NOT wait or convert yet.
 
         All lanes read rpl bf16 (one DSLoadB64 per mi) from their LDS slot, broadcasting
         data written by the representative lane that owns the matching rowGroup-pair.
+        The dscnt wait and bf16->f32 conversion are deferred to _completeGammaRead so the
+        LDS round-trip latency overlaps the residual/RMS work before gamma is consumed.
+        gammaBank is single-buffered in VGPRs, so a prior read must be completed first.
         """
-        module.addComment1(f"MF begin _ldsReadGammaBlock: broadcast-read gamma from LDS (qi={qi},buf={bufIdx}).")
+        assert not self._gammaReadPending, "gamma LDS read issued while a prior read is still pending"
+        module.addComment1(f"MF begin _ldsReadGammaBlockIssue: broadcast-read gamma from LDS (qi={qi},buf={bufIdx}).")
         tpb = self.tilesPerBlockM
         for mi in range(tpb):
             off = bufIdx * self.gammaLdsBufBytes + mi * self.mfma_m * self.gammaBytes
             module.add(DSLoadB64(
-                dst=vgpr(gammaBank + mi * self.rows_per_lane, 2),
+                dst=vgpr(gammaBank + mi * self.rowsPerLane, 2),
                 src=vgpr(self.gammaLdsReadAddr),
                 ds=DSModifiers(offset=off),
                 comment=f"broadcast-read gamma bf16 (qi={qi},mi={mi},buf={bufIdx})."))
-        module.add(SWaitCnt(dscnt=0, comment="wait gamma LDS broadcast reads."))
-        for mi in range(tpb):
-            self._convertGammaChunkBf16(module, gammaBank + mi * self.rows_per_lane)
-        module.addComment1("MF end _ldsReadGammaBlock.")
+        self._gammaReadPending = True
+        module.addComment1("MF end _ldsReadGammaBlockIssue.")
+
+
+    def _completeGammaRead(self, module, gammaBank) -> None:
+        """Wait for the deferred gamma LDS reads and convert bf16->f32 in place.
+
+        No-op unless a read is pending; called right before the first gammaBank consumer
+        so the LDS-read latency is hidden behind the intervening residual/RMS work.
+        """
+        if not self._gammaReadPending:
+            return
+        module.add(SWaitCnt(dscnt=0, comment="wait gamma LDS broadcast reads (deferred to first consumer)."))
+        for mi in range(self.tilesPerBlockM):
+            self._convertGammaChunkBf16(module, gammaBank + mi * self.rowsPerLane)
+        self._gammaReadPending = False
 
 
     def _buildUnitSequence(self, ebc):
@@ -1735,13 +1757,15 @@ class SubtileMegaFusedEmitter:
                 pqi, pnBase, pg = units[prefetchIdx]
                 module.add(self._issueUnitLoads(resRing[prefetchIdx % pfd], mBaseV,
                                                 pqi, pnBase, pg, pathInterior))
-            # Ping-pong: stage next qi's gamma then read it immediately from LDS so the
-            # DS read lands directly after the visibility barrier with no intervening vmem.
+            # Ping-pong: stage next qi's gamma and issue its LDS read directly after the
+            # visibility barrier (no intervening vmem before the DS read). The wait+convert
+            # is deferred to qi+1's first consumer, so the next-unit prefetch loads and
+            # qi+1's first-tile residual/RMS work overlap the LDS round-trip.
             if (self.gammaLdsStaging and self.gammaBuffers > 1
                     and nBase + g == self.mmaN and qi + 1 < self.nQTilesM):
                 nextBufIdx = (qi + 1) % self.gammaBuffers
                 self._stageGammaToLds(module, qi + 1, nextBufIdx)
-                self._ldsReadGammaBlock(module, gammaBank, qi + 1, nextBufIdx)
+                self._ldsReadGammaBlockIssue(module, gammaBank, qi + 1, nextBufIdx)
         module.addComment1("MF end _emitUnitIteration.")
 
 
@@ -1756,9 +1780,10 @@ class SubtileMegaFusedEmitter:
         module.addComment1("MF begin _emitFusedBody: prolog loads then PFD pipeline iteration.")
         if self.gammaLdsStaging:
             self._stageGammaToLds(module, 0, 0)
-            # Read qi=0 gamma from LDS immediately after the visibility barrier so the
-            # DS read lands with no intervening vmem instructions before it.
-            self._ldsReadGammaBlock(module, gammaBank, 0, 0)
+            # Issue the qi=0 gamma read right after the visibility barrier (no intervening
+            # vmem before the DS read); the wait+convert is deferred to the first consumer
+            # so the whole prolog's residual loads overlap the LDS round-trip.
+            self._ldsReadGammaBlockIssue(module, gammaBank, 0, 0)
         self._emitProlog(module, units, pfd, resRing, mBaseV, pathInterior)
         self._emitUnitIteration(module, vgprTiles, units, resRing, accBank, gammaBank,
                                 blkAmax, mBaseV, globalLoadsCum, issuedThroughUnit,
