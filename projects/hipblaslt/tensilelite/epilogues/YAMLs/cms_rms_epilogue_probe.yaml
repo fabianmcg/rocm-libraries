@@ -1,0 +1,108 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+#
+# THROWAWAY VALIDATION ARTIFACT (not for merge as-is) — produced by the
+# empirical feasibility probe of running the MegaFused RMS epilogue under the
+# CMS (UseCustomMainLoopSchedule=1) main-loop path. See companion report
+# epilogues/analysis/subtile_epilogue_cms_feasibility.md.
+#
+# Tile parameters EXACTLY match the registered CMS catalog entry
+# `_get_schedule_256x256x64_16bit` (CustomSchedule.py):
+#   TileConfig(256,256,64, PGR2, PLR1, DTL1, DPLB=False, WSGRA0, WSGRB0),
+#   vector_widths=[8,8,8], matrix_inst=[16,16,32,1], mfma_wave_group=[2,2].
+# so UseCustomMainLoopSchedule resolves to 1. RMSEpilogue=True, UseSubtileImpl=False.
+# SourceSwap=False + VectorWidthA=VectorWidthB=1 force the accToArchMapper
+# acc2arch permutation to IDENTITY (same regime Subtile forces).
+#
+# EMPIRICAL RESULTS (gfx950, ~/.tensile venv):
+#  * With stock validators: REJECTED early at Solution.py:303-305
+#    "RMSEpilogue requires UseSubtileImpl" (before CMS even resolves).
+#  * Relaxing Solution.py:303-305 + 3734-3735 ALONE: builds, but the fused
+#    epilogue SILENTLY NO-OPS at the 3rd UseSubtileImpl gate
+#    (KernelWriterAssembly.py:15940) — no RMS math emitted.
+#  * Additionally bypassing 15940 (no spike adapter): AttributeError
+#    'MatrixInfo' object has no attribute 'tileInfo' at KWAsm.py:15943
+#    (the vgprTiles coupling the report predicted).
+#  * With an identity-case vgprTiles shim over accToArchMapper + the two extra
+#    params below (GSU SingleBuffer to dodge the MultipleBuffer reject at
+#    Solution.py:405, and ForceDisableShadowInit=True so SrdResidualOut is
+#    defined at KWAsm.py:8997-9009): BUILDS, ASSEMBLES, and RUNS on GPU, but
+#    VALIDATION FAILS numerically (partialBuf/residualOut/D mismatch) — the
+#    Subtile epilogue's accumulator/lane layout does not transfer correctly
+#    to CMS even with an identity permutation.
+#
+# The two "extra params" (GlobalSplitUAlgorithm SingleBuffer, ForceDisableShadowInit)
+# are left in so this file reproduces the furthest-progressing configuration.
+# They are NOT needed to reproduce the stock-validator rejection, which fires
+# regardless.
+
+GlobalParameters:
+  MinimumRequiredVersion: 5.0.0
+  NumElementsToValidate: 0
+  ExitOnFails: 1
+  PrintSolutionRejectionReason: True
+  KernelTime: True
+  KeepBuildTmp: True
+
+BenchmarkProblems:
+  -
+    -
+      OperationType: GEMM
+      DataType: b
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: True
+      TransposeB: False
+      UseBeta: False
+      Batched: True
+      StridedBatched: True
+      GroupedGemm: False
+      UseBias: 0
+      UseScaleAB: ""
+      UseScaleCD: False
+      UseScaleAlphaVec: 0
+      UseScaleD: False
+      Sparse: 0
+      UseRMSEpilogue: True
+
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+            - [16, 16, 32, 1, 1, 8, 8, 2, 2]   # MT0=256 MT1=256, MIWaveTile[8,8], MIWaveGroup[2,2]
+        - RMSEpilogue: [True]
+        - UseSubtileImpl: [False]
+        - ForceDisableShadowInit: [True]
+        - StreamK: [0]
+        - GlobalSplitU: [1]
+        - GlobalSplitUAlgorithm: ["SingleBuffer"]
+        - ScheduleIterAlg: [3]
+        - PrefetchGlobalRead: [2]
+        - PrefetchLocalRead: [1]
+        - PrefetchAcrossPersistent: [0]
+        - DirectToLds: [1]
+        - SourceSwap: [False]
+        - VectorWidthA: [1]
+        - VectorWidthB: [1]
+        - StaggerU: [0]
+        - DepthU: [64]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [8]
+        - GlobalReadVectorWidthB: [8]
+        - LocalReadVectorWidth: [8]
+        - PreloadKernArgs: [False]
+        - 1LDSBuffer: [0]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+            - Exact: [512, 512, 1, 512]
+
+LibraryLogic:
+  ScheduleName: "cms_rms_epilogue_probe"
+  DeviceNames: ["Device 75a0"]
+  ArchitectureName: "gfx950"
+  LibraryType: "Equality"
