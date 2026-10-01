@@ -128,9 +128,6 @@ _VGPR_FIXED_ESTIMATE = 212
 
 # Maximum representable magnitudes of the FP8 quantization output types, used
 # to scale amax so K2 can requantize. e5m2/bf8 has a far larger range than e4m3.
-_FP8_E4M3_MAX = 448.0        # OCP FP8 e4m3.
-_FP8_E4M3_FNUZ_MAX = 240.0   # FNUZ FP8 e4m3.
-_BF8_E5M2_MAX = 57344.0      # FP8 e5m2 (bf8).
 _fp8E4m3Max = 448.0          # OCP FP8 e4m3 (name used by the MXFP8 quant helpers).
 
 
@@ -194,17 +191,17 @@ class SubtileMegaFusedEmitter:
         # ---- MXFP8 dynamic-quant geometry (camelBack); only when useMxfp8 ----
         if self.useMxfp8:
             self.tagPrefix = "mx"
-            self.mfmaM = kernel["MatrixInstM"]
-            self.mfmaN = kernel["MatrixInstN"]
-            self.rowsPerLane = (self.mfmaM * self.mfmaN) // self.waveSize
-            self.wgM = wg[0]
-            self.wgN = wg[1]
-            self.mmaM = (kernel["MacroTile0"] // self.mfmaM) // self.wgM
-            self.mmaN = (kernel["MacroTile1"] // self.mfmaN) // self.wgN
-            self.macroTile1 = kernel["MacroTile1"]
+            self.mfmaM = self.mfma_m
+            self.mfmaN = self.mfma_n
+            self.rowsPerLane = self.rows_per_lane
+            self.wgM = self.wg_m
+            self.wgN = self.wg_n
+            self.mmaM = self.mma_m
+            self.mmaN = self.mma_n
+            self.macroTile1 = self.macro_tile1
             self.q0 = 32  # MXFP8 block shape is always 32x1.
             self.q1 = 1
-            self.laneSgprCount = writer.states.laneSGPRCount
+            self.laneSgprCount = self.lane_sgpr_count
             self.nQTilesM = (self.mmaM * self.mfmaM) // self.q0
             # subCol quant (q1 < mfmaN) is the only MXFP8 mode megaFused emits; subRow
             # (q0 < mfmaM) is excluded by the emit() assertion.
@@ -275,24 +272,18 @@ class SubtileMegaFusedEmitter:
 
     def _initGeometry(self, kernel):
         """Derive MegaFused tile geometry (camelBack) shared by orchestration."""
-        mfmaM = kernel["MatrixInstM"]
-        mfmaN = kernel["MatrixInstN"]
-        waveSize = kernel["WavefrontSize"]
-        wg = kernel["MIWaveGroup"]
-        wgM, wgN = wg[0], wg[1]
-        self.mfmaM = mfmaM
-        self.mfmaN = mfmaN
-        self.rowsPerLane = (mfmaM * mfmaN) // waveSize
-        self.mmaN = (kernel["MacroTile1"] // mfmaN) // wgN
-        self.wgM = wgM
+        self.mfmaM = self.mfma_m
+        self.mfmaN = self.mfma_n
+        self.rowsPerLane = self.rows_per_lane
+        self.mmaN = self.mma_n
+        self.wgM = self.wg_m
         self.streamGroup = 4
         if self.useMxfp8:
             self.tilesPerBlockM = self.tilesPerBlockM if self.subColQuant else 2
             self.streamGroup = self.streamGroup if self.subColQuant else 4
             return
-        mmaM = (kernel["MacroTile0"] // mfmaM) // wgM
-        self.tilesPerBlockM = 2 if mmaM % 2 == 0 else 1
-        self.nQTilesM = mmaM // self.tilesPerBlockM
+        self.tilesPerBlockM = 2 if self.mma_m % 2 == 0 else 1
+        self.nQTilesM = self.mma_m // self.tilesPerBlockM
 
     def _deriveEpilogueBatchCols(self) -> int:
         """Maximize prefetchDepth within the §6 VGPR budget; derive epilogueBatchCols.
@@ -345,8 +336,9 @@ class SubtileMegaFusedEmitter:
         SGPRs push them over the gfx950 limit of 104 SGPRs).
         Excluded for partial-accumulation modes where this epilogue does not run
         on final values (resolves design §8.5).
+        Excluded when rows_per_lane != 4 since the dwordx4 path hardcodes 4 rows per lane.
         """
-        if self.residualBytes != 2 or self.useMxfp8:
+        if self.residualBytes != 2 or self.useMxfp8 or self.rows_per_lane != 4:
             return False
         partialModes = ("MultipleBuffer", "MultipleBufferSingleKernel")
         return self.kernel.get("_GlobalAccumulation") not in partialModes
@@ -1100,15 +1092,6 @@ class SubtileMegaFusedEmitter:
             module.add(VMacF32(dst=vgpr(self.partials + n), src0=vgpr(sk1),
                                src1=vgpr(sk1),
                                comment=f"rmsSum[{n}] += H² (m={m},n={n},k={k+1})."))
-        # Defensive odd tail (rpl is even in practice).
-        if rpl % 2 == 1:
-            k = rpl - 1
-            module.add(VAddF32(dst=vgpr(srcRegs[k]), src0=vgpr(srcRegs[k]),
-                               src1=vgpr(burstBase + k),
-                               comment=f"H = acc + residual (m={m},n={n},k={k})."))
-            module.add(VMacF32(dst=vgpr(self.partials + n), src0=vgpr(srcRegs[k]),
-                               src1=vgpr(srcRegs[k]),
-                               comment=f"rmsSum[{n}] += H² (m={m},n={n},k={k})."))
         module.addComment1("MF end _pass1AccResRms.")
 
 
@@ -1156,14 +1139,6 @@ class SubtileMegaFusedEmitter:
                                    comment=f"acc = H * gamma (m={m},n={n},k={k+1})."))
             self._amaxAndWriteAcc(module, sk0, vgprTiles, blkAmaxJ, m, n, k)
             self._amaxAndWriteAcc(module, sk1, vgprTiles, blkAmaxJ, m, n, k + 1)
-        # Defensive odd tail (rpl is even in practice).
-        if rpl % 2 == 1:
-            k = rpl - 1
-            acc = srcRegs[k]
-            gammaReg = gammaBank + mi * rpl + k
-            module.add(VMulF32(dst=vgpr(acc), src0=vgpr(acc), src1=vgpr(gammaReg),
-                               comment=f"acc = H * gamma (m={m},n={n},k={k})."))
-            self._amaxAndWriteAcc(module, acc, vgprTiles, blkAmaxJ, m, n, k)
         module.addComment1("MF end _pass3GammaAmax.")
 
 
@@ -1341,7 +1316,8 @@ class SubtileMegaFusedEmitter:
         amaxSlice = blkAmax + nBase
         addrBf = vgprPool.checkOut(1, tag="mf_addrBf")
         tmpBf = vgprPool.checkOut(g, tag="mf_tmpBf")
-        for r in range(2):
+        numRounds = int(math.log2(self.numRowGroups))
+        for r in range(numRounds):
             self._butterflyRound(module, addrBf, tmpBf, amaxSlice, g, self.laneId,
                                    self.mfmaN << r)
         vgprPool.checkIn(tmpBf)
