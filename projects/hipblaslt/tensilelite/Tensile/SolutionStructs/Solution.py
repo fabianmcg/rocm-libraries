@@ -337,15 +337,13 @@ def _partialRMSSideTypeSupported(dtype):
   return dtype.isBFloat16() or dtype.isSingle()
 
 
-def _resolvePartialRMSSideType(state, printRejectionReason, key, mustValidate):
+def _resolvePartialRMSSideType(state, printRejectionReason, key):
   """Validate a PartialRMS side-input type param (bf16 'b' default, f32 's').
 
   Normalizes state[key] to the lowercase char the emitter and kernel name read.
-  Returns False only when mustValidate is True and the type is unsupported.
   """
   raw = str(state.get(key, "") or "b").lower()
-  sideDt = DataType(raw)
-  if mustValidate and not _partialRMSSideTypeSupported(sideDt):
+  if not _partialRMSSideTypeSupported(DataType(raw)):
     reject(state, printRejectionReason,
            "%s=%s is not a supported PartialRMS side-input type (use b or s)" % (key, raw))
     return False
@@ -353,7 +351,18 @@ def _resolvePartialRMSSideType(state, printRejectionReason, key, mustValidate):
   return True
 
 
+def _resolveRMSGammaType(state, printRejectionReason):
+  """Validate RMSEpilogueGammaType: gamma must be bf16 ('b'); f32 is not supported.
 
+  Normalizes the value to the lowercase char the emitter and kernel name read.
+  """
+  raw = str(state.get("RMSEpilogueGammaType", "") or "b").lower()
+  if not DataType(raw).isBFloat16():
+    reject(state, printRejectionReason,
+           "RMSEpilogueGammaType=%s is not supported; gamma must be bf16 (b)" % raw)
+    return False
+  state["RMSEpilogueGammaType"] = raw
+  return True
 
 
 def _validateRMSEpilogue(state, printRejectionReason):
@@ -370,10 +379,10 @@ def _validateRMSEpilogue(state, printRejectionReason):
     return
   if not _validateSubtileEpiloguePrereqs(state, printRejectionReason, "RMSEpilogue"):
     return
-  if not _resolvePartialRMSSideType(state, printRejectionReason, "RMSEpilogueGammaType", True):
+  if not _resolveRMSGammaType(state, printRejectionReason):
     return
   # Residual-add is always active under RMSEpilogue; validate the type unconditionally.
-  if not _resolvePartialRMSSideType(state, printRejectionReason, "RMSEpilogueResidualType", True):
+  if not _resolvePartialRMSSideType(state, printRejectionReason, "RMSEpilogueResidualType"):
     return
   # PAP is not co-validated with the RMSEpilogue path; reject until audited.
   if state.get("PrefetchAcrossPersistent", 0):

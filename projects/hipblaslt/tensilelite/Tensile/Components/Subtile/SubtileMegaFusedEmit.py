@@ -176,12 +176,9 @@ class RMSEpilogueGeometry:
                                      or (self.residualBytes == 2
                                          and not self.residualType.isHalf())))
 
-        # Gamma side input.
-        self.gammaType = DataType(kernel.get("RMSEpilogueGammaType") or "b")
-        self.gammaBytes, self.gammaLog2Bytes = _sideBytes(self.gammaType)
-        self.useWideGamma = (self.rowsPerLane % 4 == 0
-                             and (self.gammaBytes == 1
-                                  or (self.gammaBytes == 2 and not self.gammaType.isHalf())))
+        # Gamma side input is always bf16; staged to LDS and read via ds_read.
+        self.gammaBytes = 2
+        self.gammaLog2Bytes = 1
 
         # Partial-accumulation modes: this epilogue does not run on final values.
         self.isPartialAccumulation = kernel.get("_GlobalAccumulation") in (
@@ -209,12 +206,6 @@ class RMSEpilogueGeometry:
         self.gammaLdsWaveStride = self.tilesPerBlockM * self.mfmaM * self.gammaBytes
         self.gammaLdsBufBytes = self.wgM * self.gammaLdsWaveStride
         self.gammaBuffers = 2 if self.nQTilesM > 1 else 1
-        self.gammaLdsStaging = (self.useWideGamma
-                                and self.rowsPerLane == 4
-                                and self.gammaBytes == 2
-                                and self.numRowGroups % 2 == 0
-                                and (self.tilesPerBlockM * self.mfmaM) % 2 == 0
-                                and (self.tilesPerBlockM * self.mfmaM) // 2 <= self.waveSize)
 
     def _deriveEpilogueBatchCols(self) -> int:
         """Maximize prefetchDepth within the VGPR budget; derive epilogueBatchCols.
@@ -447,7 +438,7 @@ class SubtileMegaFusedEmitter:
         self.pairUpperLaneMask = None
         # Shared per-tile nhInRange predicate (tail-wide path only); None elsewhere.
         self.nhInRangeMask = None
-        # Gamma DTL broadcast: two VGPRs and two SGPRs; allocated only when gammaLdsStaging.
+        # Gamma DTL broadcast: two VGPRs and two SGPRs.
         self.gammaDtlVaddr = None
         self.gammaLdsReadAddr = None
         self.gammaSoffsetSgpr = None
@@ -455,21 +446,6 @@ class SubtileMegaFusedEmitter:
         # Set when gamma LDS broadcast reads are in flight but not yet waited/converted;
         # the wait+convert is deferred to the first gammaBank consumer for latency hiding.
         self._gammaReadPending = False
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
     def _amaxAndWriteAcc(self, module, sk, vgprTiles, blkAmaxJ, m, n, ki) -> None:
@@ -495,12 +471,6 @@ class SubtileMegaFusedEmitter:
         else:
             module.add(VAccvgprWriteB32(accvgpr(reg), vgpr(sk),
                                         comment=f"write H*gamma back to acc (m={m},n={n},k={ki})."))
-
-
-
-
-
-
 
 
     def _issueUnitLoads(self, resBank, mBaseV, qi, nBase, g,
@@ -683,12 +653,11 @@ class SubtileMegaFusedEmitter:
         the scalar/wide masked path (tail arm), per design §5.
         """
         module.addComment1("prolog loads then PFD pipeline iteration.")
-        if self.geom.gammaLdsStaging:
-            self._stageGammaToLds(module, 0, 0)
-            # Issue the qi=0 gamma read right after the visibility barrier (no intervening
-            # vmem before the DS read); the wait+convert is deferred to the first consumer
-            # so the whole prolog's residual loads overlap the LDS round-trip.
-            self._ldsReadGammaBlockIssue(module, gammaBank, 0, 0)
+        self._stageGammaToLds(module, 0, 0)
+        # Issue the qi=0 gamma read right after the visibility barrier (no intervening
+        # vmem before the DS read); the wait+convert is deferred to the first consumer
+        # so the whole prolog's residual loads overlap the LDS round-trip.
+        self._ldsReadGammaBlockIssue(module, gammaBank, 0, 0)
         module.addComment1("issue residual loads for the first PFD units.")
         numUnits_ep = len(units)
         for u_ep in range(min(pfd, numUnits_ep)):
@@ -699,50 +668,6 @@ class SubtileMegaFusedEmitter:
         tpb = self.geom.tilesPerBlockM
         numUnits = len(units)
         for i, (qi, nBase, g) in enumerate(units):
-            if nBase == 0 and not self.geom.gammaLdsStaging:
-                _loadGammaMod = Module(f"MegaFused loadGammaBlock qi={qi}")
-                _loadGammaMod.addComment0(f"load and convert gamma for qi={qi}.")
-                _gammaByteV_lgb = self.writer.vgprPool.checkOut(1, tag="mf_gammaByte")
-                _gammaBaseV_lgb = self.writer.vgprPool.checkOut(1, tag="mf_gammaM")
-                if self.geom.useWideGamma:
-                    _loadGammaMod.addComment1(f"wide dwordx2 gamma loads (qi={qi}).")
-                    rpl = self.geom.rowsPerLane
-                    tpb = self.geom.tilesPerBlockM
-                    for mi in range(tpb):
-                        m = qi * tpb + mi
-                        _free0RowPos(_loadGammaMod, self.nhBase, self.wgRowBase, self.rowGroupOff, m, 0, _gammaBaseV_lgb, self.geom)
-                        _loadGammaMod.add(VLShiftLeftB32(dst=vgpr(_gammaByteV_lgb), shiftHex=hex(self.geom.gammaLog2Bytes),
-                                                          src=vgpr(self.nhBase),
-                                                          comment=f"gammaByte = nhBase * gammaBytes (mi={mi})."))
-                        _loadGammaMod.add(BufferLoadB64(vgpr(gammaBank + mi * rpl, 2), vgpr(_gammaByteV_lgb),
-                                                         sgpr(self.gammaSrd, 4), 0, MUBUFModifiers(offen=True),
-                                                         comment=f"gamma[nhBase..+3] dwordx2 (m={m})."))
-                    _loadGammaMod.add(SWaitCnt(vlcnt=0, comment="wait wide gamma loads."))
-                    for mi in range(tpb):
-                        _convertGammaChunkBf16(_loadGammaMod, gammaBank + mi * rpl)
-                else:
-                    _loadGammaMod.addComment1(f"scalar gamma loads (qi={qi}).")
-                    rpl = self.geom.rowsPerLane
-                    tpb = self.geom.tilesPerBlockM
-                    for mi in range(tpb):
-                        m = qi * tpb + mi
-                        _free0RowPos(_loadGammaMod, self.nhBase, self.wgRowBase, self.rowGroupOff, m, 0, _gammaBaseV_lgb, self.geom)
-                        for k in range(rpl):
-                            r = _addImmU32(_loadGammaMod, _gammaByteV_lgb, self.nhBase, k, _gammaBaseV_lgb,
-                                               f"gammaIdx = nhBase + {k} (mi={mi},k={k}).")
-                            _loadGammaMod.add(VLShiftLeftB32(dst=vgpr(_gammaByteV_lgb), shiftHex=hex(self.geom.gammaLog2Bytes),
-                                                              src=vgpr(r),
-                                                              comment="gammaByte = gammaIdx * gammaBytes."))
-                            _issueSideLoad(_loadGammaMod, gammaBank + mi * rpl + k, _gammaByteV_lgb, self.gammaSrd,
-                                               f"gamma[m={m},k={k}].", dtype=self.geom.gammaType)
-                    _loadGammaMod.add(SWaitCnt(vlcnt=0, comment="wait gamma loads."))
-                    for mi in range(tpb):
-                        for k in range(rpl):
-                            _convertSideElem(_loadGammaMod, gammaBank + mi * rpl + k,
-                                                 f"gamma->fp32 (mi={mi},k={k}).", dtype=self.geom.gammaType)
-                self.writer.vgprPool.checkIn(_gammaBaseV_lgb)
-                self.writer.vgprPool.checkIn(_gammaByteV_lgb)
-                module.add(_loadGammaMod)
             if self.geom.useMxfp8:
                 module.addComment1(f"zero blkAmax[nBase..nBase+g) (qi={qi},nBase={nBase}).")
                 zeroMod_eza = Module(f"MegaFused zeroBlkAmaxSlice qi={qi} nBase={nBase}")
@@ -1325,7 +1250,7 @@ class SubtileMegaFusedEmitter:
             # visibility barrier (no intervening vmem before the DS read). The wait+convert
             # is deferred to qi+1's first consumer, so the next-unit prefetch loads and
             # qi+1's first-tile residual/RMS work overlap the LDS round-trip.
-            if (self.geom.gammaLdsStaging and self.geom.gammaBuffers > 1
+            if (self.geom.gammaBuffers > 1
                     and nBase + g == self.geom.mmaN and qi + 1 < self.geom.nQTilesM):
                 nextBufIdx = (qi + 1) % self.geom.gammaBuffers
                 self._stageGammaToLds(module, qi + 1, nextBufIdx)
@@ -1360,9 +1285,8 @@ class SubtileMegaFusedEmitter:
             self.waveIdV = vgprPool.checkOut(1, tag="mf_waveIdV")
         if _useDwordx4Interior(self.geom):
             self.vPermAddr = vgprPool.checkOut(1, tag="mf_vPermAddr")
-        if self.geom.gammaLdsStaging:
-            self.gammaDtlVaddr    = vgprPool.checkOut(1, tag="mf_gammaDtlVaddr")
-            self.gammaLdsReadAddr = vgprPool.checkOut(1, tag="mf_gammaLdsReadAddr")
+        self.gammaDtlVaddr    = vgprPool.checkOut(1, tag="mf_gammaDtlVaddr")
+        self.gammaLdsReadAddr = vgprPool.checkOut(1, tag="mf_gammaLdsReadAddr")
         _setupSharedMod = Module("MegaFused shared setup")
         _setupSharedMod.addComment0("drain waits, lane arithmetic, colByte, col, rowGroup, SRDs.")
         _setupSharedMod.add(SWaitCnt(kmcnt=0, comment="drain kernarg s_loads before reading kernel args."))
@@ -1450,11 +1374,10 @@ class SubtileMegaFusedEmitter:
             self.pairUpperLaneMask = sgprPool.checkOutAligned(
                 lsc, lsc, tag="mf_pairUpper", preventOverflow=False)
         # DTL gamma broadcast: per-wave soffset (wgRowBase*gammaBytes) and M0 wave base.
-        if self.geom.gammaLdsStaging:
-            self.gammaSoffsetSgpr = sgprPool.checkOutAligned(
-                1, 1, tag="mf_gammaSoffset", preventOverflow=False)
-            self.gammaM0Base = sgprPool.checkOutAligned(
-                1, 1, tag="mf_gammaM0Base", preventOverflow=False)
+        self.gammaSoffsetSgpr = sgprPool.checkOutAligned(
+            1, 1, tag="mf_gammaSoffset", preventOverflow=False)
+        self.gammaM0Base = sgprPool.checkOutAligned(
+            1, 1, tag="mf_gammaM0Base", preventOverflow=False)
         module.add(_setupSharedMod)
         module.addComment1("row geometry, rmsSum init, gamma bank, residual scratch.")
         module.addComment1("compute rowGroupOff = rowGroup * rowsPerLane.")
@@ -1621,51 +1544,50 @@ class SubtileMegaFusedEmitter:
                                comment="pairUpper lo: lanes 16-31."))
             module.add(SMovB32(dst=sgpr(self.pairUpperLaneMask + 1), src=hex(0xFFFF0000),
                                comment="pairUpper hi: lanes 48-63."))
-        if self.geom.gammaLdsStaging:
-            module.addComment1("precompute gamma DTL addresses and M0 base.")
-            module.add(VLShiftLeftB32(dst=vgpr(self.gammaDtlVaddr), shiftHex=hex(2),
-                                      src=vgpr(self.laneId),
-                                      comment="gammaDtlVaddr = laneId * 4 (contiguous b32 DTL offset)."))
-            module.add(SNop(waitState=0,
-                            comment="conservative nop: wgRowBase was written well before this point, so the VALU hazard window is already closed."))
-            with self.writer.allocTmpSgpr(1, tag="mf_gammaRfl") as t:
-                module.add(VReadfirstlaneB32(dst=sgpr(t.idx), src=vgpr(self.wgRowBase),
-                                             comment="extract uniform wgRowBase from VGPR."))
-                module.add(SLShiftLeftB32(dst=sgpr(self.gammaSoffsetSgpr), src=sgpr(t.idx),
-                                          shiftHex=hex(self.geom.gammaLog2Bytes),
-                                          comment="gammaSoffsetSgpr = wgRowBase * gammaBytes."))
-            assert (self.geom.gammaLdsWaveStride & (self.geom.gammaLdsWaveStride - 1)) == 0, \
-                "gamma LDS wave stride must be a power of two for the log2 shift"
-            log2LdsWaveStride = self.geom.gammaLdsWaveStride.bit_length() - 1
-            if self.geom.wgM > 1:
-                waveMV = self.writer.vgprPool.checkOut(1, tag="mf_gammaWaveMV")
-                module.add(VAndB32(dst=vgpr(waveMV), src0=vgpr(self.waveIdV),
-                                   src1=self.geom.wgM - 1,
-                                   comment=f"waveM = waveId % {self.geom.wgM}."))
-                module.add(SNop(waitState=0,
-                                comment="wait for VGPR before readfirstlane (VALU write hazard)."))
-                module.add(VReadfirstlaneB32(dst=sgpr(self.gammaM0Base), src=vgpr(waveMV),
-                                             comment="waveM_scalar for M0 base."))
-                self.writer.vgprPool.checkIn(waveMV)
-                module.add(SLShiftLeftB32(dst=sgpr(self.gammaM0Base),
-                                          src=sgpr(self.gammaM0Base),
-                                          shiftHex=hex(log2LdsWaveStride),
-                                          comment=f"gammaM0Base = waveM * ldsWaveStride({self.geom.gammaLdsWaveStride})."))
-            else:
-                module.add(SMovB32(dst=sgpr(self.gammaM0Base), src=0,
-                                   comment="gammaM0Base = 0 (wgM == 1, waveM always 0)."))
-            rowGroupOffBytes = self.writer.vgprPool.checkOut(1, tag="mf_gammaRGOff")
-            module.add(VLShiftLeftB32(dst=vgpr(rowGroupOffBytes),
+        module.addComment1("precompute gamma DTL addresses and M0 base.")
+        module.add(VLShiftLeftB32(dst=vgpr(self.gammaDtlVaddr), shiftHex=hex(2),
+                                  src=vgpr(self.laneId),
+                                  comment="gammaDtlVaddr = laneId * 4 (contiguous b32 DTL offset)."))
+        module.add(SNop(waitState=0,
+                        comment="conservative nop: wgRowBase was written well before this point, so the VALU hazard window is already closed."))
+        with self.writer.allocTmpSgpr(1, tag="mf_gammaRfl") as t:
+            module.add(VReadfirstlaneB32(dst=sgpr(t.idx), src=vgpr(self.wgRowBase),
+                                         comment="extract uniform wgRowBase from VGPR."))
+            module.add(SLShiftLeftB32(dst=sgpr(self.gammaSoffsetSgpr), src=sgpr(t.idx),
                                       shiftHex=hex(self.geom.gammaLog2Bytes),
-                                      src=vgpr(self.rowGroupOff),
-                                      comment="rowGroupOff * gammaBytes for consumer LDS read base."))
-            module.add(VMovB32(dst=vgpr(self.gammaLdsReadAddr), src=sgpr(self.gammaM0Base),
-                               comment="gammaLdsReadAddr = waveM * ldsWaveStride (SGPR -> VGPR)."))
-            module.add(VAddU32(dst=vgpr(self.gammaLdsReadAddr),
-                               src0=vgpr(self.gammaLdsReadAddr),
-                               src1=vgpr(rowGroupOffBytes),
-                               comment="gammaLdsReadAddr += rowGroupOff * gammaBytes."))
-            self.writer.vgprPool.checkIn(rowGroupOffBytes)
+                                      comment="gammaSoffsetSgpr = wgRowBase * gammaBytes."))
+        assert (self.geom.gammaLdsWaveStride & (self.geom.gammaLdsWaveStride - 1)) == 0, \
+            "gamma LDS wave stride must be a power of two for the log2 shift"
+        log2LdsWaveStride = self.geom.gammaLdsWaveStride.bit_length() - 1
+        if self.geom.wgM > 1:
+            waveMV = self.writer.vgprPool.checkOut(1, tag="mf_gammaWaveMV")
+            module.add(VAndB32(dst=vgpr(waveMV), src0=vgpr(self.waveIdV),
+                               src1=self.geom.wgM - 1,
+                               comment=f"waveM = waveId % {self.geom.wgM}."))
+            module.add(SNop(waitState=0,
+                            comment="wait for VGPR before readfirstlane (VALU write hazard)."))
+            module.add(VReadfirstlaneB32(dst=sgpr(self.gammaM0Base), src=vgpr(waveMV),
+                                         comment="waveM_scalar for M0 base."))
+            self.writer.vgprPool.checkIn(waveMV)
+            module.add(SLShiftLeftB32(dst=sgpr(self.gammaM0Base),
+                                      src=sgpr(self.gammaM0Base),
+                                      shiftHex=hex(log2LdsWaveStride),
+                                      comment=f"gammaM0Base = waveM * ldsWaveStride({self.geom.gammaLdsWaveStride})."))
+        else:
+            module.add(SMovB32(dst=sgpr(self.gammaM0Base), src=0,
+                               comment="gammaM0Base = 0 (wgM == 1, waveM always 0)."))
+        rowGroupOffBytes = self.writer.vgprPool.checkOut(1, tag="mf_gammaRGOff")
+        module.add(VLShiftLeftB32(dst=vgpr(rowGroupOffBytes),
+                                  shiftHex=hex(self.geom.gammaLog2Bytes),
+                                  src=vgpr(self.rowGroupOff),
+                                  comment="rowGroupOff * gammaBytes for consumer LDS read base."))
+        module.add(VMovB32(dst=vgpr(self.gammaLdsReadAddr), src=sgpr(self.gammaM0Base),
+                           comment="gammaLdsReadAddr = waveM * ldsWaveStride (SGPR -> VGPR)."))
+        module.add(VAddU32(dst=vgpr(self.gammaLdsReadAddr),
+                           src0=vgpr(self.gammaLdsReadAddr),
+                           src1=vgpr(rowGroupOffBytes),
+                           comment="gammaLdsReadAddr += rowGroupOff * gammaBytes."))
+        self.writer.vgprPool.checkIn(rowGroupOffBytes)
         tpb = self.geom.tilesPerBlockM
         units = [
             (qi, nBase, min(ebc, self.geom.mmaN - nBase))
@@ -2017,10 +1939,8 @@ class SubtileMegaFusedEmitter:
         module.add(_rmsModule)
         sgprPool = self.writer.sgprPool
         vgprPool = self.writer.vgprPool
-        if self.gammaM0Base is not None:
-            sgprPool.checkIn(self.gammaM0Base)
-        if self.gammaSoffsetSgpr is not None:
-            sgprPool.checkIn(self.gammaSoffsetSgpr)
+        sgprPool.checkIn(self.gammaM0Base)
+        sgprPool.checkIn(self.gammaSoffsetSgpr)
         if self.pairUpperLaneMask is not None:
             sgprPool.checkIn(self.pairUpperLaneMask)
         if self.pairLowerLaneMask is not None:
@@ -2032,10 +1952,8 @@ class SubtileMegaFusedEmitter:
         sgprPool.checkIn(self.gammaSrd)
         if self.resSrd is not None:
             sgprPool.checkIn(self.resSrd)
-        if self.gammaLdsReadAddr is not None:
-            vgprPool.checkIn(self.gammaLdsReadAddr)
-        if self.gammaDtlVaddr is not None:
-            vgprPool.checkIn(self.gammaDtlVaddr)
+        vgprPool.checkIn(self.gammaLdsReadAddr)
+        vgprPool.checkIn(self.gammaDtlVaddr)
         if self.vPermAddr is not None:
             vgprPool.checkIn(self.vPermAddr)
         if self.waveIdV is not None:
