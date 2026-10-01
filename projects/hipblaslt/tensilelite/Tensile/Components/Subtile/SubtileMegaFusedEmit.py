@@ -202,10 +202,10 @@ class RMSEpilogueGeometry:
 
     def _deriveGammaLdsGeometry(self):
         """Gamma DTL-to-LDS broadcast geometry."""
+        # Total gamma LDS footprint = nQTilesM * gammaLdsBufBytes (one slot per qi, no ping-pong).
         self.numRowGroups = self.waveSize // self.mfmaN
         self.gammaLdsWaveStride = self.tilesPerBlockM * self.mfmaM * self.gammaBytes
         self.gammaLdsBufBytes = self.wgM * self.gammaLdsWaveStride
-        self.gammaBuffers = 2 if self.nQTilesM > 1 else 1
 
     def _deriveEpilogueBatchCols(self) -> int:
         """Maximize prefetchDepth within the VGPR budget; derive epilogueBatchCols.
@@ -556,9 +556,52 @@ class SubtileMegaFusedEmitter:
 
 
 
-    def _stageGammaToLds(self, module, qi, bufIdx) -> None:
-        """Stage gamma to LDS via contiguous-lane DTL; consumer reads with ds_read_b64."""
-        module.addComment1(f"contiguous-lane DTL stage gamma to LDS (qi={qi},buf={bufIdx}).")
+    def _emitGammaDtlLoad(self, module, qi) -> None:
+        """Issue one qi-block's Direct-To-LDS gamma load into its resident LDS slot.
+
+        The caller owns exec narrowing, the vmcnt wait, and the barriers; this only
+        sets M0 for slot qi and issues the DTL buffer_load.  Slot index == qi.
+        """
+        sgprPool = self.writer.sgprPool
+        # M0 = waveM*ldsWaveStride + qi*gammaLdsBufBytes (slot qi's per-wave write base).
+        if qi == 0:
+            module.add(SMovB32(dst=mgpr(0), src=sgpr(self.gammaM0Base),
+                               comment="M0 = gamma LDS wave base (slot 0)."))
+        else:
+            with self.writer.allocTmpSgpr(1, tag="mf_gammaM0") as t:
+                module.add(SAddU32(dst=sgpr(t.idx), src0=sgpr(self.gammaM0Base),
+                                   src1=qi * self.geom.gammaLdsBufBytes,
+                                   comment=f"M0 base + slot{qi} offset."))
+                module.add(SMovB32(dst=mgpr(0), src=sgpr(t.idx),
+                                   comment=f"M0 = gamma LDS wave base (slot {qi})."))
+        # soffset = wgRowBase*gammaBytes + qi*gammaLdsWaveStride (next qi-block of gamma).
+        qiSoffsetAdj = qi * self.geom.gammaLdsWaveStride
+        if qiSoffsetAdj > 0:
+            qiSoffSgpr = sgprPool.checkOutAligned(1, 1, tag="mf_gammaQiSoff", preventOverflow=False)
+            module.add(SAddU32(dst=sgpr(qiSoffSgpr), src0=sgpr(self.gammaSoffsetSgpr),
+                               src1=qiSoffsetAdj,
+                               comment=f"soffset += qi*gammaLdsWaveStride for qi={qi}."))
+        else:
+            qiSoffSgpr = self.gammaSoffsetSgpr
+        # One b32 load covers the entire qi block: lane i reads gamma[2i],gamma[2i+1]
+        # and DTL writes them contiguously at LDS M0+i*4, matching the consumer layout.
+        module.add(BufferLoadB32(
+            dst=None, vaddr=vgpr(self.gammaDtlVaddr), saddr=sgpr(self.gammaSrd, 4),
+            soffset=sgpr(qiSoffSgpr),
+            mubuf=MUBUFModifiers(offen=True, offset12=0, lds=True),
+            comment=f"gamma DTL b32 -> LDS slot {qi}."))
+        if qiSoffsetAdj > 0:
+            sgprPool.checkIn(qiSoffSgpr)
+
+    def _stageAllGammaToLds(self, module) -> None:
+        """Prefetch the whole block's gamma (all nQTilesM qi-blocks) into LDS up front.
+
+        One WAR barrier guards the prior (mainloop) LDS users; one exec narrowing
+        covers every DTL load; one vmcnt wait drains them all; one visibility barrier
+        publishes every write before any wave's first broadcast read.  Distinct qi
+        slots never alias, so no inter-stage WAR barrier is needed.
+        """
+        module.addComment1(f"stage all gamma qi-blocks to LDS up front (nQTilesM={self.geom.nQTilesM}).")
         sgprPool = self.writer.sgprPool
         lsc = self.geom.laneSgprCount
         numStageLanes = self.geom.tilesPerBlockM * self.geom.mfmaM // 2
@@ -566,7 +609,7 @@ class SubtileMegaFusedEmitter:
                                             "gamma DTL stage: WAR barrier before reusing LDS region."))
         savedExec = sgprPool.checkOutAligned(lsc, lsc, tag="mf_gammaStageExec", preventOverflow=False)
         module.add(SMovB64(dst=sgpr(savedExec, lsc), src=EXEC(),
-                           comment="save exec around contiguous-lane DTL gamma load."))
+                           comment="save exec around contiguous-lane DTL gamma loads."))
         # Narrow exec to laneId < numStageLanes (contiguous lanes); AND with waveN==0.
         repMask = sgprPool.checkOutAligned(lsc, lsc, tag="mf_gammaRep", preventOverflow=False)
         module.add(VCmpLtU32(dst=sgpr(repMask, lsc), src0=vgpr(self.laneId), src1=numStageLanes,
@@ -584,62 +627,36 @@ class SubtileMegaFusedEmitter:
                                src1=sgpr(wtmp, lsc), comment="repLane &= (waveN == 0)."))
             sgprPool.checkIn(wtmp)
         module.add(SMovB64(dst=EXEC(), src=sgpr(repMask, lsc),
-                           comment="exec = contiguous stage lanes for DTL gamma load."))
+                           comment="exec = contiguous stage lanes for DTL gamma loads."))
         sgprPool.checkIn(repMask)
-        # M0 = waveM * ldsWaveStride + bufIdx * ldsBufBytes.
-        if bufIdx == 0:
-            module.add(SMovB32(dst=mgpr(0), src=sgpr(self.gammaM0Base),
-                               comment="M0 = gamma LDS wave base (buf0)."))
-        else:
-            with self.writer.allocTmpSgpr(1, tag="mf_gammaM0") as t:
-                module.add(SAddU32(dst=sgpr(t.idx), src0=sgpr(self.gammaM0Base),
-                                   src1=bufIdx * self.geom.gammaLdsBufBytes,
-                                   comment=f"M0 base + buf{bufIdx} offset."))
-                module.add(SMovB32(dst=mgpr(0), src=sgpr(t.idx),
-                                   comment=f"M0 = gamma LDS wave base (buf{bufIdx})."))
-        # soffset = wgRowBase*gammaBytes + qi*tilesPerBlockM*mfmaM*gammaBytes.
-        qiSoffsetAdj = qi * self.geom.tilesPerBlockM * self.geom.mfmaM * self.geom.gammaBytes
-        if qiSoffsetAdj > 0:
-            qiSoffSgpr = sgprPool.checkOutAligned(1, 1, tag="mf_gammaQiSoff", preventOverflow=False)
-            module.add(SAddU32(dst=sgpr(qiSoffSgpr), src0=sgpr(self.gammaSoffsetSgpr),
-                               src1=qiSoffsetAdj,
-                               comment=f"soffset += qi*tpb*mfmaM*gammaBytes for qi={qi}."))
-        else:
-            qiSoffSgpr = self.gammaSoffsetSgpr
-        # One b32 load covers the entire qi block: lane i reads gamma[2i] and gamma[2i+1]
-        # and DTL writes them contiguously at LDS M0+i*4, matching the consumer layout.
-        module.add(BufferLoadB32(
-            dst=None, vaddr=vgpr(self.gammaDtlVaddr), saddr=sgpr(self.gammaSrd, 4),
-            soffset=sgpr(qiSoffSgpr),
-            mubuf=MUBUFModifiers(offen=True, offset12=0, lds=True),
-            comment=f"gamma DTL b32 -> LDS (qi={qi},buf={bufIdx}); {numStageLanes} lanes x 2 bf16."))
-        if qiSoffsetAdj > 0:
-            sgprPool.checkIn(qiSoffSgpr)
-        # DTL is tracked by vmcnt; wait before restoring exec and releasing the exec guard.
-        module.add(SWaitCnt(vlcnt=0, comment="wait gamma DTL loads land in LDS (vmcnt tracks DTL)."))
+        for qi in range(self.geom.nQTilesM):
+            self._emitGammaDtlLoad(module, qi)
+        # DTL is tracked by vmcnt; a single wait drains all nQTilesM loads (<= ~8 in
+        # practice, well under the vmcnt counter capacity).
+        module.add(SWaitCnt(vlcnt=0, comment="wait all gamma DTL loads land in LDS (vmcnt tracks DTL)."))
         module.add(SMovB64(dst=EXEC(), src=sgpr(savedExec, lsc),
                            comment="restore full exec after gamma DTL stage."))
         sgprPool.checkIn(savedExec)
         module.add(self.writer._syncThreads(self.kernel,
-                                            "gamma DTL stage: LDS writes visible before broadcast read."))
+                                            "gamma DTL stage: all LDS writes visible before broadcast reads."))
 
 
-    def _ldsReadGammaBlockIssue(self, module, gammaBank, qi, bufIdx) -> None:
+    def _ldsReadGammaBlockIssue(self, module, gammaBank, qi) -> None:
         """Issue broadcast LDS reads for staged gamma without waiting or converting.
 
         The wait and bf16->f32 conversion are deferred so LDS latency overlaps
         residual/RMS work.
         """
         assert not self._gammaReadPending, "gamma LDS read issued while a prior read is still pending"
-        module.addComment1(f"broadcast-read gamma from LDS (qi={qi},buf={bufIdx}).")
+        module.addComment1(f"broadcast-read gamma from LDS (qi={qi}).")
         tpb = self.geom.tilesPerBlockM
         for mi in range(tpb):
-            off = bufIdx * self.geom.gammaLdsBufBytes + mi * self.geom.mfmaM * self.geom.gammaBytes
+            off = qi * self.geom.gammaLdsBufBytes + mi * self.geom.mfmaM * self.geom.gammaBytes
             module.add(DSLoadB64(
                 dst=vgpr(gammaBank + mi * self.geom.rowsPerLane, 2),
                 src=vgpr(self.gammaLdsReadAddr),
                 ds=DSModifiers(offset=off),
-                comment=f"broadcast-read gamma bf16 (qi={qi},mi={mi},buf={bufIdx})."))
+                comment=f"broadcast-read gamma bf16 (qi={qi},mi={mi})."))
         self._gammaReadPending = True
 
 
@@ -653,11 +670,13 @@ class SubtileMegaFusedEmitter:
         the scalar/wide masked path (tail arm), per design §5.
         """
         module.addComment1("prolog loads then PFD pipeline iteration.")
-        self._stageGammaToLds(module, 0, 0)
-        # Issue the qi=0 gamma read right after the visibility barrier (no intervening
-        # vmem before the DS read); the wait+convert is deferred to the first consumer
-        # so the whole prolog's residual loads overlap the LDS round-trip.
-        self._ldsReadGammaBlockIssue(module, gammaBank, 0, 0)
+        # Prefetch every qi-block's gamma into its own LDS slot up front; the main loop
+        # only ever reads (never restages) from these resident slots.
+        self._stageAllGammaToLds(module)
+        # Issue qi=0's broadcast read right after the visibility barrier (no intervening
+        # vmem before the DS read); the wait+convert is deferred to the first consumer so
+        # the whole prolog's residual loads overlap the LDS round-trip.
+        self._ldsReadGammaBlockIssue(module, gammaBank, 0)
         module.addComment1("issue residual loads for the first PFD units.")
         numUnits_ep = len(units)
         for u_ep in range(min(pfd, numUnits_ep)):
@@ -1246,15 +1265,12 @@ class SubtileMegaFusedEmitter:
                 pqi, pnBase, pg = units[prefetchIdx]
                 module.add(self._issueUnitLoads(resRing[prefetchIdx % pfd], mBaseV,
                                                 pqi, pnBase, pg, pathInterior))
-            # Ping-pong: stage next qi's gamma and issue its LDS read directly after the
-            # visibility barrier (no intervening vmem before the DS read). The wait+convert
-            # is deferred to qi+1's first consumer, so the next-unit prefetch loads and
-            # qi+1's first-tile residual/RMS work overlap the LDS round-trip.
-            if (self.geom.gammaBuffers > 1
-                    and nBase + g == self.geom.mmaN and qi + 1 < self.geom.nQTilesM):
-                nextBufIdx = (qi + 1) % self.geom.gammaBuffers
-                self._stageGammaToLds(module, qi + 1, nextBufIdx)
-                self._ldsReadGammaBlockIssue(module, gammaBank, qi + 1, nextBufIdx)
+            # Gamma for qi+1 is already resident in LDS (staged up front); issue only its
+            # broadcast read right after this qi's last N-group. The wait+convert defers to
+            # qi+1's first consumer so the next-unit prefetch and qi+1's first-tile work
+            # overlap the LDS round-trip. No restaging ever happens inside the loop.
+            if nBase + g == self.geom.mmaN and qi + 1 < self.geom.nQTilesM:
+                self._ldsReadGammaBlockIssue(module, gammaBank, qi + 1)
 
 
 
