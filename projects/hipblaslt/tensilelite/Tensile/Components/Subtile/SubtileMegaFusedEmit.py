@@ -593,15 +593,17 @@ class SubtileMegaFusedEmitter:
         if qiSoffsetAdj > 0:
             sgprPool.checkIn(qiSoffSgpr)
 
-    def _stageAllGammaToLds(self, module) -> None:
-        """Prefetch the whole block's gamma (all nQTilesM qi-blocks) into LDS up front.
+    def _issueAllGammaToLds(self, module) -> None:
+        """Issue every nQTilesM gamma qi-block's Direct-To-LDS load (no drain, no barrier).
 
-        One WAR barrier guards the prior (mainloop) LDS users; one exec narrowing
-        covers every DTL load; one vmcnt wait drains them all; one visibility barrier
-        publishes every write before any wave's first broadcast read.  Distinct qi
+        One WAR barrier guards the prior (mainloop) LDS users; one exec narrowing covers
+        every DTL load.  Exec is restored (and its saved-exec SGPR checked in) immediately
+        after issuing the loads -- exec only gates which lanes *issue* the op, so restoring
+        it does not require waiting for completion (vlcnt tracks that).  The caller issues
+        independent work next, then calls _drainGammaToLds to wait + publish.  Distinct qi
         slots never alias, so no inter-stage WAR barrier is needed.
         """
-        module.addComment1(f"stage all gamma qi-blocks to LDS up front (nQTilesM={self.geom.nQTilesM}).")
+        module.addComment1(f"issue all gamma qi-block DTL loads up front (nQTilesM={self.geom.nQTilesM}).")
         sgprPool = self.writer.sgprPool
         lsc = self.geom.laneSgprCount
         numStageLanes = self.geom.tilesPerBlockM * self.geom.mfmaM // 2
@@ -631,15 +633,10 @@ class SubtileMegaFusedEmitter:
         sgprPool.checkIn(repMask)
         for qi in range(self.geom.nQTilesM):
             self._emitGammaDtlLoad(module, qi)
-        # DTL is tracked by vmcnt; a single wait drains all nQTilesM loads (<= ~8 in
-        # practice, well under the vmcnt counter capacity).
-        module.add(SWaitCnt(vlcnt=0, comment="wait all gamma DTL loads land in LDS (vmcnt tracks DTL)."))
+        # Restore exec right after issuing; completion is tracked by vlcnt regardless of exec.
         module.add(SMovB64(dst=EXEC(), src=sgpr(savedExec, lsc),
-                           comment="restore full exec after gamma DTL stage."))
+                           comment="restore full exec after issuing gamma DTL loads."))
         sgprPool.checkIn(savedExec)
-        module.add(self.writer._syncThreads(self.kernel,
-                                            "gamma DTL stage: all LDS writes visible before broadcast reads."))
-
 
     def _ldsReadGammaBlockIssue(self, module, gammaBank, qi) -> None:
         """Issue broadcast LDS reads for staged gamma without waiting or converting.
@@ -670,19 +667,32 @@ class SubtileMegaFusedEmitter:
         the scalar/wide masked path (tail arm), per design §5.
         """
         module.addComment1("prolog loads then PFD pipeline iteration.")
-        # Prefetch every qi-block's gamma into its own LDS slot up front; the main loop
-        # only ever reads (never restages) from these resident slots.
-        self._stageAllGammaToLds(module)
-        # Issue qi=0's broadcast read right after the visibility barrier (no intervening
-        # vmem before the DS read); the wait+convert is deferred to the first consumer so
-        # the whole prolog's residual loads overlap the LDS round-trip.
-        self._ldsReadGammaBlockIssue(module, gammaBank, 0)
-        module.addComment1("issue residual loads for the first PFD units.")
+        # Issue every qi-block's gamma DTL load up front (no drain yet); the main loop only
+        # ever reads (never restages) from these resident slots.
+        self._issueAllGammaToLds(module)
+        # Issue the first PFD units' residual loads BETWEEN the gamma DTL issue and its drain
+        # so these independent global->VGPR loads overlap the gamma global->LDS round-trip.
+        # They never touch the gamma LDS region.
+        module.addComment1("issue residual loads for the first PFD units (overlap gamma DTL round-trip).")
         numUnits_ep = len(units)
-        for u_ep in range(min(pfd, numUnits_ep)):
+        nProlog_ep = min(pfd, numUnits_ep)
+        for u_ep in range(nProlog_ep):
             pqi_ep, pnBase_ep, pg_ep = units[u_ep]
             module.add(self._issueUnitLoads(resRing[u_ep % pfd], mBaseV, pqi_ep, pnBase_ep, pg_ep,
                                             pathInterior))
+        # Drain only the gamma DTL loads (FIFO-oldest); residualOutstanding residual loads
+        # stay in flight. issuedThroughUnit[nProlog_ep-1] is exactly how many residual VMEM
+        # loads the prolog issued, so the main-loop counts remain unchanged. VMEM completes
+        # in FIFO order, so waiting vlcnt=residualOutstanding drains exactly the (older)
+        # gamma loads while leaving the residual loads in flight.
+        residualOutstanding_ep = issuedThroughUnit[nProlog_ep - 1] if nProlog_ep > 0 else 0
+        module.add(SWaitCnt(vlcnt=residualOutstanding_ep,
+                            comment=f"drain gamma DTL loads (FIFO); keep {residualOutstanding_ep} residual loads in flight."))
+        module.add(self.writer._syncThreads(self.kernel,
+                                            "gamma DTL stage: all LDS writes visible before broadcast reads."))
+        # Issue qi=0's broadcast read AFTER the visibility barrier (gamma writes now visible);
+        # the wait+convert is deferred to the first consumer so its LDS round-trip overlaps.
+        self._ldsReadGammaBlockIssue(module, gammaBank, 0)
         module.addComment1("PFD-pipeline iteration over all units.")
         tpb = self.geom.tilesPerBlockM
         numUnits = len(units)
@@ -1271,10 +1281,6 @@ class SubtileMegaFusedEmitter:
             # overlap the LDS round-trip. No restaging ever happens inside the loop.
             if nBase + g == self.geom.mmaN and qi + 1 < self.geom.nQTilesM:
                 self._ldsReadGammaBlockIssue(module, gammaBank, qi + 1)
-
-
-
-
 
 
     def emit(self, vgprTiles):
@@ -1985,29 +1991,11 @@ class SubtileMegaFusedEmitter:
         return module
 
 
-
-
     def _computeWaveM(self, module, dst: int) -> None:
         # Callers with wgM > 1 can use self.waveIdV, which emit() caches.
         module.addComment1("compute waveM = waveId mod wgM.")
         module.add(VAndB32(dst=vgpr(dst), src0=vgpr(self.waveIdV), src1=self.geom.wgM - 1,
                            comment=f"waveM = waveId % {self.geom.wgM}"))
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     def _mulVgprBySgprConst(self, module, dstVgpr: int, sgprName: str,
                              const: int, comment: str) -> None:
@@ -2041,13 +2029,3 @@ class SubtileMegaFusedEmitter:
         module.add(SMovB32(dst=sgpr(sTmp), src=const, comment=f"load {const} into SGPR."))
         module.add(VMulLOU32(dst=vgpr(dst), src0=vgpr(srcVgpr), src1=sgpr(sTmp), comment=comment))
         self.writer.sgprPool.checkIn(sTmp)
-
-
-
-
-
-
-
-
-
-
