@@ -1270,40 +1270,6 @@ class SubtileMegaFusedEmitter:
         module.addComment1("MF end _fusedElementLoop.")
 
 
-    def _initBlkAmax(self, blkAmax) -> Module:
-        """Zero the per-qi persistent blkAmax bank (one f32 per absolute N column)."""
-        module = Module("MegaFused initBlkAmax")
-        module.addComment0("MF begin _initBlkAmax: zero per-qi blkAmax bank.")
-        for n in range(self.mmaN):
-            module.add(VMovB32(dst=vgpr(blkAmax + n), src=0, comment=f"blkAmax[{n}] = 0."))
-        module.addComment0("MF end _initBlkAmax.")
-        return module
-
-
-    def _fusedFrontHalf(self, vgprTiles, gammaBank, blkAmax, qi, nBase, g) -> Module:
-        """Emit one N-group's element loop (residual add, bf16 store, rmsSum, gamma).
-
-        For MXFP8 the gamma-scaled result is written back to the accumulator and
-        |H*gamma| is folded into the persistent blkAmax bank; the group's MXFP8 tail
-        is deferred and emitted later by _mxDeferredTail.
-        """
-        module = Module(f"MegaFused frontHalf qi={qi} nBase={nBase}")
-        module.addComment0(f"MF begin _fusedFrontHalf: fused element loop for N-group (qi={qi},nBase={nBase}).")
-        vgprPool = self.writer.vgprPool
-        bankSize = g * self.tilesPerBlockM * self.rowsPerLane
-        # 2-aligned so AGPR-staged acc pairs are packed-VALU eligible.
-        accBank = vgprPool.checkOutAligned(bankSize, 2, tag="mf_accBank")
-        # Whole-N-group residual bank so all residual loads overlap (2-aligned for
-        # the wide BufferLoadB64 path).
-        resBank = vgprPool.checkOutAligned(bankSize, 2, tag="mf_resBank")
-        self._fusedElementLoop(module, vgprTiles, accBank, resBank, gammaBank,
-                               blkAmax, qi, nBase, g)
-        vgprPool.checkIn(resBank)
-        vgprPool.checkIn(accBank)
-        module.addComment0("MF end _fusedFrontHalf.")
-        return module
-
-
     def _mxDeferredTail(self, vgprTiles, blkAmax, qi, nBase, g) -> Module:
         """Deferred MXFP8 tail for one N-group: butterfly-reduce blkAmax, compute e8m0
         scales, re-read the accumulator to apply alpha*quantMult, and store MXScale bytes.
