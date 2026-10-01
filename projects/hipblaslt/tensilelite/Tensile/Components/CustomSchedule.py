@@ -544,6 +544,36 @@ def hasCustomSchedule(kernel):
     return False, None
 
 
+def megaFusedEpilogueCompatible(d):
+    """True when the MegaFused fused epilogue has a known-compatible accumulator-tile view.
+
+    Compatible when UseSubtileImpl (Subtile's own contiguous tile view), or when running
+    under CMS with the identity accToArchMapper permutation. The identity permutation holds
+    only for SourceSwap=False and output VectorWidthA==VectorWidthB==1 (the same regime
+    Subtile forces at Solution.py). The non-identity permutation is out of scope.
+
+    Accepts either a Solution 'state' dict (validation time, UseCustomMainLoopSchedule may be
+    unresolved/-1) or a resolved 'kernel' dict (codegen time).
+
+    At validation time VectorWidthA/B must already be resolved (e.g. set explicitly in the
+    solution); an unresolved -1 (auto) value is treated as not-yet-1 and will be rejected.
+    """
+    if d.get("UseSubtileImpl"):
+        return True
+    cms = d.get("UseCustomMainLoopSchedule", -1)
+    if cms == 1:
+        isCMS = True
+    elif cms == 0:
+        isCMS = False
+    else:  # -1 auto: resolve against the CMS catalog (validation time).
+        isCMS, _ = hasCustomSchedule(d)
+    if not isCMS:
+        return False
+    return (not d.get("SourceSwap", False)
+            and d.get("VectorWidthA") == 1
+            and d.get("VectorWidthB") == 1)
+
+
 def query_cms_kernels(dtype: Optional[str] = None, layout: Optional[str] = None) -> list[dict]:
     """Query for available CMS kernels matching the given data type and/or layout.
 

@@ -166,6 +166,24 @@ class RMSEpilogueGeometry:
         self.elemBytes = 1 if (dt.isAnyFloat8() or dt.isAnyBFloat8()) else 2
         self.log2ElemBytes = 0 if self.elemBytes == 1 else 1
 
+        # Wave/tile row(M) and col(N) strides depend on how the macro tile maps
+        # MIWaveGroup waves onto the output. Subtile uses a wave-CONTIGUOUS layout
+        # (wave owns a contiguous row/col block). Standard/CMS kernels use a
+        # wave-INTERLEAVED layout (tile stride = wg*mfma, wave stride = mfma; see
+        # KernelWriterAssembly.py:3780). These must match the main loop's actual
+        # per-wave ownership or the residual/gamma/partialBuf addressing permutes.
+        self.interleavedWaves = not bool(kernel.get("UseSubtileImpl"))
+        if self.interleavedWaves:
+            self.waveStrideM = self.mfmaM
+            self.tileStrideM = self.wgM * self.mfmaM
+            self.waveStrideN = self.mfmaN
+            self.tileStrideN = self.wgN * self.mfmaN
+        else:
+            self.waveStrideM = self.mmaM * self.mfmaM
+            self.tileStrideM = self.mfmaM
+            self.waveStrideN = self.mmaN * self.mfmaN
+            self.tileStrideN = self.mfmaN
+
     def _deriveSideInputGeometry(self, kernel):
         """Residual and gamma side-input element geometry."""
         # Residual side input (always fused on for the MegaFused epilogue).
@@ -381,10 +399,10 @@ def _packResidualOutRow(module, srcRegs, packBank, geom) -> None:
 
 def _free0RowPos(module, dst: int, rowBase: int, rowGroupOff: int,
                  m: int, k: int, scratch: int, geom) -> None:
-    # free0 row = rowBase + rowGroupOff + (m*mfmaM + k). One v_add3_u32 folds
+    # free0 row = rowBase + rowGroupOff + (m*tileStrideM + k). One v_add3_u32 folds
     # the row-base, the m/k immediate, and rowGroupOff into a single VALU op.
     module.addComment1(f"compute free0 row position (m={m},k={k}).")
-    mBase = m * geom.mfmaM + k
+    mBase = m * geom.tileStrideM + k
     if mBase == 0:
         module.add(VAddU32(vgpr(dst), vgpr(rowBase), vgpr(rowGroupOff),
                            comment=f"row = base + rowGroupOff (m={m},k={k})"))
@@ -486,7 +504,7 @@ class SubtileMegaFusedEmitter:
         for j in range(g):
             n = nBase + j
             module.addComment1(f"compute row byte base for residual (n={n}).")
-            nOff = n * self.geom.mfmaN
+            nOff = n * self.geom.tileStrideN
             r = _addImmU32(module, self.resRowByteBase, self.resTokenBase, nOff, self.resAddr,
                            f"token_n = tokenBase + {nOff} (n={n}).")
             module.add(VMulLOU32(dst=vgpr(self.resRowByteBase), src0=sgpr("SizesFree+0"), src1=vgpr(r),
@@ -507,7 +525,7 @@ class SubtileMegaFusedEmitter:
                 if pathInterior and _useDwordx4Interior(self.geom):
                     module.addComment1(f"exec-masked B128 load for pair (m={m},n={n}).")
                     lsc_irt = self.geom.laneSgprCount
-                    rowOff_irt = m * self.geom.mfmaM * 2
+                    rowOff_irt = m * self.geom.tileStrideM * 2
                     assert rowOff_irt < 4096, f"residual dwordx4 load offset {rowOff_irt} exceeds MUBUF offset12 range"
                     loadAddr_irt = self.writer.vgprPool.checkOut(1, tag="mf_dx4LoadAddr")
                     module.add(VCndMaskB32(dst=vgpr(loadAddr_irt), src0=vgpr(self.resRowByteBase),
@@ -524,7 +542,7 @@ class SubtileMegaFusedEmitter:
                     isBf16_irt = self.geom.residualBytes == 2
                     loadCls_irt = BufferLoadB64 if isBf16_irt else BufferLoadB32
                     chunkBytes_irt = 4 << self.geom.residualLog2Bytes
-                    rowOff_irt = m * self.geom.mfmaM * self.geom.residualBytes
+                    rowOff_irt = m * self.geom.tileStrideM * self.geom.residualBytes
                     for c_irt in range(self.geom.rowsPerLane // 4):
                         off_irt = rowOff_irt + chunkBytes_irt * c_irt
                         assert off_irt < 4096, f"residual wide load offset {off_irt} exceeds MUBUF offset12 range"
@@ -557,41 +575,91 @@ class SubtileMegaFusedEmitter:
 
 
     def _emitGammaDtlLoad(self, module, qi) -> None:
-        """Issue one qi-block's Direct-To-LDS gamma load into its resident LDS slot.
+        """Issue one qi-block's Direct-To-LDS gamma load(s) into the resident LDS slot(s).
 
-        The caller owns exec narrowing, the vmcnt wait, and the barriers; this only
-        sets M0 for slot qi and issues the DTL buffer_load.  Slot index == qi.
+        Contiguous layout (Subtile): one b32 DTL load per qi-block covers all
+        tilesPerBlockM tiles, which occupy contiguous global gamma rows.
+
+        Interleaved layout (CMS): the tilesPerBlockM tiles map to non-contiguous global
+        gamma rows (stride tileStrideM between tiles), so issue one b32 DTL load per
+        tile, each at its own global soffset, into the same per-mi LDS slot the consumer
+        already reads.  The LDS layout and the consumer are unchanged.
+
+        The caller owns exec narrowing, the vmcnt wait, and the barriers.
         """
         sgprPool = self.writer.sgprPool
-        # M0 = waveM*ldsWaveStride + qi*gammaLdsBufBytes (slot qi's per-wave write base).
-        if qi == 0:
+        if not self.geom.interleavedWaves:
+            # Contiguous layout (Subtile): one b32 DTL load covers the whole qi block.
+            # M0 = waveM*ldsWaveStride + qi*gammaLdsBufBytes (slot qi's per-wave write base).
+            if qi == 0:
+                module.add(SMovB32(dst=mgpr(0), src=sgpr(self.gammaM0Base),
+                                   comment="M0 = gamma LDS wave base (slot 0)."))
+            else:
+                with self.writer.allocTmpSgpr(1, tag="mf_gammaM0") as t:
+                    module.add(SAddU32(dst=sgpr(t.idx), src0=sgpr(self.gammaM0Base),
+                                       src1=qi * self.geom.gammaLdsBufBytes,
+                                       comment=f"M0 base + slot{qi} offset."))
+                    module.add(SMovB32(dst=mgpr(0), src=sgpr(t.idx),
+                                       comment=f"M0 = gamma LDS wave base (slot {qi})."))
+            # soffset = wgRowBase*gammaBytes + qi*gammaLdsWaveStride (next qi-block of gamma).
+            qiSoffsetAdj = qi * self.geom.gammaLdsWaveStride
+            if qiSoffsetAdj > 0:
+                qiSoffSgpr = sgprPool.checkOutAligned(1, 1, tag="mf_gammaQiSoff", preventOverflow=False)
+                module.add(SAddU32(dst=sgpr(qiSoffSgpr), src0=sgpr(self.gammaSoffsetSgpr),
+                                   src1=qiSoffsetAdj,
+                                   comment=f"soffset += qi*gammaLdsWaveStride for qi={qi}."))
+            else:
+                qiSoffSgpr = self.gammaSoffsetSgpr
+            # One b32 load covers the entire qi block: lane i reads gamma[2i],gamma[2i+1]
+            # and DTL writes them contiguously at LDS M0+i*4, matching the consumer layout.
+            module.add(BufferLoadB32(
+                dst=None, vaddr=vgpr(self.gammaDtlVaddr), saddr=sgpr(self.gammaSrd, 4),
+                soffset=sgpr(qiSoffSgpr),
+                mubuf=MUBUFModifiers(offen=True, offset12=0, lds=True),
+                comment=f"gamma DTL b32 -> LDS slot {qi}."))
+            if qiSoffsetAdj > 0:
+                sgprPool.checkIn(qiSoffSgpr)
+        else:
+            # Interleaved layout (CMS): tiles in a qi-block map to non-contiguous global
+            # gamma rows (stride tileStrideM = wgM*mfmaM between consecutive tiles).
+            # Issue one b32 DTL load per tile at its interleaved global soffset, writing
+            # into the same per-mi LDS slot the consumer reads.
+            tpb = self.geom.tilesPerBlockM
+            for mi in range(tpb):
+                m = qi * tpb + mi
+                # Global byte soffset for this tile:
+                #   gammaSoffsetSgpr already = wgRowBase * gammaBytes (wgRowBase includes
+                #   waveM * waveStrideM from the wgRowBase setup), so adding
+                #   m * tileStrideM * gammaBytes gives the correct interleaved row.
+                tileSoffsetAdj = m * self.geom.tileStrideM * self.geom.gammaBytes
+                if tileSoffsetAdj > 0:
+                    with self.writer.allocTmpSgpr(1, tag="mf_gammaTileSoff") as ts:
+                        module.add(SAddU32(dst=sgpr(ts.idx), src0=sgpr(self.gammaSoffsetSgpr),
+                                           src1=tileSoffsetAdj,
+                                           comment=f"soffset = wgRowBase*gammaBytes + m*tileStrideM*gammaBytes (m={m})."))
+                        self._emitGammaDtlInterleavedTileLoad(module, qi, mi, ts.idx)
+                else:
+                    self._emitGammaDtlInterleavedTileLoad(module, qi, mi, self.gammaSoffsetSgpr)
+
+    def _emitGammaDtlInterleavedTileLoad(self, module, qi, mi, soffSgpr) -> None:
+        """Set M0 for one interleaved tile's LDS slot and issue its DTL b32 load."""
+        m0Adj = qi * self.geom.gammaLdsBufBytes + mi * self.geom.mfmaM * self.geom.gammaBytes
+        if m0Adj == 0:
             module.add(SMovB32(dst=mgpr(0), src=sgpr(self.gammaM0Base),
-                               comment="M0 = gamma LDS wave base (slot 0)."))
+                               comment=f"M0 = gammaM0Base (qi={qi},mi={mi})."))
         else:
-            with self.writer.allocTmpSgpr(1, tag="mf_gammaM0") as t:
-                module.add(SAddU32(dst=sgpr(t.idx), src0=sgpr(self.gammaM0Base),
-                                   src1=qi * self.geom.gammaLdsBufBytes,
-                                   comment=f"M0 base + slot{qi} offset."))
-                module.add(SMovB32(dst=mgpr(0), src=sgpr(t.idx),
-                                   comment=f"M0 = gamma LDS wave base (slot {qi})."))
-        # soffset = wgRowBase*gammaBytes + qi*gammaLdsWaveStride (next qi-block of gamma).
-        qiSoffsetAdj = qi * self.geom.gammaLdsWaveStride
-        if qiSoffsetAdj > 0:
-            qiSoffSgpr = sgprPool.checkOutAligned(1, 1, tag="mf_gammaQiSoff", preventOverflow=False)
-            module.add(SAddU32(dst=sgpr(qiSoffSgpr), src0=sgpr(self.gammaSoffsetSgpr),
-                               src1=qiSoffsetAdj,
-                               comment=f"soffset += qi*gammaLdsWaveStride for qi={qi}."))
-        else:
-            qiSoffSgpr = self.gammaSoffsetSgpr
-        # One b32 load covers the entire qi block: lane i reads gamma[2i],gamma[2i+1]
-        # and DTL writes them contiguously at LDS M0+i*4, matching the consumer layout.
+            with self.writer.allocTmpSgpr(1, tag="mf_gammaTileM0") as tm:
+                module.add(SAddU32(dst=sgpr(tm.idx), src0=sgpr(self.gammaM0Base),
+                                   src1=m0Adj,
+                                   comment=f"M0 = gammaM0Base + qi*ldsStride + mi*mfmaM*gammaBytes (qi={qi},mi={mi})."))
+                module.add(SMovB32(dst=mgpr(0), src=sgpr(tm.idx),
+                                   comment=f"M0 = per-tile LDS slot base (qi={qi},mi={mi})."))
         module.add(BufferLoadB32(
             dst=None, vaddr=vgpr(self.gammaDtlVaddr), saddr=sgpr(self.gammaSrd, 4),
-            soffset=sgpr(qiSoffSgpr),
+            soffset=sgpr(soffSgpr),
             mubuf=MUBUFModifiers(offen=True, offset12=0, lds=True),
-            comment=f"gamma DTL b32 -> LDS slot {qi}."))
-        if qiSoffsetAdj > 0:
-            sgprPool.checkIn(qiSoffSgpr)
+            comment=f"gamma DTL b32 -> LDS slot (qi={qi},mi={mi})."))
+
 
     def _issueAllGammaToLds(self, module) -> None:
         """Issue every nQTilesM gamma qi-block's Direct-To-LDS load (no drain, no barrier).
@@ -606,7 +674,12 @@ class SubtileMegaFusedEmitter:
         module.addComment1(f"issue all gamma qi-block DTL loads up front (nQTilesM={self.geom.nQTilesM}).")
         sgprPool = self.writer.sgprPool
         lsc = self.geom.laneSgprCount
-        numStageLanes = self.geom.tilesPerBlockM * self.geom.mfmaM // 2
+        # Interleaved layout: each per-tile DTL load needs mfmaM//2 lanes (lane i reads
+        # gamma[2i,2i+1]); all per-tile loads share the same low-lane mask, so we narrow
+        # exec once to mfmaM//2.  Contiguous layout: one load per qi covers tilesPerBlockM
+        # tiles, requiring tilesPerBlockM*mfmaM//2 lanes.
+        numStageLanes = (self.geom.mfmaM // 2) if self.geom.interleavedWaves \
+            else (self.geom.tilesPerBlockM * self.geom.mfmaM // 2)
         module.add(self.writer._syncThreads(self.kernel,
                                             "gamma DTL stage: WAR barrier before reusing LDS region."))
         savedExec = sgprPool.checkOutAligned(lsc, lsc, tag="mf_gammaStageExec", preventOverflow=False)
@@ -724,7 +797,7 @@ class SubtileMegaFusedEmitter:
                 self.roRowBase = self.writer.vgprPool.checkOut(1, tag="mf_roRowBase")
                 self.roColByteBase = self.writer.vgprPool.checkOut(1, tag="mf_roColByteBase")
                 _unitMod_cui.addComment1(f"token OOB mask and roRowBase (n={n}).")
-                nOff_roBase = n * self.geom.mfmaN
+                nOff_roBase = n * self.geom.tileStrideN
                 tokV_roBase = self.writer.vgprPool.checkOut(1, tag="mf_roTokV")
                 scratch_roBase = self.writer.vgprPool.checkOut(1, tag="mf_roTokScratch")
                 r_roBase = _addImmU32(_unitMod_cui, tokV_roBase, self.resTokenBase, nOff_roBase, scratch_roBase,
@@ -886,7 +959,7 @@ class SubtileMegaFusedEmitter:
                                                src1=vgpr(self.resOobV),
                                                src2=sgpr(self.pairUpperLaneMask, lsc),
                                                comment="upper lane -> BufferOOB (store dropped); lower lane keeps addr."))
-                        rowOff = m * self.geom.mfmaM * 2
+                        rowOff = m * self.geom.tileStrideM * 2
                         assert rowOff < 4096, f"residualOut row offset {rowOff} exceeds MUBUF offset12 range"
                         _unitMod_cui.add(BufferStoreB128(src=vgpr(vPack, 4), vaddr=vgpr(dx4Addr),
                                                    saddr=sgpr(self.residualOutSrd, 4), soffset=0,
@@ -920,7 +993,7 @@ class SubtileMegaFusedEmitter:
                         _unitMod_cui.add(VCndMaskB32(dst=vgpr(wideAddrV), src0=vgpr(self.resOobV),
                                                src1=vgpr(self.roColByteBase), src2=sgpr(safe, lsc),
                                                comment="wideAddr = b64Safe ? roColByteBase : BufferOOB."))
-                        rowOff = m * self.geom.mfmaM * 2
+                        rowOff = m * self.geom.tileStrideM * 2
                         assert rowOff < 4096, f"residualOut row offset {rowOff} exceeds MUBUF offset12 range"
                         _unitMod_cui.add(BufferStoreB64(src=vgpr(packBank, 2), vaddr=vgpr(wideAddrV),
                                                   saddr=sgpr(self.residualOutSrd, 4), soffset=0,
@@ -1199,11 +1272,11 @@ class SubtileMegaFusedEmitter:
                 for j in range(g):
                     n = nBase + j
                     _mxDeferredTailMod.addComment0(f"  SubCol store qi={qi}, n={n}.")
-                    _mxDeferredTailMod.addComment1(f"compute per-lane freeV = freeBase + n*mfmaN + col (n={n}).")
+                    _mxDeferredTailMod.addComment1(f"compute per-lane freeV = freeBase + n*tileStrideN + col (n={n}).")
                     freeV = self.writer.vgprPool.checkOut(1, tag="mx_scFreeV")
                     _mxDeferredTailMod.add(VAddU32(vgpr(freeV), vgpr(self._scFreeBase), vgpr(self.col),
                                        comment="freeBase + col (per-lane)."))
-                    nOff = n * self.geom.mfmaN
+                    nOff = n * self.geom.tileStrideN
                     if 0 < nOff <= 64:
                         _mxDeferredTailMod.add(VAddU32(vgpr(freeV), vgpr(freeV), nOff, comment=f"+ n*mfmaN={nOff}."))
                     elif nOff > 64:
@@ -1338,12 +1411,12 @@ class SubtileMegaFusedEmitter:
             tmpRes = ContinuousRegister(tmpVgpr, 2)
             _setupSharedMod.add(vectorStaticDivide(waveN, "Serial", self.geom.waveSize * self.geom.wgM, tmpRes,
                                           comment=f"waveN = Serial / {self.geom.waveSize * self.geom.wgM}"))
-            colBaseBytes = self.geom.mmaN * self.geom.mfmaN * self.geom.elemBytes
+            colBaseBytes = self.geom.waveStrideN * self.geom.elemBytes
             with self.writer.allocTmpSgpr(1, tag="rAdd_setupColBase") as tmpSgprInfo:
                 _setupSharedMod.add(SMovB32(dst=sgpr(tmpSgprInfo.idx), src=hex(colBaseBytes),
                                    comment=f"col base bytes per wave ({colBaseBytes})"))
                 _setupSharedMod.add(VMulLOU32(dst=vgpr(waveN), src0=sgpr(tmpSgprInfo.idx), src1=vgpr(waveN),
-                                     comment="waveN * mmaN * mfmaN * elemBytes"))
+                                     comment="waveN * waveStrideN * elemBytes"))
             _setupSharedMod.add(VAddU32(vgpr(self.colByte), vgpr(self.colByte), vgpr(waveN),
                                comment="colByte += wave column base"))
             self.writer.vgprPool.checkIn(tmpVgpr)
@@ -1420,10 +1493,10 @@ class SubtileMegaFusedEmitter:
         if self.geom.wgM > 1:
             waveM = self.writer.vgprPool.checkOut(1, tag="pRMS_rbWaveM")
             self._computeWaveM(module, waveM)
-            waveStride = self.geom.mmaM * self.geom.mfmaM
+            waveStride = self.geom.waveStrideM
             strideV = self.writer.vgprPool.checkOut(1, tag="pRMS_rbStride")
             module.add(VMovB32(dst=vgpr(strideV), src=waveStride,
-                               comment=f"waveStride = mmaM * mfmaM = {waveStride}"))
+                               comment=f"waveStride = waveStrideM = {waveStride}"))
             module.add(VMulLOU32(dst=vgpr(waveM), src0=vgpr(strideV), src1=vgpr(waveM),
                                  comment="waveMOff = waveM * waveStride"))
             module.add(VAddU32(vgpr(self.wgRowBase), vgpr(self.wgRowBase), vgpr(waveM),
@@ -1522,7 +1595,7 @@ class SubtileMegaFusedEmitter:
             self._mulVgprBySgprConst(module, freeBaseV, "WorkGroup1", self.geom.macroTile1,
                                       "freeBase = WG1 * MT1.")
             if waveN_bsc is not None:
-                waveSpanN_cfb = self.geom.mmaN * self.geom.mfmaN
+                waveSpanN_cfb = self.geom.waveStrideN
                 tmp_cfb = self.writer.vgprPool.checkOut(1, tag="mx_scFreeBaseTmp")
                 self._shiftOrMulVgprConst(module, tmp_cfb, waveN_bsc, waveSpanN_cfb,
                                           f"waveN * waveSpanN={waveSpanN_cfb}.")
@@ -1920,8 +1993,8 @@ class SubtileMegaFusedEmitter:
                                    comment="tokenBase = colByte >> log2ElemBytes."))
         _writePartialsFree0Mod.add(SAndSaveExecB64(dst=sgpr(self.savedExec, lsc), src=sgpr(self.laneMaskSgpr, lsc),
                                    comment="save exec; set exec = writing-lane mask"))
-        # Strength-reduce token*n_d across the n loop: token advances by mfmaN each
-        # step, so token*n_d advances by the loop-invariant stride mfmaN*n_d. This
+        # Strength-reduce token*n_d across the n loop: token advances by tileStrideN each
+        # step, so token*n_d advances by the loop-invariant stride tileStrideN*n_d. This
         # replaces the per-n multiply with a single add.
         accumV = self.writer.vgprPool.checkOut(1, tag="pRMS_wF0Accum")
         # token*n_d uses 32-bit VMulLOU32; assumes token*n_d < 2^32.
@@ -1930,8 +2003,8 @@ class SubtileMegaFusedEmitter:
         strideV = None
         if self.geom.mmaN > 1:
             strideV = self.writer.vgprPool.checkOut(1, tag="pRMS_wF0Stride")
-            _writePartialsFree0Mod.add(VMulLOU32(dst=vgpr(strideV), src0=self.geom.mfmaN, src1=vgpr(ntilesV),
-                                 comment=f"stride = mfmaN({self.geom.mfmaN}) * n_d"))
+            _writePartialsFree0Mod.add(VMulLOU32(dst=vgpr(strideV), src0=self.geom.tileStrideN, src1=vgpr(ntilesV),
+                                 comment=f"stride = tileStrideN({self.geom.tileStrideN}) * n_d"))
         # Pre-compute byteAddr = (token*n_d + WG0) * 4 once, then stride by stride4 per n.
         _writePartialsFree0Mod.add(VAddU32(vgpr(globalAddr), vgpr(accumV), sgpr("WorkGroup0"),
                            comment="token*n_d + WorkGroup0 (n=0)"))
@@ -1944,7 +2017,7 @@ class SubtileMegaFusedEmitter:
             _writePartialsFree0Mod.add(BufferStoreB32(src=vgpr(self.partials + n), vaddr=vgpr(globalAddr),
                                       saddr=sgpr(partialSrd, 4), soffset=0,
                                       mubuf=MUBUFModifiers(offen=True),
-                                      comment=f"partialBuf[token+n*{self.geom.mfmaN}, WG0] = Σx² (n={n})"))
+                                      comment=f"partialBuf[token+n*{self.geom.tileStrideN}, WG0] = Σx² (n={n})"))
             if n < self.geom.mmaN - 1:
                 _writePartialsFree0Mod.add(VAddU32(vgpr(globalAddr), vgpr(globalAddr), vgpr(strideV),
                                    comment=f"byteAddr += stride4 (advance to n={n + 1})"))

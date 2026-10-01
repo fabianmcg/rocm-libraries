@@ -15934,12 +15934,66 @@ class KernelWriterAssembly(KernelWriter):
     vgprActCopy: int = -1
     calleeLabelsByGwvw: Optional[Mapping[int, Tuple[str, ...]]] = None
 
+  def _buildCmsFusedAccTileView(self, kernel):
+    """Synthesize a vgprTiles-equivalent accumulator view for a CMS kernel.
+
+    The MegaFused emitter indexes accumulators as vgprTiles[n*mmaM+m].regList.indices[ki]
+    and branches on regList.pool (vgpr vs agpr). Subtile populates that list from its
+    TileInfo; CMS kernels do not. For the identity accToArchMapper permutation
+    (SourceSwap=False, output VectorWidthA==VectorWidthB==1 — enforced by the validator)
+    the accumulator index for (tile t, row ki) is regsPerTile*t + ki, addressed against the
+    flat AGPR block with an AGPR->arch-VGPR spill boundary at maxLimitAgprs, exactly as
+    mapAcctoArchRegs addresses it. This view mutates the same physical registers the normal
+    store path (accVgprRead = mapAcctoArchRegs) later reads, so the in-place H*gamma write-back
+    and the subsequent store stay consistent.
+    """
+    from .Components.Subtile.Kernel import RegisterTileInfo
+    from rocisa.enum import RegisterType
+    from .KernelWriterModules import hasSequentialValuC
+    assert not kernel["MIArchVgpr"], "accumulator view requires MIArchVgpr=False (AGPR accumulation)"
+    assert hasSequentialValuC(kernel), \
+        "identity accToArchMapper permutation required for the CMS MegaFused accumulator view"
+    mfmaM = kernel["MatrixInstM"]
+    mfmaN = kernel["MatrixInstN"]
+    wgM, wgN = kernel["MIWaveGroup"]
+    mmaM = (kernel["MacroTile0"] // mfmaM) // wgM
+    mmaN = (kernel["MacroTile1"] // mfmaN) // wgN
+    outputsPerMFMA1B = (mfmaM * mfmaN) // kernel["WavefrontSize"]
+    regsPerTile = outputsPerMFMA1B * kernel["MIRegPerOut"]
+    maxAgpr = self.states.maxLimitAgprs
+    valuCBase = self.states.c.startVgprValu
+    tiles = [None] * (mmaM * mmaN)
+    for n in range(mmaN):
+      for m in range(mmaM):
+        t = n * mmaM + m
+        base = regsPerTile * t
+        # Tiles are regsPerTile-aligned and maxAgpr is a multiple of regsPerTile, so a
+        # single tile never straddles the AGPR/VGPR spill boundary (guaranteed on gfx950, the only ISA this path is validated for).
+        spilled = base >= maxAgpr
+        assert (base < maxAgpr) == ((base + regsPerTile - 1) < maxAgpr), \
+            "accumulator tile straddles the AGPR/VGPR spill boundary"
+        pool = self.vgprPool if spilled else self.agprPool
+        regType = RegisterType.Vgpr if spilled else RegisterType.Accvgpr
+        tileInfo = RegisterTileInfo(pool, regType)
+        for r in range(regsPerTile):
+          idx = base + r
+          phys = (valuCBase + (idx - maxAgpr)) if spilled else idx
+          tileInfo.append(phys)
+        tiles[t] = tileInfo
+    return tiles
+
   def emitSubtileFusedEpilogue(self, kernel):
-    # Only complete-tile subtile waves reach here (StreamK Role C branched away earlier).
+    # Only complete-tile waves reach here (StreamK Role C branched away earlier).
     module = Module("SubtileFusedEpilogue")
-    if not kernel.get("UseSubtileImpl"):
+    from .Components.CustomSchedule import megaFusedEpilogueCompatible
+    if not megaFusedEpilogueCompatible(kernel):
       return module
-    vgprTiles = self.states.d.tileInfo.vgprTiles
+    if kernel.get("UseSubtileImpl"):
+      vgprTiles = self.states.d.tileInfo.vgprTiles
+    else:
+      # CMS kernels have no TileInfo.vgprTiles; synthesize an equivalent accumulator
+      # view over the identity accToArchMapper layout (see _buildCmsFusedAccTileView).
+      vgprTiles = self._buildCmsFusedAccTileView(kernel)
     if not vgprTiles:
       return module
     if kernel["RMSEpilogue"]:

@@ -10070,6 +10070,15 @@ class KernelWriter(metaclass=abc.ABCMeta):
     if self.states.doShadowInit and kernel["BufferStore"]:
       self.defineSgpr("SrdD", 4, 4)
       self.defineSgpr("SrdC", 4, 4)
+      # RMSEpilogue's bf16 residual-out store needs its own SRD. When beta==0 SrdC is
+      # unused, so alias SrdResidualOut onto it (avoids exceeding the SGPR budget);
+      # otherwise define a dedicated one. Mirrors the non-shadow-init path in
+      # KernelWriterAssembly.defineAndResources.
+      if kernel["RMSEpilogue"]:
+        if not kernel["ProblemType"]["UseBeta"]:
+          self.sgprs["SrdResidualOut"] = self.sgprs["SrdC"]
+        else:
+          self.defineSgpr("SrdResidualOut", 4, 4)
 
     self.defineSgpr("NumWorkGroups0", 1)
     self.defineSgpr("NumWorkGroups1", 1)

@@ -74,7 +74,7 @@ from Tensile.SolutionStructs.Naming import getSolutionNameFull
 from Tensile.SolutionStructs.Problem import ProblemType
 from Tensile.SolutionStructs.segment_interleave import evaluate as segIntEval, aligned_budget_ok as segAlignedBudget
 from Tensile.Toolchain.Component import Assembler
-from Tensile.Components.CustomSchedule import hasCustomSchedule
+from Tensile.Components.CustomSchedule import hasCustomSchedule, megaFusedEpilogueCompatible
 
 from ..Component import TensorDataMover
 from ..Components.TensorDataMover import TensorDataMoverLoad
@@ -300,8 +300,15 @@ def _validateSubtileEpiloguePrereqs(state, printRejectionReason, epilogueName):
   emitters use AGPR read/write instructions). Returns True when all hold;
   rejects the solution and returns False otherwise.
   """
-  if not state["UseSubtileImpl"]:
-    reject(state, printRejectionReason, "%s requires UseSubtileImpl" % epilogueName)
+  # The fused epilogue runs wherever it has a compatible accumulator-tile view:
+  # Subtile's native tile view, or a CMS kernel with the identity accToArchMapper
+  # permutation (SourceSwap=False, VectorWidthA==VectorWidthB==1). The non-identity
+  # permutation is deliberately out of scope for this first working version.
+  if not megaFusedEpilogueCompatible(state):
+    reject(state, printRejectionReason,
+           "fused epilogue %s requires UseSubtileImpl, or a CMS kernel (UseCustomMainLoopSchedule=1) with "
+           "the identity accumulator permutation (SourceSwap=False, VectorWidthA=VectorWidthB=1); "
+           "the non-identity permutation is not yet supported" % epilogueName)
     return False
   if state["ISA"] != (9, 5, 0):
     reject(state, printRejectionReason, "%s is only implemented on gfx950" % epilogueName)
@@ -378,6 +385,12 @@ def _validateRMSEpilogue(state, printRejectionReason):
     reject(state, printRejectionReason, "RMSEpilogue requires MatrixInst 16x16")
     return
   if not _validateSubtileEpiloguePrereqs(state, printRejectionReason, "RMSEpilogue"):
+    return
+  # Scope boundary: the CMS fused-epilogue port currently supports bf16 output only.
+  # The MXFP8 (DestDataType=float8) dynamic-quant path is not yet ported to CMS.
+  if not state["UseSubtileImpl"] and state["ProblemType"]["DestDataType"].isFloat8():
+    reject(state, printRejectionReason,
+           "RMSEpilogue under CMS currently supports bf16 output only (MXFP8 output not yet ported)")
     return
   if not _resolveRMSGammaType(state, printRejectionReason):
     return
