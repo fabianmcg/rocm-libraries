@@ -301,17 +301,15 @@ def _validateSubtileEpiloguePrereqs(state, printRejectionReason, epilogueName):
   rejects the solution and returns False otherwise.
   """
   # The fused epilogue runs wherever it has a compatible accumulator-tile view:
-  # Subtile's native tile view, or a CMS kernel with SourceSwap=False (any VectorWidthA and
-  # VectorWidthB). The emitter's geometry is reparameterized so rowsPerLane = VW0 *
-  # outputsPerMFMA and tileStrideM = VW0 * wgM * mfmaM (VW0), with per-lane column sub-tiling
-  # folded into colOffset(n) and the colByte lane scaling (VW1). SourceSwap=True transposes
-  # the physical MFMA output layout and requires a separate emitter rework, so it stays
-  # unsupported.
+  # Subtile's native tile view, or a CMS kernel with any VectorWidthA/VectorWidthB and any
+  # SourceSwap value. For SourceSwap=True, an in-place AGPR transpose (SS->nonSS before the
+  # emitter, nonSS->SS after) is emitted so the non-SS emitter sees the correct layout; the
+  # transpose is VW-independent because it iterates all MFMA tiles flat.
   if not megaFusedEpilogueCompatible(state):
     reject(state, printRejectionReason,
-           "fused epilogue %s requires UseSubtileImpl, or a CMS kernel (UseCustomMainLoopSchedule=1) with "
-           "SourceSwap=False (any VectorWidthA/VectorWidthB); "
-           "SourceSwap=True is not yet supported" % epilogueName)
+           "fused epilogue %s requires UseSubtileImpl, or a CMS kernel "
+           "(UseCustomMainLoopSchedule=1); any VectorWidthA/VectorWidthB and any SourceSwap "
+           "value are supported" % epilogueName)
     return False
   if state["ISA"] != (9, 5, 0):
     reject(state, printRejectionReason, "%s is only implemented on gfx950" % epilogueName)

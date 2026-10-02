@@ -15934,6 +15934,139 @@ class KernelWriterAssembly(KernelWriter):
     vgprActCopy: int = -1
     calleeLabelsByGwvw: Optional[Mapping[int, Tuple[str, ...]]] = None
 
+  def _emitSourceSwapTransposeTile(self, module, agprBase, ssBaseV, nsBaseV, tmpVgprs,
+                                    toNonSwap: bool, T: int, numTiles: int):
+    """Emit the LDS round-trip for a single MFMA accumulator tile during SS transpose.
+
+    Reads the tile's AGPRs into temporaries, stores them to LDS at the source-layout
+    offsets, waits, loads from the destination-layout offsets, waits, and writes back.
+    """
+    regsPerTile = len(tmpVgprs)
+    # SS byte offsets per tIdx:   4*(laneModV*16 + laneDivV*4 + t) = ssBase + 4*t.
+    # nonSS byte offsets per tIdx: 4*((laneDivV*4+t)*16 + laneModV) = nsBase + 64*t.
+    ssOffsets = [4 * t for t in range(regsPerTile)]    # 0, 4, 8, 12
+    nsOffsets = [64 * t for t in range(regsPerTile)]   # 0, 64, 128, 192
+    # toNonSwap=True:  write to SS positions, read from nonSS positions.
+    # toNonSwap=False: write to nonSS positions, read from SS positions.
+    writeAddrV   = ssBaseV if toNonSwap else nsBaseV
+    readAddrV    = nsBaseV if toNonSwap else ssBaseV
+    writeOffsets = ssOffsets if toNonSwap else nsOffsets
+    readOffsets  = nsOffsets if toNonSwap else ssOffsets
+    module.addComment1(f"SS AGPR transpose tile T={T}/{numTiles} (toNonSwap={toNonSwap}).")
+    for t in range(regsPerTile):
+      module.add(VAccvgprReadB32(
+          vgpr(tmpVgprs[t]), accvgpr(agprBase + t),
+          comment=f"read AGPR {agprBase + t} into tmp[{t}]."))
+    for t in range(regsPerTile):
+      module.add(DSStoreB32(
+          dstAddr=vgpr(writeAddrV), src=vgpr(tmpVgprs[t]),
+          ds=DSModifiers(offset=writeOffsets[t]),
+          comment=f"write tmp[{t}] to {'SS' if toNonSwap else 'nonSS'} LDS offset {writeOffsets[t]}."))
+    module.add(SWaitCnt(dscnt=0, comment=f"tile T={T}: wait DS stores complete."))
+    for t in range(regsPerTile):
+      module.add(DSLoadB32(
+          dst=vgpr(tmpVgprs[t]), src=vgpr(readAddrV),
+          ds=DSModifiers(offset=readOffsets[t]),
+          comment=f"read from {'nonSS' if toNonSwap else 'SS'} LDS offset {readOffsets[t]}."))
+    module.add(SWaitCnt(dscnt=0, comment=f"tile T={T}: wait DS loads complete."))
+    for t in range(regsPerTile):
+      module.add(VAccvgprWriteB32(
+          accvgpr(agprBase + t), vgpr(tmpVgprs[t]),
+          comment=f"write transposed value to AGPR {agprBase + t}."))
+
+  def _emitCmsSourceSwapTranspose(self, kernel, module, toNonSwap: bool):
+    """Transpose accumulator AGPRs in-place via LDS to convert between SS and nonSS layouts.
+
+    Performs an intra-16x16-tile transpose of all MFMA accumulator tiles so the
+    non-SourceSwap epilogue emitter can operate correctly on SourceSwap accumulators.
+
+    toNonSwap=True:  SS->nonSS transpose (emit before the epilogue emitter).
+    toNonSwap=False: nonSS->SS transpose (emit after the epilogue emitter).
+
+    Each wave uses its own 1024-byte LDS scratch at waveId*1024 bytes so no
+    inter-wave barriers are needed within the per-tile loop. A cross-wave barrier
+    is emitted at the start of transpose-out to fence the emitter's cross-wave
+    LDS reduction before we overwrite its write slots.
+
+    Only supports MIRegPerOut=1 and 16x16 MFMA tiles; VectorWidth is unrestricted because
+    the transpose iterates over all MFMA tiles in a flat loop independent of VW.
+    """
+    assert not kernel["MIArchVgpr"], "ss agpr transpose requires AGPR accumulation"
+    assert kernel["MatrixInstM"] == 16 and kernel["MatrixInstN"] == 16, \
+        "ss agpr transpose only supports 16x16 MFMA tiles"
+    assert kernel["MIRegPerOut"] == 1, "ss agpr transpose only supports MIRegPerOut=1"
+    assert kernel["WavefrontSize"] == 64, "ss agpr transpose only supports WavefrontSize=64"
+
+    # Geometry: 4 outputs per MFMA lane, tiles laid out identity (nonSS src = identity).
+    outputsPerMFMA = 4  # (16 * 16) // 64
+    regsPerTile = outputsPerMFMA  # MIRegPerOut=1
+    wgM, wgN = kernel["MIWaveGroup"]
+    mmaM = (kernel["MacroTile0"] // 16) // wgM  # outerTT0
+    mmaN = (kernel["MacroTile1"] // 16) // wgN  # full column count per wave
+    numTiles = mmaM * mmaN
+
+    tag = "ssTxIn" if toNonSwap else "ssTxOut"
+    vp = self.vgprPool
+    tmpVgprs = [vp.checkOut(1, tag=f"{tag}_t{i}") for i in range(regsPerTile)]
+    laneModV, laneDivV, ssBaseV, nsBaseV, tmpAV = (
+        vp.checkOut(1, tag=f"{tag}_{s}") for s in ("lMod", "lDiv", "ssB", "nsB", "tA"))
+
+    if not toNonSwap:
+        # Fence the emitter's cross-wave LDS reduction reads before writing to
+        # the LDS scratch region that overlaps those reduction write slots.
+        module.add(self._syncThreads(
+            kernel, "SS transpose-out: barrier to fence cross-wave LDS reads."))
+
+    if toNonSwap:
+        # MFMA completion is fenced upstream by the epilogue preamble and the scheduler;
+        # this drains any remaining outstanding VMEM/SMEM so AGPRs are safe to read.
+        module.add(SWaitCnt(kmcnt=0, vlcnt=0,
+                            comment="drain main-loop ops before AGPR reads (SS transpose-in)."))
+
+    # Lane-in-wave arithmetic: laneId = Serial & 63, laneMod = laneId % 16, laneDiv = laneId >> 4.
+    module.add(VAndB32(dst=vgpr(laneModV), src0=vgpr("Serial"), src1=15,
+                       comment="laneMod = Serial & 15 (laneId %% 16)."))
+    module.add(VLShiftRightB32(dst=vgpr(laneDivV), shiftHex=hex(4), src=vgpr("Serial"),
+                               comment="laneDiv tmp = Serial >> 4."))
+    module.add(VAndB32(dst=vgpr(laneDivV), src0=vgpr(laneDivV), src1=3,
+                       comment="laneDiv = (laneId >> 4) & 3 (groups 0..3)."))
+
+    # The transpose reuses the main-loop LDS region (temporal reuse: the main loop is
+    # finished at epilogue time); each wave uses its own 1 KB slot (waveId*1024 bytes)
+    # so there is no inter-wave aliasing, and 1 KB/wave is within the main-loop LDS
+    # footprint for all supported 16x16 bf16 configurations.
+    # SS byte base  = waveBase + laneModV*64 + laneDivV*16  (t=0 byte addr).
+    # nonSS byte base = waveBase + laneDivV*256 + laneModV*4  (t=0 byte addr).
+    module.add(VLShiftRightB32(dst=vgpr(ssBaseV), shiftHex=hex(6), src=vgpr("Serial"),
+                               comment="waveId = Serial >> 6."))
+    module.add(VLShiftLeftB32(dst=vgpr(ssBaseV), shiftHex=hex(10), src=vgpr(ssBaseV),
+                              comment="waveBase = waveId * 1024 bytes."))
+    module.add(VMovB32(dst=vgpr(nsBaseV), src=vgpr(ssBaseV),
+                       comment="nsBase = waveBase."))
+    module.add(VLShiftLeftB32(dst=vgpr(tmpAV), shiftHex=hex(6), src=vgpr(laneModV),
+                              comment="laneModV * 64."))
+    module.add(VAddU32(vgpr(ssBaseV), vgpr(ssBaseV), vgpr(tmpAV),
+                       comment="ssBase += laneModV * 64."))
+    module.add(VLShiftLeftB32(dst=vgpr(tmpAV), shiftHex=hex(4), src=vgpr(laneDivV),
+                              comment="laneDivV * 16."))
+    module.add(VAddU32(vgpr(ssBaseV), vgpr(ssBaseV), vgpr(tmpAV),
+                       comment="ssBase += laneDivV * 16.  (SS t=0 byte addr)"))
+    module.add(VLShiftLeftB32(dst=vgpr(tmpAV), shiftHex=hex(8), src=vgpr(laneDivV),
+                              comment="laneDivV * 256."))
+    module.add(VAddU32(vgpr(nsBaseV), vgpr(nsBaseV), vgpr(tmpAV),
+                       comment="nsBase += laneDivV * 256."))
+    module.add(VLShiftLeftB32(dst=vgpr(tmpAV), shiftHex=hex(2), src=vgpr(laneModV),
+                              comment="laneModV * 4."))
+    module.add(VAddU32(vgpr(nsBaseV), vgpr(nsBaseV), vgpr(tmpAV),
+                       comment="nsBase += laneModV * 4.  (nonSS t=0 byte addr)"))
+
+    for T in range(numTiles):
+        self._emitSourceSwapTransposeTile(
+            module, T * regsPerTile, ssBaseV, nsBaseV, tmpVgprs, toNonSwap, T, numTiles)
+
+    for v in [*tmpVgprs, laneModV, laneDivV, ssBaseV, nsBaseV, tmpAV]:
+        vp.checkIn(v)
+
   @staticmethod
   def _cmsFusedTileRegs(n, m, outerTT0, vw0, vw1, outputsPerMFMA, regsPerOut, rowsPerLaneEff):
     """Compute the list of physical AGPR indices for emitter tile (n, m).
@@ -15976,7 +16109,8 @@ class KernelWriterAssembly(KernelWriter):
     from .Components.Subtile.Kernel import RegisterTileInfo
     from rocisa.enum import RegisterType
     assert not kernel["MIArchVgpr"], "accumulator view requires MIArchVgpr=False (AGPR accumulation)"
-    assert not kernel["SourceSwap"], "cannot use the CMS MegaFused accumulator view with SourceSwap=True"
+    # SourceSwap=True is handled via an AGPR transpose before/after the emitter; the emitter
+    # always sees non-SS layout so the same accOut formula applies for all VW combinations.
     mfmaM = kernel["MatrixInstM"]
     mfmaN = kernel["MatrixInstN"]
     wgM, wgN = kernel["MIWaveGroup"]
@@ -16013,6 +16147,8 @@ class KernelWriterAssembly(KernelWriter):
     from .Components.CustomSchedule import megaFusedEpilogueCompatible
     if not megaFusedEpilogueCompatible(kernel):
       return module
+    # CMS SourceSwap=True: transpose accumulators in/out so the non-SS emitter operates correctly.
+    isCmsSS = (not kernel.get("UseSubtileImpl") and kernel.get("SourceSwap", False))
     if kernel.get("UseSubtileImpl"):
       vgprTiles = self.states.d.tileInfo.vgprTiles
     else:
@@ -16023,7 +16159,13 @@ class KernelWriterAssembly(KernelWriter):
       return module
     if kernel["RMSEpilogue"]:
       from .Components.Subtile.SubtileMegaFusedEmit import SubtileMegaFusedEmitter
+      if isCmsSS:
+        # Transpose SS accumulators to nonSS layout before the emitter processes them.
+        self._emitCmsSourceSwapTranspose(kernel, module, toNonSwap=True)
       module.add(SubtileMegaFusedEmitter(self, kernel).emit(vgprTiles))
+      if isCmsSS:
+        # Transpose back to SS layout so the normal SS store path writes D correctly.
+        self._emitCmsSourceSwapTranspose(kernel, module, toNonSwap=False)
       return module
     return module
 

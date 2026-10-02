@@ -1,13 +1,12 @@
 # Copyright Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier: MIT
 #
-# SourceSwap=True CMS MegaFused RMSEpilogue — numerical correctness validation.
+# CMS + RMSEpilogue, SourceSwap=True, VectorWidthA=VectorWidthB=2 — fully general case
+# (accumulator transpose + VW-reparameterized non-SS emitter).
 #
 # PASSING: all three output buffers (D, partialBuf, residualOut) match reference.
-# SourceSwap=True is supported for VectorWidthA=VectorWidthB=1 via an intra-tile
-# AGPR LDS transpose (SS->nonSS before the epilogue emitter, nonSS->SS after).
 #
-# Tile parameters: VectorWidthA=VectorWidthB=1, SourceSwap=True, bf16, gfx950.
+# Tile parameters: VectorWidthA=VectorWidthB=2, SourceSwap=True, bf16, gfx950.
 #   MatrixInstruction [16,16,32,1,1,8,8,2,2]: MT0=256 MT1=256, MIWaveTile[8,8], MIWaveGroup[2,2].
 
 GlobalParameters:
@@ -57,8 +56,8 @@ BenchmarkProblems:
         - PrefetchAcrossPersistent: [0]
         - DirectToLds: [1]
         - SourceSwap: [True]
-        - VectorWidthA: [1]
-        - VectorWidthB: [1]
+        - VectorWidthA: [2]
+        - VectorWidthB: [2]
         - StaggerU: [0]
         - DepthU: [64]
         - LdsPadA: [-1]
@@ -86,7 +85,7 @@ BenchmarkProblems:
             - Exact: [512, 512, 1, 512]
 
 LibraryLogic:
-  ScheduleName: "cms_rms_epilogue_ss_probe"
+  ScheduleName: "cms_rms_epilogue_ss_vw2"
   DeviceNames: ["Device 75a0"]
   ArchitectureName: "gfx950"
   LibraryType: "Equality"
