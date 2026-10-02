@@ -301,14 +301,17 @@ def _validateSubtileEpiloguePrereqs(state, printRejectionReason, epilogueName):
   rejects the solution and returns False otherwise.
   """
   # The fused epilogue runs wherever it has a compatible accumulator-tile view:
-  # Subtile's native tile view, or a CMS kernel with the identity accToArchMapper
-  # permutation (SourceSwap=False, VectorWidthA==VectorWidthB==1). The non-identity
-  # permutation is deliberately out of scope for this first working version.
+  # Subtile's native tile view, or a CMS kernel with SourceSwap=False (any VectorWidthA and
+  # VectorWidthB). The emitter's geometry is reparameterized so rowsPerLane = VW0 *
+  # outputsPerMFMA and tileStrideM = VW0 * wgM * mfmaM (VW0), with per-lane column sub-tiling
+  # folded into colOffset(n) and the colByte lane scaling (VW1). SourceSwap=True transposes
+  # the physical MFMA output layout and requires a separate emitter rework, so it stays
+  # unsupported.
   if not megaFusedEpilogueCompatible(state):
     reject(state, printRejectionReason,
            "fused epilogue %s requires UseSubtileImpl, or a CMS kernel (UseCustomMainLoopSchedule=1) with "
-           "the identity accumulator permutation (SourceSwap=False, VectorWidthA=VectorWidthB=1); "
-           "the non-identity permutation is not yet supported" % epilogueName)
+           "SourceSwap=False (any VectorWidthA/VectorWidthB); "
+           "SourceSwap=True is not yet supported" % epilogueName)
     return False
   if state["ISA"] != (9, 5, 0):
     reject(state, printRejectionReason, "%s is only implemented on gfx950" % epilogueName)

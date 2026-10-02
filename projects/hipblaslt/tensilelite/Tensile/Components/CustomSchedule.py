@@ -548,15 +548,16 @@ def megaFusedEpilogueCompatible(d):
     """True when the MegaFused fused epilogue has a known-compatible accumulator-tile view.
 
     Compatible when UseSubtileImpl (Subtile's own contiguous tile view), or when running
-    under CMS with the identity accToArchMapper permutation. The identity permutation holds
-    only for SourceSwap=False and output VectorWidthA==VectorWidthB==1 (the same regime
-    Subtile forces at Solution.py). The non-identity permutation is out of scope.
+    under CMS with SourceSwap=False (any VectorWidthA and VectorWidthB). The emitter's row
+    and column addressing and the gamma/residual/partialBuf/output side-input addressing are
+    reparameterized to handle VectorWidthA>=1 (rowsPerLane = VW0 * outputsPerMFMA,
+    tileStrideM = VW0 * wgM * mfmaM) and VectorWidthB>=1 (per-lane column sub-tiling folded
+    into colOffset(n) and the colByte lane scaling) under the non-SourceSwap layout.
+
+    SourceSwap=True transposes the physical MFMA output layout and remains unsupported.
 
     Accepts either a Solution 'state' dict (validation time, UseCustomMainLoopSchedule may be
     unresolved/-1) or a resolved 'kernel' dict (codegen time).
-
-    At validation time VectorWidthA/B must already be resolved (e.g. set explicitly in the
-    solution); an unresolved -1 (auto) value is treated as not-yet-1 and will be rejected.
     """
     if d.get("UseSubtileImpl"):
         return True
@@ -569,9 +570,7 @@ def megaFusedEpilogueCompatible(d):
         isCMS, _ = hasCustomSchedule(d)
     if not isCMS:
         return False
-    return (not d.get("SourceSwap", False)
-            and d.get("VectorWidthA") == 1
-            and d.get("VectorWidthB") == 1)
+    return not d.get("SourceSwap", False)
 
 
 def query_cms_kernels(dtype: Optional[str] = None, layout: Optional[str] = None) -> list[dict]:

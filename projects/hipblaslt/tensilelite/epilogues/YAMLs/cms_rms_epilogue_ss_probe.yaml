@@ -1,0 +1,102 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+#
+# SourceSwap=True PROBE — gather GPU evidence that SourceSwap is NOT yet supported.
+#
+# KNOWN-FAILING config: this YAML is intentionally expected to produce numerical
+# mismatches when run with the two guards relaxed:
+#   1. megaFusedEpilogueCompatible (CustomSchedule.py) must return True for SourceSwap.
+#   2. assert not kernel["SourceSwap"] in _buildCmsFusedAccTileView (KernelWriterAssembly.py)
+#      must be commented out.
+# Without those relaxations, the solution is REJECTED and this YAML produces no kernel.
+#
+# Purpose: observe the per-buffer mismatch pattern (D, partialBuf, residualOut) that
+# results from applying the non-SourceSwap addressing to a SourceSwap=True kernel.
+# This is evidence-gathering only — do NOT fix the addressing here.
+#
+# NumElementsToValidate=-1 validates all elements; ExitOnFails=0 reports all
+# mismatches without aborting the run.
+#
+# Tile parameters match the identity-permutation config (cms_rms_epilogue.yaml):
+#   VectorWidthA=VectorWidthB=1, SourceSwap=True.
+
+GlobalParameters:
+  MinimumRequiredVersion: 5.0.0
+  NumElementsToValidate: -1
+  ExitOnFails: 0
+  PrintSolutionRejectionReason: True
+  KernelTime: True
+  KeepBuildTmp: True
+
+BenchmarkProblems:
+  -
+    -
+      OperationType: GEMM
+      DataType: b
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: True
+      TransposeB: False
+      UseBeta: False
+      Batched: True
+      StridedBatched: True
+      GroupedGemm: False
+      UseBias: 0
+      UseScaleAB: ""
+      UseScaleCD: False
+      UseScaleAlphaVec: 0
+      UseScaleD: False
+      Sparse: 0
+      UseRMSEpilogue: True
+
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+            - [16, 16, 32, 1, 1, 8, 8, 2, 2]   # MT0=256 MT1=256, MIWaveTile[8,8], MIWaveGroup[2,2]
+        - RMSEpilogue: [True]
+        - UseSubtileImpl: [False]
+        - StreamK: [0]
+        - GlobalSplitU: [1]
+        - GlobalSplitUAlgorithm: ["SingleBuffer"]
+        - ScheduleIterAlg: [3]
+        - PrefetchGlobalRead: [2]
+        - PrefetchLocalRead: [1]
+        - PrefetchAcrossPersistent: [0]
+        - DirectToLds: [1]
+        - SourceSwap: [True]
+        - VectorWidthA: [1]
+        - VectorWidthB: [1]
+        - StaggerU: [0]
+        - DepthU: [64]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [8]
+        - GlobalReadVectorWidthB: [8]
+        - LocalReadVectorWidth: [8]
+        # These three must be explicitly resolved for the CMS catalog match at
+        # Solution.py:3738 (hasCustomSchedule reads LocalReadVectorWidthA/B directly
+        # before the auto-resolution at line 4669, and DtlPlusLdsBuf before line 6403).
+        - LocalReadVectorWidthA: [8]
+        - LocalReadVectorWidthB: [8]
+        - DtlPlusLdsBuf: [0]
+        # TransposeLDS must be 1 for isTN(kernel)+TLDS==1 branch in the schedule.
+        - TransposeLDS: [1]
+        # UseCustomMainLoopSchedule=1 must be explicit so megaFusedEpilogueCompatible
+        # at Solution.py:1602 can determine isCMS=True before hasCustomSchedule runs.
+        - UseCustomMainLoopSchedule: [1]
+        - PreloadKernArgs: [False]
+        - 1LDSBuffer: [0]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+            - Exact: [512, 512, 1, 512]
+
+LibraryLogic:
+  ScheduleName: "cms_rms_epilogue_ss_probe"
+  DeviceNames: ["Device 75a0"]
+  ArchitectureName: "gfx950"
+  LibraryType: "Equality"

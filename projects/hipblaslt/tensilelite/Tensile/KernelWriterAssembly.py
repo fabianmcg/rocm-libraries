@@ -15934,50 +15934,75 @@ class KernelWriterAssembly(KernelWriter):
     vgprActCopy: int = -1
     calleeLabelsByGwvw: Optional[Mapping[int, Tuple[str, ...]]] = None
 
+  @staticmethod
+  def _cmsFusedTileRegs(n, m, outerTT0, vw0, vw1, outputsPerMFMA, regsPerOut, rowsPerLaneEff):
+    """Compute the list of physical AGPR indices for emitter tile (n, m).
+
+    Applies the non-SourceSwap accToArchMapper src formula (BM=BN=1):
+      accOut = tIdx + outputsPerMFMA * (vw0i + vw0 * (m + outerTT0 * (vc1 + vw1 * n_g)))
+    where ki = vw0i + vw0*tIdx is the within-tile row index.
+    """
+    regsPerTile = rowsPerLaneEff * regsPerOut
+    n_g = n // vw1
+    vc1 = n %  vw1
+    accRegs = []
+    for ki in range(regsPerTile):
+      ke = ki // regsPerOut
+      r  = ki %  regsPerOut
+      tIdx = ke // vw0
+      vw0i = ke %  vw0
+      accOut = tIdx + outputsPerMFMA * (vw0i + vw0 * (m + outerTT0 * (vc1 + vw1 * n_g)))
+      accRegs.append(accOut * regsPerOut + r)
+    return accRegs
+
   def _buildCmsFusedAccTileView(self, kernel):
     """Synthesize a vgprTiles-equivalent accumulator view for a CMS kernel.
 
     The MegaFused emitter indexes accumulators as vgprTiles[n*mmaM+m].regList.indices[ki]
     and branches on regList.pool (vgpr vs agpr). Subtile populates that list from its
-    TileInfo; CMS kernels do not. For the identity accToArchMapper permutation
-    (SourceSwap=False, output VectorWidthA==VectorWidthB==1 — enforced by the validator)
-    the accumulator index for (tile t, row ki) is regsPerTile*t + ki, addressed against the
-    flat AGPR block with an AGPR->arch-VGPR spill boundary at maxLimitAgprs, exactly as
-    mapAcctoArchRegs addresses it. This view mutates the same physical registers the normal
-    store path (accVgprRead = mapAcctoArchRegs) later reads, so the in-place H*gamma write-back
-    and the subsequent store stay consistent.
+    TileInfo; CMS kernels do not.
+
+    This function uses the structural accToArchMapper 'src' formula to map each emitter
+    index (tile t, row ki) to a physical AGPR, supporting VW0>1, VW1>1, SourceSwap=False.
+    For VW0=VW1=1 the formula reduces to the affine identity base = regsPerTile*t + ki.
+
+    The emitter column n in [0, mmaN) is the FULL per-lane column count; it decomposes into
+    a vw1 group n//vw1 and a sub-column n%vw1. Non-SourceSwap accToArchMapper src formula
+    (BM=BN=1):
+      accOut = tIdx + outputsPerMFMA * (vw0i + vw0 * (m + outerTT0 * (vc1 + vw1 * n_g)))
+    where ki = vw0i + vw0*tIdx is the within-tile row index (ke in the plan), n_g = n//vw1,
+    vc1 = n%vw1. For vw1=1, n_g=n and vc1=0, reducing to the former VW1==1 formula.
     """
     from .Components.Subtile.Kernel import RegisterTileInfo
     from rocisa.enum import RegisterType
-    from .KernelWriterModules import hasSequentialValuC
     assert not kernel["MIArchVgpr"], "accumulator view requires MIArchVgpr=False (AGPR accumulation)"
-    assert hasSequentialValuC(kernel), \
-        "identity accToArchMapper permutation required for the CMS MegaFused accumulator view"
+    assert not kernel["SourceSwap"], "cannot use the CMS MegaFused accumulator view with SourceSwap=True"
     mfmaM = kernel["MatrixInstM"]
     mfmaN = kernel["MatrixInstN"]
     wgM, wgN = kernel["MIWaveGroup"]
-    mmaM = (kernel["MacroTile0"] // mfmaM) // wgM
-    mmaN = (kernel["MacroTile1"] // mfmaN) // wgN
-    outputsPerMFMA1B = (mfmaM * mfmaN) // kernel["WavefrontSize"]
-    regsPerTile = outputsPerMFMA1B * kernel["MIRegPerOut"]
+    vw0 = kernel["VectorWidthA"]
+    vw1 = kernel["VectorWidthB"]
+    outputsPerMFMA = (mfmaM * mfmaN) // kernel["WavefrontSize"]
+    regsPerOut = kernel["MIRegPerOut"]
+    outerTT0 = ((kernel["MacroTile0"] // mfmaM) // wgM) // vw0   # = geom.mmaM
+    mmaN_full = (kernel["MacroTile1"] // mfmaN) // wgN            # = geom.mmaN (full col count)
+    rowsPerLaneEff = vw0 * outputsPerMFMA
     maxAgpr = self.states.maxLimitAgprs
     valuCBase = self.states.c.startVgprValu
-    tiles = [None] * (mmaM * mmaN)
-    for n in range(mmaN):
-      for m in range(mmaM):
-        t = n * mmaM + m
-        base = regsPerTile * t
-        # Tiles are regsPerTile-aligned and maxAgpr is a multiple of regsPerTile, so a
-        # single tile never straddles the AGPR/VGPR spill boundary (guaranteed on gfx950, the only ISA this path is validated for).
-        spilled = base >= maxAgpr
-        assert (base < maxAgpr) == ((base + regsPerTile - 1) < maxAgpr), \
-            "accumulator tile straddles the AGPR/VGPR spill boundary"
+    tiles = [None] * (outerTT0 * mmaN_full)
+    for n in range(mmaN_full):
+      for m in range(outerTT0):
+        t = n * outerTT0 + m
+        accRegs = self._cmsFusedTileRegs(n, m, outerTT0, vw0, vw1, outputsPerMFMA, regsPerOut, rowsPerLaneEff)
+        spilledFlags = [a >= maxAgpr for a in accRegs]
+        assert all(f == spilledFlags[0] for f in spilledFlags), \
+            "cannot build CMS MegaFused accumulator tile that straddles the AGPR/VGPR spill boundary"
+        spilled = spilledFlags[0]
         pool = self.vgprPool if spilled else self.agprPool
         regType = RegisterType.Vgpr if spilled else RegisterType.Accvgpr
         tileInfo = RegisterTileInfo(pool, regType)
-        for r in range(regsPerTile):
-          idx = base + r
-          phys = (valuCBase + (idx - maxAgpr)) if spilled else idx
+        for a in accRegs:
+          phys = (valuCBase + (a - maxAgpr)) if spilled else a
           tileInfo.append(phys)
         tiles[t] = tileInfo
     return tiles
