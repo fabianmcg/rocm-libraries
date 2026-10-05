@@ -1,0 +1,84 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+#
+# CMS + RMSEpilogue, SourceSwap=True, VectorWidthA=VectorWidthB=8 — wide-VW config.
+# Validates the pfd=0 single-bank non-prefetched fallback in _emitFusedBodyNoPrefetch.
+# For this tile (MT256x256x64, MI16x16, MIWaveTile[8,8], MIWaveGroup[2,2]) with VW=8:
+#   S = tilesPerBlockM * rowsPerLane = 1 * 32 = 32, budget = 44.
+#   pfd=1 requires (1+1)*32=64 > 44 -> infeasible; pfd=0 single-bank (32<=44) is used.
+#
+# PASSING when pfd=0 fallback is correctly implemented.
+
+GlobalParameters:
+  MinimumRequiredVersion: 5.0.0
+  NumElementsToValidate: -1
+  ExitOnFails: 1
+  PrintSolutionRejectionReason: True
+  KernelTime: True
+
+BenchmarkProblems:
+  -
+    -
+      OperationType: GEMM
+      DataType: b
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: True
+      TransposeB: False
+      UseBeta: False
+      Batched: True
+      StridedBatched: True
+      GroupedGemm: False
+      UseBias: 0
+      UseScaleAB: ""
+      UseScaleCD: False
+      UseScaleAlphaVec: 0
+      UseScaleD: False
+      Sparse: 0
+      UseRMSEpilogue: True
+
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+            - [16, 16, 32, 1, 1, 8, 8, 2, 2]   # MT0=256 MT1=256, MIWaveTile[8,8], MIWaveGroup[2,2]
+        - RMSEpilogue: [True]
+        - UseSubtileImpl: [False]
+        - StreamK: [0]
+        - GlobalSplitU: [1]
+        - GlobalSplitUAlgorithm: ["SingleBuffer"]
+        - ScheduleIterAlg: [3]
+        - PrefetchGlobalRead: [2]
+        - PrefetchLocalRead: [1]
+        - PrefetchAcrossPersistent: [0]
+        - DirectToLds: [1]
+        - SourceSwap: [True]
+        - VectorWidthA: [8]
+        - VectorWidthB: [8]
+        - StaggerU: [0]
+        - DepthU: [64]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StoreVectorWidth: [8]
+        - GlobalReadVectorWidthA: [8]
+        - GlobalReadVectorWidthB: [8]
+        - LocalReadVectorWidth: [8]
+        - LocalReadVectorWidthA: [8]
+        - LocalReadVectorWidthB: [8]
+        - DtlPlusLdsBuf: [0]
+        - TransposeLDS: [1]
+        - UseCustomMainLoopSchedule: [1]
+        - PreloadKernArgs: [False]
+        - 1LDSBuffer: [0]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+            - Exact: [2048, 16384, 1, 2048]
+
+LibraryLogic:
+  ScheduleName: "cms_rms_epilogue_ss_vw8"
+  DeviceNames: ["Device 75a0"]
+  ArchitectureName: "gfx950"
+  LibraryType: "Equality"

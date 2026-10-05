@@ -254,6 +254,11 @@ class RMSEpilogueGeometry:
         S = tilesPerBlockM * rowsPerLane is the per-column bank size in the ring.
         Grow PFD from 1 while EBC_max(PFD) >= 1 fits, capped at _PREFETCH_DEPTH_CAP;
         EBC follows as the largest column batch fitting at the chosen depth.
+
+        When no prefetched depth fits (wide-VW configs with large S), a non-prefetched
+        single-bank fallback (pfd=0) is used if one bank (S VGPRs) fits within the
+        budget.  In that mode the residual is loaded and consumed serially; there is no
+        prefetch ring and no separate accBank.  Only the non-MXFP8 path supports pfd=0.
         """
         s = self.tilesPerBlockM * self.rowsPerLane
         budget = _VGPR_BUDGET - _VGPR_FIXED_ESTIMATE
@@ -266,6 +271,11 @@ class RMSEpilogueGeometry:
             bestPfd = pfd
             bestEbc = min(ebc, self.mmaN)
         if bestPfd == 0:
+            # No prefetched depth fits.  Fall back to pfd=0 single-bank mode when
+            # one bank (S VGPRs) fits and this is a non-MXFP8 kernel.
+            if not self.useMxfp8 and s <= budget:
+                self.prefetchDepth = 0
+                return 1
             raise RuntimeError(
                 f"megaFused epilogue infeasible: EBC=0 at PFD=1 for this tile shape "
                 f"(S={s}, mmaN={self.mmaN}, VGPRFixed est={_VGPR_FIXED_ESTIMATE})"
@@ -708,25 +718,26 @@ class SubtileMegaFusedEmitter:
             dst=None, vaddr=vgpr(self.gammaDtlVaddr), saddr=sgpr(self.gammaSrd, 4),
             soffset=sgpr(soffSgpr),
             mubuf=MUBUFModifiers(offen=True, offset12=0, lds=True),
-            comment=f"gamma DTL b32 lower half -> LDS slot (qi={qi},mi={mi})."))
-        if self.geom.vw0 > 1:
-            # VW0=2: second b32 DTL covers upper mfmaM rows; M0 and soffset each advance by halfBytes.
-            m0Adj2 = m0Adj + halfBytes
-            with self.writer.allocTmpSgpr(1, tag="mf_gammaTileM0b") as tm2:
-                module.add(SAddU32(dst=sgpr(tm2.idx), src0=sgpr(self.gammaM0Base),
-                                   src1=m0Adj2,
-                                   comment=f"M0 = slot base + halfBytes (qi={qi},mi={mi} upper)."))
-                module.add(SMovB32(dst=mgpr(0), src=sgpr(tm2.idx),
-                                   comment=f"M0 = upper half LDS slot (qi={qi},mi={mi})."))
-            with self.writer.allocTmpSgpr(1, tag="mf_gammaSoffUpper") as ts2:
-                module.add(SAddU32(dst=sgpr(ts2.idx), src0=sgpr(soffSgpr),
-                                   src1=halfBytes,
-                                   comment=f"soffset2 = soffset + mfmaM*gammaBytes (upper gamma rows, qi={qi},mi={mi})."))
+            comment=f"gamma DTL b32 half 0 -> LDS slot (qi={qi},mi={mi})."))
+        # For vw0>1: issue one b32 DTL load per additional half; each advances M0 and
+        # soffset by halfBytes so successive mfmaM-row blocks map to contiguous LDS.
+        for h in range(1, self.geom.vw0):
+            m0AdjH = m0Adj + h * halfBytes
+            with self.writer.allocTmpSgpr(1, tag="mf_gammaTileM0h") as tmh:
+                module.add(SAddU32(dst=sgpr(tmh.idx), src0=sgpr(self.gammaM0Base),
+                                   src1=m0AdjH,
+                                   comment=f"M0 = slot base + {h}*halfBytes (qi={qi},mi={mi},h={h})."))
+                module.add(SMovB32(dst=mgpr(0), src=sgpr(tmh.idx),
+                                   comment=f"M0 = LDS slot for half {h} (qi={qi},mi={mi})."))
+            with self.writer.allocTmpSgpr(1, tag="mf_gammaSoffH") as tsh:
+                module.add(SAddU32(dst=sgpr(tsh.idx), src0=sgpr(soffSgpr),
+                                   src1=h * halfBytes,
+                                   comment=f"soffset += {h}*halfBytes (half {h}, qi={qi},mi={mi})."))
                 module.add(BufferLoadB32(
                     dst=None, vaddr=vgpr(self.gammaDtlVaddr), saddr=sgpr(self.gammaSrd, 4),
-                    soffset=sgpr(ts2.idx),
+                    soffset=sgpr(tsh.idx),
                     mubuf=MUBUFModifiers(offen=True, offset12=0, lds=True),
-                    comment=f"gamma DTL b32 upper half -> LDS slot (qi={qi},mi={mi})."))
+                    comment=f"gamma DTL b32 half {h} -> LDS slot (qi={qi},mi={mi})."))
 
 
     def _issueAllGammaToLds(self, module) -> None:
@@ -811,15 +822,14 @@ class SubtileMegaFusedEmitter:
                 src=vgpr(self.gammaLdsReadAddr),
                 ds=DSModifiers(offset=off),
                 comment=f"broadcast-read gamma lower 4 bf16 (qi={qi},mi={mi})."))
-            if self.geom.vw0 > 1:
-                # Upper half: 4 more packed bf16 in 2 dwords → VGPRs base+2, base+3 (contiguous
-                # with lower half so _convertGammaChunk sees 4 packed dwords at base+0..3).
-                # The upper half is at LDS offset +innerGapBytes within the per-rowGroup region.
+            # Each additional half (h=1..vw0-1) reads the next block of 4 packed bf16
+            # into contiguous VGPRs so _convertGammaChunk sees vw0 packed dwords at base+0..2*vw0-1.
+            for h in range(1, self.geom.vw0):
                 module.add(DSLoadB64(
-                    dst=vgpr(gammaBank + mi * rpl + 2, 2),
+                    dst=vgpr(gammaBank + mi * rpl + h * 2, 2),
                     src=vgpr(self.gammaLdsReadAddr),
-                    ds=DSModifiers(offset=off + innerGapBytes),
-                    comment=f"broadcast-read gamma upper 4 bf16 (qi={qi},mi={mi}) off+{innerGapBytes}."))
+                    ds=DSModifiers(offset=off + h * innerGapBytes),
+                    comment=f"broadcast-read gamma half {h} (qi={qi},mi={mi}) off+{h * innerGapBytes}."))
         self._gammaReadPending = True
 
 
@@ -1462,6 +1472,397 @@ class SubtileMegaFusedEmitter:
                 self._ldsReadGammaBlockIssue(module, gammaBank, qi + 1)
 
 
+    def _computeTileNoPrefetch(self, module, vgprTiles, workBank, gammaBank,
+                               blkAmax, mBaseV, qi, j, mi, n, pathInterior,
+                               tokMaskSgpr) -> None:
+        """Emit the per-(qi, n, mi) tile compute block for the pfd=0 serial path.
+
+        Covers residual in-place convert, acc read-pair-and-add into workBank
+        (H = residual + acc), H^2 accumulation, residualOut store dispatch, and
+        H*gamma write-back.  Called once per tile from _emitFusedBodyNoPrefetch.
+        """
+        rpl = self.geom.rowsPerLane
+        tpb = self.geom.tilesPerBlockM
+        lsc = self.geom.laneSgprCount
+        m = qi * tpb + mi
+        bankBase = (j * tpb + mi) * rpl
+        burstBase = workBank + bankBase
+        coords = [(m, n, k) for k in range(rpl)]
+
+        module.addComment1(f"pfd=0 tile (qi={qi},j={j},mi={mi},m={m},n={n}).")
+        _free0RowPos(module, self.nhBase, self.wgRowBase, self.rowGroupOff,
+                     m, 0, mBaseV, self.geom)
+
+        useDx4 = pathInterior and _useDwordx4Interior(self.geom)
+        tailWide = (self.geom.useWideResidual and not pathInterior
+                    and not self.geom.useMxfp8)
+        # pfd=0 never allocates nhInRangeMask (rpl*lsc SGPRs can be very large
+        # for wide-VW kernels). The straddle fallback recomputes per-element
+        # OOB masks inline, which is correct and avoids the SGPR pressure.
+
+        # Convert residual in-place (already loaded into workBank, waited above).
+        module.addComment1("convert residual in workBank in-place (pfd=0).")
+        if useDx4:
+            lsc_rdrl = self.geom.laneSgprCount
+            module.add(DSBPermuteB32(vgpr(burstBase + 2), vgpr(self.vPermAddr),
+                                     vgpr(burstBase + 2),
+                                     comment="gather partner bank[2]."))
+            module.add(DSBPermuteB32(vgpr(burstBase + 3), vgpr(self.vPermAddr),
+                                     vgpr(burstBase + 3),
+                                     comment="gather partner bank[3]."))
+            module.add(SWaitCnt(dscnt=0, comment="wait ds_bpermute."))
+            module.add(VCndMaskB32(dst=vgpr(burstBase), src0=vgpr(burstBase),
+                                   src1=vgpr(burstBase + 2),
+                                   src2=sgpr(self.pairUpperLaneMask, lsc_rdrl),
+                                   comment="bank[0] = upperLane ? rows 4,5 : rows 0,1."))
+            module.add(VCndMaskB32(dst=vgpr(burstBase + 1), src0=vgpr(burstBase + 1),
+                                   src1=vgpr(burstBase + 3),
+                                   src2=sgpr(self.pairUpperLaneMask, lsc_rdrl),
+                                   comment="bank[1] = upperLane ? rows 6,7 : rows 2,3."))
+            _convertResidualChunkBf16(module, burstBase)
+        elif self.geom.useWideResidual:
+            if self.geom.residualBytes == 2:
+                # High to low: avoid overwriting source dwords before reading.
+                for _cvt_c in range(self.geom.rowsPerLane // 4 - 1, -1, -1):
+                    _convertResidualChunkBf16(module, burstBase + 4 * _cvt_c)
+            else:
+                cvt_fp8 = (ECvtPkFP8toF32 if self.geom.residualType.isAnyFloat8()
+                           else ECvtPkBF8toF32)
+                module.add(cvt_fp8(dst=vgpr(burstBase + 2, 2), src=vgpr(burstBase),
+                                   sel=HighBitSel.HIGH,
+                                   comment="residual fp8 (k=2,3) -> f32."))
+                module.add(cvt_fp8(dst=vgpr(burstBase, 2), src=vgpr(burstBase),
+                                   sel=HighBitSel.LOW,
+                                   comment="residual fp8 (k=0,1) -> f32."))
+            if not pathInterior:
+                module.addComment1("software-mask wide residual OOB elements.")
+                lsc_mwr = self.geom.laneSgprCount
+                for k_mwr in range(rpl):
+                    maskK_mwr = (
+                        (self.nhInRangeMask + k_mwr * lsc_mwr)
+                        if self.nhInRangeMask is not None
+                        else self.resOobMask)
+                    nhR_mwr = _addImmU32(
+                        module, self.resAddr, self.nhBase, k_mwr,
+                        self.resRowByteBase, f"nhPos = nhBase + {k_mwr}.")
+                    module.add(VCmpLtU32(dst=sgpr(maskK_mwr, lsc_mwr),
+                                         src0=vgpr(nhR_mwr),
+                                         src1=sgpr("SizesFree+0"),
+                                         comment=f"nhInRange[{k_mwr}]."))
+                    module.add(VCndMaskB32(dst=vgpr(burstBase + k_mwr), src0=0,
+                                           src1=vgpr(burstBase + k_mwr),
+                                           src2=sgpr(maskK_mwr, lsc_mwr),
+                                           comment=f"mask residual k={k_mwr}."))
+        else:
+            for k_frt in range(rpl):
+                _convertSideElem(module, burstBase + k_frt,
+                                 f"residual->fp32 (k={k_frt}).",
+                                 dtype=self.geom.residualType)
+
+        # Deferred gamma wait+convert; overlaps with residual convert above.
+        if self._gammaReadPending:
+            module.add(SWaitCnt(dscnt=0,
+                                comment="wait gamma LDS broadcast reads (deferred)."))
+            for _mi_cvt in range(self.geom.tilesPerBlockM):
+                _convertGammaChunk(
+                    module,
+                    gammaBank + _mi_cvt * self.geom.rowsPerLane,
+                    self.geom.rowsPerLane)
+            self._gammaReadPending = False
+
+        # Read acc pair-wise from AGPR into a 2-VGPR temp; add into workBank.
+        # H = residual(burstBase) + acc(temp) -> burstBase in-place.
+        module.addComment1("acc pair-wise read; H = residual + acc -> workBank.")
+        accTemp = self.writer.vgprPool.checkOutAligned(2, 2, tag="mf_accTemp")
+        for k in range(0, rpl - rpl % 2, 2):
+            tile0 = vgprTiles[coords[k][1] * self.geom.mmaM + coords[k][0]]
+            tile1 = vgprTiles[coords[k + 1][1] * self.geom.mmaM + coords[k + 1][0]]
+            reg0 = tile0.regList.indices[coords[k][2]]
+            reg1 = tile1.regList.indices[coords[k + 1][2]]
+            from0_agpr = tile0.regList.pool != self.writer.vgprPool
+            from1_agpr = tile1.regList.pool != self.writer.vgprPool
+            if from0_agpr:
+                module.add(VAccvgprReadB32(vgpr(accTemp), accvgpr(reg0),
+                                           comment=f"acc[{k}] -> temp[0]."))
+            else:
+                module.add(VMovB32(dst=vgpr(accTemp), src=vgpr(reg0),
+                                   comment=f"acc[{k}] VGPR -> temp[0]."))
+            if from1_agpr:
+                module.add(VAccvgprReadB32(vgpr(accTemp + 1), accvgpr(reg1),
+                                           comment=f"acc[{k+1}] -> temp[1]."))
+            else:
+                module.add(VMovB32(dst=vgpr(accTemp + 1), src=vgpr(reg1),
+                                   comment=f"acc[{k+1}] VGPR -> temp[1]."))
+            if from0_agpr or from1_agpr:
+                module.add(SNop(
+                    waitState=1,
+                    comment="fill v_accvgpr_read->VALU wait state (gfx950)."))
+            if (_isPackPair(burstBase + k, burstBase + k + 1)
+                    and _isPackPair(accTemp, accTemp + 1)):
+                module.add(VAddPKF32(
+                    dst=vgpr(burstBase + k, 2),
+                    src0=vgpr(burstBase + k, 2),
+                    src1=vgpr(accTemp, 2),
+                    comment=f"H = residual+acc (packed k={k},{k+1})."))
+            else:
+                module.add(VAddF32(
+                    dst=vgpr(burstBase + k), src0=vgpr(burstBase + k),
+                    src1=vgpr(accTemp),
+                    comment=f"H = residual+acc (k={k})."))
+                module.add(VAddF32(
+                    dst=vgpr(burstBase + k + 1), src0=vgpr(burstBase + k + 1),
+                    src1=vgpr(accTemp + 1),
+                    comment=f"H = residual+acc (k={k+1})."))
+        self.writer.vgprPool.checkIn(accTemp)
+        # srcRegs aliases burstBase slots (H lives in workBank after the adds).
+        srcRegs = [burstBase + k for k in range(rpl)]
+
+        # H^2 accumulation into partials.
+        module.addComment1(f"rmsSum[{n}] += H^2 (m={m},n={n}).")
+        for k in range(0, rpl - rpl % 2, 2):
+            sk0, sk1 = srcRegs[k], srcRegs[k + 1]
+            module.add(VMacF32(dst=vgpr(self.partials + n), src0=vgpr(sk0),
+                               src1=vgpr(sk0),
+                               comment=f"rmsSum += H^2 (k={k})."))
+            module.add(VMacF32(dst=vgpr(self.partials + n), src0=vgpr(sk1),
+                               src1=vgpr(sk1),
+                               comment=f"rmsSum += H^2 (k={k+1})."))
+
+        # Store H to residualOut.
+        if useDx4:
+            module.addComment1(f"dwordx4 ResidualOut store (m={m},n={n}).")
+            assert rpl % 2 == 0
+            vgprPool = self.writer.vgprPool
+            vPack = vgprPool.checkOutAligned(4, 4, tag="mf_dx4Pack")
+            _packResidualOutRow(module, srcRegs, vPack, self.geom)
+            module.add(DSBPermuteB32(vgpr(vPack + 2), vgpr(self.vPermAddr),
+                                     vgpr(vPack),
+                                     comment="lower: vPack[2] <- upper vPack[0]."))
+            module.add(DSBPermuteB32(vgpr(vPack + 3), vgpr(self.vPermAddr),
+                                     vgpr(vPack + 1),
+                                     comment="lower: vPack[3] <- upper vPack[1]."))
+            module.add(SWaitCnt(dscnt=0, comment="wait ds_bpermute."))
+            dx4Addr = vgprPool.checkOut(1, tag="mf_dx4StoreAddr")
+            module.add(VCndMaskB32(
+                dst=vgpr(dx4Addr), src0=vgpr(self.roColByteBase),
+                src1=vgpr(self.resOobV),
+                src2=sgpr(self.pairUpperLaneMask, lsc),
+                comment="upper lane -> OOB; lower keeps addr."))
+            rowOff = m * self.geom.tileStrideM * 2
+            assert rowOff < 4096
+            module.add(BufferStoreB128(
+                src=vgpr(vPack, 4), vaddr=vgpr(dx4Addr),
+                saddr=sgpr(self.residualOutSrd, 4), soffset=0,
+                mubuf=MUBUFModifiers(offen=True, offset12=rowOff),
+                comment=f"ResidualOut dwordx4 (m={m},n={n})."))
+            vgprPool.checkIn(dx4Addr)
+            vgprPool.checkIn(vPack)
+        else:
+            module.addComment1(f"packed ResidualOut store (m={m},n={n}).")
+            assert rpl % 2 == 0
+            assert lsc == 2
+            vgprPool = self.writer.vgprPool
+            sgprPool = self.writer.sgprPool
+            packBank = vgprPool.checkOutAligned(rpl // 2, 2, tag="mf_roPack")
+            nhTopV = vgprPool.checkOut(1, tag="mf_roNhTop")
+            _packResidualOutRow(module, srcRegs, packBank, self.geom)
+            safe = sgprPool.checkOutAligned(lsc, lsc, tag="mf_roSafe",
+                                            preventOverflow=False)
+            wideAddrV = vgprPool.checkOut(1, tag="mf_roWideAddr")
+            nhTop = _addImmU32(module, nhTopV, self.nhBase, rpl - 1, nhTopV,
+                               f"nhTop = nhBase + {rpl-1}.")
+            module.add(VCmpLtU32(dst=sgpr(safe, lsc), src0=vgpr(nhTop),
+                                 src1=sgpr("SizesFree+0"),
+                                 comment="b64Safe = nhTop < N_hidden."))
+            module.add(VCndMaskB32(dst=vgpr(wideAddrV), src0=vgpr(self.resOobV),
+                                   src1=vgpr(self.roColByteBase),
+                                   src2=sgpr(safe, lsc),
+                                   comment="wideAddr = safe ? roColByteBase : OOB."))
+            rowOff = m * self.geom.tileStrideM * 2
+            assert rowOff < 4096
+            if rpl == 4:
+                module.add(BufferStoreB64(
+                    src=vgpr(packBank, 2), vaddr=vgpr(wideAddrV),
+                    saddr=sgpr(self.residualOutSrd, 4), soffset=0,
+                    mubuf=MUBUFModifiers(offen=True, offset12=rowOff),
+                    comment=f"ResidualOut dwordx2 (m={m},n={n})."))
+            else:
+                # rpl >= 8: store in B128 chunks (4 packed dwords each = 8 bf16).
+                for _chunk in range(rpl // 8):
+                    chunkOff = rowOff + _chunk * 16
+                    assert chunkOff < 4096
+                    module.add(BufferStoreB128(
+                        src=vgpr(packBank + _chunk * 4, 4),
+                        vaddr=vgpr(wideAddrV),
+                        saddr=sgpr(self.residualOutSrd, 4), soffset=0,
+                        mubuf=MUBUFModifiers(offen=True, offset12=chunkOff),
+                        comment=f"ResidualOut B128 chunk {_chunk} (m={m},n={n})."))
+            module.addComment1(f"per-element straddle fallback (m={m},n={n}).")
+            module.add(SAndN2B32(dst=sgpr(safe), src0=sgpr(tokMaskSgpr),
+                                 src1=sgpr(safe),
+                                 comment="straddle_lo = tokMask_lo & ~b64Safe_lo."))
+            module.add(SAndN2B32(dst=sgpr(safe + 1),
+                                 src0=sgpr(tokMaskSgpr + 1),
+                                 src1=sgpr(safe + 1),
+                                 comment="straddle_hi."))
+            module.add(SAndB64(dst=sgpr(safe, lsc), src0=sgpr(safe, lsc),
+                               src1=sgpr(safe, lsc),
+                               comment="SCC = (straddle != 0)."))
+            skipLabel = Label(
+                self.writer.labels.getNameInc(f"mf_roStraddleEnd_m{m}n{n}"), "")
+            module.add(SCBranchSCC0(labelName=skipLabel.getLabelName(),
+                                    comment="no straddle -> skip fallback."))
+            for k in range(rpl):
+                accReg_sbi = srcRegs[k]
+                addrV_sbi = self.writer.vgprPool.checkOut(1, tag="mf_bf16Addr")
+                valV_sbi = self.writer.vgprPool.checkOut(1, tag="mf_bf16Val")
+                nhByteV_sbi = self.writer.vgprPool.checkOut(1, tag="mf_nhByte")
+                with self.writer.allocTmpSgpr(lsc, tag="mf_nhMask") as nhMask_sbi:
+                    module.add(VLShiftLeftB32(
+                        dst=vgpr(addrV_sbi), shiftHex=hex(1),
+                        src=vgpr(self.roRowBase),
+                        comment="base0 = roRowBase * 2 (bf16)."))
+                    nh_sbi = _addImmU32(module, nhByteV_sbi, self.nhBase, k,
+                                        valV_sbi, f"nhPos = nhBase + {k}.")
+                    if self.nhInRangeMask is not None:
+                        maskReg_sbi = self.nhInRangeMask + k * lsc
+                    else:
+                        module.add(VCmpLtU32(
+                            dst=sgpr(nhMask_sbi.idx, lsc), src0=vgpr(nh_sbi),
+                            src1=sgpr("SizesFree+0"),
+                            comment="nhInRange."))
+                        maskReg_sbi = nhMask_sbi.idx
+                    module.add(VLShiftLeftB32(
+                        dst=vgpr(nhByteV_sbi), shiftHex=hex(1), src=vgpr(nh_sbi),
+                        comment="nhByte = nhPos * 2."))
+                    module.add(VAddU32(vgpr(addrV_sbi), vgpr(addrV_sbi),
+                                       vgpr(nhByteV_sbi),
+                                       comment="byteAddr = base0 + nhByte."))
+                    module.add(VCndMaskB32(dst=vgpr(addrV_sbi),
+                                           src0=vgpr(self.resOobV),
+                                           src1=vgpr(addrV_sbi),
+                                           src2=sgpr(maskReg_sbi, lsc),
+                                           comment="clamp OOB."))
+                    module.add(VCndMaskB32(dst=vgpr(addrV_sbi),
+                                           src0=vgpr(self.resOobV),
+                                           src1=vgpr(addrV_sbi),
+                                           src2=sgpr(safe, lsc),
+                                           comment="only straddle lanes store."))
+                    module.add(VCvtPkF32toBF16(
+                        dst=vgpr(valV_sbi), src0=vgpr(accReg_sbi),
+                        src1=vgpr(accReg_sbi), comment="H -> bf16."))
+                    module.add(BufferStoreB16(
+                        src=vgpr(valV_sbi), vaddr=vgpr(addrV_sbi),
+                        saddr=sgpr(self.residualOutSrd, 4), soffset=0,
+                        mubuf=MUBUFModifiers(offen=True),
+                        comment=f"ResidualOut bf16(H) (m={m},n={n},k={k})."))
+                self.writer.vgprPool.checkIn(nhByteV_sbi)
+                self.writer.vgprPool.checkIn(valV_sbi)
+                self.writer.vgprPool.checkIn(addrV_sbi)
+            module.add(skipLabel)
+            vgprPool.checkIn(wideAddrV)
+            sgprPool.checkIn(safe)
+            vgprPool.checkIn(nhTopV)
+            vgprPool.checkIn(packBank)
+
+        # Apply gamma, fold amax, write back to accumulator.
+        blkAmaxJ = None  # useMxfp8 is False for pfd=0.
+        module.addComment1(f"apply gamma, write acc (m={m},n={n}).")
+        for k in range(0, rpl - rpl % 2, 2):
+            sk0, sk1 = srcRegs[k], srcRegs[k + 1]
+            gk = gammaBank + mi * rpl + k
+            if _isPackPair(sk0, sk1):
+                module.add(VMulPKF32(dst=vgpr(sk0, 2), src0=vgpr(sk0, 2),
+                                     src1=vgpr(gk, 2),
+                                     comment=f"H*gamma (packed k={k},{k+1})."))
+            else:
+                module.add(VMulF32(dst=vgpr(sk0), src0=vgpr(sk0), src1=vgpr(gk),
+                                   comment=f"H*gamma (k={k})."))
+                module.add(VMulF32(dst=vgpr(sk1), src0=vgpr(sk1),
+                                   src1=vgpr(gk + 1),
+                                   comment=f"H*gamma (k={k+1})."))
+            self._amaxAndWriteAcc(module, sk0, vgprTiles, blkAmaxJ, m, n, k)
+            self._amaxAndWriteAcc(module, sk1, vgprTiles, blkAmaxJ, m, n, k + 1)
+
+    def _emitFusedBodyNoPrefetch(self, module, vgprTiles, units, workBank, gammaBank,
+                                  blkAmax, mBaseV, pathInterior: bool = False) -> None:
+        """Single-bank no-prefetch fallback (prefetchDepth=0).
+
+        Loads residual serially into workBank per unit (issue + immediate wait), then
+        reads each accumulator pair from AGPR into a 2-VGPR inline temp and adds it
+        into workBank in place: H = residual + acc -> workBank.  There is no prefetch
+        ring and no separate accBank.  Only the non-MXFP8 path is supported here.
+        """
+        assert not self.geom.useMxfp8, "pfd=0 single-bank mode does not support MXFP8"
+        module.addComment1("pfd=0 single-bank serial path (no residual prefetch ring).")
+        self._issueAllGammaToLds(module)
+        # No residual loads in flight yet; drain gamma DTL only.
+        module.add(SWaitCnt(vlcnt=0,
+                            comment="drain gamma DTL loads (pfd=0, no residual in flight)."))
+        module.add(self.writer._syncThreads(
+            self.kernel, "gamma DTL stage: LDS writes visible before broadcast reads."))
+        self._ldsReadGammaBlockIssue(module, gammaBank, 0)
+
+        tpb = self.geom.tilesPerBlockM
+        lsc = self.geom.laneSgprCount
+
+        for i, (qi, nBase, g) in enumerate(units):
+            # Issue residual loads for this unit and wait for them immediately.
+            module.add(self._issueUnitLoads(workBank, mBaseV, qi, nBase, g, pathInterior))
+            module.add(SWaitCnt(vlcnt=0,
+                                comment=f"wait all residual loads unit {i} (pfd=0 serial)."))
+
+            _unitMod = Module(f"MegaFused computeUnit pfd=0 qi={qi} nBase={nBase}")
+            _unitMod.addComment0(f"compute pass (pfd=0) for unit (qi={qi},nBase={nBase}).")
+
+            for j in range(g):
+                n = nBase + j
+                tokMaskSgpr = self.writer.sgprPool.checkOutAligned(
+                    lsc, lsc, tag="mf_roTokMask", preventOverflow=False)
+                self.roRowBase = self.writer.vgprPool.checkOut(1, tag="mf_roRowBase")
+                self.roColByteBase = self.writer.vgprPool.checkOut(1, tag="mf_roColByteBase")
+                _unitMod.addComment1(f"token OOB mask and roRowBase (n={n}).")
+                nOff_roBase = self.geom.colOffset(n)
+                tokV_roBase = self.writer.vgprPool.checkOut(1, tag="mf_roTokV")
+                scratch_roBase = self.writer.vgprPool.checkOut(1, tag="mf_roTokScratch")
+                r_roBase = _addImmU32(_unitMod, tokV_roBase, self.resTokenBase, nOff_roBase,
+                                      scratch_roBase,
+                                      f"token_n = resTokenBase + {nOff_roBase} (n={n}).")
+                _unitMod.add(VCmpLtU32(dst=sgpr(tokMaskSgpr, lsc), src0=vgpr(r_roBase),
+                                       src1=sgpr("SizesFree+1"),
+                                       comment="tokenInRange = token_n < M_tokens."))
+                _unitMod.add(VMulLOU32(dst=vgpr(self.roRowBase), src0=sgpr("SizesFree+0"),
+                                       src1=vgpr(r_roBase),
+                                       comment=f"roRowBase = token_n * N_hidden (n={n})."))
+                _unitMod.add(VAddU32(dst=vgpr(self.roColByteBase), src0=vgpr(self.roRowBase),
+                                     src1=vgpr(self.wgRowBase),
+                                     comment="roColBase = token_n*N_hidden + wgRowBase."))
+                _unitMod.add(VAddU32(dst=vgpr(self.roColByteBase), src0=vgpr(self.roColByteBase),
+                                     src1=vgpr(self.rowGroupOff),
+                                     comment="roColBase += rowGroupOff."))
+                _unitMod.add(VLShiftLeftB32(dst=vgpr(self.roColByteBase), shiftHex=hex(1),
+                                            src=vgpr(self.roColByteBase),
+                                            comment="roColByteBase = roColBase * 2 (bf16)."))
+                self.writer.vgprPool.checkIn(scratch_roBase)
+                self.writer.vgprPool.checkIn(tokV_roBase)
+
+                for mi in range(tpb):
+                    self._computeTileNoPrefetch(_unitMod, vgprTiles, workBank, gammaBank,
+                                               blkAmax, mBaseV, qi, j, mi, n, pathInterior,
+                                               tokMaskSgpr)
+
+                self.writer.vgprPool.checkIn(self.roColByteBase)
+                self.roColByteBase = None
+                self.writer.vgprPool.checkIn(self.roRowBase)
+                self.roRowBase = None
+                self.writer.sgprPool.checkIn(tokMaskSgpr)
+
+            module.add(_unitMod)
+
+            # Issue the next qi-block's gamma LDS read after this unit's last N-group.
+            if nBase + g == self.geom.mmaN and qi + 1 < self.geom.nQTilesM:
+                self._ldsReadGammaBlockIssue(module, gammaBank, qi + 1)
+
     def emit(self, vgprTiles):
         assert not self.geom.useMxfp8 or self.geom.subColQuant, \
             "megaFused MXFP8 requires subColQuant (q1 < mfmaN)"
@@ -1815,21 +2216,32 @@ class SubtileMegaFusedEmitter:
             cumTiles += g * tpb
         tpb = self.geom.tilesPerBlockM
         bankSize = ebc * tpb * self.geom.rowsPerLane
-        resRing = [
-            self.writer.vgprPool.checkOutAligned(bankSize, 2, tag=f"mf_resBank{sl}")
-            for sl in range(pfd)
-        ]
-        accBank = self.writer.vgprPool.checkOutAligned(bankSize, 2, tag="mf_accBank")
         blkAmax = None
         if self.geom.useMxfp8:
             blkAmax = self.writer.vgprPool.checkOut(self.geom.mmaN, tag="mf_blkAmax")
         mBaseV = self.writer.vgprPool.checkOut(1, tag="mf_mBase")
-        # Banks are allocated once and shared by both branch arms; only one arm
-        # executes at runtime (the branch is workgroup-uniform), so VGPR usage
-        # is unchanged relative to a single-path emit.
-        emitBodyFn = lambda mod, pathInterior: self._emitFusedBody(
-            mod, vgprTiles, units, resRing, accBank, gammaBank, blkAmax,
-            mBaseV, globalLoadsCum, issuedThroughUnit, tileStarts, pfd, pathInterior)
+        if pfd == 0:
+            # Non-prefetched single-bank fallback: one workBank (size = bankSize = S).
+            # No separate accBank or prefetch ring; acc is read pair-wise inline.
+            workBank = self.writer.vgprPool.checkOutAligned(bankSize, 2, tag="mf_workBank")
+            resRing = []
+            accBank = None
+            emitBodyFn = lambda mod, pathInterior: self._emitFusedBodyNoPrefetch(
+                mod, vgprTiles, units, workBank, gammaBank, blkAmax, mBaseV, pathInterior)
+        else:
+            # Normal prefetched ring: resRing (pfd banks) + one accBank.
+            # Banks are allocated once and shared by both branch arms; only one arm
+            # executes at runtime (the branch is workgroup-uniform), so VGPR usage
+            # is unchanged relative to a single-path emit.
+            resRing = [
+                self.writer.vgprPool.checkOutAligned(bankSize, 2, tag=f"mf_resBank{sl}")
+                for sl in range(pfd)
+            ]
+            accBank = self.writer.vgprPool.checkOutAligned(bankSize, 2, tag="mf_accBank")
+            workBank = None
+            emitBodyFn = lambda mod, pathInterior: self._emitFusedBody(
+                mod, vgprTiles, units, resRing, accBank, gammaBank, blkAmax,
+                mBaseV, globalLoadsCum, issuedThroughUnit, tileStarts, pfd, pathInterior)
         module.addComment1("workgroup-uniform interior/tail branch.")
         tailLabel = Label(self.writer.labels.getNameInc("mf_interiorTail_tail"),
                           "tail arm entry (wgMaxRow >= N_hidden).")
@@ -1867,9 +2279,12 @@ class SubtileMegaFusedEmitter:
         self.writer.vgprPool.checkIn(mBaseV)
         if self.geom.useMxfp8:
             self.writer.vgprPool.checkIn(blkAmax)
-        self.writer.vgprPool.checkIn(accBank)
-        for sl in range(pfd - 1, -1, -1):
-            self.writer.vgprPool.checkIn(resRing[sl])
+        if pfd == 0:
+            self.writer.vgprPool.checkIn(workBank)
+        else:
+            self.writer.vgprPool.checkIn(accBank)
+            for sl in range(pfd - 1, -1, -1):
+                self.writer.vgprPool.checkIn(resRing[sl])
         # Free gamma before the butterfly to cap VGPR high-water (stack-LIFO order).
         # Gamma is fully consumed by the fused body at this point.
         self.writer.vgprPool.checkIn(gammaBank)
@@ -2116,8 +2531,15 @@ class SubtileMegaFusedEmitter:
         if self.geom.mmaN > 1:
             groupDelta = self.geom.tileStrideN - (self.geom.vw1 - 1)
             strideV = self.writer.vgprPool.checkOut(1, tag="pRMS_wF0Stride")
-            _writePartialsFree0Mod.add(VMulLOU32(dst=vgpr(strideV), src0=groupDelta, src1=vgpr(ntilesV),
-                                 comment=f"groupStride = (tileStrideN-(vw1-1)={groupDelta}) * n_d"))
+            # VMulLOU32 only accepts inline literals up to 64; materialize larger constants.
+            if groupDelta > _INLINE_CONST_MAX:
+                _writePartialsFree0Mod.add(VMovB32(dst=vgpr(strideV), src=groupDelta,
+                                                   comment=f"groupDelta={groupDelta} (too large for inline)."))
+                _writePartialsFree0Mod.add(VMulLOU32(dst=vgpr(strideV), src0=vgpr(strideV), src1=vgpr(ntilesV),
+                                     comment=f"groupStride = (tileStrideN-(vw1-1)={groupDelta}) * n_d"))
+            else:
+                _writePartialsFree0Mod.add(VMulLOU32(dst=vgpr(strideV), src0=groupDelta, src1=vgpr(ntilesV),
+                                     comment=f"groupStride = (tileStrideN-(vw1-1)={groupDelta}) * n_d"))
             if self.geom.vw1 > 1:
                 subStrideV = self.writer.vgprPool.checkOut(1, tag="pRMS_wF0SubStride")
         # Pre-compute byteAddr = (token*n_d + WG0) * 4 once, then stride per n.
