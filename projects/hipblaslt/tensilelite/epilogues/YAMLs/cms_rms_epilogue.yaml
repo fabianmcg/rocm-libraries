@@ -88,7 +88,7 @@ BenchmarkProblems:
       BenchmarkJoinParameters:
       BenchmarkFinalParameters:
         - ProblemSizes:
-            - Exact: [512, 512, 1, 512]
+            - Exact: [2048, 16384, 1, 2048]
 
 LibraryLogic:
   ScheduleName: "cms_rms_epilogue"
