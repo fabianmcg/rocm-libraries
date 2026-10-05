@@ -1,0 +1,199 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+#
+# AMENDED attempt to also enable RMSEpilogue -- STILL DOES NOT BUILD, kept as a
+# documented, reproducible dead end (see bottom of this comment block for what was
+# tried). RMSEpilogue has not previously been tested together with Bias, Activation,
+# UseScaleAlphaVec, or UseBeta=True, and this file shows exactly how far that
+# combination gets.
+#
+# Two changes were required just to clear the RMSEpilogue/CMS validators, both due
+# to a pre-existing (not newly-discovered-today) RMSEpilogue/StreamK constraint,
+# unrelated to the SourceSwap/VectorWidth generalization work:
+#   - StreamK changed 5 (Hybrid SK3+SK4) -> 0. _validateSubtileEpiloguePrereqs
+#     (Solution.py) requires StreamK==0 or (StreamK==3 and StreamKForceDPOnly==1);
+#     StreamKForceDPOnly itself only supports StreamK==3
+#     (_validateStreamKForceDPOnly, Solution.py:624). StreamK=5 satisfies neither,
+#     so this exact kernel (as originally decoded) cannot carry RMSEpilogue.
+#   - GlobalSplitU 0->1 and GlobalSplitUAlgorithm MultipleBuffer->SingleBuffer,
+#     since with StreamK=0 the MultipleBuffer algorithm resolves
+#     state["_GlobalAccumulation"]=="MultipleBuffer", which RMSEpilogue explicitly
+#     rejects ("does not support MultipleBuffer GSU"); SingleBuffer is the
+#     already-validated accumulation mode for CMS RMSEpilogue.
+#
+# With those two changes, the solution passes every RMSEpilogue/CMS/SourceSwap
+# validator (confirming today's SourceSwap+VectorWidth generalization is not the
+# blocker here) but then fails at CODEGEN on two independent, pre-existing hardware
+# resource budgets:
+#   - At the original VectorWidthA=VectorWidthB=8: the MegaFused epilogue's own
+#     feasibility check rejects it outright ("megaFused epilogue infeasible: EBC=0
+#     at PFD=1 ... S=32 ... VGPRFixed est=212") -- at VW=8 the per-lane row count
+#     (rowsPerLane = VW0*outputsPerMFMA = 32) leaves no room for even one epilogue
+#     batch column in the fixed 256-VGPR budget. Reducing VectorWidthA/B to 2 (and
+#     StoreVectorWidth to match, since MFMA SourceSwap mode requires
+#     StoreVectorWidth <= VectorWidthA) clears this.
+#   - Even at VectorWidthA=VectorWidthB=2, the kernel then overflows SGPRs:
+#     "too many sgprs, vgprs=156, sgprs=104". The architectural cap for gfx950 is
+#     102 (hardware_caps.hpp: MaxSgpr = 102 for isaVersion[0] < 10), so this is only
+#     2 SGPRs over -- NOT a fundamental wall. Confirmed by comparison: the clean,
+#     already-passing SourceSwap+VW2 RMSEpilogue baseline with no Bias/Activation/
+#     ScaleAlphaVec/Beta (cms_rms_epilogue_ss_vw2.yaml) uses 100/102 SGPRs --
+#     i.e. RMSEpilogue+SourceSwap+CMS alone is already within 2 SGPRs of the cap
+#     before Bias/Activation/ScaleAlphaVec/UseBeta=True add anything.
+#   - Disabling UseBeta alone (keeping Bias+Activation+ScaleAlphaVec) DOES clear the
+#     SGPR budget -- no more overflow -- but then hits a DIFFERENT, more serious
+#     problem: the assembler rejects the generated code with "invalid register
+#     alignment" on `s_mov_b64 s[72:73], s[sgprResidualBuf:sgprResidualBuf+1]` (and
+#     the same for sgprAddressResidualOut, sgprRMSNormGamma, sgprPartialBuf). These
+#     are RMSEpilogue's four SRD-pointer kernel args, each a 64-bit pointer that
+#     needs an even-aligned SGPR pair for `s_mov_b64`; in this UseBeta=False
+#     configuration they land at an ODD kernarg SGPR offset instead. This is a
+#     genuine, reproducible kernarg-layout alignment bug in how RMSEpilogue's SRD
+#     args are placed relative to Bias/Activation/ScaleAlphaVec's kernarg slots --
+#     not a resource/tuning limit, and not something fixable from the YAML.
+#
+# Bottom line: RMSEpilogue + CMS + SourceSwap + VectorWidth as generalized this
+# session is NOT the obstacle here, and the SGPR budget gap (2 registers) is small
+# enough that it is plausibly closable. The actual blocker found is a kernarg
+# SGPR-alignment bug in the RMSEpilogue SRD layout that only surfaces under this
+# specific feature combination (RMSEpilogue + Bias + Activation + ScaleAlphaVec +
+# UseBeta=False) -- fixing it is a real (if likely small) implementation task:
+# ensure RMSEpilogue's four SRD-pointer kernel args are always emitted at an
+# even SGPR offset regardless of what else precedes them in the kernarg layout.
+#
+# Original (pre-amendment) decoding, reverse-engineered from the target
+# kernel/solution name:
+#
+#   Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x256x64_MI16x16x1_CMS_SN_...
+#   ..._SK5_..._SS1_..._WGMXCC1
+#
+# Decoded problem type: bf16 in/out, fp32 compute, HPA, TransposeA/TransposeB =
+# True/False, UseBeta, simple (non-per-batch) Bias, hipblaslt "all" activation
+# table with fp32 activation compute type, a single (M- or N-only) alpha-scale
+# vector, and SupportUserArgs (user-driven-tuning / UserArgs dispatch).
+#
+# Decoded solution: MT256x256x64 (MacroTile0 x MacroTile1 x DepthU), MI16x16x1
+# (MIBlock 16x16, MatrixInstB=1) with MIWaveTile=[8,8] -- matching the
+# MatrixInstruction=[16,16,32,1,1,8,8,2,2] entry used by the CMS catalog for
+# this exact tile (see cms_rms_epilogue.yaml), UseCustomMainLoopSchedule=1
+# (CMS), StreamK=5 (Hybrid SK3+SK4-in-one-kernel mode), SourceSwap=1,
+# WorkGroupMappingXCC pinned to 1 (fixed values change codegen per
+# Naming.py), PreloadKernArgs=1, ExpandPointerSwap=0, VectorWidthA/B=8,
+# StoreVectorWidth=8, GlobalSplitUAlgorithm=MultipleBuffer with
+# GlobalSplitU=0 (StreamK replaces the GSU reduction here).
+#
+# Validated: `Tensile/bin/Tensile` builds this config, the client run PASSES
+# numeric validation, and the generated kernel name matches the target
+# EXACTLY except for 7 extra tokens (LDSSI0, NTG0, NVG0, RMSE0, RAP0,
+# TDMPLB0, THG0) that this checkout's Solution.py always materializes on
+# `state` (LDSSegmentInterleave, NonTemporal/NonVolatile/TemporalHintGate,
+# RMSEpilogue, ReuseAcrossPersistent, TDMPlusLdsBuf) but that are apparently
+# absent from `state` -- and hence absent from the name -- in whichever
+# TensileLite revision produced the target string. All 7 are inactive
+# (value 0/False) on both sides, i.e. a naming/version-skew artifact, not a
+# functional difference: every value-bearing token in the target decodes and
+# reproduces exactly once MaxOccupancy, LdsPadMetadata, NonTemporalA-D,
+# StoreSyncOpt, StreamKXCCMapping, TransposeLDSMetadata, UseSgprForGRO and
+# NumElementsPerBatchStore are pinned below (Tensile auto-resolves these from
+# LDS/register allocation and StreamK grid sizing, and this checkout's
+# auto-resolution picks different values than the target for this exact
+# tile/StreamK combo, so they are forked explicitly to match).
+
+GlobalParameters:
+  MinimumRequiredVersion: 5.0.0
+  NumElementsToValidate: -1
+  ExitOnFails: 1
+  PrintSolutionRejectionReason: True
+  KernelTime: True
+  KeepBuildTmp: True
+
+BenchmarkProblems:
+  -
+    -
+      OperationType: GEMM
+      DataType: b
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: True
+      TransposeB: False
+      UseBeta: False
+      Batched: True
+      StridedBatched: True
+      GroupedGemm: False
+      UseBias: 1
+      UseScaleAB: ""
+      UseScaleCD: False
+      UseScaleAlphaVec: 1
+      UseScaleD: False
+      Sparse: 0
+      Activation: True
+      ActivationType: hipblaslt_all
+      ActivationComputeDataType: s
+      SupportUserArgs: True
+      UseRMSEpilogue: True
+
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+            - [16, 16, 32, 1, 1, 8, 8, 2, 2]   # MT0=256 MT1=256, MIWaveTile[8,8], MIWaveGroup[2,2]
+        - RMSEpilogue: [True]
+        - UseSubtileImpl: [False]
+        - StreamK: [0]
+        - GlobalSplitU: [1]
+        - GlobalSplitUAlgorithm: ["SingleBuffer"]
+        - ScheduleIterAlg: [3]
+        - PrefetchGlobalRead: [2]
+        - PrefetchLocalRead: [1]
+        - PrefetchAcrossPersistent: [0]
+        - DirectToLds: [1]
+        - SourceSwap: [True]
+        - VectorWidthA: [2]
+        - VectorWidthB: [2]
+        - StaggerU: [0]
+        - DepthU: [64]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - StoreVectorWidth: [2]
+        - GlobalReadVectorWidthA: [8]
+        - GlobalReadVectorWidthB: [8]
+        - LocalReadVectorWidth: [8]
+        # These three must be explicitly resolved for the CMS catalog match at
+        # Solution.py:3738 (hasCustomSchedule reads LocalReadVectorWidthA/B directly
+        # before the auto-resolution at line 4669, and DtlPlusLdsBuf before line 6403).
+        - LocalReadVectorWidthA: [8]
+        - LocalReadVectorWidthB: [8]
+        - DtlPlusLdsBuf: [0]
+        # TransposeLDS must be 1 for isTN(kernel)+TLDS==1 branch in the schedule.
+        - TransposeLDS: [1]
+        # UseCustomMainLoopSchedule=1 must be explicit so megaFusedEpilogueCompatible
+        # at Solution.py:1602 can determine isCMS=True before hasCustomSchedule runs.
+        - UseCustomMainLoopSchedule: [1]
+        - PreloadKernArgs: [False]
+        - ExpandPointerSwap: [False]
+        - 1LDSBuffer: [0]
+        - MaxOccupancy: [1]
+        - LdsPadMetadata: [0]
+        - NonTemporalA: [1]
+        - NonTemporalB: [1]
+        - NonTemporalC: [4]
+        - NonTemporalD: [3]
+        - StoreSyncOpt: [1]
+        - TransposeLDSMetadata: [1]
+        - UseSgprForGRO: [0]
+        - NumElementsPerBatchStore: [12]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+            - Exact: [4096, 4096, 1, 4096]
+        - BiasTypeArgs: ['s']
+        - ActivationArgs:
+            - [Enum: gelu]
+
+LibraryLogic:
+  ScheduleName: "decoded_bias_activation_streamk_cms"
+  DeviceNames: ["Device 75a0"]
+  ArchitectureName: "gfx950"
+  LibraryType: "Equality"
