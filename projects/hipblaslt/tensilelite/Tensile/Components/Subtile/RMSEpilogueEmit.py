@@ -61,6 +61,7 @@ from rocisa.instruction import (
     VPermlane16SwapB32,
     VReadfirstlaneB32,
     VXorB32,
+    _SWaitCnt,
 )
 
 
@@ -89,7 +90,9 @@ class RMSEpilogueEmitter:
         self.MT0 = kernel["MacroTile0"]
         self.MT1 = kernel["MacroTile1"]
         self.numPairs = (self.T_M // 2) * self.T_N
-        self.PREFETCH = 1
+        # PREFETCH must divide numPairs for the two-phase constexpr group loop;
+        # deepen to a depth-2 ring only when numPairs is even and >= 2.
+        self.PREFETCH = 2 if (self.numPairs % 2 == 0 and self.numPairs >= 2) else 1
 
         # MXFP8 dynamic quant is derived: RMSEpilogue active and D output is F8.
         self.useMxfp8 = (bool(kernel.get("RMSEpilogue", False))
@@ -808,17 +811,28 @@ class RMSEpilogueEmitter:
         vgprPool.checkIn(val)
 
     def _emitBody(self, module, vgprTiles, isX4):
-        """Per-arm pair loop (PREFETCH=1): load one residual, consume one.
+        """Per-arm two-phase pair loop with a depth-``PREFETCH`` residual ring.
 
-        Faithful port of the @mega_fused_body loop (MLIR 285-397) over all pairs
-        in COLUMN-FASTEST order (n fastest): t -> n = t % T_N, mp = t // T_N.
-        PREFETCH=1 means load-one / consume-one (no prefetch ring; that is a
-        later perf milestone). The caller owns the top-level is_x4 branch (F8);
-        the reduction over ssqAcc arrives in F7.
+        Faithful port of the @mega_fused_body two-phase loop (MLIR 290-397) over
+        all pairs in COLUMN-FASTEST order (n fastest): t -> n = t % T_N,
+        mp = t // T_N. Each group of ``PREFETCH`` pairs first issues all P loads
+        (phase 1), then consumes each in turn (phase 2), so the next group's loads
+        cannot overwrite a bank until every consume of this group has finished in
+        program order (no WAR hazard on the ring).
+
+        Per-pair vmem = 1 load + 1 store (OUR kernel stores only residualOut; D =
+        H*gamma is a register writeback, not a store). gfx950 has a single
+        combined vmcnt (loads+stores, FIFO). When consume ``d`` runs, the vmem ops
+        issued after its load[grp+d] but still outstanding are (P-1-d) remaining
+        prefetch loads plus d stores from earlier consumes this group = P-1, a
+        constant. So every consume waits s_waitcnt vmcnt(P-1). This legitimately
+        differs from the write-only reference sandbox (two stores per pair -> its
+        vmcnt(1)/vmcnt(2) pattern); we have one store, so vmcnt(P-1).
         """
-        module.addComment0(f"MegaFused body (PREFETCH=1, isX4={isX4}).")
+        P = self.PREFETCH
+        module.addComment0(f"MegaFused body (PREFETCH={P}, isX4={isX4}).")
         vgprPool = self.writer.vgprPool
-        resBank  = vgprPool.checkOutAligned(8, 4, tag="rms_resBank")
+        resBanks = [vgprPool.checkOutAligned(8, 4, tag=f"rms_resBank{d}") for d in range(P)]
         accStage = vgprPool.checkOutAligned(8, 2, tag="rms_accStage")
         g8Bank   = vgprPool.checkOutAligned(8, 2, tag="rms_g8Bank")
         ssqAcc   = vgprPool.checkOut(self.T_N, tag="rms_ssqAcc")
@@ -826,19 +840,31 @@ class RMSEpilogueEmitter:
         module.addComment1("zero-init ssqAcc[0..T_N-1].")
         for n in range(self.T_N):
             module.add(VMovB32(dst=vgpr(ssqAcc + n), src=0, comment=f"ssqAcc[{n}] = 0.0"))
-        for t in range(self.numPairs):
-            n  = t % self.T_N
-            mp = t // self.T_N
-            module.addComment1(f"pair t={t} (mp={mp}, n={n}).")
-            self._loadRaw(module, resBank, mp, n, isX4)
-            module.add(SWaitCnt(vlcnt=0, comment="wait residual load (PREFETCH=1, vmcnt 0)."))
-            if isX4:
-                self._pairShuffle(module, resBank)
-            residualF32 = self._residualToF32(module, resBank, isX4)
-            self._computePair(module, vgprTiles, residualF32, accStage, g8Bank, ssqAcc, mp, n, isX4)
+        for grp in range(0, self.numPairs, P):
+            # Phase 1: issue all P prefetch loads for this group.
+            for d in range(P):
+                t = grp + d
+                n = t % self.T_N
+                mp = t // self.T_N
+                module.addComment1(f"prefetch load pair t={t} (mp={mp}, n={n}) -> bank {d}.")
+                self._loadRaw(module, resBanks[d], mp, n, isX4)
+            # Phase 2: consume each, waiting vmcnt(P-1) so the remaining P-1 vmem
+            # ops (loads + this-group stores) stay in flight for overlap.
+            for d in range(P):
+                t = grp + d
+                n = t % self.T_N
+                mp = t // self.T_N
+                module.addComment1(f"consume pair t={t} (mp={mp}, n={n}) from bank {d}.")
+                module.add(_SWaitCnt(lgkmcnt=-1, vmcnt=P - 1,
+                                     comment=f"combined vmcnt({P - 1}): keep P-1 vmem ops in flight."))
+                if isX4:
+                    self._pairShuffle(module, resBanks[d])
+                residualF32 = self._residualToF32(module, resBanks[d], isX4)
+                self._computePair(module, vgprTiles, residualF32, accStage, g8Bank, ssqAcc, mp, n, isX4)
         vgprPool.checkIn(g8Bank)
         vgprPool.checkIn(accStage)
-        vgprPool.checkIn(resBank)
+        for b in reversed(resBanks):
+            vgprPool.checkIn(b)
         # Reduction: combine row-groups, cross-wave combine, and partial write.
         self._combineRowGroups(module, ssqAcc)
         self._writePartials(module, ssqAcc)
