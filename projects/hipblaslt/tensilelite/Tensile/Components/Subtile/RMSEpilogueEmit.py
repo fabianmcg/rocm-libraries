@@ -683,5 +683,127 @@ class RMSEpilogueEmitter:
         self._loadNativeTile(module, bank, 1, m1, n, mBaseV)
         self.writer.vgprPool.checkIn(mBaseV)
 
+    def _computeRoBaseP(self, module, n):
+        """Compute roRowBase and roColByteBase for column n using pairRowOff.
+
+        Used by the interior paired dwordx4 store path. Returns the allocated
+        tokMaskSgpr so the caller can check it in after use.
+        """
+        lsc = self.geom.laneSgprCount
+        tokMaskSgpr = self.writer.sgprPool.checkOutAligned(lsc, lsc, tag="mf_roTokMask", preventOverflow=False)
+        self.roRowBase = self.writer.vgprPool.checkOut(1, tag="mf_roRowBase")
+        self.roColByteBase = self.writer.vgprPool.checkOut(1, tag="mf_roColByteBase")
+        nOff = self.geom.colOffset(n)
+        tokV = self.writer.vgprPool.checkOut(1, tag="mf_roTokV")
+        scratch = self.writer.vgprPool.checkOut(1, tag="mf_roTokScratch")
+        r = _addImmU32(module, tokV, self.resTokenBase, nOff, scratch, f"token_n = resTokenBase + {nOff} (n={n}).")
+        module.add(VCmpLtU32(dst=sgpr(tokMaskSgpr, lsc), src0=vgpr(r), src1=sgpr("SizesFree+1"),
+                             comment="tokenInRange = token_n < M_tokens."))
+        module.add(VMulLOU32(dst=vgpr(self.roRowBase), src0=sgpr("SizesFree+0"), src1=vgpr(r),
+                             comment=f"roRowBase = token_n * N_hidden (n={n})."))
+        module.add(VAddU32(dst=vgpr(self.roColByteBase), src0=vgpr(self.roRowBase), src1=vgpr(self.wgRowBase),
+                           comment="roColBase = token_n*N_hidden + wgRowBase."))
+        module.add(VAddU32(dst=vgpr(self.roColByteBase), src0=vgpr(self.roColByteBase), src1=vgpr(self.pairRowOff),
+                           comment="roColBase += pairRowOff (paired per-lane row origin)."))
+        module.add(VLShiftLeftB32(dst=vgpr(self.roColByteBase), shiftHex=hex(1), src=vgpr(self.roColByteBase),
+                                  comment="roColByteBase = roColBase * 2 (bf16)."))
+        self.writer.vgprPool.checkIn(scratch)
+        self.writer.vgprPool.checkIn(tokV)
+        return tokMaskSgpr
+
+    def _computeRoBaseNative(self, module, n):
+        """Compute roRowBase and roColByteBase for column n using rowGroupOff.
+
+        Used by the tail per-row-clamped store path. Returns the allocated
+        tokMaskSgpr so the caller can check it in after use.
+        """
+        lsc = self.geom.laneSgprCount
+        tokMaskSgpr = self.writer.sgprPool.checkOutAligned(lsc, lsc, tag="mf_roTokMask", preventOverflow=False)
+        self.roRowBase = self.writer.vgprPool.checkOut(1, tag="mf_roRowBase")
+        self.roColByteBase = self.writer.vgprPool.checkOut(1, tag="mf_roColByteBase")
+        nOff = self.geom.colOffset(n)
+        tokV = self.writer.vgprPool.checkOut(1, tag="mf_roTokV")
+        scratch = self.writer.vgprPool.checkOut(1, tag="mf_roTokScratch")
+        r = _addImmU32(module, tokV, self.resTokenBase, nOff, scratch, f"token_n = resTokenBase + {nOff} (n={n}).")
+        module.add(VCmpLtU32(dst=sgpr(tokMaskSgpr, lsc), src0=vgpr(r), src1=sgpr("SizesFree+1"),
+                             comment="tokenInRange = token_n < M_tokens."))
+        module.add(VMulLOU32(dst=vgpr(self.roRowBase), src0=sgpr("SizesFree+0"), src1=vgpr(r),
+                             comment=f"roRowBase = token_n * N_hidden (n={n})."))
+        module.add(VAddU32(dst=vgpr(self.roColByteBase), src0=vgpr(self.roRowBase), src1=vgpr(self.wgRowBase),
+                           comment="roColBase = token_n*N_hidden + wgRowBase."))
+        module.add(VAddU32(dst=vgpr(self.roColByteBase), src0=vgpr(self.roColByteBase), src1=vgpr(self.rowGroupOff),
+                           comment="roColBase += rowGroupOff (per-lane row origin)."))
+        module.add(VLShiftLeftB32(dst=vgpr(self.roColByteBase), shiftHex=hex(1), src=vgpr(self.roColByteBase),
+                                  comment="roColByteBase = roColBase * 2 (bf16)."))
+        self.writer.vgprPool.checkIn(scratch)
+        self.writer.vgprPool.checkIn(tokV)
+        return tokMaskSgpr
+
+    def _storeResidualOut(self, module, nativeRegs, mp, n, pathInterior):
+        """Emit bf16(H) stores to residualOut for pair mp (tiles m=2*mp and m+1).
+
+        Interior path: one paired dwordx4 store per pair (no masking, 64 lanes).
+        Tail path: per-row-clamped B16 stores for each of the two tiles.
+        """
+        if pathInterior:
+            tokMask = self._computeRoBaseP(module, n)
+            vPack = self.writer.vgprPool.checkOutAligned(4, 4, tag="mf_roPackP")
+            module.addComment1("pack 8 native f32 H -> 4 bf16 dwords (dword p = [n2p, n2p+1]).")
+            for p in range(4):
+                module.add(VCvtPkF32toBF16(dst=vgpr(vPack + p), src0=vgpr(nativeRegs[2*p]),
+                                           src1=vgpr(nativeRegs[2*p+1]),
+                                           comment=f"pack native[{2*p}] lo16, native[{2*p+1}] hi16 -> bf16x2."))
+            self._pairShuffle(module, vPack)
+            rowOff = (2*mp) * self.geom.tileStrideM * self.geom.residualBytes
+            assert rowOff < 4096, f"residualOut paired dwordx4 offset {rowOff} exceeds MUBUF offset12 range"
+            module.add(BufferStoreB128(src=vgpr(vPack, 4), vaddr=vgpr(self.roColByteBase),
+                                       saddr=sgpr(self.residualOutSrd, 4), soffset=0,
+                                       mubuf=MUBUFModifiers(offen=True, offset12=rowOff),
+                                       comment=f"ResidualOut paired dwordx4 (mp={mp},n={n}) off={rowOff}: 64 lanes."))
+            self.writer.vgprPool.checkIn(vPack)
+            self.writer.sgprPool.checkIn(tokMask)
+            self.writer.vgprPool.checkIn(self.roColByteBase); self.roColByteBase = None
+            self.writer.vgprPool.checkIn(self.roRowBase); self.roRowBase = None
+            return
+        tokMask = self._computeRoBaseNative(module, n)
+        rpl = self.geom.rowsPerLane
+        lsc = self.geom.laneSgprCount
+        for t in range(2):
+            mTile = 2*mp + t
+            nhScratch = self.writer.vgprPool.checkOut(1, tag="mf_roTailScratch")
+            # self.nhBase is the setup-allocated scratch (tag "mf_nhBase"); reuse it directly here.
+            _free0RowPos(module, self.nhBase, self.wgRowBase, self.rowGroupOff, mTile, 0, nhScratch, self.geom)
+            for k in range(rpl):
+                addrV   = self.writer.vgprPool.checkOut(1, tag="mf_roTailAddr")
+                valV    = self.writer.vgprPool.checkOut(1, tag="mf_roTailVal")
+                nhByteV = self.writer.vgprPool.checkOut(1, tag="mf_roTailNhByte")
+                with self.writer.allocTmpSgpr(lsc, tag="mf_roTailMask") as nhMask:
+                    module.add(VLShiftLeftB32(dst=vgpr(addrV), shiftHex=hex(1), src=vgpr(self.roRowBase),
+                                              comment="base0 = roRowBase * 2 (bf16)."))
+                    nh = _addImmU32(module, nhByteV, self.nhBase, k, valV, f"nhPos = nhBase + {k} (t={t},k={k}).")
+                    module.add(VCmpLtU32(dst=sgpr(nhMask.idx, lsc), src0=vgpr(nh), src1=sgpr("SizesFree+0"),
+                                         comment="nhInRange = nhPos < N_hidden."))
+                    module.add(VLShiftLeftB32(dst=vgpr(nhByteV), shiftHex=hex(1), src=vgpr(nh),
+                                              comment="nhByte = nhPos * 2 (bf16)."))
+                    module.add(VAddU32(vgpr(addrV), vgpr(addrV), vgpr(nhByteV),
+                                       comment="byteAddr = base0 + nhByte."))
+                    module.add(VCndMaskB32(dst=vgpr(addrV), src0=vgpr(self.resOobV), src1=vgpr(addrV),
+                                           src2=sgpr(nhMask.idx, lsc),
+                                           comment="clamp OOB when nhPos >= N_hidden."))
+                    module.add(VCvtPkF32toBF16(dst=vgpr(valV), src0=vgpr(nativeRegs[t*4 + k]),
+                                               src1=vgpr(nativeRegs[t*4 + k]),
+                                               comment="H -> bf16 (low 16)."))
+                    module.add(BufferStoreB16(src=vgpr(valV), vaddr=vgpr(addrV),
+                                             saddr=sgpr(self.residualOutSrd, 4), soffset=0,
+                                             mubuf=MUBUFModifiers(offen=True),
+                                             comment=f"ResidualOut bf16(H) (mp={mp},t={t},k={k})."))
+                self.writer.vgprPool.checkIn(nhByteV)
+                self.writer.vgprPool.checkIn(valV)
+                self.writer.vgprPool.checkIn(addrV)
+            self.writer.vgprPool.checkIn(nhScratch)
+        self.writer.sgprPool.checkIn(tokMask)
+        self.writer.vgprPool.checkIn(self.roColByteBase); self.roColByteBase = None
+        self.writer.vgprPool.checkIn(self.roRowBase); self.roRowBase = None
+
     def emit(self, vgprTiles):
         return self._delegate.emit(vgprTiles)
