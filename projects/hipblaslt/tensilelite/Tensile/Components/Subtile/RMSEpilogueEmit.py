@@ -741,6 +741,40 @@ class RMSEpilogueEmitter:
         vgprPool.checkIn(addr)
         vgprPool.checkIn(val)
 
+    def _emitBody(self, module, vgprTiles, isX4):
+        """Per-arm pair loop (PREFETCH=1): load one residual, consume one.
+
+        Faithful port of the @mega_fused_body loop (MLIR 285-397) over all pairs
+        in COLUMN-FASTEST order (n fastest): t -> n = t % T_N, mp = t // T_N.
+        PREFETCH=1 means load-one / consume-one (no prefetch ring; that is a
+        later perf milestone). The caller owns the top-level is_x4 branch (F8);
+        the reduction over ssqAcc arrives in F7.
+        """
+        module.addComment0(f"MegaFused body (PREFETCH=1, isX4={isX4}).")
+        vgprPool = self.writer.vgprPool
+        resBank  = vgprPool.checkOutAligned(8, 4, tag="rms_resBank")
+        accStage = vgprPool.checkOut(8, tag="rms_accStage")
+        g8Bank   = vgprPool.checkOut(8, tag="rms_g8Bank")
+        ssqAcc   = vgprPool.checkOut(self.T_N, tag="rms_ssqAcc")
+        self.ssqAccBase = ssqAcc
+        module.addComment1("zero-init ssqAcc[0..T_N-1].")
+        for n in range(self.T_N):
+            module.add(VMovB32(dst=vgpr(ssqAcc + n), src=0, comment=f"ssqAcc[{n}] = 0.0"))
+        for t in range(self.numPairs):
+            n  = t % self.T_N
+            mp = t // self.T_N
+            module.addComment1(f"pair t={t} (mp={mp}, n={n}).")
+            self._loadRaw(module, resBank, mp, n, isX4)
+            module.add(SWaitCnt(vlcnt=0, comment="wait residual load (PREFETCH=1, vmcnt 0)."))
+            if isX4:
+                self._pairShuffle(module, resBank)
+            residualF32 = self._residualToF32(module, resBank, isX4)
+            self._computePair(module, vgprTiles, residualF32, accStage, g8Bank, ssqAcc, mp, n, isX4)
+        vgprPool.checkIn(g8Bank)
+        vgprPool.checkIn(accStage)
+        vgprPool.checkIn(resBank)
+        # TODO(F7): reduction (combine_rowgroups + cross-wave + partial write) consumes/frees ssqAcc.
+
     def _computePair(self, module, vgprTiles, residualF32, accStage, g8Bank,
                      ssqAccBase, mp, n, isX4):
         """Per-pair compute: H = residual + acc, ssq partial, residualOut, D = H*gamma.
