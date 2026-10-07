@@ -13,11 +13,14 @@ DELEGATES to SubtileMegaFusedEmitter so the correctness harness stays green.
 import math
 
 from rocisa.code import Module
-from rocisa.container import EXEC, MUBUFModifiers, mgpr, sgpr, vgpr
+from rocisa.container import EXEC, DSModifiers, MUBUFModifiers, mgpr, sgpr, vgpr
 from rocisa.instruction import (
     BufferLoadB32,
     BufferLoadB128,
     BufferLoadD16B16,
+    BufferStoreB16,
+    BufferStoreB128,
+    DSLoadB64,
     DSStoreB16,
     SAddU32,
     SAndSaveExecB64,
@@ -32,6 +35,7 @@ from rocisa.instruction import (
     VCmpLtU32,
     VCndMaskB32,
     VCvtBF16toFP32,
+    VCvtPkF32toBF16,
     VLShiftLeftB32,
     VLShiftRightB32,
     VMovB32,
@@ -99,6 +103,8 @@ class RMSEpilogueEmitter:
         self.gammaLdsBase = None
         # Static byte footprint of the flat gamma LDS buffer (set in prefetch).
         self.gammaLdsBytes = None
+        # Per-lane gamma LDS read base byte offset (set in _computeGammaReadBase).
+        self.gammaReadBaseV = None
 
     def _nativeEligible(self):
         return (not self.useMxfp8 and not self.interleaved
@@ -571,3 +577,162 @@ class RMSEpilogueEmitter:
                 module.add(VCvtBF16toFP32(vgpr(bank + j), vgpr(bank + j), None, 0,
                                           comment=f"f32[{j}] = extf(lo16 bf16[{j}])."))
         return [bank + j for j in range(8)]
+
+    def _computeGammaReadBase(self, module):
+        """Precompute this lane's gamma LDS read base byte offset.
+
+        Faithful to the #rowg/#goff gamma LDS index of @mega_fused_body (MLIR
+        280-284, 354-355): LDS[idx] = gamma[WorkGroup0*MT0 + idx] with
+        idx = waveM*(T_M*16) + m*16 + g*4 + k. The index-independent per-lane
+        term is waveM*(T_M*16) + g*4; its byte offset is that * 2 (bf16). The
+        body (F4) adds the m*32 tile term per pair. Freed in the final teardown.
+        """
+        vgprPool = self.writer.vgprPool
+        self.gammaReadBaseV = vgprPool.checkOut(1, tag="rms_gammaReadBase")
+        module.addComment1("gamma read base = (waveM*(T_M*16) + g*4) * 2 (bf16 LDS byte offset).")
+        rwSpanM = self.T_M * 16
+        # waveMTerm = waveM * (T_M*16): shift when power of two, else materialized mul.
+        if rwSpanM & (rwSpanM - 1) == 0:
+            module.add(VLShiftLeftB32(dst=vgpr(self.gammaReadBaseV),
+                                      shiftHex=hex(int(math.log2(rwSpanM))),
+                                      src=vgpr(self.waveMV),
+                                      comment=f"waveMTerm = waveM * {rwSpanM} (T_M*16)."))
+        else:
+            tmpV = vgprPool.checkOut(1, tag="rms_gammaReadTmp")
+            module.add(VMovB32(dst=vgpr(tmpV), src=rwSpanM, comment=f"T_M*16={rwSpanM}."))
+            module.add(VMulLOU32(dst=vgpr(self.gammaReadBaseV), src0=vgpr(tmpV), src1=vgpr(self.waveMV),
+                                 comment=f"waveMTerm = waveM * {rwSpanM} (T_M*16)."))
+            vgprPool.checkIn(tmpV)
+        module.add(VAddU32(vgpr(self.gammaReadBaseV), vgpr(self.gammaReadBaseV), vgpr(self.g4V),
+                           comment="+= g4 (native row-group offset)."))
+        module.add(VLShiftLeftB32(dst=vgpr(self.gammaReadBaseV), shiftHex=hex(1),
+                                  src=vgpr(self.gammaReadBaseV),
+                                  comment="gamma read base byte offset = idx * 2 (bf16)."))
+        if self.gammaLdsBase:
+            module.add(VAddU32(vgpr(self.gammaReadBaseV), vgpr(self.gammaReadBaseV), self.gammaLdsBase,
+                               comment=f"+= gammaLdsBase({self.gammaLdsBase})."))
+
+    def _readGammaLds(self, module, g8Bank, mp):
+        """Read this pair's two native gamma tiles from flat gamma LDS into g8Bank.
+
+        Faithful port of the gamma LDS read in @mega_fused_body (MLIR 353-371):
+        tile m -> g8Bank[0..3], tile m+1 -> g8Bank[4..7], native f32 order. The
+        two tiles are 16 rows (32 bf16 bytes) apart in LDS. ``g8Bank`` is an
+        8-wide VGPR block owned by the caller.
+        """
+        vgprPool = self.writer.vgprPool
+        m = 2 * mp
+        gldsAddr = vgprPool.checkOut(1, tag="rms_gldsAddr")
+        module.add(VAddU32(vgpr(gldsAddr), vgpr(self.gammaReadBaseV), m * 16 * 2,
+                           comment=f"gldsAddr = gammaReadBase + m*32 (m={m})."))
+        module.add(DSLoadB64(dst=vgpr(g8Bank + 0, 2), src=vgpr(gldsAddr),
+                             ds=DSModifiers(offset=0), comment="tile m gamma: 4 bf16 (2 dwords)."))
+        module.add(DSLoadB64(dst=vgpr(g8Bank + 4, 2), src=vgpr(gldsAddr),
+                             ds=DSModifiers(offset=32), comment="tile m+1 gamma: 4 bf16 (+16 rows)."))
+        module.add(SWaitCnt(dscnt=0, comment="wait gamma ds_reads (lgkmcnt 0)."))
+        # Expand each 2-dword half to 4 f32, high-index first (in place).
+        for i in range(3, -1, -1):
+            module.add(VCvtBF16toFP32(vgpr(g8Bank + 0 + i), vgpr(g8Bank + 0 + i // 2), None, i % 2,
+                                      comment=f"tile m gamma f32[{i}] = extf(dword {i // 2}, half {i % 2})."))
+        for i in range(3, -1, -1):
+            module.add(VCvtBF16toFP32(vgpr(g8Bank + 4 + i), vgpr(g8Bank + 4 + i // 2), None, i % 2,
+                                      comment=f"tile m+1 gamma f32[{i}] = extf(dword {i // 2}, half {i % 2})."))
+        vgprPool.checkIn(gldsAddr)
+
+    def _storeResidualOut(self, module, hRegs, mp, n, isX4):
+        """Store bf16(H) for pair ``mp``, column-tile ``n`` to the ResidualOut SRD.
+
+        Faithful port of @store_data (MLIR 166-218) targeting the residual
+        stream. ``hRegs`` lists the 8 native-order f32 H VGPRs. WIDE packs,
+        pair-shuffles, and issues one dwordx4; NARROW issues eight per-row
+        clamped bf16 stores. Addressing mirrors the residual load (@load_raw).
+        """
+        if isX4:
+            self._storeResidualOutWide(module, hRegs, mp, n)
+        else:
+            self._storeResidualOutNarrow(module, hRegs, mp, n)
+
+    def _storeResidualOutWide(self, module, hRegs, mp, n):
+        """Pack 8 f32 -> 4 bf16 dwords, pair-shuffle, one dwordx4 store (MLIR 173-178)."""
+        vgprPool = self.writer.vgprPool
+        sgprPool = self.writer.sgprPool
+        lsc = self.laneSGPRCount
+        m = 2 * mp
+        vPack = vgprPool.checkOutAligned(4, 4, tag="rms_resStorePack")
+        for p in range(4):
+            module.add(VCvtPkF32toBF16(dst=vgpr(vPack + p), src0=vgpr(hRegs[2 * p]),
+                                       src1=vgpr(hRegs[2 * p + 1]),
+                                       comment=f"pack f32 pair ({2 * p},{2 * p + 1}) -> bf16 dword {p}."))
+        # native -> tile-contiguous (involutive) before the coalesced store.
+        self._pairShuffle(module, vPack)
+        rowBaseP = vgprPool.checkOut(1, tag="rms_resStoreRow")
+        col      = vgprPool.checkOut(1, tag="rms_resStoreCol")
+        addr     = vgprPool.checkOut(1, tag="rms_resStoreAddr")
+        module.add(VAddU32(vgpr(rowBaseP), vgpr(self.rowOriginV), vgpr(self.pairRowOffV),
+                           comment="rowBaseP = rowOrigin + pairRowOff."))
+        module.add(VAddU32(vgpr(rowBaseP), vgpr(rowBaseP), m * 16, comment=f"rowBaseP += m*16 (m={m})."))
+        module.add(VAddU32(vgpr(col), vgpr(self.colBaseV), n * 16, comment=f"col = colBase + n*16 (n={n})."))
+        module.add(VMulLOU32(dst=vgpr(addr), src0=sgpr("SizesFree+0"), src1=vgpr(col),
+                             comment="addr = column * rowExtent."))
+        module.add(VAddU32(vgpr(addr), vgpr(addr), vgpr(rowBaseP), comment="addr += rowBaseP."))
+        module.add(VLShiftLeftB32(dst=vgpr(addr), shiftHex=hex(1), src=vgpr(addr),
+                                  comment="addr *= 2 (bf16 bytes)."))
+        mask = sgprPool.checkOutAligned(lsc, lsc, tag="rms_resStoreMask", preventOverflow=False)
+        module.add(VCmpLtU32(dst=sgpr(mask, lsc), src0=vgpr(rowBaseP), src1=sgpr("SizesFree+0"),
+                             comment="inRange = rowBaseP < rowExtent."))
+        module.add(VCndMaskB32(dst=vgpr(addr), src0=vgpr(self.oobV), src1=vgpr(addr),
+                               src2=sgpr(mask, lsc), comment="OOB addr when rowBaseP >= rowExtent."))
+        module.add(BufferStoreB128(src=vgpr(vPack, 4), vaddr=vgpr(addr),
+                                   saddr=sgpr(self.residualOutSrd, 4), soffset=0,
+                                   mubuf=MUBUFModifiers(offen=True),
+                                   comment="store dwordx4 = residualOut[pair 8 rows]."))
+        sgprPool.checkIn(mask)
+        vgprPool.checkIn(rowBaseP)
+        vgprPool.checkIn(col)
+        vgprPool.checkIn(addr)
+        vgprPool.checkIn(vPack)
+
+    def _storeResidualOutNarrow(self, module, hRegs, mp, n):
+        """Eight per-row clamped bf16 stores, one per native tile (MLIR 179-216)."""
+        self._storeResidualOutNarrowTile(module, hRegs, 0, 2 * mp, n)
+        self._storeResidualOutNarrowTile(module, hRegs, 4, 2 * mp + 1, n)
+
+    def _storeResidualOutNarrowTile(self, module, hRegs, slotBase, ti, n):
+        """Store one native tile's four bf16 H rows, per-row clamped."""
+        vgprPool = self.writer.vgprPool
+        sgprPool = self.writer.sgprPool
+        lsc = self.laneSGPRCount
+        rowBaseT = vgprPool.checkOut(1, tag="rms_resStoreRowT")
+        col      = vgprPool.checkOut(1, tag="rms_resStoreColN")
+        row      = vgprPool.checkOut(1, tag="rms_resStoreRowN")
+        addr     = vgprPool.checkOut(1, tag="rms_resStoreAddrN")
+        val      = vgprPool.checkOut(1, tag="rms_resStoreVal")
+        module.add(VAddU32(vgpr(rowBaseT), vgpr(self.rowOriginV), vgpr(self.g4V),
+                           comment="rowBaseT = rowOrigin + g4."))
+        module.add(VAddU32(vgpr(rowBaseT), vgpr(rowBaseT), ti * 16, comment=f"rowBaseT += ti*16 (ti={ti})."))
+        module.add(VAddU32(vgpr(col), vgpr(self.colBaseV), n * 16, comment=f"col = colBase + n*16 (n={n})."))
+        for k in range(4):
+            mask = sgprPool.checkOutAligned(lsc, lsc, tag="rms_resStoreMaskN", preventOverflow=False)
+            module.add(VAddU32(vgpr(row), vgpr(rowBaseT), k, comment=f"row = rowBaseT + {k}."))
+            module.add(VCmpLtU32(dst=sgpr(mask, lsc), src0=vgpr(row), src1=sgpr("SizesFree+0"),
+                                 comment="inRange = row < rowExtent."))
+            module.add(VMulLOU32(dst=vgpr(addr), src0=sgpr("SizesFree+0"), src1=vgpr(col),
+                                 comment="addr = column * rowExtent."))
+            module.add(VAddU32(vgpr(addr), vgpr(addr), vgpr(row), comment="addr += row."))
+            module.add(VLShiftLeftB32(dst=vgpr(addr), shiftHex=hex(1), src=vgpr(addr),
+                                      comment="addr *= 2 (bf16 bytes)."))
+            module.add(VCndMaskB32(dst=vgpr(addr), src0=vgpr(self.oobV), src1=vgpr(addr),
+                                   src2=sgpr(mask, lsc), comment="OOB addr when row >= rowExtent."))
+            module.add(VCvtPkF32toBF16(dst=vgpr(val), src0=vgpr(hRegs[slotBase + k]),
+                                       src1=vgpr(hRegs[slotBase + k]),
+                                       comment=f"val = bf16(H[{slotBase + k}])."))
+            module.add(BufferStoreB16(src=vgpr(val), vaddr=vgpr(addr),
+                                      saddr=sgpr(self.residualOutSrd, 4), soffset=0,
+                                      mubuf=MUBUFModifiers(offen=True),
+                                      comment=f"store bf16 = residualOut[row {k}]."))
+            sgprPool.checkIn(mask)
+        vgprPool.checkIn(rowBaseT)
+        vgprPool.checkIn(col)
+        vgprPool.checkIn(row)
+        vgprPool.checkIn(addr)
+        vgprPool.checkIn(val)
