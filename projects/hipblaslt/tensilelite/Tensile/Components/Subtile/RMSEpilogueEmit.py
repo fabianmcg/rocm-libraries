@@ -878,6 +878,60 @@ class RMSEpilogueEmitter:
                 module.add(VAccvgprWriteB32(accvgpr(reg), vgpr(sk),
                                             comment=f"write D back to acc (tile={tileIdx},n={n},k={k})."))
 
+    def _residualToF32(self, module, bank, pathInterior):
+        """Convert 8 bf16 residual VGPRs to f32 in place, native order.
+
+        Interior path: bank[0..3] hold 4 packed bf16 dwords (2 bf16 per dword)
+        after pair_shuffle; expand high-index first so each source dword is read
+        before its low half is overwritten.
+
+        Tail path: bank[0..7] hold 8 independent lo16 bf16 values; convert in
+        forward order.
+
+        Returns a list of 8 VGPR ints [bank+0 .. bank+7] holding f32.
+        """
+        if pathInterior:
+            module.addComment1("expand 8 native bf16 residual -> 8 f32 (high index first, in place).")
+            for i in range(7, -1, -1):
+                module.add(VCvtBF16toFP32(vgpr(bank + i), vgpr(bank + i // 2), None, i % 2,
+                                          comment=f"residual native[{i}] bf16({'hi' if i%2 else 'lo'}) -> f32."))
+        else:
+            module.addComment1("convert 8 native lo16 bf16 residual -> 8 f32 (in place).")
+            for j in range(8):
+                module.add(VCvtBF16toFP32(vgpr(bank + j), vgpr(bank + j), None, 0,
+                                          comment=f"residual native[{j}] lo16 -> f32."))
+        return [bank + j for j in range(8)]
+
+    def _emitPairSweep(self, module, vgprTiles, pathInterior):
+        """Emit the per-pair body with PREFETCH=1 (simplest correct schedule).
+
+        No prefetch ring yet: load one pair-column, wait, convert, compute, repeat.
+        """
+        module.addComment0(f"MegaFused pair sweep (PREFETCH=1, pathInterior={pathInterior}).")
+        rpl = self.geom.rowsPerLane
+        tpb = self.geom.tilesPerBlockM
+        vgprPool = self.writer.vgprPool
+        # resBank: 8 VGPRs, 4-aligned (B128 needs 4-aligned base; also holds 8 expanded f32).
+        resBank = vgprPool.checkOutAligned(8, 4, tag="mf_resBank")
+        accStageBank = vgprPool.checkOut(8, tag="mf_accStage")
+        for qi in range(self.geom.nQTilesM):
+            module.addComment1(f"gamma block load/convert for qi={qi}.")
+            self._ldsReadGammaBlockIssue(module, self.gammaBank, qi)
+            module.add(SWaitCnt(dscnt=0, comment=f"wait gamma LDS read (qi={qi})."))
+            for mi in range(tpb):
+                _convertGammaChunk(module, self.gammaBank + mi * rpl, rpl)
+            self._gammaReadPending = False
+            for n in range(self.geom.mmaN):
+                module.addComment1(f"pair compute (qi={qi}, n={n}).")
+                self._loadRaw(module, resBank, qi, n, pathInterior)
+                module.add(SWaitCnt(vlcnt=0, comment="wait residual load (PREFETCH=1)."))
+                if pathInterior:
+                    self._pairShuffle(module, resBank)
+                residualF32 = self._residualToF32(module, resBank, pathInterior)
+                self._computePair(module, vgprTiles, residualF32, accStageBank, qi, n, pathInterior)
+        vgprPool.checkIn(accStageBank)
+        vgprPool.checkIn(resBank)
+
     def _reduceAndWritePartials(self, module) -> None:
         """Reduce rmsSum intra-wave, fence stores, and write partials to partialBuf.
 
