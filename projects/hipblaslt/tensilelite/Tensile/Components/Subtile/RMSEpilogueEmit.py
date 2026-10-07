@@ -12,7 +12,7 @@ DELEGATES to SubtileMegaFusedEmitter so the correctness harness stays green.
 
 import math
 
-from rocisa.code import Module
+from rocisa.code import Label, Module
 from rocisa.container import EXEC, DSModifiers, MUBUFModifiers, accvgpr, mgpr, sgpr, vgpr
 from rocisa.instruction import (
     BufferLoadB32,
@@ -27,7 +27,11 @@ from rocisa.instruction import (
     DSStoreB16,
     DSStoreB32,
     SAddU32,
+    SAndB32,
     SAndSaveExecB64,
+    SBranch,
+    SCBranchSCC0,
+    SCmpEQU32,
     SLShiftLeftB32,
     SLShiftRightB32,
     SMovB32,
@@ -130,9 +134,55 @@ class RMSEpilogueEmitter:
         return SubtileMegaFusedEmitter(self.writer, self.kernel).emit(vgprTiles)
 
     def _emitNative(self, vgprTiles):
-        # TODO(F2-F7): replace with the faithful native implementation.
-        from .SubtileMegaFusedEmit import SubtileMegaFusedEmitter
-        return SubtileMegaFusedEmitter(self.writer, self.kernel).emit(vgprTiles)
+        module = Module("RMSEpilogue native (faithful MLIR paired-permlane).")
+        # Drain GEMM vector memory before reusing AGPRs/LDS (epilogue entry).
+        module.add(SWaitCnt(vlcnt=0, comment="drain GEMM loads before epilogue."))
+        self._emitSetup(module)
+        self._computeAddrConstants(module)
+        self._computeGammaReadBase(module)
+        # Top-level is_x4 = (rowExtent % 8 == 0) branch (MLIR:552-554).
+        narrowLabel = Label(self.writer.labels.getNameInc("rms_narrow"),
+                            "narrow (rowExtent%8 != 0) arm.")
+        endLabel = Label(self.writer.labels.getNameInc("rms_end"), "epilogue merge point.")
+        with self.writer.allocTmpSgpr(1, tag="rms_isx4") as t:
+            module.add(SAndB32(dst=sgpr(t.idx), src0=sgpr("SizesFree+0"), src1=7,
+                               comment="rowExtent & 7."))
+            module.add(SCmpEQU32(src0=sgpr(t.idx), src1=0,
+                                 comment="SCC = (rowExtent%8 == 0): wide path."))
+        module.add(SCBranchSCC0(labelName=narrowLabel.getLabelName(),
+                                comment="branch to narrow when rowExtent%8 != 0."))
+        # Wide arm: DTL gamma + barrier + dwordx4 body.
+        module.addComment0("Wide arm (rowExtent%8==0): dwordx4 coalesced.")
+        self._emitGammaPrefetchDTL(module)
+        self._emitBody(module, vgprTiles, isX4=True)
+        module.add(SBranch(labelName=endLabel.getLabelName(), comment="wide done; skip narrow."))
+        # Narrow arm: software gamma + barrier + scalar body.
+        module.add(narrowLabel)
+        module.addComment0("Narrow arm (rowExtent%8!=0): scalar bf16.")
+        self._emitGammaPrefetch(module)
+        self._emitBody(module, vgprTiles, isX4=False)
+        module.add(endLabel)
+        self._emitTeardown(module)
+        return module
+
+    def _emitTeardown(self, module):
+        """Free every persistent register checked out by setup/address/gamma-base.
+
+        Balances the checkouts in _emitSetup, _computeAddrConstants, and
+        _computeGammaReadBase. residualOutSrd aliases SrdResidualOut (not
+        pool-allocated) and is intentionally not freed.
+        """
+        module.addComment1("RMS epilogue teardown: free persistent setup registers.")
+        vgprPool = self.writer.vgprPool
+        sgprPool = self.writer.sgprPool
+        for attr in ("laneV", "cV", "gV", "waveIdV", "waveMV", "waveNV",
+                     "rowOriginV", "colOriginV", "colBaseV", "pairRowOffV",
+                     "g4V", "oobV", "gammaReadBaseV"):
+            vgprPool.checkIn(getattr(self, attr))
+            setattr(self, attr, None)
+        for attr in ("resSrd", "gammaSrd"):
+            sgprPool.checkIn(getattr(self, attr))
+            setattr(self, attr, None)
 
     def _emitSetup(self, module):
         """Emit the kernel prologue: lane decode, row/col origins, buffer SRDs.
@@ -161,18 +211,19 @@ class RMSEpilogueEmitter:
         module.add(VLShiftRightB32(dst=vgpr(self.waveIdV),
                                    shiftHex=hex(int(math.log2(self.waveSize))),
                                    src=vgpr("Serial"), comment="waveId = Serial >> 6."))
-        # waveM = waveId // G_N; waveN = waveId % G_N (G_N is a power of two).
-        if self.G_N == 1:
-            module.add(VMovB32(dst=vgpr(self.waveMV), src=vgpr(self.waveIdV),
-                               comment="waveM = waveId (G_N == 1)."))
-            module.add(VMovB32(dst=vgpr(self.waveNV), src=0, comment="waveN = 0 (G_N == 1)."))
+        # M-fastest wave linearization: waveId = waveN*G_M + waveM, so
+        # waveM = waveId % G_M and waveN = waveId // G_M (G_M is a power of two).
+        if self.G_M == 1:
+            module.add(VMovB32(dst=vgpr(self.waveMV), src=0, comment="waveM = 0 (G_M == 1)."))
+            module.add(VMovB32(dst=vgpr(self.waveNV), src=vgpr(self.waveIdV),
+                               comment="waveN = waveId (G_M == 1)."))
         else:
-            assert self.G_N & (self.G_N - 1) == 0, "G_N must be a power of two"
-            module.add(VLShiftRightB32(dst=vgpr(self.waveMV),
-                                       shiftHex=hex(int(math.log2(self.G_N))),
-                                       src=vgpr(self.waveIdV), comment="waveM = waveId >> log2(G_N)."))
-            module.add(VAndB32(dst=vgpr(self.waveNV), src0=vgpr(self.waveIdV), src1=self.G_N - 1,
-                               comment="waveN = waveId & (G_N - 1)."))
+            assert self.G_M & (self.G_M - 1) == 0, "G_M must be a power of two"
+            module.add(VAndB32(dst=vgpr(self.waveMV), src0=vgpr(self.waveIdV), src1=self.G_M - 1,
+                               comment="waveM = waveId & (G_M - 1)."))
+            module.add(VLShiftRightB32(dst=vgpr(self.waveNV),
+                                       shiftHex=hex(int(math.log2(self.G_M))),
+                                       src=vgpr(self.waveIdV), comment="waveN = waveId >> log2(G_M)."))
 
         # ---- Row/col origins (MLIR 515-522) ----
         self.rowOriginV = vgprPool.checkOut(1, tag="rms_rowOrigin")
@@ -286,18 +337,22 @@ class RMSEpilogueEmitter:
                                rowWaveBaseS, idxV, growV, gvalV, ldsOffV):
         """Emit one prefetch pass: load gamma[rowWaveBase+idx] -> LDS[idx]."""
         lsc = self.laneSGPRCount
+        vgprPool = self.writer.vgprPool
         sgprPool = self.writer.sgprPool
         if p == 0:
             module.add(VMovB32(dst=vgpr(idxV), src=vgpr("Serial"), comment="idx = Serial."))
         else:
-            module.add(VAddU32(vgpr(idxV), vgpr("Serial"), p * blockDim,
-                               comment=f"idx = Serial + {p}*blockDim."))
+            self._vaddImm(module, idxV, "Serial", p * blockDim, f"idx = Serial + {p}*blockDim.")
         savedExec = None
         if needGuard:
             mask = sgprPool.checkOutAligned(lsc, lsc, tag="rms_gammaMask", preventOverflow=False)
             savedExec = sgprPool.checkOutAligned(lsc, lsc, tag="rms_gammaExec", preventOverflow=False)
-            module.add(VCmpLtU32(dst=sgpr(mask, lsc), src0=vgpr(idxV), src1=self.MT0,
+            # MT0 exceeds the inline cap, so materialize it before the compare.
+            mt0V = vgprPool.checkOut(1, tag="rms_gammaMt0")
+            module.add(VMovB32(dst=vgpr(mt0V), src=self.MT0, comment=f"MT0 = {self.MT0}."))
+            module.add(VCmpLtU32(dst=sgpr(mask, lsc), src0=vgpr(idxV), src1=vgpr(mt0V),
                                  comment=f"active = idx < MT0({self.MT0})."))
+            vgprPool.checkIn(mt0V)
             module.add(SAndSaveExecB64(dst=sgpr(savedExec, lsc), src=sgpr(mask, lsc),
                                        comment="narrow exec to active prefetch lanes."))
             sgprPool.checkIn(mask)
@@ -492,9 +547,9 @@ class RMSEpilogueEmitter:
         # rowBaseP = rowOrigin + pairRowOff + m*16.
         module.add(VAddU32(vgpr(rowBaseP), vgpr(self.rowOriginV), vgpr(self.pairRowOffV),
                            comment="rowBaseP = rowOrigin + pairRowOff."))
-        module.add(VAddU32(vgpr(rowBaseP), vgpr(rowBaseP), m * 16, comment=f"rowBaseP += m*16 (m={m})."))
+        self._vaddImm(module, rowBaseP, rowBaseP, m * 16, f"rowBaseP += m*16 (m={m}).")
         # col = colBase + n*16.
-        module.add(VAddU32(vgpr(col), vgpr(self.colBaseV), n * 16, comment=f"col = colBase + n*16 (n={n})."))
+        self._vaddImm(module, col, self.colBaseV, n * 16, f"col = colBase + n*16 (n={n}).")
         # addr = (column*rowExtent + rowBaseP) << 1 (bf16 column-major byte offset).
         module.add(VMulLOU32(dst=vgpr(addr), src0=sgpr("SizesFree+0"), src1=vgpr(col),
                              comment="addr = column * rowExtent."))
@@ -536,9 +591,9 @@ class RMSEpilogueEmitter:
         # rowBaseT = rowOrigin + g4 + ti*16 (native-tile base row for this lane).
         module.add(VAddU32(vgpr(rowBaseT), vgpr(self.rowOriginV), vgpr(self.g4V),
                            comment="rowBaseT = rowOrigin + g4."))
-        module.add(VAddU32(vgpr(rowBaseT), vgpr(rowBaseT), ti * 16, comment=f"rowBaseT += ti*16 (ti={ti})."))
+        self._vaddImm(module, rowBaseT, rowBaseT, ti * 16, f"rowBaseT += ti*16 (ti={ti}).")
         # col = colBase + n*16.
-        module.add(VAddU32(vgpr(col), vgpr(self.colBaseV), n * 16, comment=f"col = colBase + n*16 (n={n})."))
+        self._vaddImm(module, col, self.colBaseV, n * 16, f"col = colBase + n*16 (n={n}).")
         for k in range(4):
             mask = sgprPool.checkOutAligned(lsc, lsc, tag="rms_narrowMask", preventOverflow=False)
             module.add(VAddU32(vgpr(row), vgpr(rowBaseT), k, comment=f"row = rowBaseT + {k}."))
@@ -636,8 +691,8 @@ class RMSEpilogueEmitter:
         vgprPool = self.writer.vgprPool
         m = 2 * mp
         gldsAddr = vgprPool.checkOut(1, tag="rms_gldsAddr")
-        module.add(VAddU32(vgpr(gldsAddr), vgpr(self.gammaReadBaseV), m * 16 * 2,
-                           comment=f"gldsAddr = gammaReadBase + m*32 (m={m})."))
+        self._vaddImm(module, gldsAddr, self.gammaReadBaseV, m * 16 * 2,
+                      f"gldsAddr = gammaReadBase + m*32 (m={m}).")
         module.add(DSLoadB64(dst=vgpr(g8Bank + 0, 2), src=vgpr(gldsAddr),
                              ds=DSModifiers(offset=0), comment="tile m gamma: 4 bf16 (2 dwords)."))
         module.add(DSLoadB64(dst=vgpr(g8Bank + 4, 2), src=vgpr(gldsAddr),
@@ -683,8 +738,8 @@ class RMSEpilogueEmitter:
         addr     = vgprPool.checkOut(1, tag="rms_resStoreAddr")
         module.add(VAddU32(vgpr(rowBaseP), vgpr(self.rowOriginV), vgpr(self.pairRowOffV),
                            comment="rowBaseP = rowOrigin + pairRowOff."))
-        module.add(VAddU32(vgpr(rowBaseP), vgpr(rowBaseP), m * 16, comment=f"rowBaseP += m*16 (m={m})."))
-        module.add(VAddU32(vgpr(col), vgpr(self.colBaseV), n * 16, comment=f"col = colBase + n*16 (n={n})."))
+        self._vaddImm(module, rowBaseP, rowBaseP, m * 16, f"rowBaseP += m*16 (m={m}).")
+        self._vaddImm(module, col, self.colBaseV, n * 16, f"col = colBase + n*16 (n={n}).")
         module.add(VMulLOU32(dst=vgpr(addr), src0=sgpr("SizesFree+0"), src1=vgpr(col),
                              comment="addr = column * rowExtent."))
         module.add(VAddU32(vgpr(addr), vgpr(addr), vgpr(rowBaseP), comment="addr += rowBaseP."))
@@ -722,8 +777,8 @@ class RMSEpilogueEmitter:
         val      = vgprPool.checkOut(1, tag="rms_resStoreVal")
         module.add(VAddU32(vgpr(rowBaseT), vgpr(self.rowOriginV), vgpr(self.g4V),
                            comment="rowBaseT = rowOrigin + g4."))
-        module.add(VAddU32(vgpr(rowBaseT), vgpr(rowBaseT), ti * 16, comment=f"rowBaseT += ti*16 (ti={ti})."))
-        module.add(VAddU32(vgpr(col), vgpr(self.colBaseV), n * 16, comment=f"col = colBase + n*16 (n={n})."))
+        self._vaddImm(module, rowBaseT, rowBaseT, ti * 16, f"rowBaseT += ti*16 (ti={ti}).")
+        self._vaddImm(module, col, self.colBaseV, n * 16, f"col = colBase + n*16 (n={n}).")
         for k in range(4):
             mask = sgprPool.checkOutAligned(lsc, lsc, tag="rms_resStoreMaskN", preventOverflow=False)
             module.add(VAddU32(vgpr(row), vgpr(rowBaseT), k, comment=f"row = rowBaseT + {k}."))
@@ -782,7 +837,10 @@ class RMSEpilogueEmitter:
         vgprPool.checkIn(g8Bank)
         vgprPool.checkIn(accStage)
         vgprPool.checkIn(resBank)
-        # TODO(F7): reduction (combine_rowgroups + cross-wave + partial write) consumes/frees ssqAcc.
+        # Reduction: combine row-groups, cross-wave combine, and partial write.
+        self._combineRowGroups(module, ssqAcc)
+        self._writePartials(module, ssqAcc)
+        vgprPool.checkIn(ssqAcc)
 
     def _combineRowGroups(self, module, ssqAccBase):
         """Intra-wave row-group XOR butterfly over ssqAcc (no LDS).
@@ -820,17 +878,26 @@ class RMSEpilogueEmitter:
         for a in reversed(addrs):
             vgprPool.checkIn(a)
 
-    def _addColOffset(self, module, dst, base, off):
-        """dst = base + off, materializing off in dst when it exceeds the inline cap.
+    def _vaddImm(self, module, dst, src, imm, comment):
+        """dst = src + imm, materializing imm in a temp VGPR above the inline cap.
 
-        VALU inline literals cap at 64; n*16 reaches (T_N-1)*16 (up to 240), so a
-        larger column offset is loaded with VMovB32 before the add.
+        Inline VALU literals cap at 64, and a VOP2 32-bit literal is only encodable
+        in the src0 slot, so a larger immediate second operand is first loaded into
+        a temp VGPR. The temp is independent of src, so this is safe in place
+        (dst == src).
         """
-        if off <= 64:
-            module.add(VAddU32(vgpr(dst), vgpr(base), off, comment=f"column = colBase + {off}."))
+        if imm <= 64:
+            module.add(VAddU32(vgpr(dst), vgpr(src), imm, comment=comment))
             return
-        module.add(VMovB32(dst=vgpr(dst), src=off, comment=f"colOff = {off}."))
-        module.add(VAddU32(vgpr(dst), vgpr(dst), vgpr(base), comment="column = colBase + colOff."))
+        vgprPool = self.writer.vgprPool
+        tmp = vgprPool.checkOut(1, tag="rms_immTmp")
+        module.add(VMovB32(dst=vgpr(tmp), src=imm, comment=f"imm = {imm}."))
+        module.add(VAddU32(vgpr(dst), vgpr(src), vgpr(tmp), comment=comment))
+        vgprPool.checkIn(tmp)
+
+    def _addColOffset(self, module, dst, base, off):
+        """dst = base + off (column = colBase + n*16); see _vaddImm for the cap handling."""
+        self._vaddImm(module, dst, base, off, f"column = colBase + {off}.")
 
     def _storePartialColumn(self, module, valReg, n, ntV, partialSrd, colV, addrV, colMask):
         """Predicated store of one column's partial to partialBuf (shared by both G_M paths).
@@ -929,7 +996,7 @@ class RMSEpilogueEmitter:
             # writer-exec: sum the G_M sibling waves' slots, then store.
             module.add(SAndSaveExecB64(dst=sgpr(savedExec, lsc), src=sgpr(writerMask, lsc),
                                        comment="exec = writer lanes."))
-            strideBytes = self.G_N * 64 * 4  # waveLdsStride (elements) * 4.
+            strideBytes = 64 * 4   # waveLdsStride = 64 elements (M-fastest: consecutive waveIds are the G_M siblings).
             rowSum = vgprPool.checkOut(1, tag="rms_pwRowSum")
             tmp = vgprPool.checkOut(1, tag="rms_pwTmp")
             colV = vgprPool.checkOut(1, tag="rms_pwCol")
