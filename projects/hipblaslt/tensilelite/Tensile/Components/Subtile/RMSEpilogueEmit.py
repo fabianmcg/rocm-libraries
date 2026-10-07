@@ -94,6 +94,8 @@ from .SubtileMegaFusedEmit import (
     SubtileMegaFusedEmitter,
     RMSEpilogueGeometry,
     _buildBufferSrd,
+    _convertGammaChunk,
+    _convertGammaChunkBf16,
     _useDwordx4Interior,
 )
 
@@ -324,6 +326,215 @@ class RMSEpilogueEmitter:
                                    comment="resTokenBase = colByte >> log2ElemBytes."))
         module.add(VMovB32(dst=vgpr(self.resOobV), src="BufferOOB",
                            comment="resOobV = BufferOOB (OOB loads return 0 / stores dropped)."))
+
+    def _emitGammaDtlLoadContiguous(self, module, qi) -> None:
+        """Issue one qi-block's DTL gamma load for the contiguous (Subtile) layout.
+
+        One b32 DTL load covers all tilesPerBlockM tiles because they occupy contiguous
+        global gamma rows; lane i reads gamma[2i],gamma[2i+1] and DTL writes them
+        contiguously at LDS M0+i*4, matching the consumer layout.
+        """
+        sgprPool = self.writer.sgprPool
+        # M0 = waveM*ldsWaveStride + qi*gammaLdsBufBytes (slot qi's per-wave write base).
+        if qi == 0:
+            module.add(SMovB32(dst=mgpr(0), src=sgpr(self.gammaM0Base),
+                               comment="M0 = gamma LDS wave base (slot 0)."))
+        else:
+            with self.writer.allocTmpSgpr(1, tag="mf_gammaM0") as t:
+                module.add(SAddU32(dst=sgpr(t.idx), src0=sgpr(self.gammaM0Base),
+                                   src1=qi * self.geom.gammaLdsBufBytes,
+                                   comment=f"M0 base + slot{qi} offset."))
+                module.add(SMovB32(dst=mgpr(0), src=sgpr(t.idx),
+                                   comment=f"M0 = gamma LDS wave base (slot {qi})."))
+        # soffset = wgRowBase*gammaBytes + qi*gammaLdsWaveStride (next qi-block of gamma).
+        qiSoffsetAdj = qi * self.geom.gammaLdsWaveStride
+        if qiSoffsetAdj > 0:
+            qiSoffSgpr = sgprPool.checkOutAligned(1, 1, tag="mf_gammaQiSoff", preventOverflow=False)
+            module.add(SAddU32(dst=sgpr(qiSoffSgpr), src0=sgpr(self.gammaSoffsetSgpr),
+                               src1=qiSoffsetAdj,
+                               comment=f"soffset += qi*gammaLdsWaveStride for qi={qi}."))
+        else:
+            qiSoffSgpr = self.gammaSoffsetSgpr
+        module.add(BufferLoadB32(
+            dst=None, vaddr=vgpr(self.gammaDtlVaddr), saddr=sgpr(self.gammaSrd, 4),
+            soffset=sgpr(qiSoffSgpr),
+            mubuf=MUBUFModifiers(offen=True, offset12=0, lds=True),
+            comment=f"gamma DTL b32 -> LDS slot {qi}."))
+        if qiSoffsetAdj > 0:
+            sgprPool.checkIn(qiSoffSgpr)
+
+    def _emitGammaDtlLoad(self, module, qi) -> None:
+        """Issue one qi-block's Direct-To-LDS gamma load(s) into the resident LDS slot(s).
+
+        Contiguous layout (Subtile): delegates to _emitGammaDtlLoadContiguous.
+
+        Interleaved layout (CMS): the tilesPerBlockM tiles map to non-contiguous global
+        gamma rows (stride tileStrideM between tiles), so issue one b32 DTL load per
+        tile, each at its own global soffset, into the same per-mi LDS slot the consumer
+        already reads.  The LDS layout and the consumer are unchanged.
+
+        The caller owns exec narrowing, the vmcnt wait, and the barriers.
+        """
+        if not self.geom.interleavedWaves:
+            self._emitGammaDtlLoadContiguous(module, qi)
+            return
+        # Interleaved layout (CMS): tiles in a qi-block map to non-contiguous global
+        # gamma rows (stride tileStrideM = wgM*mfmaM between consecutive tiles).
+        # Issue one b32 DTL load per tile at its interleaved global soffset, writing
+        # into the same per-mi LDS slot the consumer reads.
+        tpb = self.geom.tilesPerBlockM
+        for mi in range(tpb):
+            m = qi * tpb + mi
+            # Global byte soffset for this tile:
+            #   gammaSoffsetSgpr already = wgRowBase * gammaBytes (wgRowBase includes
+            #   waveM * waveStrideM from the wgRowBase setup), so adding
+            #   m * tileStrideM * gammaBytes gives the correct interleaved row.
+            tileSoffsetAdj = m * self.geom.tileStrideM * self.geom.gammaBytes
+            if tileSoffsetAdj > 0:
+                with self.writer.allocTmpSgpr(1, tag="mf_gammaTileSoff") as ts:
+                    module.add(SAddU32(dst=sgpr(ts.idx), src0=sgpr(self.gammaSoffsetSgpr),
+                                       src1=tileSoffsetAdj,
+                                       comment=f"soffset = wgRowBase*gammaBytes + m*tileStrideM*gammaBytes (m={m})."))
+                    self._emitGammaDtlInterleavedTileLoad(module, qi, mi, ts.idx)
+            else:
+                self._emitGammaDtlInterleavedTileLoad(module, qi, mi, self.gammaSoffsetSgpr)
+
+    def _emitGammaDtlInterleavedTileLoad(self, module, qi, mi, soffSgpr) -> None:
+        """Set M0 for one interleaved tile's LDS slot and issue its DTL load(s).
+
+        For VW0=1 a single b32 DTL (2 bf16 per lane) fills a 32-byte slot per tile.
+        For VW0=2 two b32 DTL loads fill a 64-byte slot per tile: the first covers the
+        lower mfmaM gamma rows, the second (at M0+mfmaM*gammaBytes, soffset+mfmaM*gammaBytes)
+        covers the upper mfmaM rows. The consumer reads two DSLoadB64 at off and off+8.
+        """
+        halfBytes = self.geom.mfmaM * self.geom.gammaBytes   # bytes for one b32-DTL half (VW0=1 full slot)
+        m0Adj = qi * self.geom.gammaLdsBufBytes + mi * self.geom.mfmaM * self.geom.vw0 * self.geom.gammaBytes
+        if m0Adj == 0:
+            module.add(SMovB32(dst=mgpr(0), src=sgpr(self.gammaM0Base),
+                               comment=f"M0 = gammaM0Base (qi={qi},mi={mi})."))
+        else:
+            with self.writer.allocTmpSgpr(1, tag="mf_gammaTileM0") as tm:
+                module.add(SAddU32(dst=sgpr(tm.idx), src0=sgpr(self.gammaM0Base),
+                                   src1=m0Adj,
+                                   comment=f"M0 = gammaM0Base + qi*ldsStride + mi*mfmaM*vw0*gammaBytes (qi={qi},mi={mi})."))
+                module.add(SMovB32(dst=mgpr(0), src=sgpr(tm.idx),
+                                   comment=f"M0 = per-tile LDS slot base (qi={qi},mi={mi})."))
+        module.add(BufferLoadB32(
+            dst=None, vaddr=vgpr(self.gammaDtlVaddr), saddr=sgpr(self.gammaSrd, 4),
+            soffset=sgpr(soffSgpr),
+            mubuf=MUBUFModifiers(offen=True, offset12=0, lds=True),
+            comment=f"gamma DTL b32 half 0 -> LDS slot (qi={qi},mi={mi})."))
+        # For vw0>1: issue one b32 DTL load per additional half; each advances M0 and
+        # soffset by halfBytes so successive mfmaM-row blocks map to contiguous LDS.
+        for h in range(1, self.geom.vw0):
+            m0AdjH = m0Adj + h * halfBytes
+            with self.writer.allocTmpSgpr(1, tag="mf_gammaTileM0h") as tmh:
+                module.add(SAddU32(dst=sgpr(tmh.idx), src0=sgpr(self.gammaM0Base),
+                                   src1=m0AdjH,
+                                   comment=f"M0 = slot base + {h}*halfBytes (qi={qi},mi={mi},h={h})."))
+                module.add(SMovB32(dst=mgpr(0), src=sgpr(tmh.idx),
+                                   comment=f"M0 = LDS slot for half {h} (qi={qi},mi={mi})."))
+            with self.writer.allocTmpSgpr(1, tag="mf_gammaSoffH") as tsh:
+                module.add(SAddU32(dst=sgpr(tsh.idx), src0=sgpr(soffSgpr),
+                                   src1=h * halfBytes,
+                                   comment=f"soffset += {h}*halfBytes (half {h}, qi={qi},mi={mi})."))
+                module.add(BufferLoadB32(
+                    dst=None, vaddr=vgpr(self.gammaDtlVaddr), saddr=sgpr(self.gammaSrd, 4),
+                    soffset=sgpr(tsh.idx),
+                    mubuf=MUBUFModifiers(offen=True, offset12=0, lds=True),
+                    comment=f"gamma DTL b32 half {h} -> LDS slot (qi={qi},mi={mi})."))
+
+    def _issueAllGammaToLds(self, module) -> None:
+        """Issue every nQTilesM gamma qi-block's Direct-To-LDS load (no drain, no barrier).
+
+        One WAR barrier guards the prior (mainloop) LDS users; one exec narrowing covers
+        every DTL load.  Exec is restored (and its saved-exec SGPR checked in) immediately
+        after issuing the loads -- exec only gates which lanes *issue* the op, so restoring
+        it does not require waiting for completion (vlcnt tracks that).  The caller issues
+        independent work next, then calls _drainGammaToLds to wait + publish.  Distinct qi
+        slots never alias, so no inter-stage WAR barrier is needed.
+        """
+        module.addComment1(f"issue all gamma qi-block DTL loads up front (nQTilesM={self.geom.nQTilesM}).")
+        sgprPool = self.writer.sgprPool
+        lsc = self.geom.laneSgprCount
+        # Interleaved layout: each per-tile DTL load needs mfmaM//2 lanes (lane i reads
+        # gamma[2i,2i+1]); all per-tile loads share the same low-lane mask, so we narrow
+        # exec once to mfmaM//2.  Contiguous layout: one load per qi covers tilesPerBlockM
+        # tiles, requiring tilesPerBlockM*mfmaM//2 lanes.
+        numStageLanes = (self.geom.mfmaM // 2) if self.geom.interleavedWaves \
+            else (self.geom.tilesPerBlockM * self.geom.mfmaM // 2)
+        module.add(self.writer._syncThreads(self.kernel,
+                                            "gamma DTL stage: WAR barrier before reusing LDS region."))
+        savedExec = sgprPool.checkOutAligned(lsc, lsc, tag="mf_gammaStageExec", preventOverflow=False)
+        module.add(SMovB64(dst=sgpr(savedExec, lsc), src=EXEC(),
+                           comment="save exec around contiguous-lane DTL gamma loads."))
+        # Narrow exec to laneId < numStageLanes (contiguous lanes); AND with waveN==0.
+        repMask = sgprPool.checkOutAligned(lsc, lsc, tag="mf_gammaRep", preventOverflow=False)
+        module.add(VCmpLtU32(dst=sgpr(repMask, lsc), src0=vgpr(self.laneId), src1=numStageLanes,
+                             comment=f"stageLane = laneId < {numStageLanes} (contiguous b32 DTL)."))
+        if self.geom.wgN > 1:
+            wtmp = sgprPool.checkOutAligned(lsc, lsc, tag="mf_gammaRepWN", preventOverflow=False)
+            waveThreshold = self.geom.wgM * self.geom.waveSize
+            with self.writer.allocTmpSgpr(1, tag="mf_gammaWNThr") as thr:
+                module.add(SMovB32(dst=sgpr(thr.idx), src=hex(waveThreshold),
+                                   comment=f"wgM*waveSize = {waveThreshold} (waveN==0 bound)."))
+                module.add(VCmpLtU32(dst=sgpr(wtmp, lsc), src0=vgpr("Serial"),
+                                     src1=sgpr(thr.idx),
+                                     comment="waveN0 = Serial < wgM*waveSize."))
+            module.add(SAndB64(dst=sgpr(repMask, lsc), src0=sgpr(repMask, lsc),
+                               src1=sgpr(wtmp, lsc), comment="repLane &= (waveN == 0)."))
+            sgprPool.checkIn(wtmp)
+        module.add(SMovB64(dst=EXEC(), src=sgpr(repMask, lsc),
+                           comment="exec = contiguous stage lanes for DTL gamma loads."))
+        sgprPool.checkIn(repMask)
+        for qi in range(self.geom.nQTilesM):
+            self._emitGammaDtlLoad(module, qi)
+        # Restore exec right after issuing; completion is tracked by vlcnt regardless of exec.
+        module.add(SMovB64(dst=EXEC(), src=sgpr(savedExec, lsc),
+                           comment="restore full exec after issuing gamma DTL loads."))
+        sgprPool.checkIn(savedExec)
+
+    def _ldsReadGammaBlockIssue(self, module, gammaBank, qi) -> None:
+        """Issue broadcast LDS reads for staged gamma without waiting or converting.
+
+        The wait and bf16->f32 conversion are deferred so LDS latency overlaps
+        residual/RMS work.
+
+        For VW0=1 (rowsPerLane=4) a single DSLoadB64 reads 8 bytes = 4 packed bf16
+        into 2 VGPRs (base+0,1). _convertGammaChunk then expands those 4 values.
+
+        For VW0=2 (rowsPerLane=8) two DSLoadB64 reads fill 4 contiguous VGPRs
+        (base+0..3): the first read covers the lower mfmaM gamma rows (off1), the
+        second covers the upper mfmaM rows (off1+mfmaM*gammaBytes). Together they
+        provide the 4 packed dwords that _convertGammaChunk expands to 8 f32.
+        """
+        assert not self._gammaReadPending, "gamma LDS read issued while a prior read is still pending"
+        module.addComment1(f"broadcast-read gamma from LDS (qi={qi}).")
+        tpb = self.geom.tilesPerBlockM
+        rpl = self.geom.rowsPerLane
+        # Each rowGroup region in LDS spans rowsPerLane*gammaBytes bytes total.
+        # The first DSLoadB64 reads k=0..3 (8 bytes); the second k=4..7 (next 8 bytes).
+        # This inner gap is always 8 bytes (4 bf16), independent of VW0 or tileStrideM.
+        # The second DSLoadB64 half sits at off + outputsPerMFMA gamma values =
+        # 4*gammaBytes = 8 bytes = one DSLoadB64 width within the rowGroup's slice.
+        innerGapBytes = 4 * self.geom.gammaBytes  # 8 bytes for 4 bf16 per DSLoadB64
+        for mi in range(tpb):
+            off = qi * self.geom.gammaLdsBufBytes + mi * self.geom.mfmaM * self.geom.vw0 * self.geom.gammaBytes
+            # Lower half: 4 packed bf16 in 2 dwords -> VGPRs base+0, base+1.
+            module.add(DSLoadB64(
+                dst=vgpr(gammaBank + mi * rpl, 2),
+                src=vgpr(self.gammaLdsReadAddr),
+                ds=DSModifiers(offset=off),
+                comment=f"broadcast-read gamma lower 4 bf16 (qi={qi},mi={mi})."))
+            # Each additional half (h=1..vw0-1) reads the next block of 4 packed bf16
+            # into contiguous VGPRs so _convertGammaChunk sees vw0 packed dwords at base+0..2*vw0-1.
+            for h in range(1, self.geom.vw0):
+                module.add(DSLoadB64(
+                    dst=vgpr(gammaBank + mi * rpl + h * 2, 2),
+                    src=vgpr(self.gammaLdsReadAddr),
+                    ds=DSModifiers(offset=off + h * innerGapBytes),
+                    comment=f"broadcast-read gamma half {h} (qi={qi},mi={mi}) off+{h * innerGapBytes}."))
+        self._gammaReadPending = True
 
     def emit(self, vgprTiles):
         return self._delegate.emit(vgprTiles)
