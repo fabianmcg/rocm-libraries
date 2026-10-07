@@ -805,5 +805,77 @@ class RMSEpilogueEmitter:
         self.writer.vgprPool.checkIn(self.roColByteBase); self.roColByteBase = None
         self.writer.vgprPool.checkIn(self.roRowBase); self.roRowBase = None
 
+    def _computePair(self, module, vgprTiles, residualF32Regs, accStageBank, mp, n, pathInterior):
+        """Compute one pair mp for column n: H=acc+residual, RMS, residualOut, gamma, writeback.
+
+        Scalar-only; packed promotion is a later milestone.
+        residualF32Regs: list of 8 VGPR ints holding the residual as f32, native order.
+        accStageBank: base VGPR of an 8-slot staging area for AGPR reads.
+        """
+        m = 2 * mp
+        m1 = 2 * mp + 1
+
+        # Step 1: read accumulator for both tiles into VGPRs (mirror lines 967-981).
+        module.addComment1(f"read accumulator into VGPR staging area (mp={mp},n={n}).")
+        accRegs = []
+        slot = 0
+        for j in range(8):
+            tileIdx = m if j < 4 else m1
+            k = j % 4
+            tileInfo = vgprTiles[n * self.geom.mmaM + tileIdx]
+            reg = tileInfo.regList.indices[k]
+            if tileInfo.regList.pool == self.writer.vgprPool:
+                accRegs.append(reg)
+            else:
+                module.add(VAccvgprReadB32(vgpr(accStageBank + slot), accvgpr(reg),
+                                           comment=f"acc[mp={mp},n={n},j={j}] agpr -> vgpr."))
+                accRegs.append(accStageBank + slot)
+                slot += 1
+        # Mandatory hazard nop when fewer than 2 AGPRs were read (gfx950 v_accvgpr_read->VALU).
+        if 0 < slot < 2:
+            module.add(SNop(waitState=1,
+                            comment="fill the mandatory v_accvgpr_read->VALU wait state (gfx950)."))
+
+        # Step 2: H = acc + residual (mirror lines 1065-1078, scalar only).
+        module.addComment1(f"H = acc + residual (mp={mp},n={n}).")
+        for j in range(8):
+            module.add(VAddF32(dst=vgpr(accRegs[j]), src0=vgpr(accRegs[j]),
+                               src1=vgpr(residualF32Regs[j]),
+                               comment=f"H = acc + residual (j={j}, n={n})."))
+
+        # Step 3: RMS accumulate (mirror lines 1079-1084).
+        module.addComment1(f"rmsSum[{n}] += H*H (mp={mp},n={n}).")
+        for j in range(8):
+            module.add(VMacF32(dst=vgpr(self.partials + n), src0=vgpr(accRegs[j]),
+                               src1=vgpr(accRegs[j]),
+                               comment=f"rmsSum[{n}] += H*H (j={j})."))
+
+        # Step 4: store bf16(H) to residualOut (H values are pre-gamma).
+        self._storeResidualOut(module, accRegs, mp, n, pathInterior)
+
+        # Step 5: D = H * gamma (mirror lines 1225-1238, scalar only).
+        module.addComment1(f"D = H * gamma (mp={mp},n={n}).")
+        for j in range(8):
+            module.add(VMulF32(dst=vgpr(accRegs[j]), src0=vgpr(accRegs[j]),
+                               src1=vgpr(self.gammaBank + j),
+                               comment=f"D = H * gamma (j={j}, n={n})."))
+
+        # Step 6: write D back to the accumulator register file (mirror _amaxAndWriteAcc
+        # lines 533-542, non-MXFP8 branch only — no amax, no MXFP8).
+        module.addComment1(f"write D back to accumulator register file (mp={mp},n={n}).")
+        for j in range(8):
+            tileIdx = m if j < 4 else m1
+            k = j % 4
+            tileInfo = vgprTiles[n * self.geom.mmaM + tileIdx]
+            reg = tileInfo.regList.indices[k]
+            sk = accRegs[j]
+            if tileInfo.regList.pool == self.writer.vgprPool:
+                if sk != reg:
+                    module.add(VMovB32(dst=vgpr(reg), src=vgpr(sk),
+                                       comment=f"write D back to acc (tile={tileIdx},n={n},k={k})."))
+            else:
+                module.add(VAccvgprWriteB32(accvgpr(reg), vgpr(sk),
+                                            comment=f"write D back to acc (tile={tileIdx},n={n},k={k})."))
+
     def emit(self, vgprTiles):
         return self._delegate.emit(vgprTiles)
