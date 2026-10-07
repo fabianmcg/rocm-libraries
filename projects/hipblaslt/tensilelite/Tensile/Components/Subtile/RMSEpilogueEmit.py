@@ -22,8 +22,10 @@ from rocisa.instruction import (
     BufferStoreB32,
     BufferStoreB128,
     DSBPermuteB32,
+    DSLoadB32,
     DSLoadB64,
     DSStoreB16,
+    DSStoreB32,
     SAddU32,
     SAndSaveExecB64,
     SLShiftLeftB32,
@@ -830,6 +832,30 @@ class RMSEpilogueEmitter:
         module.add(VMovB32(dst=vgpr(dst), src=off, comment=f"colOff = {off}."))
         module.add(VAddU32(vgpr(dst), vgpr(dst), vgpr(base), comment="column = colBase + colOff."))
 
+    def _storePartialColumn(self, module, valReg, n, ntV, partialSrd, colV, addrV, colMask):
+        """Predicated store of one column's partial to partialBuf (shared by both G_M paths).
+
+        Faithful to the per-column store in @mega_fused_body (MLIR 445-448,
+        459-463): column = colBase + n*16, the partial byte offset is
+        (column*numRowTiles + WorkGroup0)*4, OOB-clamped when column>=colExtent.
+        """
+        lsc = self.laneSGPRCount
+        self._addColOffset(module, colV, self.colBaseV, n * 16)
+        module.add(VCmpLtU32(dst=sgpr(colMask, lsc), src0=vgpr(colV), src1=sgpr("SizesFree+1"),
+                             comment="column < colExtent."))
+        module.add(VMulLOU32(dst=vgpr(addrV), src0=vgpr(ntV), src1=vgpr(colV),
+                             comment="column*numRowTiles."))
+        module.add(VAddU32(vgpr(addrV), vgpr(addrV), sgpr("WorkGroup0"),
+                           comment="+ WorkGroup0 (rowTileIdx)."))
+        module.add(VLShiftLeftB32(dst=vgpr(addrV), shiftHex=hex(2), src=vgpr(addrV),
+                                  comment="byte = idx*4."))
+        module.add(VCndMaskB32(dst=vgpr(addrV), src0=vgpr(self.oobV), src1=vgpr(addrV),
+                               src2=sgpr(colMask, lsc), comment="OOB when column>=colExtent."))
+        module.add(BufferStoreB32(src=vgpr(valReg), vaddr=vgpr(addrV),
+                                  saddr=sgpr(partialSrd, 4), soffset=0,
+                                  mubuf=MUBUFModifiers(offen=True),
+                                  comment=f"partialBuf[column,WG0] = partial[n={n}]."))
+
     def _writePartials(self, module, ssqAccBase):
         """Predicated write of each column's wavefront-complete Sigma(H^2) to partialBuf.
 
@@ -885,35 +911,70 @@ class RMSEpilogueEmitter:
         vgprPool.checkIn(selV)
         savedExec = sgprPool.checkOutAligned(lsc, lsc, tag="rms_pwExec", preventOverflow=False)
         if self.G_M > 1:
-            assert False, "TODO(F8b): G_M>1 cross-wave combine not yet implemented"
-        # ---- G_M==1: writer stores ssqAcc[n] directly, OOB-clamped by column<colExtent ----
-        module.add(SAndSaveExecB64(dst=sgpr(savedExec, lsc), src=sgpr(writerMask, lsc),
-                                   comment="exec = writer lanes."))
-        colV = vgprPool.checkOut(1, tag="rms_pwCol")
-        addrV = vgprPool.checkOut(1, tag="rms_pwAddr")
-        colMask = sgprPool.checkOutAligned(lsc, lsc, tag="rms_pwColMask", preventOverflow=False)
-        for n in range(self.T_N):
-            self._addColOffset(module, colV, self.colBaseV, n * 16)
-            module.add(VCmpLtU32(dst=sgpr(colMask, lsc), src0=vgpr(colV), src1=sgpr("SizesFree+1"),
-                                 comment="column < colExtent."))
-            module.add(VMulLOU32(dst=vgpr(addrV), src0=vgpr(ntV), src1=vgpr(colV),
-                                 comment="column*numRowTiles."))
-            module.add(VAddU32(vgpr(addrV), vgpr(addrV), sgpr("WorkGroup0"),
-                               comment="+ WorkGroup0 (rowTileIdx)."))
-            module.add(VLShiftLeftB32(dst=vgpr(addrV), shiftHex=hex(2), src=vgpr(addrV),
-                                      comment="byte = idx*4."))
-            module.add(VCndMaskB32(dst=vgpr(addrV), src0=vgpr(self.oobV), src1=vgpr(addrV),
-                                   src2=sgpr(colMask, lsc), comment="OOB when column>=colExtent."))
-            module.add(BufferStoreB32(src=vgpr(ssqAccBase + n), vaddr=vgpr(addrV),
-                                      saddr=sgpr(partialSrd, 4), soffset=0,
-                                      mubuf=MUBUFModifiers(offen=True),
-                                      comment=f"partialBuf[column,WG0] = ssq[{n}]."))
-        module.add(SWaitCnt(vscnt=0, comment="drain partialBuf stores."))
-        module.add(SMovB64(dst=EXEC(), src=sgpr(savedExec, lsc), comment="restore exec."))
-        vgprPool.checkIn(addrV)
-        vgprPool.checkIn(colV)
+            # ---- G_M>1: cross-wave LDS combine, then the writer stores the sum ----
+            module.addComment1("cross-wave LDS combine (G_M>1).")
+            tidX4 = vgprPool.checkOut(1, tag="rms_pwTidX4")
+            module.add(VLShiftLeftB32(dst=vgpr(tidX4), shiftHex=hex(2), src=vgpr("Serial"),
+                                      comment="tid*4 (LDS byte base)."))
+            # WAR barrier: gamma LDS reads done before reusing LDS base 0.
+            module.add(self.writer._syncThreads(
+                self.kernel, "cross-wave: ensure gamma LDS free before ssq write."))
+            module.addComment1("full-exec: each lane writes ssqAcc[n] to lds[n*256 + tid].")
+            for n in range(self.T_N):
+                module.add(DSStoreB32(dstAddr=vgpr(tidX4), src=vgpr(ssqAccBase + n),
+                                      ds=DSModifiers(offset=n * 256 * 4),
+                                      comment=f"lds[n={n}, tid] = ssqAcc[{n}]."))
+            module.add(SWaitCnt(dscnt=0, comment="wait ssq LDS writes."))
+            module.add(self.writer._syncThreads(self.kernel, "cross-wave: publish ssq LDS."))
+            # writer-exec: sum the G_M sibling waves' slots, then store.
+            module.add(SAndSaveExecB64(dst=sgpr(savedExec, lsc), src=sgpr(writerMask, lsc),
+                                       comment="exec = writer lanes."))
+            strideBytes = self.G_N * 64 * 4  # waveLdsStride (elements) * 4.
+            rowSum = vgprPool.checkOut(1, tag="rms_pwRowSum")
+            tmp = vgprPool.checkOut(1, tag="rms_pwTmp")
+            colV = vgprPool.checkOut(1, tag="rms_pwCol")
+            addrV = vgprPool.checkOut(1, tag="rms_pwAddr")
+            colMask = sgprPool.checkOutAligned(lsc, lsc, tag="rms_pwColMask", preventOverflow=False)
+            for n in range(self.T_N):
+                for wm in range(self.G_M):
+                    off = n * 256 * 4 + wm * strideBytes
+                    assert off < 65536, "lds ds offset exceeds 16-bit; fold into the address vgpr"
+                    module.add(DSLoadB32(dst=vgpr(tmp), src=vgpr(tidX4),
+                                         ds=DSModifiers(offset=off),
+                                         comment=f"lds sibling wave {wm}, col {n}."))
+                    module.add(SWaitCnt(dscnt=0, comment="wait lds read."))
+                    if wm == 0:
+                        module.add(VMovB32(dst=vgpr(rowSum), src=vgpr(tmp),
+                                           comment="rowSum = wave0 partial."))
+                    else:
+                        module.add(VAddF32(dst=vgpr(rowSum), src0=vgpr(rowSum), src1=vgpr(tmp),
+                                           comment=f"rowSum += wave{wm} partial."))
+                self._storePartialColumn(module, rowSum, n, ntV, partialSrd, colV, addrV, colMask)
+            module.add(SWaitCnt(vscnt=0, comment="drain partialBuf stores."))
+            module.add(SMovB64(dst=EXEC(), src=sgpr(savedExec, lsc), comment="restore exec."))
+            vgprPool.checkIn(addrV)
+            vgprPool.checkIn(colV)
+            vgprPool.checkIn(tmp)
+            vgprPool.checkIn(rowSum)
+            vgprPool.checkIn(tidX4)
+            sgprPool.checkIn(colMask)
+        else:
+            # ---- G_M==1: writer stores ssqAcc[n] directly, OOB-clamped by column<colExtent ----
+            module.add(SAndSaveExecB64(dst=sgpr(savedExec, lsc), src=sgpr(writerMask, lsc),
+                                       comment="exec = writer lanes."))
+            colV = vgprPool.checkOut(1, tag="rms_pwCol")
+            addrV = vgprPool.checkOut(1, tag="rms_pwAddr")
+            colMask = sgprPool.checkOutAligned(lsc, lsc, tag="rms_pwColMask", preventOverflow=False)
+            for n in range(self.T_N):
+                self._storePartialColumn(module, ssqAccBase + n, n, ntV, partialSrd,
+                                         colV, addrV, colMask)
+            module.add(SWaitCnt(vscnt=0, comment="drain partialBuf stores."))
+            module.add(SMovB64(dst=EXEC(), src=sgpr(savedExec, lsc), comment="restore exec."))
+            vgprPool.checkIn(addrV)
+            vgprPool.checkIn(colV)
+            sgprPool.checkIn(colMask)
+        # ---- shared teardown (both branches) ----
         vgprPool.checkIn(ntV)
-        sgprPool.checkIn(colMask)
         sgprPool.checkIn(savedExec)
         sgprPool.checkIn(writerMask)
         sgprPool.checkIn(partialSrd)
