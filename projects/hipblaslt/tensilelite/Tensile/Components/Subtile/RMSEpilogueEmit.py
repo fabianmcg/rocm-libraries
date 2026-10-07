@@ -43,6 +43,7 @@ from rocisa.instruction import (
     VAccvgprReadB32,
     VAccvgprWriteB32,
     VAddF32,
+    VAddPKF32,
     VAddU32,
     VAndB32,
     VCmpEQU32,
@@ -55,6 +56,7 @@ from rocisa.instruction import (
     VMovB32,
     VMulF32,
     VMulLOU32,
+    VMulPKF32,
     VOrB32,
     VPermlane16SwapB32,
     VReadfirstlaneB32,
@@ -817,8 +819,8 @@ class RMSEpilogueEmitter:
         module.addComment0(f"MegaFused body (PREFETCH=1, isX4={isX4}).")
         vgprPool = self.writer.vgprPool
         resBank  = vgprPool.checkOutAligned(8, 4, tag="rms_resBank")
-        accStage = vgprPool.checkOut(8, tag="rms_accStage")
-        g8Bank   = vgprPool.checkOut(8, tag="rms_g8Bank")
+        accStage = vgprPool.checkOutAligned(8, 2, tag="rms_accStage")
+        g8Bank   = vgprPool.checkOutAligned(8, 2, tag="rms_g8Bank")
         ssqAcc   = vgprPool.checkOut(self.T_N, tag="rms_ssqAcc")
         self.ssqAccBase = ssqAcc
         module.addComment1("zero-init ssqAcc[0..T_N-1].")
@@ -1046,6 +1048,52 @@ class RMSEpilogueEmitter:
         sgprPool.checkIn(writerMask)
         sgprPool.checkIn(partialSrd)
 
+    def _isPackPair(self, a, b):
+        """True iff (a, b) is an even-aligned consecutive VGPR pair (packable)."""
+        return (a % 2 == 0) and (b == a + 1)
+
+    def _pkMulPairs(self, module, dstBase, aBase, bBase, comment):
+        """Emit dst = a * b over 8 contiguous f32, packing even-aligned pairs.
+
+        dstBase/aBase/bBase are the base VGPRs of three 8-wide contiguous banks;
+        each packable pair becomes one v_pk_mul_f32, else two scalar v_mul_f32.
+        """
+        for p in range(4):
+            d0 = dstBase + 2 * p
+            a0 = aBase + 2 * p
+            b0 = bBase + 2 * p
+            if (self._isPackPair(d0, d0 + 1) and self._isPackPair(a0, a0 + 1)
+                    and self._isPackPair(b0, b0 + 1)):
+                module.add(VMulPKF32(dst=vgpr(d0, 2), src0=vgpr(a0, 2), src1=vgpr(b0, 2),
+                                     comment=f"{comment} (packed {2 * p},{2 * p + 1})."))
+                continue
+            module.add(VMulF32(dst=vgpr(d0), src0=vgpr(a0), src1=vgpr(b0),
+                               comment=f"{comment} ({2 * p})."))
+            module.add(VMulF32(dst=vgpr(d0 + 1), src0=vgpr(a0 + 1), src1=vgpr(b0 + 1),
+                               comment=f"{comment} ({2 * p + 1})."))
+
+    def _pkAddPairs(self, module, dstBase, aRegs, bRegs, comment):
+        """Emit dst = a + b over 8 f32, packing per-pair when all three align.
+
+        dstBase is the base of an 8-wide contiguous bank; aRegs/bRegs are LISTS
+        of 8 VGPRs (acc may be aliased tile regs, not a contiguous bank). A pair
+        packs only when its dst, a, and b sub-pairs are each even-aligned
+        consecutive; otherwise it falls back to two scalar v_add_f32.
+        """
+        for p in range(4):
+            d0 = dstBase + 2 * p
+            a0, a1 = aRegs[2 * p], aRegs[2 * p + 1]
+            b0, b1 = bRegs[2 * p], bRegs[2 * p + 1]
+            if (self._isPackPair(d0, d0 + 1) and self._isPackPair(a0, a1)
+                    and self._isPackPair(b0, b1)):
+                module.add(VAddPKF32(dst=vgpr(d0, 2), src0=vgpr(a0, 2), src1=vgpr(b0, 2),
+                                     comment=f"{comment} (packed {2 * p},{2 * p + 1})."))
+                continue
+            module.add(VAddF32(dst=vgpr(d0), src0=vgpr(a0), src1=vgpr(b0),
+                               comment=f"{comment} ({2 * p})."))
+            module.add(VAddF32(dst=vgpr(d0 + 1), src0=vgpr(a1), src1=vgpr(b1),
+                               comment=f"{comment} ({2 * p + 1})."))
+
     def _computePair(self, module, vgprTiles, residualF32, accStage, g8Bank,
                      ssqAccBase, mp, n, isX4):
         """Per-pair compute: H = residual + acc, ssq partial, residualOut, D = H*gamma.
@@ -1080,26 +1128,24 @@ class RMSEpilogueEmitter:
             module.add(SNop(waitState=1, comment="accvgpr_read->VALU hazard (gfx950)"))
 
         # ---- Step 2: H8 = residual + acc (in place, MLIR 352 + acc deviation) ----
-        for j in range(8):
-            module.add(VAddF32(dst=vgpr(residualF32[j]), src0=vgpr(residualF32[j]),
-                               src1=vgpr(accRegs[j]), comment=f"H8[{j}] = residual + acc."))
+        # residualF32 is a contiguous even-aligned bank (packable); accRegs packs
+        # when AGPR-staged into the even-aligned accStage, else falls back scalar.
+        self._pkAddPairs(module, residualF32[0], residualF32, accRegs,
+                         "H8 = residual + acc")
 
         # ---- Step 3: ssq pairwise tree (MLIR 374-386), scalar faithful tree ----
-        sq = [vgprPool.checkOut(1, tag=f"rms_ssq{j}") for j in range(8)]
-        for j in range(8):
-            module.add(VMulF32(dst=vgpr(sq[j]), src0=vgpr(residualF32[j]),
-                               src1=vgpr(residualF32[j]), comment=f"sq[{j}] = H8[{j}]^2."))
-        module.add(VAddF32(dst=vgpr(sq[0]), src0=vgpr(sq[0]), src1=vgpr(sq[1]), comment="s01."))
-        module.add(VAddF32(dst=vgpr(sq[2]), src0=vgpr(sq[2]), src1=vgpr(sq[3]), comment="s23."))
-        module.add(VAddF32(dst=vgpr(sq[4]), src0=vgpr(sq[4]), src1=vgpr(sq[5]), comment="s45."))
-        module.add(VAddF32(dst=vgpr(sq[6]), src0=vgpr(sq[6]), src1=vgpr(sq[7]), comment="s67."))
-        module.add(VAddF32(dst=vgpr(sq[0]), src0=vgpr(sq[0]), src1=vgpr(sq[2]), comment="s0123."))
-        module.add(VAddF32(dst=vgpr(sq[4]), src0=vgpr(sq[4]), src1=vgpr(sq[6]), comment="s4567."))
-        module.add(VAddF32(dst=vgpr(sq[0]), src0=vgpr(sq[0]), src1=vgpr(sq[4]), comment="s = s0123 + s4567."))
-        module.add(VAddF32(dst=vgpr(ssqAccBase + n), src0=vgpr(ssqAccBase + n), src1=vgpr(sq[0]),
+        sq = vgprPool.checkOutAligned(8, 2, tag="rms_ssq")
+        self._pkMulPairs(module, sq, residualF32[0], residualF32[0], "sq = H8^2")
+        module.add(VAddF32(dst=vgpr(sq + 0), src0=vgpr(sq + 0), src1=vgpr(sq + 1), comment="s01."))
+        module.add(VAddF32(dst=vgpr(sq + 2), src0=vgpr(sq + 2), src1=vgpr(sq + 3), comment="s23."))
+        module.add(VAddF32(dst=vgpr(sq + 4), src0=vgpr(sq + 4), src1=vgpr(sq + 5), comment="s45."))
+        module.add(VAddF32(dst=vgpr(sq + 6), src0=vgpr(sq + 6), src1=vgpr(sq + 7), comment="s67."))
+        module.add(VAddF32(dst=vgpr(sq + 0), src0=vgpr(sq + 0), src1=vgpr(sq + 2), comment="s0123."))
+        module.add(VAddF32(dst=vgpr(sq + 4), src0=vgpr(sq + 4), src1=vgpr(sq + 6), comment="s4567."))
+        module.add(VAddF32(dst=vgpr(sq + 0), src0=vgpr(sq + 0), src1=vgpr(sq + 4), comment="s = s0123 + s4567."))
+        module.add(VAddF32(dst=vgpr(ssqAccBase + n), src0=vgpr(ssqAccBase + n), src1=vgpr(sq + 0),
                            comment=f"ssqAcc[{n}] += s."))
-        for j in range(8):
-            vgprPool.checkIn(sq[j])
+        vgprPool.checkIn(sq)
 
         # ---- Step 4: residualOut store (H pre-gamma, MLIR 389-392) ----
         self._storeResidualOut(module, residualF32, mp, n, isX4)
@@ -1108,9 +1154,9 @@ class RMSEpilogueEmitter:
         self._readGammaLds(module, g8Bank, mp)
 
         # ---- Step 6: D = H * gamma (in place, MLIR 372) ----
-        for j in range(8):
-            module.add(VMulF32(dst=vgpr(residualF32[j]), src0=vgpr(residualF32[j]),
-                               src1=vgpr(g8Bank + j), comment=f"Dout[{j}] = H8[{j}] * gamma[{j}]."))
+        # residualF32 and g8Bank are both contiguous even-aligned -> all packed.
+        self._pkMulPairs(module, residualF32[0], residualF32[0], g8Bank,
+                         "Dout = H8 * gamma")
 
         # ---- Step 7: D writeback to the accumulator register file ----
         for j in range(8):
