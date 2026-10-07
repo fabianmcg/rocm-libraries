@@ -16158,11 +16158,11 @@ class KernelWriterAssembly(KernelWriter):
     if not vgprTiles:
       return module
     if kernel["RMSEpilogue"]:
-      from .Components.Subtile.SubtileMegaFusedEmit import SubtileMegaFusedEmitter
+      from .Components.Subtile.RMSEpilogueEmit import RMSEpilogueEmitter
       if isCmsSS:
         # Transpose SS accumulators to nonSS layout before the emitter processes them.
         self._emitCmsSourceSwapTranspose(kernel, module, toNonSwap=True)
-      module.add(SubtileMegaFusedEmitter(self, kernel).emit(vgprTiles))
+      module.add(RMSEpilogueEmitter(self, kernel).emit(vgprTiles))
       if isCmsSS:
         # Transpose back to SS layout so the normal SS store path writes D correctly.
         self._emitCmsSourceSwapTranspose(kernel, module, toNonSwap=False)
