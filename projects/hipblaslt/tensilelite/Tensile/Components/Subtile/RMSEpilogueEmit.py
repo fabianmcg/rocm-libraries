@@ -99,6 +99,7 @@ from .SubtileMegaFusedEmit import (
     _convertGammaChunk,
     _convertGammaChunkBf16,
     _free0RowPos,
+    _INLINE_CONST_MAX,
     _issueSideLoad,
     _useDwordx4Interior,
 )
@@ -876,6 +877,252 @@ class RMSEpilogueEmitter:
             else:
                 module.add(VAccvgprWriteB32(accvgpr(reg), vgpr(sk),
                                             comment=f"write D back to acc (tile={tileIdx},n={n},k={k})."))
+
+    def _reduceAndWritePartials(self, module) -> None:
+        """Reduce rmsSum intra-wave, fence stores, and write partials to partialBuf.
+
+        Faithful port of SubtileMegaFusedEmitter.emit() lines 2450-2489 (intra-wave
+        butterfly), line 2509 (store drain), and lines 2516-2737 (cross-wave reduce
+        and partialBuf write). Dead code: not called yet.
+        """
+        # Block 1: intra-wave row-group XOR butterfly reduction (lines 2450-2489).
+        _reduceRGF0Mod = Module("PartialRMS reduceRowGroupFree0")
+        _reduceRGF0Mod.addComment0("intra-wave row-group butterfly (no LDS memory, no barrier).")
+        numRounds_rgf0 = int(math.log2(self.geom.waveSize // self.geom.mfmaN))
+        rgrMod = Module("PartialRMS rowGroupReduceFree0")
+        rgrMod.addComment0("XOR butterfly row-group reduction.")
+        rgrMod.addComment1(
+            f"PartialRMS step 2 (free0): XOR butterfly over {self.geom.waveSize // self.geom.mfmaN} row groups."
+        )
+        if numRounds_rgf0 == 0:
+            _reduceRGF0Mod.add(rgrMod)
+        else:
+            addrV_rgf0 = self.writer.vgprPool.checkOut(1, tag="pRMS_rgrAddr")
+            tmpV_rgf0 = self.writer.vgprPool.checkOut(self.geom.numPartials, tag="pRMS_rgrTmp")
+            for i_rgf0 in range(numRounds_rgf0):
+                xorVal_rgf0 = self.geom.mfmaN << i_rgf0
+                rgrMod.add(
+                    VXorB32(dst=vgpr(addrV_rgf0), src0=vgpr(self.laneId), src1=xorVal_rgf0,
+                            comment=f"partnerLane = laneId ^ {xorVal_rgf0}")
+                )
+                rgrMod.add(
+                    VLShiftLeftB32(dst=vgpr(addrV_rgf0), shiftHex=hex(2), src=vgpr(addrV_rgf0),
+                                   comment="byteAddr = partnerLane * 4")
+                )
+                for n in range(self.geom.numPartials):
+                    rgrMod.add(
+                        DSBPermuteB32(vgpr(tmpV_rgf0 + n), vgpr(addrV_rgf0), vgpr(self.partials + n),
+                                      comment=f"fetch partner partial[{n}]")
+                    )
+                rgrMod.add(SWaitCnt(dscnt=0, comment="wait ds_bpermute"))
+                for n in range(self.geom.numPartials):
+                    rgrMod.add(
+                        VAddF32(dst=vgpr(self.partials + n), src0=vgpr(self.partials + n),
+                               src1=vgpr(tmpV_rgf0 + n), comment=f"partial[{n}] + partner")
+                    )
+            self.writer.vgprPool.checkIn(tmpV_rgf0)
+            self.writer.vgprPool.checkIn(addrV_rgf0)
+            _reduceRGF0Mod.add(rgrMod)
+        module.add(_reduceRGF0Mod)
+        # Block 2: store drain fencing the cross-wave phase (line 2509 only).
+        module.add(SWaitCnt(vscnt=0, comment="drain ResidualOut (and MXScale for MXFP8) stores before cross-wave reduce."))
+        # Block 3: cross-wave reduce + partialBuf write (lines 2516-2737).
+        _rmsModule = Module("MegaFused reduceAndWriteRms")
+        _rmsModule.addComment0("reduce rmsSum across row groups and waves, write to partialBuf.")
+        _rmsSgprPool = self.writer.sgprPool
+        partialSrd = _rmsSgprPool.checkOutAligned(4, 4, tag="mf_partialSrd", preventOverflow=False)
+        _buildBufferSrd(_rmsModule, partialSrd, "PartialBuf", "partialBuf")
+        _crossWaveModule = Module("PartialRMS reduceCrossWaveFree0")
+        _crossWaveModule.addComment0("cross-wave LDS reduction (fenced, wgM > 1 only).")
+        if self.geom.wgM > 1:
+            reduceArrays = [(self.partials, VAddF32, "+")]
+            numArrays = len(reduceArrays)
+            laneSlotBytes = numArrays * self.geom.numPartials * 4
+            strideW = self.geom.waveSize * laneSlotBytes
+            _crossWaveReduceF0Mod = Module("PartialRMS crossWaveReduceFree0")
+            _crossWaveReduceF0Mod.addComment0("fused cross-wave LDS reduction pass.")
+            _crossWaveReduceF0Mod.addComment1(
+                f"PartialRMS step 3 (free0): cross-wave LDS reduction over wgM={self.geom.wgM}, "
+                f"arrays={numArrays}."
+            )
+            _crossWaveReduceF0Mod.add(self.writer._syncThreads(
+                self.kernel,
+                "partialRMS free0 cross-wave: ensure siblings done reading LDS before scratch write."))
+            writeAddr = self.writer.vgprPool.checkOut(1, tag="pRMS_xwF0WriteAddr")
+            readAddr = self.writer.vgprPool.checkOut(1, tag="pRMS_xwF0ReadAddr")
+            readTmp = self.writer.vgprPool.checkOut(numArrays * self.geom.numPartials, tag="pRMS_xwF0ReadTmp")
+            _crossWaveReduceF0Mod.addComment1("compute LDS write/read addresses for cross-wave reduction.")
+            laneSlotBytes_cwca = numArrays * self.geom.numPartials * 4
+            strideW_cwca = self.geom.waveSize * laneSlotBytes_cwca
+            waveM_cwca = self.writer.vgprPool.checkOut(1, tag="pRMS_xwF0WaveM")
+            readBaseWave_cwca = self.writer.vgprPool.checkOut(1, tag="pRMS_xwF0ReadBase")
+            laneLoc_cwca = self.writer.vgprPool.checkOut(1, tag="pRMS_xwF0Lane")
+            _crossWaveReduceF0Mod.add(VMovB32(dst=vgpr(laneLoc_cwca), src=vgpr(self.laneId),
+                               comment="laneId for LDS addressing (cached)"))
+            _crossWaveReduceF0Mod.add(VAndB32(dst=vgpr(waveM_cwca), src0=vgpr(self.waveIdV), src1=self.geom.wgM - 1,
+                               comment=f"waveM = waveId % {self.geom.wgM}"))
+            _crossWaveReduceF0Mod.add(VXorB32(dst=vgpr(readBaseWave_cwca), src0=vgpr(self.waveIdV), src1=vgpr(waveM_cwca),
+                               comment="readBaseWave = waveN * wgM"))
+            with self.writer.allocTmpSgpr(1, tag="pRMS_xwF0AddrSetup") as tmpSgprInfo_cwca:
+                tmpSgpr_cwca = tmpSgprInfo_cwca.idx
+                _crossWaveReduceF0Mod.add(SMovB32(dst=sgpr(tmpSgpr_cwca), src=hex(strideW_cwca),
+                                   comment=f"strideW={strideW_cwca}"))
+                _crossWaveReduceF0Mod.add(VMulLOU32(dst=vgpr(writeAddr), src0=sgpr(tmpSgpr_cwca),
+                                     src1=vgpr(self.waveIdV),
+                                     comment="writeAddr = waveId * strideW"))
+                _crossWaveReduceF0Mod.add(VMulLOU32(dst=vgpr(readAddr), src0=sgpr(tmpSgpr_cwca),
+                                     src1=vgpr(readBaseWave_cwca),
+                                     comment="readAddr = readBaseWave * strideW"))
+                _crossWaveReduceF0Mod.add(SMovB32(dst=sgpr(tmpSgpr_cwca), src=hex(laneSlotBytes_cwca),
+                                   comment=f"laneSlotBytes={laneSlotBytes_cwca}"))
+                _crossWaveReduceF0Mod.add(VMulLOU32(dst=vgpr(laneLoc_cwca), src0=sgpr(tmpSgpr_cwca),
+                                     src1=vgpr(laneLoc_cwca),
+                                     comment="lane * laneSlotBytes"))
+                _crossWaveReduceF0Mod.add(VAddU32(vgpr(writeAddr), vgpr(writeAddr), vgpr(laneLoc_cwca),
+                                   comment="writeAddr += lane*laneSlotBytes"))
+                _crossWaveReduceF0Mod.add(VAddU32(vgpr(readAddr), vgpr(readAddr), vgpr(laneLoc_cwca),
+                                   comment="readAddr += lane*laneSlotBytes"))
+            self.writer.vgprPool.checkIn(laneLoc_cwca)
+            self.writer.vgprPool.checkIn(readBaseWave_cwca)
+            self.writer.vgprPool.checkIn(waveM_cwca)
+            _crossWaveReduceF0Mod.addComment1("LDS store each array partial for cross-wave reduction.")
+            for a_cws, (base_cws, _op_cws, _verb_cws) in enumerate(reduceArrays):
+                for i_cws in range(self.geom.numPartials):
+                    off_cws = (a_cws * self.geom.numPartials + i_cws) * 4
+                    _crossWaveReduceF0Mod.add(DSStoreB32(dstAddr=vgpr(writeAddr), src=vgpr(base_cws + i_cws),
+                                          ds=DSModifiers(offset=off_cws),
+                                          comment=f"LDS store arr[{a_cws}] partial[{i_cws}]."))
+            _crossWaveReduceF0Mod.add(SWaitCnt(dscnt=0, comment="wait LDS writes."))
+            _crossWaveReduceF0Mod.add(self.writer._syncThreads(self.kernel, "partialRMS free0 cross-wave write."))
+            _crossWaveReduceF0Mod.addComment1("LDS-staged cross-wave load and reduce.")
+            numArrays = len(reduceArrays)
+            for j in range(self.geom.wgM):
+                for a, (base, _op, _verb) in enumerate(reduceArrays):
+                    for i in range(self.geom.numPartials):
+                        off = (a * self.geom.numPartials + i) * 4
+                        dst = (base + i) if j == 0 else (readTmp + a * self.geom.numPartials + i)
+                        _crossWaveReduceF0Mod.add(DSLoadB32(dst=vgpr(dst), src=vgpr(readAddr), ds=DSModifiers(offset=off),
+                                             comment=f"LDS load wave[{j}] arr[{a}] partial[{i}]."))
+                _crossWaveReduceF0Mod.add(SWaitCnt(dscnt=0, comment="wait LDS reads."))
+                if j > 0:
+                    _crossWaveReduceF0Mod.addComment1(f"accumulate wave[{j}] partials into base.")
+                    for a_cwa, (base_cwa, op_cwa, verb_cwa) in enumerate(reduceArrays):
+                        for i_cwa in range(self.geom.numPartials):
+                            src_cwa = readTmp + a_cwa * self.geom.numPartials + i_cwa
+                            _crossWaveReduceF0Mod.add(op_cwa(dst=vgpr(base_cwa + i_cwa), src0=vgpr(base_cwa + i_cwa),
+                                              src1=vgpr(src_cwa),
+                                              comment=f"arr[{a_cwa}] partial[{i_cwa}] {verb_cwa} wave[{j}]."))
+                if j < self.geom.wgM - 1:
+                    with self.writer.allocTmpSgpr(1, tag="pRMS_xwF0Advance") as tmpSgprInfo:
+                        _crossWaveReduceF0Mod.add(SMovB32(dst=sgpr(tmpSgprInfo.idx), src=hex(strideW),
+                                           comment=f"strideW={strideW}."))
+                        _crossWaveReduceF0Mod.add(VAddU32(vgpr(readAddr), vgpr(readAddr), sgpr(tmpSgprInfo.idx),
+                                           comment="advance readAddr to next sibling wave."))
+            self.writer.vgprPool.checkIn(readTmp)
+            self.writer.vgprPool.checkIn(readAddr)
+            self.writer.vgprPool.checkIn(writeAddr)
+            _crossWaveModule.add(_crossWaveReduceF0Mod)
+        _rmsModule.add(_crossWaveModule)
+        globalAddr = self.writer.vgprPool.checkOut(1, tag="mf_globalAddr")
+        _writePartialsFree0Mod = Module("PartialRMS writePartialsFree0")
+        _writePartialsFree0Mod.addComment0("predicated write of Σx² partials to partialBuf.")
+        _writePartialsFree0Mod.addComment1(
+            "PartialRMS step 4 (free0): predicated write of Σx² to partialBuf[token, WG0].")
+        lsc = self.geom.laneSgprCount
+        _writePartialsFree0Mod.addComment1("compute lane mask for rowGroup==0 and waveM==0.")
+        log2MfmaN = int(math.log2(self.geom.mfmaN))
+        rgV = self.writer.vgprPool.checkOut(1, tag="pRMS_wF0RowGroup")
+        _writePartialsFree0Mod.add(VLShiftRightB32(dst=vgpr(rgV), shiftHex=hex(log2MfmaN), src=vgpr(self.laneId),
+                                   comment=f"rowGroup = laneId >> {log2MfmaN}"))
+        if self.geom.wgM > 1:
+            waveMv = self.writer.vgprPool.checkOut(1, tag="pRMS_wF0WaveM")
+            self._computeWaveM(_writePartialsFree0Mod, waveMv)
+            _writePartialsFree0Mod.add(VOrB32(dst=vgpr(rgV), src0=vgpr(rgV), src1=vgpr(waveMv),
+                              comment="selV = rowGroup | waveM (zero iff both zero)"))
+            self.writer.vgprPool.checkIn(waveMv)
+        _writePartialsFree0Mod.add(VCmpEQU32(dst=sgpr(self.laneMaskSgpr, self.geom.laneSgprCount), src0=0, src1=vgpr(rgV),
+                             comment="laneMask: rowGroup==0 && waveM==0"))
+        self.writer.vgprPool.checkIn(rgV)
+        ntilesV = self.writer.vgprPool.checkOut(1, tag="pRMS_wF0NTiles")
+        _writePartialsFree0Mod.addComment1("compute n_d = ceil(SizesFree0 / MT0).")
+        with self.writer.allocTmpSgpr(1, tag="pRMS_wF0NTilesS") as ntilesS:
+            _writePartialsFree0Mod.add(SAddU32(dst=sgpr(ntilesS.idx), src0=sgpr("SizesFree+0"),
+                               src1=self.geom.macroTile0 - 1,
+                               comment=f"N_hidden + MT0-1 (MT0={self.geom.macroTile0})"))
+            mt0 = self.geom.macroTile0
+            if mt0 & (mt0 - 1) == 0:
+                _writePartialsFree0Mod.add(SLShiftRightB32(dst=sgpr(ntilesS.idx), shiftHex=hex(mt0.bit_length() - 1),
+                                           src=sgpr(ntilesS.idx),
+                                           comment=f"n_d = ceil(SizesFree0 / MT0={mt0})"))
+            else:
+                p = (mt0 - 1).bit_length()
+                magic = -(-(1 << (32 + p - 1)) // mt0)
+                magic, postShift = magic & 0xFFFFFFFF, p - 1
+                _writePartialsFree0Mod.add(SMulHIU32(dst=sgpr(ntilesS.idx), src0=sgpr(ntilesS.idx), src1=hex(magic),
+                                     comment=f"n_d magic mul (divisor={mt0})"))
+                if postShift:
+                    _writePartialsFree0Mod.add(SLShiftRightB32(dst=sgpr(ntilesS.idx), shiftHex=hex(postShift),
+                                               src=sgpr(ntilesS.idx),
+                                               comment=f"n_d >> {postShift} (magic post-shift)"))
+            _writePartialsFree0Mod.add(VMovB32(dst=vgpr(ntilesV), src=sgpr(ntilesS.idx), comment="ntilesV = n_d"))
+        tokenBase = self.writer.vgprPool.checkOut(1, tag="pRMS_wF0TokenBase")
+        _writePartialsFree0Mod.add(VLShiftRightB32(dst=vgpr(tokenBase), shiftHex=hex(self.geom.log2ElemBytes),
+                                   src=vgpr(self.colByte),
+                                   comment="tokenBase = colByte >> log2ElemBytes."))
+        _writePartialsFree0Mod.add(SAndSaveExecB64(dst=sgpr(self.savedExec, lsc), src=sgpr(self.laneMaskSgpr, lsc),
+                                   comment="save exec; set exec = writing-lane mask"))
+        # Strength-reduce token*n_d across the n loop; see SubtileMegaFusedEmitter comment.
+        accumV = self.writer.vgprPool.checkOut(1, tag="pRMS_wF0Accum")
+        _writePartialsFree0Mod.add(VMulLOU32(dst=vgpr(accumV), src0=vgpr(ntilesV), src1=vgpr(tokenBase),
+                             comment="accum = tokenBase * n_d"))
+        strideV = None
+        subStrideV = None
+        if self.geom.mmaN > 1:
+            groupDelta = self.geom.tileStrideN - (self.geom.vw1 - 1)
+            strideV = self.writer.vgprPool.checkOut(1, tag="pRMS_wF0Stride")
+            if groupDelta > _INLINE_CONST_MAX:
+                _writePartialsFree0Mod.add(VMovB32(dst=vgpr(strideV), src=groupDelta,
+                                                   comment=f"groupDelta={groupDelta} (too large for inline)."))
+                _writePartialsFree0Mod.add(VMulLOU32(dst=vgpr(strideV), src0=vgpr(strideV), src1=vgpr(ntilesV),
+                                     comment=f"groupStride = (tileStrideN-(vw1-1)={groupDelta}) * n_d"))
+            else:
+                _writePartialsFree0Mod.add(VMulLOU32(dst=vgpr(strideV), src0=groupDelta, src1=vgpr(ntilesV),
+                                     comment=f"groupStride = (tileStrideN-(vw1-1)={groupDelta}) * n_d"))
+            if self.geom.vw1 > 1:
+                subStrideV = self.writer.vgprPool.checkOut(1, tag="pRMS_wF0SubStride")
+        _writePartialsFree0Mod.add(VAddU32(vgpr(globalAddr), vgpr(accumV), sgpr("WorkGroup0"),
+                           comment="token*n_d + WorkGroup0 (n=0)"))
+        _writePartialsFree0Mod.add(VLShiftLeftB32(dst=vgpr(globalAddr), shiftHex=hex(2), src=vgpr(globalAddr),
+                                  comment="byteAddr = (token*n_d + WG0) * 4"))
+        if strideV is not None:
+            _writePartialsFree0Mod.add(VLShiftLeftB32(dst=vgpr(strideV), shiftHex=hex(2), src=vgpr(strideV),
+                                      comment="groupStride4 = groupStride * 4"))
+        if subStrideV is not None:
+            _writePartialsFree0Mod.add(VLShiftLeftB32(dst=vgpr(subStrideV), shiftHex=hex(2), src=vgpr(ntilesV),
+                                      comment="subStride4 = n_d * 4 (within-group delta=1)"))
+        for n in range(self.geom.mmaN):
+            _writePartialsFree0Mod.add(BufferStoreB32(src=vgpr(self.partials + n), vaddr=vgpr(globalAddr),
+                                      saddr=sgpr(partialSrd, 4), soffset=0,
+                                      mubuf=MUBUFModifiers(offen=True),
+                                      comment=f"partialBuf[token+colOffset({n})={self.geom.colOffset(n)}, WG0] = Σx²"))
+            if n < self.geom.mmaN - 1:
+                boundary = ((n + 1) % self.geom.vw1) == 0
+                adv = strideV if boundary else subStrideV
+                _writePartialsFree0Mod.add(VAddU32(vgpr(globalAddr), vgpr(globalAddr), vgpr(adv),
+                                   comment=f"byteAddr += {'groupStride4' if boundary else 'subStride4'} (advance to n={n + 1})"))
+        _writePartialsFree0Mod.add(SWaitCnt(vscnt=0, comment="wait partialBuf stores"))
+        _writePartialsFree0Mod.add(SMovB64(dst=EXEC(), src=sgpr(self.savedExec, lsc), comment="restore exec mask"))
+        if subStrideV is not None:
+            self.writer.vgprPool.checkIn(subStrideV)
+        if strideV is not None:
+            self.writer.vgprPool.checkIn(strideV)
+        self.writer.vgprPool.checkIn(accumV)
+        self.writer.vgprPool.checkIn(tokenBase)
+        self.writer.vgprPool.checkIn(ntilesV)
+        _rmsModule.add(_writePartialsFree0Mod)
+        self.writer.vgprPool.checkIn(globalAddr)
+        _rmsSgprPool.checkIn(partialSrd)
+        module.add(_rmsModule)
 
     def emit(self, vgprTiles):
         return self._delegate.emit(vgprTiles)
