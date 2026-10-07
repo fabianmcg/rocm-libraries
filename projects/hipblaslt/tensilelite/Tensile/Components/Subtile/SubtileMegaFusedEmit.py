@@ -118,6 +118,9 @@ _VGPR_FIXED_ESTIMATE = 212
 # to scale amax so K2 can requantize. e5m2/bf8 has a far larger range than e4m3.
 _fp8E4m3Max = 448.0          # OCP FP8 e4m3 (name used by the MXFP8 quant helpers).
 
+# Number of residual tiles per batch for the batched-drain schedule.  A batch of
+# 4 dwordx4 loads fills 4 HBM cache lines and matches the BATCH=4 two-phase MLIR idiom.
+_batchedDrainTiles = 16
 
 
 def _sideBytes(dtype):
@@ -551,75 +554,103 @@ class SubtileMegaFusedEmitter:
         issued = 0
         for j in range(g):
             n = nBase + j
-            module.addComment1(f"compute row byte base for residual (n={n}).")
-            nOff = self.geom.colOffset(n)
-            r = _addImmU32(module, self.resRowByteBase, self.resTokenBase, nOff, self.resAddr,
-                           f"token_n = tokenBase + {nOff} (n={n}).")
-            module.add(VMulLOU32(dst=vgpr(self.resRowByteBase), src0=sgpr("SizesFree+0"), src1=vgpr(r),
-                                 comment="token_n * SizesFree0."))
-            if self.geom.useWideResidual:
-                module.add(VAddU32(vgpr(self.resRowByteBase), vgpr(self.resRowByteBase), vgpr(self.wgRowBase),
-                                   comment="+ wgRowBase (fold row origin)."))
-                module.add(VAddU32(vgpr(self.resRowByteBase), vgpr(self.resRowByteBase), vgpr(self.rowGroupOff),
-                                   comment="+ rowGroupOff (fold row origin)."))
-            module.add(VLShiftLeftB32(dst=vgpr(self.resRowByteBase), shiftHex=hex(self.geom.residualLog2Bytes),
-                                      src=vgpr(self.resRowByteBase),
-                                      comment="rowByteBase * residualBytes (row origin folded when wide)."))
+            self._computeResidualRowByteBase(module, n)
             for mi in range(tpb):
                 m = qi * tpb + mi
-                burstBase = resBank + (j * tpb + mi) * rpl
-                module.addComment1(f"issue residual loads for tile (m={m},n={n}).")
-                rpl_irt = self.geom.rowsPerLane
-                if pathInterior and _useDwordx4Interior(self.geom):
-                    module.addComment1(f"exec-masked B128 load for pair (m={m},n={n}).")
-                    lsc_irt = self.geom.laneSgprCount
-                    rowOff_irt = m * self.geom.tileStrideM * 2
-                    assert rowOff_irt < 4096, f"residual dwordx4 load offset {rowOff_irt} exceeds MUBUF offset12 range"
-                    loadAddr_irt = self.writer.vgprPool.checkOut(1, tag="mf_dx4LoadAddr")
-                    module.add(VCndMaskB32(dst=vgpr(loadAddr_irt), src0=vgpr(self.resRowByteBase),
-                                           src1=vgpr(self.resOobV), src2=sgpr(self.pairUpperLaneMask, lsc_irt),
-                                           comment="upper lane -> BufferOOB (load dropped); lower lane keeps base."))
-                    module.add(BufferLoadB128(vgpr(burstBase, 4), vgpr(loadAddr_irt),
-                                              sgpr(self.resSrd, 4), 0,
-                                              MUBUFModifiers(offen=True, offset12=rowOff_irt),
-                                              comment=f"R dwordx4 (m={m},n={n}) off={rowOff_irt}: 8 bf16 for pair (full exec)."))
-                    self.writer.vgprPool.checkIn(loadAddr_irt)
-                    issued += 1
-                elif self.geom.useWideResidual:
-                    module.addComment1(f"wide residual load (m={m},n={n}).")
-                    isBf16_irt = self.geom.residualBytes == 2
-                    loadCls_irt = BufferLoadB64 if isBf16_irt else BufferLoadB32
-                    chunkBytes_irt = 4 << self.geom.residualLog2Bytes
-                    rowOff_irt = m * self.geom.tileStrideM * self.geom.residualBytes
-                    for c_irt in range(self.geom.rowsPerLane // 4):
-                        off_irt = rowOff_irt + chunkBytes_irt * c_irt
-                        assert off_irt < 4096, f"residual wide load offset {off_irt} exceeds MUBUF offset12 range"
-                        dstBase_irt = burstBase + 4 * c_irt
-                        dst_irt = vgpr(dstBase_irt, 2) if isBf16_irt else vgpr(dstBase_irt)
-                        module.add(loadCls_irt(dst_irt, vgpr(self.resRowByteBase), sgpr(self.resSrd, 4), 0,
-                                               MUBUFModifiers(offen=True, offset12=off_irt),
-                                               comment=f"R wide [4 residual] (m={m},n={n},c={c_irt}) off={off_irt}."))
-                    issued += rpl_irt // 4
-                else:
-                    for k_irt in range(rpl_irt):
-                        module.addComment1(f"compute clamped residual byte address (m={m},k={k_irt}).")
-                        _free0RowPos(module, self.resAddr, self.wgRowBase, self.rowGroupOff, m, k_irt, mBaseV, self.geom)
-                        module.add(VCmpLtU32(dst=sgpr(self.resOobMask, self.geom.laneSgprCount), src0=vgpr(self.resAddr),
-                                             src1=sgpr("SizesFree+0"), comment="inRange = nhidden_pos < N_hidden"))
-                        module.add(VLShiftLeftB32(dst=vgpr(self.resAddr), shiftHex=hex(self.geom.residualLog2Bytes),
-                                                  src=vgpr(self.resAddr),
-                                                  comment="nhiddenByte = nhidden_pos * residualBytes."))
-                        module.add(VAddU32(vgpr(self.resAddr), vgpr(self.resAddr), vgpr(self.resRowByteBase),
-                                           comment="byteAddr = rowByteBase + nhiddenByte"))
-                        module.add(VCndMaskB32(dst=vgpr(self.resAddr), src0=vgpr(self.resOobV), src1=vgpr(self.resAddr),
-                                               src2=sgpr(self.resOobMask, self.geom.laneSgprCount),
-                                               comment="clamp OOB when nhidden_pos >= N_hidden"))
-                        _issueSideLoad(module, burstBase + k_irt, self.resAddr, self.resSrd,
-                                           f"R[m={m},n={n},k={k_irt}].", dtype=self.geom.residualType)
-                    issued += rpl_irt
+                bankSlot = j * tpb + mi
+                issued += self._issueTileResidualLoad(
+                    module, resBank, bankSlot, m, n, mBaseV, pathInterior)
                 loadsCumulative.append(issued)
         return module
 
+    def _computeResidualRowByteBase(self, module, n) -> None:
+        """Compute self.resRowByteBase for column n (sets the attribute in place).
+
+        The result encodes token_n*N_hidden (plus wgRowBase+rowGroupOff when wide)
+        multiplied by residualBytes; subsequent tile loads add only the row offset.
+        """
+        module.addComment1(f"compute row byte base for residual (n={n}).")
+        nOff = self.geom.colOffset(n)
+        r = _addImmU32(module, self.resRowByteBase, self.resTokenBase, nOff, self.resAddr,
+                       f"token_n = tokenBase + {nOff} (n={n}).")
+        module.add(VMulLOU32(dst=vgpr(self.resRowByteBase), src0=sgpr("SizesFree+0"),
+                             src1=vgpr(r), comment="token_n * SizesFree0."))
+        if self.geom.useWideResidual:
+            module.add(VAddU32(vgpr(self.resRowByteBase), vgpr(self.resRowByteBase),
+                               vgpr(self.wgRowBase), comment="+ wgRowBase (fold row origin)."))
+            module.add(VAddU32(vgpr(self.resRowByteBase), vgpr(self.resRowByteBase),
+                               vgpr(self.rowGroupOff), comment="+ rowGroupOff (fold row origin)."))
+        module.add(VLShiftLeftB32(dst=vgpr(self.resRowByteBase),
+                                  shiftHex=hex(self.geom.residualLog2Bytes),
+                                  src=vgpr(self.resRowByteBase),
+                                  comment="rowByteBase * residualBytes (row origin folded when wide)."))
+
+    def _issueTileResidualLoad(self, module, resBank, bankSlot, m, n, mBaseV,
+                               pathInterior: bool = False) -> int:
+        """Issue one tile's residual load into resBank at bankSlot*rpl; return load count.
+
+        Assumes self.resRowByteBase is already set for column n by _computeResidualRowByteBase.
+        """
+        rpl = self.geom.rowsPerLane
+        burstBase = resBank + bankSlot * rpl
+        module.addComment1(f"issue residual loads for tile (m={m},n={n}).")
+        if pathInterior and _useDwordx4Interior(self.geom):
+            module.addComment1(f"exec-masked B128 load for pair (m={m},n={n}).")
+            lsc_irt = self.geom.laneSgprCount
+            rowOff_irt = m * self.geom.tileStrideM * 2
+            assert rowOff_irt < 4096, (
+                f"residual dwordx4 load offset {rowOff_irt} exceeds MUBUF offset12 range")
+            loadAddr_irt = self.writer.vgprPool.checkOut(1, tag="mf_dx4LoadAddr")
+            module.add(VCndMaskB32(dst=vgpr(loadAddr_irt), src0=vgpr(self.resRowByteBase),
+                                   src1=vgpr(self.resOobV),
+                                   src2=sgpr(self.pairUpperLaneMask, lsc_irt),
+                                   comment="upper lane -> BufferOOB (load dropped); lower lane keeps base."))
+            module.add(BufferLoadB128(vgpr(burstBase, 4), vgpr(loadAddr_irt),
+                                      sgpr(self.resSrd, 4), 0,
+                                      MUBUFModifiers(offen=True, offset12=rowOff_irt),
+                                      comment=(f"R dwordx4 (m={m},n={n}) off={rowOff_irt}:"
+                                               " 8 bf16 for pair (full exec).")))
+            self.writer.vgprPool.checkIn(loadAddr_irt)
+            return 1
+        if self.geom.useWideResidual:
+            module.addComment1(f"wide residual load (m={m},n={n}).")
+            isBf16_irt = self.geom.residualBytes == 2
+            loadCls_irt = BufferLoadB64 if isBf16_irt else BufferLoadB32
+            chunkBytes_irt = 4 << self.geom.residualLog2Bytes
+            rowOff_irt = m * self.geom.tileStrideM * self.geom.residualBytes
+            for c_irt in range(rpl // 4):
+                off_irt = rowOff_irt + chunkBytes_irt * c_irt
+                assert off_irt < 4096, (
+                    f"residual wide load offset {off_irt} exceeds MUBUF offset12 range")
+                dstBase_irt = burstBase + 4 * c_irt
+                dst_irt = vgpr(dstBase_irt, 2) if isBf16_irt else vgpr(dstBase_irt)
+                module.add(loadCls_irt(dst_irt, vgpr(self.resRowByteBase),
+                                       sgpr(self.resSrd, 4), 0,
+                                       MUBUFModifiers(offen=True, offset12=off_irt),
+                                       comment=(f"R wide [4 residual]"
+                                                f" (m={m},n={n},c={c_irt}) off={off_irt}.")))
+            return rpl // 4
+        for k_irt in range(rpl):
+            module.addComment1(f"compute clamped residual byte address (m={m},k={k_irt}).")
+            _free0RowPos(module, self.resAddr, self.wgRowBase, self.rowGroupOff,
+                         m, k_irt, mBaseV, self.geom)
+            module.add(VCmpLtU32(dst=sgpr(self.resOobMask, self.geom.laneSgprCount),
+                                 src0=vgpr(self.resAddr), src1=sgpr("SizesFree+0"),
+                                 comment="inRange = nhidden_pos < N_hidden"))
+            module.add(VLShiftLeftB32(dst=vgpr(self.resAddr),
+                                      shiftHex=hex(self.geom.residualLog2Bytes),
+                                      src=vgpr(self.resAddr),
+                                      comment="nhiddenByte = nhidden_pos * residualBytes."))
+            module.add(VAddU32(vgpr(self.resAddr), vgpr(self.resAddr),
+                               vgpr(self.resRowByteBase),
+                               comment="byteAddr = rowByteBase + nhiddenByte"))
+            module.add(VCndMaskB32(dst=vgpr(self.resAddr), src0=vgpr(self.resOobV),
+                                   src1=vgpr(self.resAddr),
+                                   src2=sgpr(self.resOobMask, self.geom.laneSgprCount),
+                                   comment="clamp OOB when nhidden_pos >= N_hidden"))
+            _issueSideLoad(module, burstBase + k_irt, self.resAddr, self.resSrd,
+                           f"R[m={m},n={n},k={k_irt}].", dtype=self.geom.residualType)
+        return rpl
 
 
     def _emitGammaDtlLoadContiguous(self, module, qi) -> None:
@@ -1474,7 +1505,7 @@ class SubtileMegaFusedEmitter:
 
     def _computeTileNoPrefetch(self, module, vgprTiles, workBank, gammaBank,
                                blkAmax, mBaseV, qi, j, mi, n, pathInterior,
-                               tokMaskSgpr) -> None:
+                               tokMaskSgpr, bankBase=None) -> None:
         """Emit the per-(qi, n, mi) tile compute block for the pfd=0 serial path.
 
         Covers residual in-place convert, acc read-pair-and-add into workBank
@@ -1485,7 +1516,8 @@ class SubtileMegaFusedEmitter:
         tpb = self.geom.tilesPerBlockM
         lsc = self.geom.laneSgprCount
         m = qi * tpb + mi
-        bankBase = (j * tpb + mi) * rpl
+        if bankBase is None:
+            bankBase = (j * tpb + mi) * rpl
         burstBase = workBank + bankBase
         coords = [(m, n, k) for k in range(rpl)]
 
@@ -1784,6 +1816,117 @@ class SubtileMegaFusedEmitter:
             self._amaxAndWriteAcc(module, sk0, vgprTiles, blkAmaxJ, m, n, k)
             self._amaxAndWriteAcc(module, sk1, vgprTiles, blkAmaxJ, m, n, k + 1)
 
+    def _emitBatchedDrainBatch(self, module, vgprTiles, gammaBank, blkAmax,
+                               mBaseV, workBank, qi, cols, pathInterior) -> None:
+        """Phase 1 + Phase 2 for one (qi, cols) column-batch of the batched-drain schedule.
+
+        Phase 1 issues all residual loads for the batch without intervening compute.
+        Phase 2 drains them with decreasing vlcnt, computes H and stores ResidualOut.
+        """
+        tpb = self.geom.tilesPerBlockM
+        lsc = self.geom.laneSgprCount
+        rpl = self.geom.rowsPerLane
+        # Phase 1: issue all loads for the batch.
+        module.addComment1(
+            f"batched-drain Phase 1 (qi={qi}, cols={cols}): issue all residual loads.")
+        totalLoads = 0
+        cumLoads = []
+        for colIdx, n in enumerate(cols):
+            self._computeResidualRowByteBase(module, n)
+            for mi in range(tpb):
+                m = qi * tpb + mi
+                slot = colIdx * tpb + mi
+                issued = self._issueTileResidualLoad(
+                    module, workBank, slot, m, n, mBaseV, pathInterior)
+                totalLoads += issued
+                cumLoads.append(totalLoads)
+        # Phase 2: drain and compute one tile at a time.
+        module.addComment1(
+            f"batched-drain Phase 2 (qi={qi}, cols={cols}): drain and compute.")
+        tileInBatch = 0
+        for colIdx, n in enumerate(cols):
+            # Set up the per-column ResidualOut store registers.
+            tokMaskSgpr = self.writer.sgprPool.checkOutAligned(
+                lsc, lsc, tag="mf_roTokMask", preventOverflow=False)
+            self.roRowBase = self.writer.vgprPool.checkOut(1, tag="mf_roRowBase")
+            self.roColByteBase = self.writer.vgprPool.checkOut(
+                1, tag="mf_roColByteBase")
+            module.addComment1(f"token OOB mask and roRowBase (n={n}).")
+            nOff_roBase = self.geom.colOffset(n)
+            tokV_roBase = self.writer.vgprPool.checkOut(1, tag="mf_roTokV")
+            scratch_roBase = self.writer.vgprPool.checkOut(1, tag="mf_roTokScratch")
+            r_roBase = _addImmU32(
+                module, tokV_roBase, self.resTokenBase, nOff_roBase,
+                scratch_roBase, f"token_n = resTokenBase + {nOff_roBase} (n={n}).")
+            module.add(VCmpLtU32(dst=sgpr(tokMaskSgpr, lsc), src0=vgpr(r_roBase),
+                                 src1=sgpr("SizesFree+1"),
+                                 comment="tokenInRange = token_n < M_tokens."))
+            module.add(VMulLOU32(dst=vgpr(self.roRowBase), src0=sgpr("SizesFree+0"),
+                                 src1=vgpr(r_roBase),
+                                 comment=f"roRowBase = token_n * N_hidden (n={n})."))
+            module.add(VAddU32(dst=vgpr(self.roColByteBase),
+                               src0=vgpr(self.roRowBase), src1=vgpr(self.wgRowBase),
+                               comment="roColBase = token_n*N_hidden + wgRowBase."))
+            module.add(VAddU32(dst=vgpr(self.roColByteBase),
+                               src0=vgpr(self.roColByteBase),
+                               src1=vgpr(self.rowGroupOff),
+                               comment="roColBase += rowGroupOff."))
+            module.add(VLShiftLeftB32(dst=vgpr(self.roColByteBase), shiftHex=hex(1),
+                                      src=vgpr(self.roColByteBase),
+                                      comment="roColByteBase = roColBase * 2 (bf16)."))
+            self.writer.vgprPool.checkIn(scratch_roBase)
+            self.writer.vgprPool.checkIn(tokV_roBase)
+            for mi in range(tpb):
+                # Decreasing-vlcnt wait for this tile only; later tiles stay in flight.
+                remaining = totalLoads - cumLoads[tileInBatch]
+                module.add(SWaitCnt(
+                    vlcnt=remaining,
+                    comment=(f"batched drain: wait tile {tileInBatch} of batch"
+                             f" (vlcnt={remaining}).")))
+                self._computeTileNoPrefetch(
+                    module, vgprTiles, workBank, gammaBank, blkAmax, mBaseV,
+                    qi, colIdx, mi, n, pathInterior, tokMaskSgpr,
+                    bankBase=(colIdx * tpb + mi) * rpl)
+                tileInBatch += 1
+            # Tear down per-column store registers.
+            self.writer.vgprPool.checkIn(self.roColByteBase)
+            self.roColByteBase = None
+            self.writer.vgprPool.checkIn(self.roRowBase)
+            self.roRowBase = None
+            self.writer.sgprPool.checkIn(tokMaskSgpr)
+
+    def _emitFusedBodyBatchedDrain(self, module, vgprTiles, gammaBank, blkAmax,
+                                   mBaseV, workBank, colsPerBatch,
+                                   pathInterior: bool = False) -> None:
+        """Strict batch two-phase residual schedule for the bf16 dwordx4 case.
+
+        Phase 1 issues all loads for colsPerBatch columns without any intervening
+        compute.  Phase 2 drains them tile-by-tile with a decreasing vlcnt wait,
+        then computes H=acc+residual, H^2, and stores ResidualOut.  No cross-batch
+        lookahead: the next batch starts only after Phase 2 of the current batch
+        completes, matching the MLIR BATCH=4 two-phase idiom.
+        """
+        assert not self.geom.useMxfp8, "batched-drain schedule is non-MXFP8 only"
+        module.addComment1("batched-drain prolog: issue gamma DTL loads and drain.")
+        self._issueAllGammaToLds(module)
+        module.add(SWaitCnt(vlcnt=0,
+                            comment="drain gamma DTL (no residual in flight)."))
+        module.add(self.writer._syncThreads(
+            self.kernel, "gamma DTL stage: LDS writes visible before broadcast reads."))
+        self._ldsReadGammaBlockIssue(module, gammaBank, 0)
+
+        mmaN = self.geom.mmaN
+        nQTilesM = self.geom.nQTilesM
+        for qi in range(nQTilesM):
+            for colStart in range(0, mmaN, colsPerBatch):
+                cols = list(range(colStart, min(colStart + colsPerBatch, mmaN)))
+                self._emitBatchedDrainBatch(
+                    module, vgprTiles, gammaBank, blkAmax, mBaseV, workBank,
+                    qi, cols, pathInterior)
+                # Issue next qi-block's gamma LDS read after the last batch of this qi.
+                if colStart + colsPerBatch >= mmaN and qi + 1 < nQTilesM:
+                    self._ldsReadGammaBlockIssue(module, gammaBank, qi + 1)
+
     def _emitFusedBodyNoPrefetch(self, module, vgprTiles, units, workBank, gammaBank,
                                   blkAmax, mBaseV, pathInterior: bool = False) -> None:
         """Single-bank no-prefetch fallback (prefetchDepth=0).
@@ -1870,9 +2013,10 @@ class SubtileMegaFusedEmitter:
         pfd = self.geom.prefetchDepth
         s = self.geom.tilesPerBlockM * self.geom.rowsPerLane
         module = Module("SubtileMegaFusedEpilogue")
+        _bd_note = " [batched-drain]" if _useDwordx4Interior(self.geom) else ""
         module.addComment0(
             f"MegaFused PFD ring: EBC={ebc} PFD={pfd} S={s} "
-            f"(nQTilesM={self.geom.nQTilesM} mmaN={self.geom.mmaN}).")
+            f"(nQTilesM={self.geom.nQTilesM} mmaN={self.geom.mmaN}){_bd_note}.")
         module.addComment0("top-level MegaFused epilogue emission.")
         vgprPool = self.writer.vgprPool
         self.laneId      = vgprPool.checkOut(1, tag="mf_laneId")
@@ -2220,7 +2364,20 @@ class SubtileMegaFusedEmitter:
         if self.geom.useMxfp8:
             blkAmax = self.writer.vgprPool.checkOut(self.geom.mmaN, tag="mf_blkAmax")
         mBaseV = self.writer.vgprPool.checkOut(1, tag="mf_mBase")
-        if pfd == 0:
+        useBatchedDrain = _useDwordx4Interior(self.geom)
+        if useBatchedDrain:
+            # Batched-drain two-phase schedule: one workBank sized for colsPerBatch columns.
+            # Supersedes both the PFD ring and the pfd=0 fallback for the dwordx4 case.
+            colsPerBatch = max(1, _batchedDrainTiles // tpb)
+            batchBankSize = colsPerBatch * tpb * self.geom.rowsPerLane
+            workBank = self.writer.vgprPool.checkOutAligned(
+                batchBankSize, 2, tag="mf_batchBank")
+            resRing = []
+            accBank = None
+            emitBodyFn = lambda mod, pathInterior: self._emitFusedBodyBatchedDrain(
+                mod, vgprTiles, gammaBank, blkAmax, mBaseV, workBank,
+                colsPerBatch, pathInterior)
+        elif pfd == 0:
             # Non-prefetched single-bank fallback: one workBank (size = bankSize = S).
             # No separate accBank or prefetch ring; acc is read pair-wise inline.
             workBank = self.writer.vgprPool.checkOutAligned(bankSize, 2, tag="mf_workBank")
@@ -2279,7 +2436,7 @@ class SubtileMegaFusedEmitter:
         self.writer.vgprPool.checkIn(mBaseV)
         if self.geom.useMxfp8:
             self.writer.vgprPool.checkIn(blkAmax)
-        if pfd == 0:
+        if useBatchedDrain or pfd == 0:
             self.writer.vgprPool.checkIn(workBank)
         else:
             self.writer.vgprPool.checkIn(accBank)
