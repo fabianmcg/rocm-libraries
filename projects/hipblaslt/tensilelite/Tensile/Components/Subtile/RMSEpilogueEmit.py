@@ -13,15 +13,18 @@ DELEGATES to SubtileMegaFusedEmitter so the correctness harness stays green.
 import math
 
 from rocisa.code import Module
-from rocisa.container import EXEC, MUBUFModifiers, sgpr, vgpr
+from rocisa.container import EXEC, MUBUFModifiers, mgpr, sgpr, vgpr
 from rocisa.instruction import (
+    BufferLoadB32,
     BufferLoadD16B16,
     DSStoreB16,
+    SAddU32,
     SAndSaveExecB64,
     SLShiftLeftB32,
     SMovB32,
     SMovB64,
     SMulI32,
+    SNop,
     SWaitCnt,
     VAddU32,
     VAndB32,
@@ -30,6 +33,7 @@ from rocisa.instruction import (
     VLShiftRightB32,
     VMovB32,
     VMulLOU32,
+    VReadfirstlaneB32,
 )
 
 
@@ -84,6 +88,8 @@ class RMSEpilogueEmitter:
         self.gammaSrd = None
         # Byte offset of the flat gamma LDS buffer (set in _emitGammaPrefetch).
         self.gammaLdsBase = None
+        # Static byte footprint of the flat gamma LDS buffer (set in prefetch).
+        self.gammaLdsBytes = None
 
     def _nativeEligible(self):
         return (not self.useMxfp8 and not self.interleaved
@@ -217,6 +223,7 @@ class RMSEpilogueEmitter:
         # epilogue LDS (the main-loop LDS, free post-loop). gammaLdsBase is the
         # byte offset handed to ds_write/ds_read; the body (F4) reads from it.
         self.gammaLdsBase = 0
+        self.gammaLdsBytes = self.MT0 * 2
 
         module.addComment1(
             f"gamma LDS prefetch: flat LDS[idx]=gamma[rowWaveBase+idx], idx in [0,{self.MT0}).")
@@ -286,3 +293,112 @@ class RMSEpilogueEmitter:
             module.add(SMovB64(dst=EXEC(), src=sgpr(savedExec, lsc),
                                comment="restore full exec after prefetch pass."))
             sgprPool.checkIn(savedExec)
+
+    def _emitGammaPrefetchDTL(self, module):
+        """Prefetch this block's MT0 gamma rows into flat LDS via direct-to-LDS.
+
+        Faithful port of the WIDE gamma prefetch (@mega_fused_epilogue lines
+        555-591, the dwordx4-coalesced path). It fills the SAME flat layout as the
+        software prefetch -- ``LDS[idx] = gamma[rowWaveBase + idx]`` for idx in
+        [0, MT0), with ``rowWaveBase = WorkGroup0 * MT0`` -- but cooperatively: the
+        first ``loaderWaves = ceil(MT0 / 128)`` waves each issue one b32
+        direct-to-LDS load whose 64 lanes read two bf16 gamma rows apiece
+        (lane l -> gamma[chunkBase + 2l], gamma[chunkBase + 2l + 1]).
+
+        Each physical wave handles exactly its own chunk ``w = waveId``:
+        ``chunkBase = rowWaveBase + w*128`` rows, global byte soffset
+        ``soffB = chunkBase*2``, per-lane vaddr ``voff = lane*4``, and per-wave LDS
+        base ``M0 = gammaLdsBase + w*256`` bytes. Waves >= loaderWaves skip the load
+        (narrowed exec) but still reach the publish barrier.
+
+        Dead code pending wiring (F2b); emit() still delegates.
+        """
+        vgprPool = self.writer.vgprPool
+        sgprPool = self.writer.sgprPool
+        lsc = self.laneSGPRCount
+        loaderWaves = (self.MT0 + 127) // 128
+        numWaves = self.wgM * self.wgN
+        assert loaderWaves <= numWaves, "gamma DTL prefetch needs loaderWaves <= wgM*wgN waves"
+
+        # LDS region: the flat gamma buffer starts the epilogue LDS. The DTL path
+        # rounds its footprint up to whole 128-row (256-byte) chunks; partial
+        # last-wave OOB rows land in unread slots >= MT0.
+        self.gammaLdsBase = 0
+        self.gammaLdsBytes = max(self.MT0 * 2, loaderWaves * 256)
+
+        module.addComment1(
+            f"gamma DTL prefetch: flat LDS[idx]=gamma[rowWaveBase+idx], "
+            f"loaderWaves={loaderWaves} (ceil(MT0({self.MT0})/128)).")
+        rowWaveBaseS = sgprPool.checkOut(1, tag="rms_dtlRowWaveBase")
+        module.add(SMulI32(dst=sgpr(rowWaveBaseS), src0=sgpr("WorkGroup0"), src1=hex(self.MT0),
+                           comment=f"rowWaveBase = WorkGroup0 * MT0({self.MT0})."))
+        # WAR: sibling waves may still read the main-loop LDS; fence before reuse.
+        module.add(self.writer._syncThreads(self.kernel,
+                                            "gamma DTL prefetch: WAR barrier before reusing LDS."))
+
+        # waveId = Serial >> 6 (uniform per wave); scalar copy drives M0/soffB.
+        waveIdV = vgprPool.checkOut(1, tag="rms_dtlWaveId")
+        module.add(VLShiftRightB32(dst=vgpr(waveIdV),
+                                   shiftHex=hex(int(math.log2(self.waveSize))),
+                                   src=vgpr("Serial"), comment="waveId = Serial >> 6."))
+        module.add(SNop(waitState=0, comment="VALU write -> readfirstlane hazard."))
+        wS = sgprPool.checkOut(1, tag="rms_dtlWave")
+        module.add(VReadfirstlaneB32(dst=sgpr(wS), src=vgpr(waveIdV),
+                                     comment="w = waveId (uniform scalar)."))
+        # w256 = w * 256 feeds both M0 (= gammaLdsBase + w*256) and soffB.
+        w256S = sgprPool.checkOut(1, tag="rms_dtlW256")
+        module.add(SLShiftLeftB32(dst=sgpr(w256S), src=sgpr(wS), shiftHex=hex(8),
+                                  comment="w256 = w * 256 (128 rows * 2 bytes)."))
+        # soffB = chunkBase*2 = rowWaveBase*2 + w*256 (byte soffset).
+        soffBS = sgprPool.checkOut(1, tag="rms_dtlSoff")
+        module.add(SLShiftLeftB32(dst=sgpr(soffBS), src=sgpr(rowWaveBaseS), shiftHex=hex(1),
+                                  comment="rowWaveBase * 2 (bf16 byte offset)."))
+        module.add(SAddU32(dst=sgpr(soffBS), src0=sgpr(soffBS), src1=sgpr(w256S),
+                           comment="soffB = (rowWaveBase + w*128) * 2."))
+        # Per-lane vaddr voff = lane*4 = (Serial & 63) << 2.
+        voffV = vgprPool.checkOut(1, tag="rms_dtlVoff")
+        module.add(VAndB32(dst=vgpr(voffV), src0=vgpr("Serial"), src1=self.waveSize - 1,
+                           comment="lane = Serial & 63."))
+        module.add(VLShiftLeftB32(dst=vgpr(voffV), shiftHex=hex(2), src=vgpr(voffV),
+                                  comment="voff = lane * 4 (b32 DTL byte offset)."))
+
+        # Guard: narrow exec to loader waves (waveId < loaderWaves); the whole wave
+        # is uniform, so a loader wave keeps exec full and others drop to zero.
+        mask = sgprPool.checkOutAligned(lsc, lsc, tag="rms_dtlMask", preventOverflow=False)
+        savedExec = sgprPool.checkOutAligned(lsc, lsc, tag="rms_dtlExec", preventOverflow=False)
+        module.add(VCmpLtU32(dst=sgpr(mask, lsc), src0=vgpr(waveIdV), src1=loaderWaves,
+                             comment=f"isLoader = waveId < loaderWaves({loaderWaves})."))
+        module.add(SAndSaveExecB64(dst=sgpr(savedExec, lsc), src=sgpr(mask, lsc),
+                                   comment="narrow exec to loader waves."))
+        sgprPool.checkIn(mask)
+
+        # M0 = gammaLdsBase + w*256 (per-wave LDS base), then one b32 DTL load.
+        if self.gammaLdsBase:
+            m0S = sgprPool.checkOut(1, tag="rms_dtlM0")
+            module.add(SAddU32(dst=sgpr(m0S), src0=sgpr(w256S), src1=self.gammaLdsBase,
+                               comment=f"M0 = gammaLdsBase({self.gammaLdsBase}) + w*256."))
+            module.add(SMovB32(dst=mgpr(0), src=sgpr(m0S), comment="M0 = per-wave LDS base."))
+            sgprPool.checkIn(m0S)
+        else:
+            module.add(SMovB32(dst=mgpr(0), src=sgpr(w256S),
+                               comment="M0 = gammaLdsBase(0) + w*256 = per-wave LDS base."))
+        module.add(BufferLoadB32(
+            dst=None, vaddr=vgpr(voffV), saddr=sgpr(self.gammaSrd, 4), soffset=sgpr(soffBS),
+            mubuf=MUBUFModifiers(offen=True, offset12=0, lds=True),
+            comment="gamma b32 DTL -> LDS[M0 + lane*4] = gamma[chunkBase + 2*lane]."))
+
+        module.add(SMovB64(dst=EXEC(), src=sgpr(savedExec, lsc),
+                           comment="restore full exec after DTL issue."))
+        sgprPool.checkIn(savedExec)
+
+        vgprPool.checkIn(waveIdV)
+        vgprPool.checkIn(voffV)
+        sgprPool.checkIn(wS)
+        sgprPool.checkIn(w256S)
+        sgprPool.checkIn(soffBS)
+        sgprPool.checkIn(rowWaveBaseS)
+
+        # Publish: drain the DTL writes, then barrier so the body reads full LDS.
+        module.add(SWaitCnt(vlcnt=0, dscnt=0, comment="wait gamma DTL loads (vmcnt0 lgkmcnt0)."))
+        module.add(self.writer._syncThreads(self.kernel,
+                                            "gamma DTL prefetch: LDS fully populated before body reads."))
