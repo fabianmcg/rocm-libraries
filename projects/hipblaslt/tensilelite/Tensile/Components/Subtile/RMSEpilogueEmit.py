@@ -13,7 +13,7 @@ DELEGATES to SubtileMegaFusedEmitter so the correctness harness stays green.
 import math
 
 from rocisa.code import Module
-from rocisa.container import EXEC, DSModifiers, MUBUFModifiers, mgpr, sgpr, vgpr
+from rocisa.container import EXEC, DSModifiers, MUBUFModifiers, accvgpr, mgpr, sgpr, vgpr
 from rocisa.instruction import (
     BufferLoadB32,
     BufferLoadB128,
@@ -30,6 +30,9 @@ from rocisa.instruction import (
     SMulI32,
     SNop,
     SWaitCnt,
+    VAccvgprReadB32,
+    VAccvgprWriteB32,
+    VAddF32,
     VAddU32,
     VAndB32,
     VCmpLtU32,
@@ -39,6 +42,7 @@ from rocisa.instruction import (
     VLShiftLeftB32,
     VLShiftRightB32,
     VMovB32,
+    VMulF32,
     VMulLOU32,
     VPermlane16SwapB32,
     VReadfirstlaneB32,
@@ -736,3 +740,84 @@ class RMSEpilogueEmitter:
         vgprPool.checkIn(row)
         vgprPool.checkIn(addr)
         vgprPool.checkIn(val)
+
+    def _computePair(self, module, vgprTiles, residualF32, accStage, g8Bank,
+                     ssqAccBase, mp, n, isX4):
+        """Per-pair compute: H = residual + acc, ssq partial, residualOut, D = H*gamma.
+
+        Faithful port of @mega_fused_body (MLIR 352-396) for pair ``mp``,
+        column-tile ``n``. ``residualF32`` is an 8-wide caller-owned bank holding
+        the native f32 residual on entry; it holds H8 after the add and Dout after
+        the gamma multiply. ``accStage`` stages AGPR accumulator reads, ``g8Bank``
+        receives the pair's native gamma, and ``ssqAccBase`` is the T_N-wide f32
+        column partial array (caller zero-inits before the pair loop).
+
+        The one sanctioned deviation from MLIR is H = extf(native) + acc; the
+        reference uses H = residual directly.
+        """
+        vgprPool = self.writer.vgprPool
+        # ---- Step 1: read the accumulator into native-order accRegs ----
+        accRegs = []
+        slot = 0
+        for j in range(8):
+            tileIdx = 2 * mp if j < 4 else 2 * mp + 1
+            k = j % 4
+            tile = vgprTiles[n * self.T_M + tileIdx]
+            reg = tile.regList.indices[k]
+            if tile.regList.pool == self.writer.vgprPool:
+                accRegs.append(reg)
+                continue
+            module.add(VAccvgprReadB32(dst=vgpr(accStage + slot), src=accvgpr(reg),
+                                       comment=f"stage acc (mp={mp},n={n},j={j})."))
+            accRegs.append(accStage + slot)
+            slot += 1
+        if slot > 0:
+            module.add(SNop(waitState=1, comment="accvgpr_read->VALU hazard (gfx950)"))
+
+        # ---- Step 2: H8 = residual + acc (in place, MLIR 352 + acc deviation) ----
+        for j in range(8):
+            module.add(VAddF32(dst=vgpr(residualF32[j]), src0=vgpr(residualF32[j]),
+                               src1=vgpr(accRegs[j]), comment=f"H8[{j}] = residual + acc."))
+
+        # ---- Step 3: ssq pairwise tree (MLIR 374-386), scalar faithful tree ----
+        sq = [vgprPool.checkOut(1, tag=f"rms_ssq{j}") for j in range(8)]
+        for j in range(8):
+            module.add(VMulF32(dst=vgpr(sq[j]), src0=vgpr(residualF32[j]),
+                               src1=vgpr(residualF32[j]), comment=f"sq[{j}] = H8[{j}]^2."))
+        module.add(VAddF32(dst=vgpr(sq[0]), src0=vgpr(sq[0]), src1=vgpr(sq[1]), comment="s01."))
+        module.add(VAddF32(dst=vgpr(sq[2]), src0=vgpr(sq[2]), src1=vgpr(sq[3]), comment="s23."))
+        module.add(VAddF32(dst=vgpr(sq[4]), src0=vgpr(sq[4]), src1=vgpr(sq[5]), comment="s45."))
+        module.add(VAddF32(dst=vgpr(sq[6]), src0=vgpr(sq[6]), src1=vgpr(sq[7]), comment="s67."))
+        module.add(VAddF32(dst=vgpr(sq[0]), src0=vgpr(sq[0]), src1=vgpr(sq[2]), comment="s0123."))
+        module.add(VAddF32(dst=vgpr(sq[4]), src0=vgpr(sq[4]), src1=vgpr(sq[6]), comment="s4567."))
+        module.add(VAddF32(dst=vgpr(sq[0]), src0=vgpr(sq[0]), src1=vgpr(sq[4]), comment="s = s0123 + s4567."))
+        module.add(VAddF32(dst=vgpr(ssqAccBase + n), src0=vgpr(ssqAccBase + n), src1=vgpr(sq[0]),
+                           comment=f"ssqAcc[{n}] += s."))
+        for j in range(8):
+            vgprPool.checkIn(sq[j])
+
+        # ---- Step 4: residualOut store (H pre-gamma, MLIR 389-392) ----
+        self._storeResidualOut(module, residualF32, mp, n, isX4)
+
+        # ---- Step 5: gamma read (MLIR 353-371) ----
+        self._readGammaLds(module, g8Bank, mp)
+
+        # ---- Step 6: D = H * gamma (in place, MLIR 372) ----
+        for j in range(8):
+            module.add(VMulF32(dst=vgpr(residualF32[j]), src0=vgpr(residualF32[j]),
+                               src1=vgpr(g8Bank + j), comment=f"Dout[{j}] = H8[{j}] * gamma[{j}]."))
+
+        # ---- Step 7: D writeback to the accumulator register file ----
+        for j in range(8):
+            tileIdx = 2 * mp if j < 4 else 2 * mp + 1
+            k = j % 4
+            tile = vgprTiles[n * self.T_M + tileIdx]
+            reg = tile.regList.indices[k]
+            sk = residualF32[j]
+            if tile.regList.pool == self.writer.vgprPool:
+                if sk != reg:
+                    module.add(VMovB32(dst=vgpr(reg), src=vgpr(sk),
+                                       comment=f"write D back to acc (mp={mp},n={n},j={j})."))
+                continue
+            module.add(VAccvgprWriteB32(accvgpr(reg), vgpr(sk),
+                                        comment=f"write D back to acc (mp={mp},n={n},j={j})."))
