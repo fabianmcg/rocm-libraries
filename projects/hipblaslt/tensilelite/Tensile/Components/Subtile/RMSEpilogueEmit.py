@@ -85,6 +85,7 @@ from rocisa.instruction import (
     VMulLOU32,
     VMulPKF32,
     VOrB32,
+    VPermlane16SwapB32,
     VReadfirstlaneB32,
     VXorB32,
 )
@@ -535,6 +536,26 @@ class RMSEpilogueEmitter:
                     ds=DSModifiers(offset=off + h * innerGapBytes),
                     comment=f"broadcast-read gamma half {h} (qi={qi},mi={mi}) off+{h * innerGapBytes}."))
         self._gammaReadPending = True
+
+    def _pairShuffle(self, module, bank) -> None:
+        """Emit the involutive pair_shuffle: 2x VPermlane16SwapB32, raw<->native.
+
+        Mirrors @pair_shuffle in mega_fused_epilogue.mlir (lines 144-158): swaps
+        d0<->d2 and d1<->d3 across lane-16 halves so the layout converts between
+        8 contiguous bf16 rows per lane (raw dwordx4 load) and per-lane native
+        [tileA 4 rows, tileB 4 rows] (accumulator layout). Involutive: applying
+        it twice is identity.
+        """
+        module.addComment1("pair_shuffle: 2x permlane16_swap, raw<->native (involutive).")
+        module.add(VPermlane16SwapB32(dst=vgpr(bank + 0), src=vgpr(bank + 2),
+                                      comment="swap d0<->d2 across lane-16 halves (a0,b0)."))
+        module.add(VPermlane16SwapB32(dst=vgpr(bank + 1), src=vgpr(bank + 3),
+                                      comment="swap d1<->d3 across lane-16 halves (a1,b1)."))
+
+    def _pairedDwordx4Eligible(self) -> bool:
+        # Faithful MLIR paired dwordx4 wide path: bf16, non-MXFP8, rowsPerLane==4,
+        # not partial-accum, and an even mmaM so (m, m+1) pairs are well-formed.
+        return _useDwordx4Interior(self.geom) and self.geom.mmaM % 2 == 0
 
     def emit(self, vgprTiles):
         return self._delegate.emit(vgprTiles)
