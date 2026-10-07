@@ -16,6 +16,7 @@ from rocisa.code import Module
 from rocisa.container import EXEC, MUBUFModifiers, mgpr, sgpr, vgpr
 from rocisa.instruction import (
     BufferLoadB32,
+    BufferLoadB128,
     BufferLoadD16B16,
     DSStoreB16,
     SAddU32,
@@ -29,10 +30,13 @@ from rocisa.instruction import (
     VAddU32,
     VAndB32,
     VCmpLtU32,
+    VCndMaskB32,
+    VCvtBF16toFP32,
     VLShiftLeftB32,
     VLShiftRightB32,
     VMovB32,
     VMulLOU32,
+    VPermlane16SwapB32,
     VReadfirstlaneB32,
 )
 
@@ -83,6 +87,11 @@ class RMSEpilogueEmitter:
         self.waveNV = None
         self.rowOriginV = None
         self.colOriginV = None
+        # Residual-load address constants (allocated in _computeAddrConstants).
+        self.colBaseV = None
+        self.pairRowOffV = None
+        self.g4V = None
+        self.oobV = None
         self.resSrd = None
         self.residualOutSrd = None
         self.gammaSrd = None
@@ -402,3 +411,163 @@ class RMSEpilogueEmitter:
         module.add(SWaitCnt(vlcnt=0, dscnt=0, comment="wait gamma DTL loads (vmcnt0 lgkmcnt0)."))
         module.add(self.writer._syncThreads(self.kernel,
                                             "gamma DTL prefetch: LDS fully populated before body reads."))
+
+    def _computeAddrConstants(self, module):
+        """Per-lane residual-address constants (precompute once per emission).
+
+        Faithful to the #eoff column-major model of @mega_fused_epilogue: the
+        residual byte address is (column*rowExtent + row) * 2. colBase, pairRowOff
+        and g4 are the index-independent lane terms; the per-load code adds the
+        pair/tile/column terms on top. These VGPRs are freed in the final teardown
+        milestone.
+        """
+        vgprPool = self.writer.vgprPool
+        self.colBaseV    = vgprPool.checkOut(1, tag="rms_colBase")
+        self.pairRowOffV = vgprPool.checkOut(1, tag="rms_pairRowOff")
+        self.g4V         = vgprPool.checkOut(1, tag="rms_g4")
+        self.oobV        = vgprPool.checkOut(1, tag="rms_oob")
+        module.addComment1("residual load constants: colBase, pairRowOff, g4, oob.")
+        # colBase = colOrigin + c (the lane's column within the wave tile).
+        module.add(VAddU32(vgpr(self.colBaseV), vgpr(self.colOriginV), vgpr(self.cV),
+                           comment="colBase = colOrigin + c."))
+        # pairRowOff = (g&1)*16 + (g>>1)*8: tileSel*16 + half*8.
+        tmpV = vgprPool.checkOut(1, tag="rms_pairRowTmp")
+        module.add(VAndB32(dst=vgpr(tmpV), src0=vgpr(self.gV), src1=1, comment="tileSel = g & 1."))
+        module.add(VLShiftLeftB32(dst=vgpr(tmpV), shiftHex=hex(4), src=vgpr(tmpV),
+                                  comment="tileSel * 16."))
+        module.add(VLShiftRightB32(dst=vgpr(self.pairRowOffV), shiftHex=hex(1), src=vgpr(self.gV),
+                                   comment="half = g >> 1."))
+        module.add(VLShiftLeftB32(dst=vgpr(self.pairRowOffV), shiftHex=hex(3),
+                                  src=vgpr(self.pairRowOffV), comment="half * 8."))
+        module.add(VAddU32(vgpr(self.pairRowOffV), vgpr(self.pairRowOffV), vgpr(tmpV),
+                           comment="pairRowOff = tileSel*16 + half*8."))
+        vgprPool.checkIn(tmpV)
+        # g4 = g * 4 (native-tile row-group offset).
+        module.add(VLShiftLeftB32(dst=vgpr(self.g4V), shiftHex=hex(2), src=vgpr(self.gV),
+                                  comment="g4 = g * 4."))
+        # oob = BufferOOB sentinel address that clamps an OOB row to a no-op load.
+        module.add(VMovB32(dst=vgpr(self.oobV), src="BufferOOB", comment="oob = BufferOOB sentinel."))
+
+    def _loadRaw(self, module, bank, mp, n, isX4):
+        """Load the raw residual for pair ``mp``, column-tile ``n`` into ``bank``.
+
+        Faithful port of @load_raw (MLIR 84-137). WIDE issues one dwordx4 with a
+        per-pair all-or-nothing row clamp; NARROW issues eight scalar bf16 with a
+        per-row clamp. ``bank`` is an 8-wide, 4-aligned VGPR block checked out by
+        the caller. No @pair_shuffle here -- the caller applies it (WIDE only).
+        """
+        if isX4:
+            self._loadRawWide(module, bank, mp, n)
+        else:
+            self._loadRawNarrow(module, bank, mp, n)
+
+    def _loadRawWide(self, module, bank, mp, n):
+        """One dwordx4 per pair, per-pair row clamp (MLIR 91-96)."""
+        vgprPool = self.writer.vgprPool
+        sgprPool = self.writer.sgprPool
+        lsc = self.laneSGPRCount
+        m = 2 * mp
+        rowBaseP = vgprPool.checkOut(1, tag="rms_rowBaseP")
+        col      = vgprPool.checkOut(1, tag="rms_wideCol")
+        addr     = vgprPool.checkOut(1, tag="rms_wideAddr")
+        # rowBaseP = rowOrigin + pairRowOff + m*16.
+        module.add(VAddU32(vgpr(rowBaseP), vgpr(self.rowOriginV), vgpr(self.pairRowOffV),
+                           comment="rowBaseP = rowOrigin + pairRowOff."))
+        module.add(VAddU32(vgpr(rowBaseP), vgpr(rowBaseP), m * 16, comment=f"rowBaseP += m*16 (m={m})."))
+        # col = colBase + n*16.
+        module.add(VAddU32(vgpr(col), vgpr(self.colBaseV), n * 16, comment=f"col = colBase + n*16 (n={n})."))
+        # addr = (column*rowExtent + rowBaseP) << 1 (bf16 column-major byte offset).
+        module.add(VMulLOU32(dst=vgpr(addr), src0=sgpr("SizesFree+0"), src1=vgpr(col),
+                             comment="addr = column * rowExtent."))
+        module.add(VAddU32(vgpr(addr), vgpr(addr), vgpr(rowBaseP), comment="addr += rowBaseP."))
+        module.add(VLShiftLeftB32(dst=vgpr(addr), shiftHex=hex(1), src=vgpr(addr),
+                                  comment="addr *= 2 (bf16 bytes)."))
+        # inRange = rowBaseP < rowExtent: one clamp covers the pair's 8 rows
+        # (rowExtent % 8 == 0 and rowBaseP is 8-aligned).
+        mask = sgprPool.checkOutAligned(lsc, lsc, tag="rms_wideMask", preventOverflow=False)
+        module.add(VCmpLtU32(dst=sgpr(mask, lsc), src0=vgpr(rowBaseP), src1=sgpr("SizesFree+0"),
+                             comment="inRange = rowBaseP < rowExtent."))
+        module.add(VCndMaskB32(dst=vgpr(addr), src0=vgpr(self.oobV), src1=vgpr(addr),
+                               src2=sgpr(mask, lsc), comment="OOB addr when rowBaseP >= rowExtent."))
+        module.add(BufferLoadB128(vgpr(bank, 4), vgpr(addr), sgpr(self.resSrd, 4), 0,
+                                  MUBUFModifiers(offen=True),
+                                  comment="raw dwordx4 = residual[pair 8 rows]."))
+        sgprPool.checkIn(mask)
+        vgprPool.checkIn(rowBaseP)
+        vgprPool.checkIn(col)
+        vgprPool.checkIn(addr)
+
+    def _loadRawNarrow(self, module, bank, mp, n):
+        """Eight scalar bf16, per-row clamp (MLIR 97-134).
+
+        Native order: bank[0..3] = tile m rows g*4+0..3, bank[4..7] = tile m1.
+        """
+        self._loadRawNarrowTile(module, bank, 0, 2 * mp, n)
+        self._loadRawNarrowTile(module, bank, 4, 2 * mp + 1, n)
+
+    def _loadRawNarrowTile(self, module, bank, slotBase, ti, n):
+        """Load one native tile's four bf16 rows into bank[slotBase .. slotBase+3]."""
+        vgprPool = self.writer.vgprPool
+        sgprPool = self.writer.sgprPool
+        lsc = self.laneSGPRCount
+        rowBaseT = vgprPool.checkOut(1, tag="rms_rowBaseT")
+        col      = vgprPool.checkOut(1, tag="rms_narrowCol")
+        row      = vgprPool.checkOut(1, tag="rms_narrowRow")
+        addr     = vgprPool.checkOut(1, tag="rms_narrowAddr")
+        # rowBaseT = rowOrigin + g4 + ti*16 (native-tile base row for this lane).
+        module.add(VAddU32(vgpr(rowBaseT), vgpr(self.rowOriginV), vgpr(self.g4V),
+                           comment="rowBaseT = rowOrigin + g4."))
+        module.add(VAddU32(vgpr(rowBaseT), vgpr(rowBaseT), ti * 16, comment=f"rowBaseT += ti*16 (ti={ti})."))
+        # col = colBase + n*16.
+        module.add(VAddU32(vgpr(col), vgpr(self.colBaseV), n * 16, comment=f"col = colBase + n*16 (n={n})."))
+        for k in range(4):
+            mask = sgprPool.checkOutAligned(lsc, lsc, tag="rms_narrowMask", preventOverflow=False)
+            module.add(VAddU32(vgpr(row), vgpr(rowBaseT), k, comment=f"row = rowBaseT + {k}."))
+            module.add(VCmpLtU32(dst=sgpr(mask, lsc), src0=vgpr(row), src1=sgpr("SizesFree+0"),
+                                 comment="inRange = row < rowExtent."))
+            module.add(VMulLOU32(dst=vgpr(addr), src0=sgpr("SizesFree+0"), src1=vgpr(col),
+                                 comment="addr = column * rowExtent."))
+            module.add(VAddU32(vgpr(addr), vgpr(addr), vgpr(row), comment="addr += row."))
+            module.add(VLShiftLeftB32(dst=vgpr(addr), shiftHex=hex(1), src=vgpr(addr),
+                                      comment="addr *= 2 (bf16 bytes)."))
+            module.add(VCndMaskB32(dst=vgpr(addr), src0=vgpr(self.oobV), src1=vgpr(addr),
+                                   src2=sgpr(mask, lsc), comment="OOB addr when row >= rowExtent."))
+            module.add(BufferLoadD16B16(vgpr(bank + slotBase + k), vgpr(addr), sgpr(self.resSrd, 4), 0,
+                                        MUBUFModifiers(offen=True), comment=f"raw bf16 = residual[row {k}]."))
+            sgprPool.checkIn(mask)
+        vgprPool.checkIn(rowBaseT)
+        vgprPool.checkIn(col)
+        vgprPool.checkIn(row)
+        vgprPool.checkIn(addr)
+
+    def _pairShuffle(self, module, bank):
+        """Cross-lane pair shuffle (WIDE only): tile-contiguous raw -> native.
+
+        Faithful port of @pair_shuffle (MLIR 144-158). Two involutive
+        permlane16_swap ops over the (g, g^1) lane pair. After: bank[0..3] =
+        native dwords [a0,a1,b0,b1] = [tileM r0,r1 | tileM r2,r3 |
+        tileM1 r0,r1 | tileM1 r2,r3].
+        """
+        module.add(VPermlane16SwapB32(dst=vgpr(bank + 0), src=vgpr(bank + 2),
+                                      comment="pair swap dword 0 <-> 2."))
+        module.add(VPermlane16SwapB32(dst=vgpr(bank + 1), src=vgpr(bank + 3),
+                                      comment="pair swap dword 1 <-> 3."))
+
+    def _residualToF32(self, module, bank, isX4):
+        """Expand the raw bf16 residual in ``bank`` to 8 native-order f32.
+
+        Faithful port of the ``%H8 = extf %native`` step (MLIR 352). WIDE unpacks
+        4 native packed dwords into 8 f32 high-index-first (so each packed source
+        dword is fully read before its low half is overwritten); NARROW converts
+        8 lo16 bf16 in place. Returns [bank+0 .. bank+7] in native f32 order
+        [tileM r0..3, tileM1 r0..3].
+        """
+        if isX4:
+            for i in range(7, -1, -1):
+                module.add(VCvtBF16toFP32(vgpr(bank + i), vgpr(bank + i // 2), None, i % 2,
+                                          comment=f"f32[{i}] = extf(dword {i // 2}, half {i % 2})."))
+        else:
+            for j in range(8):
+                module.add(VCvtBF16toFP32(vgpr(bank + j), vgpr(bank + j), None, 0,
+                                          comment=f"f32[{j}] = extf(lo16 bf16[{j}])."))
+        return [bank + j for j in range(8)]
