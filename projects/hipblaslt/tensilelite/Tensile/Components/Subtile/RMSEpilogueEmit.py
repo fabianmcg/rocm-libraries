@@ -94,9 +94,12 @@ from Tensile.Common.DataType import DataType
 from .SubtileMegaFusedEmit import (
     SubtileMegaFusedEmitter,
     RMSEpilogueGeometry,
+    _addImmU32,
     _buildBufferSrd,
     _convertGammaChunk,
     _convertGammaChunkBf16,
+    _free0RowPos,
+    _issueSideLoad,
     _useDwordx4Interior,
 )
 
@@ -139,6 +142,8 @@ class RMSEpilogueEmitter:
         self.vPermAddr = None
         self.pairLowerLaneMask = None
         self.pairUpperLaneMask = None
+        # Paired dwordx4 per-lane row origin; allocated by _computePairRowOff.
+        self.pairRowOff = None
         # Shared per-tile nhInRange predicate (tail-wide path only); None elsewhere.
         self.nhInRangeMask = None
         # Gamma DTL broadcast: two VGPRs and two SGPRs.
@@ -556,6 +561,127 @@ class RMSEpilogueEmitter:
         # Faithful MLIR paired dwordx4 wide path: bf16, non-MXFP8, rowsPerLane==4,
         # not partial-accum, and an even mmaM so (m, m+1) pairs are well-formed.
         return _useDwordx4Interior(self.geom) and self.geom.mmaM % 2 == 0
+
+    def _computeResidualRowByteBase(self, module, n) -> None:
+        """Compute self.resRowByteBase for column n (sets the attribute in place).
+
+        The result encodes token_n*N_hidden (plus wgRowBase+rowGroupOff when wide)
+        multiplied by residualBytes; subsequent tile loads add only the row offset.
+        """
+        module.addComment1(f"compute row byte base for residual (n={n}).")
+        nOff = self.geom.colOffset(n)
+        r = _addImmU32(module, self.resRowByteBase, self.resTokenBase, nOff, self.resAddr,
+                       f"token_n = tokenBase + {nOff} (n={n}).")
+        module.add(VMulLOU32(dst=vgpr(self.resRowByteBase), src0=sgpr("SizesFree+0"),
+                             src1=vgpr(r), comment="token_n * SizesFree0."))
+        if self.geom.useWideResidual:
+            module.add(VAddU32(vgpr(self.resRowByteBase), vgpr(self.resRowByteBase),
+                               vgpr(self.wgRowBase), comment="+ wgRowBase (fold row origin)."))
+            module.add(VAddU32(vgpr(self.resRowByteBase), vgpr(self.resRowByteBase),
+                               vgpr(self.rowGroupOff), comment="+ rowGroupOff (fold row origin)."))
+        module.add(VLShiftLeftB32(dst=vgpr(self.resRowByteBase),
+                                  shiftHex=hex(self.geom.residualLog2Bytes),
+                                  src=vgpr(self.resRowByteBase),
+                                  comment="rowByteBase * residualBytes (row origin folded when wide)."))
+
+    def _loadNativeTile(self, module, bank, bankSlot, m, n, mBaseV) -> None:
+        """Issue rpl clamped bf16 loads for one native tile into bank at bankSlot*rpl.
+
+        Assumes self.resRowByteBase is set for column n by _computeResidualRowByteBase.
+        """
+        rpl = self.geom.rowsPerLane
+        burstBase = bank + bankSlot * rpl
+        module.addComment1(f"issue native per-element residual loads for tile (m={m},n={n}).")
+        for k_irt in range(rpl):
+            module.addComment1(f"compute clamped residual byte address (m={m},k={k_irt}).")
+            _free0RowPos(module, self.resAddr, self.wgRowBase, self.rowGroupOff,
+                         m, k_irt, mBaseV, self.geom)
+            module.add(VCmpLtU32(dst=sgpr(self.resOobMask, self.geom.laneSgprCount),
+                                 src0=vgpr(self.resAddr), src1=sgpr("SizesFree+0"),
+                                 comment="inRange = nhidden_pos < N_hidden"))
+            module.add(VLShiftLeftB32(dst=vgpr(self.resAddr),
+                                      shiftHex=hex(self.geom.residualLog2Bytes),
+                                      src=vgpr(self.resAddr),
+                                      comment="nhiddenByte = nhidden_pos * residualBytes."))
+            module.add(VAddU32(vgpr(self.resAddr), vgpr(self.resAddr),
+                               vgpr(self.resRowByteBase),
+                               comment="byteAddr = rowByteBase + nhiddenByte"))
+            module.add(VCndMaskB32(dst=vgpr(self.resAddr), src0=vgpr(self.resOobV),
+                                   src1=vgpr(self.resAddr),
+                                   src2=sgpr(self.resOobMask, self.geom.laneSgprCount),
+                                   comment="clamp OOB when nhidden_pos >= N_hidden"))
+            _issueSideLoad(module, burstBase + k_irt, self.resAddr, self.resSrd,
+                           f"R[m={m},n={n},k={k_irt}].", dtype=self.geom.residualType)
+
+    def _computePairRowOff(self, module) -> None:
+        """Allocate self.pairRowOff and compute (g&1)*16 + (g>>1)*8 per lane.
+
+        pairRowOff is the per-lane paired row origin for the interior dwordx4 path;
+        it converts the 8-contiguous-rows raw layout produced by the wide load to
+        the native per-lane accumulator layout.
+        """
+        module.addComment1("compute pairRowOff = (g&1)*16 + (g>>1)*8 (paired dwordx4 row origin).")
+        self.pairRowOff = self.writer.vgprPool.checkOut(1, tag="mf_pairRowOff")
+        tmp = self.writer.vgprPool.checkOut(1, tag="mf_pairRowOffTmp")
+        module.add(VAndB32(dst=vgpr(tmp), src0=vgpr(self.rowGroup), src1=1, comment="g & 1."))
+        module.add(VLShiftLeftB32(dst=vgpr(tmp), shiftHex=hex(4), src=vgpr(tmp),
+                                  comment="(g&1) << 4 = tileSel*16."))
+        module.add(VLShiftRightB32(dst=vgpr(self.pairRowOff), shiftHex=hex(1),
+                                   src=vgpr(self.rowGroup), comment="g >> 1."))
+        module.add(VLShiftLeftB32(dst=vgpr(self.pairRowOff), shiftHex=hex(3),
+                                  src=vgpr(self.pairRowOff), comment="(g>>1) << 3 = half*8."))
+        module.add(VAddU32(vgpr(self.pairRowOff), vgpr(self.pairRowOff), vgpr(tmp),
+                           comment="pairRowOff = tileSel*16 + half*8."))
+        self.writer.vgprPool.checkIn(tmp)
+
+    def _computeResidualRowByteBaseP(self, module, n) -> None:
+        """Compute self.resRowByteBase for column n using pairRowOff instead of rowGroupOff.
+
+        Identical to _computeResidualRowByteBase except that the wide-residual fold
+        adds pairRowOff (paired row origin) rather than rowGroupOff; used by the
+        interior paired dwordx4 path.
+        """
+        module.addComment1(f"compute paired row byte base for residual (n={n}).")
+        nOff = self.geom.colOffset(n)
+        r = _addImmU32(module, self.resRowByteBase, self.resTokenBase, nOff, self.resAddr,
+                       f"token_n = tokenBase + {nOff} (n={n}).")
+        module.add(VMulLOU32(dst=vgpr(self.resRowByteBase), src0=sgpr("SizesFree+0"),
+                             src1=vgpr(r), comment="token_n * SizesFree0."))
+        if self.geom.useWideResidual:
+            module.add(VAddU32(vgpr(self.resRowByteBase), vgpr(self.resRowByteBase),
+                               vgpr(self.wgRowBase), comment="+ wgRowBase (fold row origin)."))
+            module.add(VAddU32(vgpr(self.resRowByteBase), vgpr(self.resRowByteBase),
+                               vgpr(self.pairRowOff), comment="+ pairRowOff (fold paired row origin)."))
+        module.add(VLShiftLeftB32(dst=vgpr(self.resRowByteBase),
+                                  shiftHex=hex(self.geom.residualLog2Bytes),
+                                  src=vgpr(self.resRowByteBase),
+                                  comment="rowByteBase * residualBytes (paired row origin folded when wide)."))
+
+    def _loadRaw(self, module, bank, mp, n, pathInterior) -> None:
+        """Issue residual loads for pair mp (tiles m=2*mp and m1=2*mp+1) into bank.
+
+        pathInterior=True: one 64-lane paired dwordx4 load, no per-row clamp.
+        pathInterior=False: two native per-row-clamped load series (tail path).
+        The caller applies _pairShuffle after this call for the interior path only;
+        this method issues loads only and performs no computation.
+        """
+        m = 2 * mp
+        m1 = 2 * mp + 1
+        if pathInterior:
+            self._computeResidualRowByteBaseP(module, n)
+            rowOff = m * self.geom.tileStrideM * self.geom.residualBytes
+            assert rowOff < 4096, \
+                f"paired dwordx4 load offset {rowOff} exceeds MUBUF offset12 range"
+            module.add(BufferLoadB128(
+                vgpr(bank, 4), vgpr(self.resRowByteBase), sgpr(self.resSrd, 4), 0,
+                MUBUFModifiers(offen=True, offset12=rowOff),
+                comment=f"R paired dwordx4 (mp={mp},n={n}) off={rowOff}: 8 bf16, 64 lanes, raw."))
+            return
+        self._computeResidualRowByteBase(module, n)
+        mBaseV = self.writer.vgprPool.checkOut(1, tag="mf_loadRawMBase")
+        self._loadNativeTile(module, bank, 0, m, n, mBaseV)
+        self._loadNativeTile(module, bank, 1, m1, n, mBaseV)
+        self.writer.vgprPool.checkIn(mBaseV)
 
     def emit(self, vgprTiles):
         return self._delegate.emit(vgprTiles)
