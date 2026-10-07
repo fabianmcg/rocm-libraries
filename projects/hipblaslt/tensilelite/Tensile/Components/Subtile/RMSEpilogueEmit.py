@@ -20,6 +20,7 @@ from rocisa.instruction import (
     BufferLoadD16B16,
     BufferStoreB16,
     BufferStoreB128,
+    DSBPermuteB32,
     DSLoadB64,
     DSStoreB16,
     SAddU32,
@@ -46,6 +47,7 @@ from rocisa.instruction import (
     VMulLOU32,
     VPermlane16SwapB32,
     VReadfirstlaneB32,
+    VXorB32,
 )
 
 
@@ -774,6 +776,42 @@ class RMSEpilogueEmitter:
         vgprPool.checkIn(accStage)
         vgprPool.checkIn(resBank)
         # TODO(F7): reduction (combine_rowgroups + cross-wave + partial write) consumes/frees ssqAcc.
+
+    def _combineRowGroups(self, module, ssqAccBase):
+        """Intra-wave row-group XOR butterfly over ssqAcc (no LDS).
+
+        Faithful port of @combine_rowgroups (@mega_fused_epilogue 226-239) and
+        its per-column use (402-406). Each ssqAcc[n] holds this lane's per-row-
+        group partial sum of H^2; a 2-round XOR butterfly over the
+        waveSize//mfmaN = 4 row-groups (g = lane>>4) folds them so every lane
+        ends with the wavefront-complete partial for its column. Rounds XOR the
+        lane with bit 4 (16) then bit 5 (32); ds_bpermute gathers the partner
+        lane's running sum, which is then added.
+        """
+        module.addComment0("intra-wave row-group XOR butterfly over ssqAcc (no LDS).")
+        vgprPool = self.writer.vgprPool
+        numRounds = int(math.log2(self.waveSize // self.mfmaN))
+        # Precompute the two partner byte-addresses (independent of n).
+        addrs = []
+        for r in range(numRounds):
+            xorVal = self.mfmaN << r
+            a = vgprPool.checkOut(1, tag=f"rms_bpAddr{r}")
+            module.add(VXorB32(dst=vgpr(a), src0=vgpr(self.laneV), src1=xorVal,
+                               comment=f"partner = lane ^ {xorVal}."))
+            module.add(VLShiftLeftB32(dst=vgpr(a), shiftHex=hex(2), src=vgpr(a),
+                                      comment="byteAddr = partner * 4."))
+            addrs.append(a)
+        tmp = vgprPool.checkOut(1, tag="rms_bpTmp")
+        for n in range(self.T_N):
+            for r in range(numRounds):
+                module.add(DSBPermuteB32(vgpr(tmp), vgpr(addrs[r]), vgpr(ssqAccBase + n),
+                                         comment=f"fetch partner ssqAcc[{n}] (round {r})."))
+                module.add(SWaitCnt(dscnt=0, comment="wait ds_bpermute."))
+                module.add(VAddF32(dst=vgpr(ssqAccBase + n), src0=vgpr(ssqAccBase + n),
+                                   src1=vgpr(tmp), comment=f"ssqAcc[{n}] += partner."))
+        vgprPool.checkIn(tmp)
+        for a in reversed(addrs):
+            vgprPool.checkIn(a)
 
     def _computePair(self, module, vgprTiles, residualF32, accStage, g8Bank,
                      ssqAccBase, mp, n, isX4):
