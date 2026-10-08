@@ -62,7 +62,8 @@ from Tensile.SolutionStructs.LdsPadding import get_fp4_mt_config, get_fp8_mt_con
                                                get_fp16_valid_blocks, get_fp32_valid_blocks, \
                                                MXS_LDS_BLOCK_BYTES, MXS_LDS_PAD_BYTES
 from Tensile.Common.GlobalParameters import defaultSolution, \
-                                            defaultInternalSupportParams
+                                            defaultInternalSupportParams, \
+                                            globalParameters
 from Tensile.Common.ValidParameters import validParameters, \
                                             _getExpectedTypes, \
                                             _expectedParamTypes, \
@@ -394,6 +395,22 @@ def _validateRMSEpilogue(state, printRejectionReason):
   if not state["UseSubtileImpl"]:
     reject(state, printRejectionReason,
            "RMSEpilogue requires UseSubtileImpl=True; non-subtile (CMS) RMSEpilogue is not supported")
+    return
+  # The native (non-delegated) RMS epilogue owns the write: it stores D = H*gamma
+  # directly and skips GlobalWriteBatch, so it never applies alpha. The validation
+  # reference applies alpha, so a native-path config is only correct at alpha == 1.
+  # Reject native-eligible configs (Subtile bf16-dest with even tile-M; Subtile is
+  # already enforced above) when the alpha data-init is not 1 (DataInitName.One).
+  # MXFP8 (float8 dest) and odd-tile-M configs fall back to the old GlobalWriteBatch
+  # path, which applies alpha and is unaffected. Mirrors the native-path gate in
+  # KernelWriterAssembly._nativeRmsEpilogueActive (tM = (MacroTile0 // 16) // wg0).
+  destType = state["ProblemType"]["DestDataType"]
+  tM = (state["MacroTile0"] // 16) // state["MIWaveGroup"][0]
+  if destType.isBFloat16() and tM % 2 == 0 and \
+     globalParameters.get("DataInitTypeAlpha", 1) != 1:
+    reject(state, printRejectionReason,
+           "native RMSEpilogue path does not apply alpha; requires "
+           "DataInitTypeAlpha == 1 (DataInitName.One)")
     return
   if not _resolveRMSGammaType(state, printRejectionReason):
     return
