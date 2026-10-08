@@ -42,7 +42,6 @@ from rocisa.instruction import (
     SSubU32,
     SWaitCnt,
     VAccvgprReadB32,
-    VAccvgprWriteB32,
     VAddF32,
     VAddPKF32,
     VAddU32,
@@ -1241,17 +1240,6 @@ class RMSEpilogueEmitter:
         self._storeResidualOut(module, residualF32, mp, n, isX4,
                                self.dOutSrd, self.dStrideSgpr, self.colBaseDV)
 
-        # ---- Step 7: D writeback to the accumulator register file ----
-        for j in range(8):
-            tileIdx = 2 * mp if j < 4 else 2 * mp + 1
-            k = j % 4
-            tile = vgprTiles[n * self.T_M + tileIdx]
-            reg = tile.regList.indices[k]
-            sk = residualF32[j]
-            if tile.regList.pool == self.writer.vgprPool:
-                if sk != reg:
-                    module.add(VMovB32(dst=vgpr(reg), src=vgpr(sk),
-                                       comment=f"write D back to acc (mp={mp},n={n},j={j})."))
-                continue
-            module.add(VAccvgprWriteB32(accvgpr(reg), vgpr(sk),
-                                        comment=f"write D back to acc (mp={mp},n={n},j={j})."))
+        # D is stored directly to SrdD in Step 6b and GlobalWriteBatch is skipped on
+        # the native path, so there is no downstream accumulator reader: the former
+        # Step 7 writeback of D into the acc/C-tile registers is dead and removed.
