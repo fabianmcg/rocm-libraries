@@ -1071,30 +1071,35 @@ class RMSEpilogueEmitter:
                                        comment="exec = writer lanes."))
             strideBytes = 64 * 4   # waveLdsStride = 64 elements (M-fastest: consecutive waveIds are the G_M siblings).
             rowSum = vgprPool.checkOut(1, tag="rms_pwRowSum")
-            tmp = vgprPool.checkOut(1, tag="rms_pwTmp")
+            slots = [vgprPool.checkOut(1, tag=f"rms_pwSlot{wm}") for wm in range(self.G_M)]
             colV = vgprPool.checkOut(1, tag="rms_pwCol")
             addrV = vgprPool.checkOut(1, tag="rms_pwAddr")
             colMask = sgprPool.checkOutAligned(lsc, lsc, tag="rms_pwColMask", preventOverflow=False)
             for n in range(self.T_N):
+                # Issue all G_M sibling-wave reads first, then drain with staggered
+                # lgkmcnt so each add fires as its read retires (ref BB_6).
                 for wm in range(self.G_M):
                     off = n * 256 * 4 + wm * strideBytes
                     assert off < 65536, "lds ds offset exceeds 16-bit; fold into the address vgpr"
-                    module.add(DSLoadB32(dst=vgpr(tmp), src=vgpr(tidX4),
+                    module.add(DSLoadB32(dst=vgpr(slots[wm]), src=vgpr(tidX4),
                                          ds=DSModifiers(offset=off),
                                          comment=f"lds sibling wave {wm}, col {n}."))
-                    module.add(SWaitCnt(dscnt=0, comment="wait lds read."))
+                for wm in range(self.G_M):
+                    module.add(SWaitCnt(dscnt=self.G_M - 1 - wm,
+                                        comment=f"drain to {self.G_M - 1 - wm} outstanding lds reads."))
                     if wm == 0:
-                        module.add(VMovB32(dst=vgpr(rowSum), src=vgpr(tmp),
+                        module.add(VMovB32(dst=vgpr(rowSum), src=vgpr(slots[0]),
                                            comment="rowSum = wave0 partial."))
                     else:
-                        module.add(VAddF32(dst=vgpr(rowSum), src0=vgpr(rowSum), src1=vgpr(tmp),
+                        module.add(VAddF32(dst=vgpr(rowSum), src0=vgpr(rowSum), src1=vgpr(slots[wm]),
                                            comment=f"rowSum += wave{wm} partial."))
                 self._storePartialColumn(module, rowSum, n, ntV, partialSrd, colV, addrV, colMask)
             module.add(SWaitCnt(vscnt=0, comment="drain partialBuf stores."))
             module.add(SMovB64(dst=EXEC(), src=sgpr(savedExec, lsc), comment="restore exec."))
             vgprPool.checkIn(addrV)
             vgprPool.checkIn(colV)
-            vgprPool.checkIn(tmp)
+            for wm in reversed(range(self.G_M)):
+                vgprPool.checkIn(slots[wm])
             vgprPool.checkIn(rowSum)
             vgprPool.checkIn(tidX4)
             sgprPool.checkIn(colMask)
