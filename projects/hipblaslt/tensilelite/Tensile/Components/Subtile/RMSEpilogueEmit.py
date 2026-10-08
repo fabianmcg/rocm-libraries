@@ -57,6 +57,7 @@ from rocisa.instruction import (
     VMulF32,
     VMulLOU32,
     VMulPKF32,
+    VNop,
     VOrB32,
     VPermlane16SwapB32,
     VReadfirstlaneB32,
@@ -1221,24 +1222,26 @@ class RMSEpilogueEmitter:
                            comment=f"ssqAcc[{n}] += s."))
         vgprPool.checkIn(sq)
 
-        # ---- Step 4: residualOut store (H pre-gamma, MLIR 389-392) ----
-        self._storeResidualOut(module, residualF32, mp, n, isX4,
-                               self.residualOutSrd, "SizesFree+0", self.colBaseV)
-
-        # ---- Step 5: gamma read (MLIR 353-371) ----
+        # ---- Step 5: gamma read (MLIR 353-371), before the stores ----
         self._readGammaLds(module, g8Bank, mp)
 
-        # ---- Step 6: D = H * gamma (in place, MLIR 372) ----
-        # residualF32 and g8Bank are both contiguous even-aligned -> all packed.
-        self._pkMulPairs(module, residualF32[0], residualF32[0], g8Bank,
-                         "Dout = H8 * gamma")
+        # ---- Step 6: D = H8 * gamma into a SEPARATE bank (MLIR 372). Computing out
+        # of place keeps residualF32 = H8 live so the residual store below still
+        # writes H (the reference keeps %native and %Dout both live).
+        dBank = vgprPool.checkOutAligned(8, 2, tag="rms_dBank")
+        self._pkMulPairs(module, dBank, residualF32[0], g8Bank, "Dout = H8 * gamma")
 
-        # ---- Step 6b: D store (H*gamma) directly to the D output buffer (SrdD). ----
-        # Matches the reference's second store per pair; residual (Step 4) is stored
-        # first, then D here. bf16 pack via VCvtPkF32toBF16, column stride = StrideD1,
-        # row clamp still vs SizesFree0 (M).
+        # ---- Steps 4 + 6b: both stores issued back-to-back after H*gamma (residual
+        # H8 first, then D), matching the @mega_fused_body schedule (MLIR 389-392). ----
         self._storeResidualOut(module, residualF32, mp, n, isX4,
+                               self.residualOutSrd, "SizesFree+0", self.colBaseV)
+        # WAR hazard: the residual store's dwordx4 reads its bf16 pack registers, and
+        # the D store reuses the same pack bank. Let the store's source read drain
+        # before the D pack overwrites it (the reference spaces these with two nops).
+        module.add(VNop(2, comment="WAR: drain residual store pack read before D pack reuses it."))
+        self._storeResidualOut(module, [dBank + j for j in range(8)], mp, n, isX4,
                                self.dOutSrd, self.dStrideSgpr, self.colBaseDV)
+        vgprPool.checkIn(dBank)
 
         # D is stored directly to SrdD in Step 6b and GlobalWriteBatch is skipped on
         # the native path, so there is no downstream accumulator reader: the former
