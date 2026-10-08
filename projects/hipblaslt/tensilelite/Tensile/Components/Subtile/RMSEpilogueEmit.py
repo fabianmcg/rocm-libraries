@@ -39,6 +39,7 @@ from rocisa.instruction import (
     SMulHIU32,
     SMulI32,
     SNop,
+    SSubU32,
     SWaitCnt,
     VAccvgprReadB32,
     VAccvgprWriteB32,
@@ -115,11 +116,15 @@ class RMSEpilogueEmitter:
         self.colOriginV = None
         # Residual-load address constants (allocated in _computeAddrConstants).
         self.colBaseV = None
+        # Tile-relative D column base (no WG1*MT1; SrdD already folds it).
+        self.colBaseDV = None
         self.pairRowOffV = None
         self.g4V = None
         self.oobV = None
         self.resSrd = None
         self.residualOutSrd = None
+        self.dOutSrd = None
+        self.dStrideSgpr = None
         self.gammaSrd = None
         # Byte offset of the flat gamma LDS buffer (set in _emitGammaPrefetch).
         self.gammaLdsBase = None
@@ -129,8 +134,13 @@ class RMSEpilogueEmitter:
         self.gammaReadBaseV = None
 
     def _nativeEligible(self):
-        return (not self.useMxfp8 and not self.interleaved
-                and self.rowsPerLane == 4 and self.T_M % 2 == 0)
+        # The native RMS epilogue is gamma-only by design: it stores D = H*gamma
+        # directly and skips GlobalWriteBatch, so it does NOT apply alpha or beta*C,
+        # bias, activation, scales, E, or amaxD (GlobalWriteBatch normally does). Only
+        # alpha==1 and beta==0 configs using none of those features are valid here.
+        # Delegate to the writer's authoritative gate so the store-skip predicate and
+        # this emitter never drift (rowsPerLane is the only emitter-local extra check).
+        return self.rowsPerLane == 4 and self.writer._nativeRmsEpilogueActive(self.kernel)
 
     def emit(self, vgprTiles):
         if self._nativeEligible():
@@ -181,7 +191,7 @@ class RMSEpilogueEmitter:
         vgprPool = self.writer.vgprPool
         sgprPool = self.writer.sgprPool
         for attr in ("laneV", "cV", "gV", "waveIdV", "waveMV", "waveNV",
-                     "rowOriginV", "colOriginV", "colBaseV", "pairRowOffV",
+                     "rowOriginV", "colOriginV", "colBaseV", "colBaseDV", "pairRowOffV",
                      "g4V", "oobV", "gammaReadBaseV"):
             vgprPool.checkIn(getattr(self, attr))
             setattr(self, attr, None)
@@ -263,6 +273,10 @@ class RMSEpilogueEmitter:
         self.gammaSrd = sgprPool.checkOutAligned(4, 4, tag="rms_gammaSrd", preventOverflow=False)
         # ResidualOut aliases the (beta=0 unused) SrdC named SGPR.
         self.residualOutSrd = self.writer.sgprs["SrdResidualOut"]
+        # D output SRD is already built (batch offset folded) and live here; reuse it.
+        self.dOutSrd = self.writer.sgprs["SrdD"]
+        self.dStrideSgpr = "StrideD" + self.writer.states.indexChars[self.kernel["PackedC1IndicesX"][0]]
+        self._boundDOutSrdRecords(module)
         self._buildResidualSrd(module, self.resSrd, "ResidualBuf", "residual")
         self._buildResidualSrd(module, self.residualOutSrd, "AddressResidualOut", "residualOut")
         self._buildGammaSrd(module, self.gammaSrd)
@@ -276,6 +290,25 @@ class RMSEpilogueEmitter:
         module.add(SLShiftLeftB32(dst=sgpr(srd + 2), src=sgpr(srd + 2), shiftHex=hex(1),
                                   comment="numRecords *= 2 (bf16)."))
         module.add(SMovB32(dst=sgpr(srd + 3), src="Srd127_96", comment=f"{name} SRD flags."))
+
+    def _boundDOutSrdRecords(self, module):
+        """Bound the reused D SRD to this workgroup's valid column span.
+
+        SrdD's base folds WG1*MT1 columns but its numRecords is left unbounded
+        (BufferOOB). The native D store only clamps rows, so a partial-N tile would
+        write columns past N into a neighbour row. Mirror the residual SRD's bound
+        (column-major: validCols * rowExtent * bpe) so overflow stores are dropped.
+        """
+        module.addComment1("bound D SRD numRecords to valid columns (SrdD base folds WG1*MT1).")
+        with self.writer.allocTmpSgpr(1, tag="rms_dRecords") as t:
+            module.add(SMulI32(dst=sgpr(t.idx), src0=self.MT1, src1=sgpr("WorkGroup1"),
+                               comment="colFolded = WorkGroup1 * MT1 (already in SrdD base)."))
+            module.add(SSubU32(dst=sgpr(t.idx), src0=sgpr("SizesFree+1"), src1=sgpr(t.idx),
+                               comment="validCols = SizesFree1 - colFolded."))
+            module.add(SMulI32(dst=sgpr(t.idx), src0=sgpr(t.idx), src1=sgpr("SizesFree+0"),
+                               comment="records = validCols * rowExtent."))
+            module.add(SLShiftLeftB32(dst=sgpr(self.dOutSrd + 2), src=sgpr(t.idx), shiftHex=hex(1),
+                                      comment="SrdD numRecords = records * 2 (bf16)."))
 
     def _buildGammaSrd(self, module, srd):
         """Build the gamma SRD: numRecords = SizesFree0 * 2 (bf16, one per row)."""
@@ -502,13 +535,24 @@ class RMSEpilogueEmitter:
         """
         vgprPool = self.writer.vgprPool
         self.colBaseV    = vgprPool.checkOut(1, tag="rms_colBase")
+        self.colBaseDV   = vgprPool.checkOut(1, tag="rms_colBaseD")
         self.pairRowOffV = vgprPool.checkOut(1, tag="rms_pairRowOff")
         self.g4V         = vgprPool.checkOut(1, tag="rms_g4")
         self.oobV        = vgprPool.checkOut(1, tag="rms_oob")
-        module.addComment1("residual load constants: colBase, pairRowOff, g4, oob.")
+        module.addComment1("residual load constants: colBase, colBaseD, pairRowOff, g4, oob.")
         # colBase = colOrigin + c (the lane's column within the wave tile).
         module.add(VAddU32(vgpr(self.colBaseV), vgpr(self.colOriginV), vgpr(self.cV),
                            comment="colBase = colOrigin + c."))
+        # colBaseD = waveN*(T_N*16) + c: tile-relative (SrdD folds WG1*MT1, so the
+        # D store must NOT re-add it, unlike the residual store's global colBase).
+        cwSpanN = self.T_N * 16
+        tmpColD = vgprPool.checkOut(1, tag="rms_colBaseDTmp")
+        module.add(VMovB32(dst=vgpr(tmpColD), src=cwSpanN, comment=f"T_N*16={cwSpanN}."))
+        module.add(VMulLOU32(dst=vgpr(self.colBaseDV), src0=vgpr(tmpColD), src1=vgpr(self.waveNV),
+                             comment="colBaseD = waveN * (T_N*16)."))
+        vgprPool.checkIn(tmpColD)
+        module.add(VAddU32(vgpr(self.colBaseDV), vgpr(self.colBaseDV), vgpr(self.cV),
+                           comment="colBaseD = waveN*(T_N*16) + c (tile-relative; SrdD folds WG1*MT1)."))
         # pairRowOff = (g&1)*16 + (g>>1)*8: tileSel*16 + half*8.
         tmpV = vgprPool.checkOut(1, tag="rms_pairRowTmp")
         module.add(VAndB32(dst=vgpr(tmpV), src0=vgpr(self.gV), src1=1, comment="tileSel = g & 1."))
@@ -712,20 +756,25 @@ class RMSEpilogueEmitter:
                                       comment=f"tile m+1 gamma f32[{i}] = extf(dword {i // 2}, half {i % 2})."))
         vgprPool.checkIn(gldsAddr)
 
-    def _storeResidualOut(self, module, hRegs, mp, n, isX4):
-        """Store bf16(H) for pair ``mp``, column-tile ``n`` to the ResidualOut SRD.
+    def _storeResidualOut(self, module, hRegs, mp, n, isX4, srd, colStride, colBase):
+        """Store bf16(H) for pair ``mp``, column-tile ``n`` to the given SRD.
 
-        Faithful port of @store_data (MLIR 166-218) targeting the residual
-        stream. ``hRegs`` lists the 8 native-order f32 H VGPRs. WIDE packs,
-        pair-shuffles, and issues one dwordx4; NARROW issues eight per-row
-        clamped bf16 stores. Addressing mirrors the residual load (@load_raw).
+        Faithful port of @store_data (MLIR 166-218). ``hRegs`` lists the 8
+        native-order f32 H VGPRs. WIDE packs, pair-shuffles, and issues one
+        dwordx4; NARROW issues eight per-row clamped bf16 stores. Addressing
+        mirrors the residual load (@load_raw). ``srd`` is the SGPR name for the
+        4-sgpr buffer descriptor; ``colStride`` is the SGPR name for the column
+        leading-dimension stride (use "SizesFree+0" for the residual stream,
+        self.dStrideSgpr for the D stream). ``colBase`` is the column-base VGPR:
+        the GLOBAL self.colBaseV for the residual stream, the tile-relative
+        self.colBaseDV for the D stream (SrdD already folds WG1*MT1).
         """
         if isX4:
-            self._storeResidualOutWide(module, hRegs, mp, n)
+            self._storeResidualOutWide(module, hRegs, mp, n, srd, colStride, colBase)
         else:
-            self._storeResidualOutNarrow(module, hRegs, mp, n)
+            self._storeResidualOutNarrow(module, hRegs, mp, n, srd, colStride, colBase)
 
-    def _storeResidualOutWide(self, module, hRegs, mp, n):
+    def _storeResidualOutWide(self, module, hRegs, mp, n, srd, colStride, colBase):
         """Pack 8 f32 -> 4 bf16 dwords, pair-shuffle, one dwordx4 store (MLIR 173-178)."""
         vgprPool = self.writer.vgprPool
         sgprPool = self.writer.sgprPool
@@ -744,8 +793,8 @@ class RMSEpilogueEmitter:
         module.add(VAddU32(vgpr(rowBaseP), vgpr(self.rowOriginV), vgpr(self.pairRowOffV),
                            comment="rowBaseP = rowOrigin + pairRowOff."))
         self._vaddImm(module, rowBaseP, rowBaseP, m * 16, f"rowBaseP += m*16 (m={m}).")
-        self._vaddImm(module, col, self.colBaseV, n * 16, f"col = colBase + n*16 (n={n}).")
-        module.add(VMulLOU32(dst=vgpr(addr), src0=sgpr("SizesFree+0"), src1=vgpr(col),
+        self._vaddImm(module, col, colBase, n * 16, f"col = colBase + n*16 (n={n}).")
+        module.add(VMulLOU32(dst=vgpr(addr), src0=sgpr(colStride), src1=vgpr(col),
                              comment="addr = column * rowExtent."))
         module.add(VAddU32(vgpr(addr), vgpr(addr), vgpr(rowBaseP), comment="addr += rowBaseP."))
         module.add(VLShiftLeftB32(dst=vgpr(addr), shiftHex=hex(1), src=vgpr(addr),
@@ -756,21 +805,21 @@ class RMSEpilogueEmitter:
         module.add(VCndMaskB32(dst=vgpr(addr), src0=vgpr(self.oobV), src1=vgpr(addr),
                                src2=sgpr(mask, lsc), comment="OOB addr when rowBaseP >= rowExtent."))
         module.add(BufferStoreB128(src=vgpr(vPack, 4), vaddr=vgpr(addr),
-                                   saddr=sgpr(self.residualOutSrd, 4), soffset=0,
+                                   saddr=sgpr(srd, 4), soffset=0,
                                    mubuf=MUBUFModifiers(offen=True),
-                                   comment="store dwordx4 = residualOut[pair 8 rows]."))
+                                   comment="store dwordx4 bf16 -> output buffer."))
         sgprPool.checkIn(mask)
         vgprPool.checkIn(rowBaseP)
         vgprPool.checkIn(col)
         vgprPool.checkIn(addr)
         vgprPool.checkIn(vPack)
 
-    def _storeResidualOutNarrow(self, module, hRegs, mp, n):
+    def _storeResidualOutNarrow(self, module, hRegs, mp, n, srd, colStride, colBase):
         """Eight per-row clamped bf16 stores, one per native tile (MLIR 179-216)."""
-        self._storeResidualOutNarrowTile(module, hRegs, 0, 2 * mp, n)
-        self._storeResidualOutNarrowTile(module, hRegs, 4, 2 * mp + 1, n)
+        self._storeResidualOutNarrowTile(module, hRegs, 0, 2 * mp, n, srd, colStride, colBase)
+        self._storeResidualOutNarrowTile(module, hRegs, 4, 2 * mp + 1, n, srd, colStride, colBase)
 
-    def _storeResidualOutNarrowTile(self, module, hRegs, slotBase, ti, n):
+    def _storeResidualOutNarrowTile(self, module, hRegs, slotBase, ti, n, srd, colStride, colBase):
         """Store one native tile's four bf16 H rows, per-row clamped."""
         vgprPool = self.writer.vgprPool
         sgprPool = self.writer.sgprPool
@@ -783,14 +832,14 @@ class RMSEpilogueEmitter:
         module.add(VAddU32(vgpr(rowBaseT), vgpr(self.rowOriginV), vgpr(self.g4V),
                            comment="rowBaseT = rowOrigin + g4."))
         self._vaddImm(module, rowBaseT, rowBaseT, ti * 16, f"rowBaseT += ti*16 (ti={ti}).")
-        self._vaddImm(module, col, self.colBaseV, n * 16, f"col = colBase + n*16 (n={n}).")
+        self._vaddImm(module, col, colBase, n * 16, f"col = colBase + n*16 (n={n}).")
         for k in range(4):
             mask = sgprPool.checkOutAligned(lsc, lsc, tag="rms_resStoreMaskN", preventOverflow=False)
             module.add(VAddU32(vgpr(row), vgpr(rowBaseT), k, comment=f"row = rowBaseT + {k}."))
             module.add(VCmpLtU32(dst=sgpr(mask, lsc), src0=vgpr(row), src1=sgpr("SizesFree+0"),
                                  comment="inRange = row < rowExtent."))
-            module.add(VMulLOU32(dst=vgpr(addr), src0=sgpr("SizesFree+0"), src1=vgpr(col),
-                                 comment="addr = column * rowExtent."))
+            module.add(VMulLOU32(dst=vgpr(addr), src0=sgpr(colStride), src1=vgpr(col),
+                                 comment="addr = column * colStride."))
             module.add(VAddU32(vgpr(addr), vgpr(addr), vgpr(row), comment="addr += row."))
             module.add(VLShiftLeftB32(dst=vgpr(addr), shiftHex=hex(1), src=vgpr(addr),
                                       comment="addr *= 2 (bf16 bytes)."))
@@ -800,7 +849,7 @@ class RMSEpilogueEmitter:
                                        src1=vgpr(hRegs[slotBase + k]),
                                        comment=f"val = bf16(H[{slotBase + k}])."))
             module.add(BufferStoreB16(src=vgpr(val), vaddr=vgpr(addr),
-                                      saddr=sgpr(self.residualOutSrd, 4), soffset=0,
+                                      saddr=sgpr(srd, 4), soffset=0,
                                       mubuf=MUBUFModifiers(offen=True),
                                       comment=f"store bf16 = residualOut[row {k}]."))
             sgprPool.checkIn(mask)
@@ -820,14 +869,11 @@ class RMSEpilogueEmitter:
         cannot overwrite a bank until every consume of this group has finished in
         program order (no WAR hazard on the ring).
 
-        Per-pair vmem = 1 load + 1 store (OUR kernel stores only residualOut; D =
-        H*gamma is a register writeback, not a store). gfx950 has a single
-        combined vmcnt (loads+stores, FIFO). When consume ``d`` runs, the vmem ops
-        issued after its load[grp+d] but still outstanding are (P-1-d) remaining
-        prefetch loads plus d stores from earlier consumes this group = P-1, a
-        constant. So every consume waits s_waitcnt vmcnt(P-1). This legitimately
-        differs from the write-only reference sandbox (two stores per pair -> its
-        vmcnt(1)/vmcnt(2) pattern); we have one store, so vmcnt(P-1).
+        Per-pair vmem = 1 load + 2 stores (residualOut store, then D store). gfx950
+        has a single combined vmcnt (loads+stores, FIFO). The wait is deliberately
+        kept at the conservative constant vmcnt(P-1) in this milestone; over-waiting
+        is always correctness-safe. The tighter vmcnt(P-1+d) schedule that accounts
+        for the extra D store per pair is a later milestone cleanup.
         """
         P = self.PREFETCH
         module.addComment0(f"MegaFused body (PREFETCH={P}, isX4={isX4}).")
@@ -1174,7 +1220,8 @@ class RMSEpilogueEmitter:
         vgprPool.checkIn(sq)
 
         # ---- Step 4: residualOut store (H pre-gamma, MLIR 389-392) ----
-        self._storeResidualOut(module, residualF32, mp, n, isX4)
+        self._storeResidualOut(module, residualF32, mp, n, isX4,
+                               self.residualOutSrd, "SizesFree+0", self.colBaseV)
 
         # ---- Step 5: gamma read (MLIR 353-371) ----
         self._readGammaLds(module, g8Bank, mp)
@@ -1183,6 +1230,13 @@ class RMSEpilogueEmitter:
         # residualF32 and g8Bank are both contiguous even-aligned -> all packed.
         self._pkMulPairs(module, residualF32[0], residualF32[0], g8Bank,
                          "Dout = H8 * gamma")
+
+        # ---- Step 6b: D store (H*gamma) directly to the D output buffer (SrdD). ----
+        # Matches the reference's second store per pair; residual (Step 4) is stored
+        # first, then D here. bf16 pack via VCvtPkF32toBF16, column stride = StrideD1,
+        # row clamp still vs SizesFree0 (M).
+        self._storeResidualOut(module, residualF32, mp, n, isX4,
+                               self.dOutSrd, self.dStrideSgpr, self.colBaseDV)
 
         # ---- Step 7: D writeback to the accumulator register file ----
         for j in range(8):

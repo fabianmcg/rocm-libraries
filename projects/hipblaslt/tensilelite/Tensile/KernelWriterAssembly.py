@@ -16141,6 +16141,57 @@ class KernelWriterAssembly(KernelWriter):
         tiles[t] = tileInfo
     return tiles
 
+  def _nativeRmsEpilogueActive(self, kernel):
+    """Single authoritative gate for the native (non-delegated) RMS epilogue path.
+
+    The native RMS epilogue is gamma-only by design: it stores D = H*gamma directly
+    and skips GlobalWriteBatch, so it does NOT apply alpha or beta*C, bias, activation,
+    scales, the E output, or amaxD (GlobalWriteBatch normally does). Only configs that
+    use none of those GWB-provided features are valid on this path; every excluded
+    config falls back to the delegated SubtileMegaFusedEmitter + GlobalWriteBatch,
+    which reproduces them correctly.
+
+    Alpha is a runtime scalar (sgpr "Alpha"), not a compile-time property, so it cannot
+    be gated here: the integration layer must not route alpha != 1 (nor beta != 0) to
+    this path. RMSEpilogueEmitter._nativeEligible delegates to this predicate so the
+    store gate and the emitter never drift.
+    """
+    if not kernel["RMSEpilogue"]:
+      return False
+    from .Components.CustomSchedule import megaFusedEpilogueCompatible
+    if not megaFusedEpilogueCompatible(kernel):
+      return False
+    if not kernel.get("UseSubtileImpl"):
+      return False
+    destType = kernel["ProblemType"]["DestDataType"]
+    if destType.isFloat8():
+      return False
+    if not destType.isBFloat16():
+      return False
+    # Exclude any config using a GlobalWriteBatch-provided feature the gamma-only
+    # native store does not reproduce (skipping GWB would otherwise silently drop it).
+    problemType = kernel["ProblemType"]
+    if problemType["UseBeta"]:
+      return False
+    if problemType["UseBias"]:
+      return False
+    if problemType["UseGateResidual"]:
+      return False
+    if problemType["ActivationType"] != 'none' and kernel["ActivationFused"]:
+      return False
+    if problemType["UseScaleAB"]:
+      return False
+    if problemType["UseScaleCD"]:
+      return False
+    if problemType["UseScaleAlphaVec"]:
+      return False
+    if problemType["UseE"]:
+      return False
+    if problemType["OutputAmaxD"]:
+      return False
+    tM = (kernel["MacroTile0"] // 16) // kernel["MIWaveGroup"][0]
+    return tM % 2 == 0
+
   def emitSubtileFusedEpilogue(self, kernel):
     # Only complete-tile waves reach here (StreamK Role C branched away earlier).
     module = Module("SubtileFusedEpilogue")
@@ -17469,13 +17520,14 @@ class KernelWriterAssembly(KernelWriter):
             # Primer uses the next real row jump; boundary delta may be 0 (mid-row).
             _next_firing_rowInc = next_firing_per_batch[batchIdx]
             _direct_next_rowInc = next_rowInc_per_batch[batchIdx] if batchIdx < numBatches else 0
-            m.add(self.globalWriteBatch(kernel, tPA, tPB, activation, ss, batchIdx, \
-                applyAlpha, beta, edge, atomic, gwvw, atomicW, \
-                elementsThisBatch, self.vgprs.addrE, self.vgprs.addrD, self.vgprs.addrC, self.vgprs.addrBias, \
-                self.vgprs.addrScaleAVec, self.vgprs.addrScaleBVec, self.vgprs.addrScaleAlphaVec, \
-                biasLocalBarrierInit, tmpVgpr, tmpVgprDynamic, cvtVgprStruct, activationSetPCStruct, \
-                activationTypeStr, elementSgprs, tmpSgpr, passAccVgprRead, passMulAlpha, factorDim, numBatches, \
-                _next_firing_rowInc, _direct_next_rowInc))
+            if not self._nativeRmsEpilogueActive(kernel):
+              m.add(self.globalWriteBatch(kernel, tPA, tPB, activation, ss, batchIdx, \
+                  applyAlpha, beta, edge, atomic, gwvw, atomicW, \
+                  elementsThisBatch, self.vgprs.addrE, self.vgprs.addrD, self.vgprs.addrC, self.vgprs.addrBias, \
+                  self.vgprs.addrScaleAVec, self.vgprs.addrScaleBVec, self.vgprs.addrScaleAlphaVec, \
+                  biasLocalBarrierInit, tmpVgpr, tmpVgprDynamic, cvtVgprStruct, activationSetPCStruct, \
+                  activationTypeStr, elementSgprs, tmpSgpr, passAccVgprRead, passMulAlpha, factorDim, numBatches, \
+                  _next_firing_rowInc, _direct_next_rowInc))
             biasLocalBarrierInit = True
           return m
 

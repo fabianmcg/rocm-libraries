@@ -14,6 +14,11 @@ GlobalParameters:
   PrintSolutionRejectionReason: True
   KernelTime: True
   KeepBuildTmp: True
+  # The native RMS epilogue is gamma-only by design: it stores D = H*gamma directly
+  # and skips GlobalWriteBatch, so it does NOT apply alpha or beta*C (GWB normally
+  # does). Only alpha==1 and beta==0 configs are valid on this path; validated here
+  # at alpha=1.
+  DataInitTypeAlpha: 1
 
 BenchmarkProblems:
 
