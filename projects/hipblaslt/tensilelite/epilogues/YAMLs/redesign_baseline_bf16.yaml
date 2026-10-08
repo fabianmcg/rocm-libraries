@@ -26,6 +26,7 @@ GlobalParameters:
   DataInitTypeB: 13
   DataInitTypeD: 12
   DataInitTypeBeta: 1
+  DataInitTypeAlpha: 1
   CSVExportWinner: true
   CSVMergeSameProblemID: true
   PreciseKernelTime: false
@@ -62,6 +63,7 @@ BenchmarkProblems:
         - MatrixInstruction:
           - [16, 16, 32, 1,  1, 4, 16, 4, 1]  # MT 256x256, MIWaveTile[4,16], MIWaveGroup[4,1] (swept winner for [2048,16384,1,2048]; see note above).
         - RMSEpilogue: [True]
+        - RMSEpiloguePrefetchDepth: [1, 2, 3, 4]
         - StreamK: [3]
         - StreamKForceDPOnly: [1]
         - StreamKAtomic: [0]
