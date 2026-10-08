@@ -92,12 +92,14 @@ class RMSEpilogueEmitter:
         self.MT1 = kernel["MacroTile1"]
         self.numPairs = (self.T_M // 2) * self.T_N
         # The two-phase group loop handles a partial last group, so PREFETCH need not
-        # divide numPairs. autoPrefetch is the historical default (a depth-2 ring when
-        # numPairs is even and >= 2 -- the perf winner; else depth 1). The
+        # divide numPairs. autoPrefetch defaults to a depth-4 ring (min(4, numPairs)):
+        # depth 4 measured fastest on the MT256x256 baseline at zero extra VGPR cost,
+        # and deeper prefetch hides more residual-load latency. The
         # RMSEpiloguePrefetchDepth solution parameter overrides it; -1 (or absent)
-        # selects the auto default. The emitter does NOT budget-check the depth: the
-        # generic kernel register/occupancy check rejects an over-budget kernel.
-        self.autoPrefetch = 2 if (self.numPairs % 2 == 0 and self.numPairs >= 2) else 1
+        # selects this auto default. The emitter does NOT budget-check the depth: the
+        # generic kernel register/occupancy check drops an over-budget kernel, so a
+        # larger tile that cannot afford depth 4 fails safe (rejected, not run wrong).
+        self.autoPrefetch = max(1, min(4, self.numPairs))
         requested = kernel.get("RMSEpiloguePrefetchDepth", -1)
         self.PREFETCH = self.autoPrefetch if requested == -1 else int(requested)
 
