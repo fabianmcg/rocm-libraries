@@ -795,6 +795,10 @@ class RMSEpilogueEmitter:
             module.add(VCvtPkF32toBF16(dst=vgpr(vPack + p), src0=vgpr(hRegs[2 * p]),
                                        src1=vgpr(hRegs[2 * p + 1]),
                                        comment=f"pack f32 pair ({2 * p},{2 * p + 1}) -> bf16 dword {p}."))
+        # gfx950 hazard: a VALU write (v_cvt_pk above) to a VGPR that a following
+        # v_permlane*_swap reads requires >= 2 wait states; _pairShuffle reads the
+        # just-packed vPack dwords, so fence here (hand-written asm is not auto-fixed).
+        module.add(SNop(waitState=1, comment="gfx950 hazard: VALU write (v_cvt_pk) -> v_permlane read needs 2 wait states"))
         # native -> tile-contiguous (involutive) before the coalesced store.
         self._pairShuffle(module, vPack)
         rowBaseP = vgprPool.checkOut(1, tag="rms_resStoreRow")
@@ -956,6 +960,9 @@ class RMSEpilogueEmitter:
                 xorW = self.mfmaN << r
                 module.add(VMovB32(dst=vgpr(tmp), src=vgpr(s),
                                    comment=f"ssqAcc[{n}] own copy (round {r})."))
+                # gfx950 hazard: v_mov above writes tmp, which this v_permlane*_swap
+                # reads; requires >= 2 wait states (hand-written asm is not auto-fixed).
+                module.add(SNop(waitState=1, comment="gfx950 hazard: VALU write (v_mov) -> v_permlane read needs 2 wait states"))
                 module.add(swaps[r](dst=vgpr(s), src=vgpr(tmp),
                                     comment=f"ssqAcc[{n}] <- partner^{xorW}; tmp keeps own."))
                 module.add(VAddF32(dst=vgpr(s), src0=vgpr(s), src1=vgpr(tmp),
