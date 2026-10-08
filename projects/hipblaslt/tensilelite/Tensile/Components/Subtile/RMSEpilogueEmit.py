@@ -91,8 +91,9 @@ class RMSEpilogueEmitter:
         self.MT0 = kernel["MacroTile0"]
         self.MT1 = kernel["MacroTile1"]
         self.numPairs = (self.T_M // 2) * self.T_N
-        # PREFETCH must divide numPairs for the two-phase constexpr group loop;
-        # deepen to a depth-2 ring only when numPairs is even and >= 2.
+        # The two-phase group loop now handles a partial last group, so PREFETCH
+        # need not divide numPairs. The default stays a depth-2 ring when numPairs
+        # is even and >= 2 (empirically the perf winner); deeper depths are opt-in.
         self.PREFETCH = 2 if (self.numPairs % 2 == 0 and self.numPairs >= 2) else 1
 
         # MXFP8 dynamic quant is derived: RMSEpilogue active and D output is F8.
@@ -866,7 +867,7 @@ class RMSEpilogueEmitter:
 
         Faithful port of the @mega_fused_body two-phase loop (MLIR 290-397) over
         all pairs in COLUMN-FASTEST order (n fastest): t -> n = t % T_N,
-        mp = t // T_N. Each group of ``PREFETCH`` pairs first issues all P loads
+        mp = t // T_N. Each group of up to ``PREFETCH`` pairs (the last group may be partial) first issues all P loads
         (phase 1), then consumes each in turn (phase 2), so the next group's loads
         cannot overwrite a bank until every consume of this group has finished in
         program order (no WAR hazard on the ring).
@@ -891,23 +892,26 @@ class RMSEpilogueEmitter:
         for n in range(self.T_N):
             module.add(VMovB32(dst=vgpr(ssqAcc + n), src=0, comment=f"ssqAcc[{n}] = 0.0"))
         for grp in range(0, self.numPairs, P):
-            # Phase 1: issue all P prefetch loads for this group.
-            for d in range(P):
+            # The last group is partial when P does not divide numPairs.
+            groupSize = min(P, self.numPairs - grp)
+            # Phase 1: issue all groupSize prefetch loads for this group.
+            for d in range(groupSize):
                 t = grp + d
                 n = t % self.T_N
                 mp = t // self.T_N
                 module.addComment1(f"prefetch load pair t={t} (mp={mp}, n={n}) -> bank {d}.")
                 self._loadRaw(module, resBanks[d], mp, n, isX4)
             # Phase 2: consume each. At consume d the in-flight VMEM ops newer than
-            # load_d are (P-1-d) remaining prefetch loads + 2*d earlier-consume
-            # stores = P-1+d, so wait vmcnt(P-1+d) (two stores/pair; P=2 -> 1,2).
-            for d in range(P):
+            # load_d are (groupSize-1-d) remaining prefetch loads + 2*d earlier-
+            # consume stores = groupSize-1+d, so wait vmcnt(groupSize-1+d) (two
+            # stores/pair; a full group of 2 -> 1,2).
+            for d in range(groupSize):
                 t = grp + d
                 n = t % self.T_N
                 mp = t // self.T_N
                 module.addComment1(f"consume pair t={t} (mp={mp}, n={n}) from bank {d}.")
-                module.add(_SWaitCnt(lgkmcnt=-1, vmcnt=P - 1 + d,
-                                     comment=f"combined vmcnt({P - 1 + d}): (P-1-d) loads + 2d stores in flight."))
+                module.add(_SWaitCnt(lgkmcnt=-1, vmcnt=groupSize - 1 + d,
+                                     comment=f"combined vmcnt({groupSize - 1 + d}): (groupSize-1-d) loads + 2d stores in flight."))
                 if isX4:
                     self._pairShuffle(module, resBanks[d])
                 residualF32 = self._residualToF32(module, resBanks[d], isX4)
