@@ -387,11 +387,13 @@ def _validateRMSEpilogue(state, printRejectionReason):
     return
   if not _validateSubtileEpiloguePrereqs(state, printRejectionReason, "RMSEpilogue"):
     return
-  # Scope boundary: the CMS fused-epilogue port currently supports bf16 output only.
-  # The MXFP8 (DestDataType=float8) dynamic-quant path is not yet ported to CMS.
-  if not state["UseSubtileImpl"] and state["ProblemType"]["DestDataType"].isFloat8():
+  # Non-subtile (CMS/interleaved) RMSEpilogue is unsupported: these configs would
+  # fall through to the old SubtileMegaFused path, which miscomputes the residual
+  # at lone-leftover tile corners (last partial row AND last partial column). Reject
+  # outright rather than silently generate a known-broken kernel.
+  if not state["UseSubtileImpl"]:
     reject(state, printRejectionReason,
-           "RMSEpilogue under CMS currently supports bf16 output only (MXFP8 output not yet ported)")
+           "RMSEpilogue requires UseSubtileImpl=True; non-subtile (CMS) RMSEpilogue is not supported")
     return
   if not _resolveRMSGammaType(state, printRejectionReason):
     return

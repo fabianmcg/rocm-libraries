@@ -127,3 +127,18 @@ def test_rmsepilogue_skipped_when_false():
     state["RMSEpilogue"] = False
     _validateRMSEpilogue(state, False)
     assert state.get("Valid") is True
+
+
+# ---------------------------------------------------------------------------
+# RMSEpilogue requires the Subtile path (non-subtile/CMS is unsupported)
+# ---------------------------------------------------------------------------
+
+def test_rmsepilogue_non_subtile_rejected():
+    # Non-subtile (CMS) RMSEpilogue falls to the old MegaFused path, which
+    # miscomputes lone-leftover corners; it must be rejected at validation.
+    state = _makeRMSEpilogueState(dest="B", mi=16)
+    state["UseSubtileImpl"] = False
+    # CMS-compatible so the shared prereqs pass; the UseSubtileImpl guard rejects.
+    state["UseCustomMainLoopSchedule"] = 1
+    _validateRMSEpilogue(state, False)
+    assert state.get("Valid") is False
