@@ -2,12 +2,11 @@
 # SPDX-License-Identifier: MIT
 """RMSEpilogueEmitter: faithful from-scratch RMS epilogue emitter (Subtile gfx950).
 
-This is a ground-up rewrite that mirrors the reference kernel
-mega_fused_epilogue.mlir (@mega_fused_epilogue). Milestone F1 provides only the
-scaffold: config/geometry, emit() routing, and _emitSetup (the MLIR prologue,
-lines 470-546). The native compute path (gamma prefetch/load/compute/reduction
-and the body) arrives in later milestones (F2-F7); until then every config
-DELEGATES to SubtileMegaFusedEmitter so the correctness harness stays green.
+Mirrors the reference kernel mega_fused_epilogue.mlir (@mega_fused_epilogue). The
+native path stores D = H*gamma directly and is exclusive: when it is active it is the
+only epilogue (GlobalWriteBatch is skipped) and it does not apply alpha, beta*C, bias,
+activation, scales, E, or amaxD. Every Subtile-layout, non-MXFP8 bf16 config takes the
+native path; MXFP8 (float8 D) configs delegate to SubtileMegaFusedEmitter instead.
 """
 
 import math
@@ -134,10 +133,10 @@ class RMSEpilogueEmitter:
         self.gammaReadBaseV = None
 
     def _nativeEligible(self):
-        # The native RMS epilogue is gamma-only by design: it stores D = H*gamma
-        # directly and skips GlobalWriteBatch, so it does NOT apply alpha or beta*C,
-        # bias, activation, scales, E, or amaxD (GlobalWriteBatch normally does). Only
-        # alpha==1 and beta==0 configs using none of those features are valid here.
+        # The native RMS epilogue is exclusive and self-contained: when active it is
+        # the only epilogue, it stores D = H*gamma directly, and GlobalWriteBatch is
+        # skipped. By design it does NOT apply alpha, beta*C, bias, activation, scales,
+        # E, or amaxD -- those features are simply not applied for a config routed here.
         # Delegate to the writer's authoritative gate so the store-skip predicate and
         # this emitter never drift (rowsPerLane is the only emitter-local extra check).
         return self.rowsPerLane == 4 and self.writer._nativeRmsEpilogueActive(self.kernel)
@@ -150,6 +149,8 @@ class RMSEpilogueEmitter:
 
     def _emitNative(self, vgprTiles):
         module = Module("RMSEpilogue native (faithful MLIR paired-permlane).")
+        assert self.kernel["ProblemType"]["DestDataType"].isBFloat16(), \
+            "native RMS epilogue emits bf16 D only; non-bf16 dest must route to the old path"
         # Drain GEMM vector memory before reusing AGPRs/LDS (epilogue entry).
         module.add(SWaitCnt(vlcnt=0, comment="drain GEMM loads before epilogue."))
         self._emitSetup(module)
