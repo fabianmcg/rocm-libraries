@@ -396,22 +396,38 @@ def _validateRMSEpilogue(state, printRejectionReason):
     reject(state, printRejectionReason,
            "RMSEpilogue requires UseSubtileImpl=True; non-subtile (CMS) RMSEpilogue is not supported")
     return
-  # The native (non-delegated) RMS epilogue owns the write: it stores D = H*gamma
-  # directly and skips GlobalWriteBatch, so it never applies alpha. The validation
-  # reference applies alpha, so a native-path config is only correct at alpha == 1.
-  # Reject native-eligible configs (Subtile bf16-dest with even tile-M; Subtile is
-  # already enforced above) when the alpha data-init is not 1 (DataInitName.One).
-  # MXFP8 (float8 dest) and odd-tile-M configs fall back to the old GlobalWriteBatch
-  # path, which applies alpha and is unaffected. Mirrors the native-path gate in
-  # KernelWriterAssembly._nativeRmsEpilogueActive (tM = (MacroTile0 // 16) // wg0).
+  # The native RMSEpilogueEmitter is the ONLY supported epilogue for non-float8 (bf16)
+  # output. The old SubtileMegaFusedEmitter + GlobalWriteBatch path is reachable only for
+  # MXFP8 (float8) dest; it is confirmed unsafe for bf16 (it miscomputes the lone-leftover
+  # corner of a %8==1 problem, e.g. 521x521, intermittently). So any bf16 Subtile config
+  # that is not native-eligible must be rejected here, never silently delegated to the old
+  # emitter. Native eligibility mirrors KernelWriterAssembly._nativeRmsEpilogueActive;
+  # UseSubtileImpl, MI 16x16, and megaFusedEpilogueCompatible are already enforced above,
+  # so the remaining conditions are bf16 dest and even tile-M
+  # (tM = (MacroTile0 // 16) // MIWaveGroup[0]).
   destType = state["ProblemType"]["DestDataType"]
-  tM = (state["MacroTile0"] // 16) // state["MIWaveGroup"][0]
-  if destType.isBFloat16() and tM % 2 == 0 and \
-     globalParameters.get("DataInitTypeAlpha", 1) != 1:
-    reject(state, printRejectionReason,
-           "native RMSEpilogue path does not apply alpha; requires "
-           "DataInitTypeAlpha == 1 (DataInitName.One)")
-    return
+  if not destType.isFloat8():
+    if not destType.isBFloat16():
+      reject(state, printRejectionReason,
+             "RMSEpilogue supports bf16 or float8 output only; a non-bf16, non-float8 dest "
+             "would fall back to the old SubtileMegaFusedEmitter, which is not supported")
+      return
+    tM = (state["MacroTile0"] // 16) // state["MIWaveGroup"][0]
+    if tM % 2 != 0:
+      reject(state, printRejectionReason,
+             "RMSEpilogue bf16 native path requires even tile-M "
+             "(tM = (MacroTile0 // 16) // MIWaveGroup[0]); odd tile-M would fall back to the "
+             "old SubtileMegaFusedEmitter, which miscomputes the lone-leftover corner and is "
+             "not supported for bf16")
+      return
+    # Native path owns the write and never applies alpha, but the validation reference
+    # does, so a native config is only correct at alpha == 1. Reject otherwise
+    # (DataInitName.One == 1). MXFP8/float8 configs use the old path, which applies alpha.
+    if globalParameters.get("DataInitTypeAlpha", 1) != 1:
+      reject(state, printRejectionReason,
+             "native RMSEpilogue path does not apply alpha; requires "
+             "DataInitTypeAlpha == 1 (DataInitName.One)")
+      return
   if not _resolveRMSGammaType(state, printRejectionReason):
     return
   # Residual-add is always active under RMSEpilogue; validate the type unconditionally.
