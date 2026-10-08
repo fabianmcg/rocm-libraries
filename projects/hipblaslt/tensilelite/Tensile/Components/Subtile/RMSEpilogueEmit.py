@@ -59,6 +59,7 @@ from rocisa.instruction import (
     VNop,
     VOrB32,
     VPermlane16SwapB32,
+    VPermlane32SwapB32,
     VReadfirstlaneB32,
     VXorB32,
     _SWaitCnt,
@@ -921,40 +922,34 @@ class RMSEpilogueEmitter:
         vgprPool.checkIn(ssqAcc)
 
     def _combineRowGroups(self, module, ssqAccBase):
-        """Intra-wave row-group XOR butterfly over ssqAcc (no LDS).
+        """Intra-wave row-group XOR butterfly over ssqAcc (permlane, no LDS).
 
-        Faithful port of @combine_rowgroups (@mega_fused_epilogue 226-239) and
-        its per-column use (402-406). Each ssqAcc[n] holds this lane's per-row-
-        group partial sum of H^2; a 2-round XOR butterfly over the
-        waveSize//mfmaN = 4 row-groups (g = lane>>4) folds them so every lane
-        ends with the wavefront-complete partial for its column. Rounds XOR the
-        lane with bit 4 (16) then bit 5 (32); ds_bpermute gathers the partner
-        lane's running sum, which is then added.
+        Faithful port of the updated @combine_rowgroups. Each ssqAcc[n] holds
+        this lane's per-row-group partial sum of H^2; a 2-round XOR butterfly
+        over the waveSize//mfmaN = 4 row-groups (g = lane>>4) folds them so every
+        lane ends with the wavefront-complete partial for its column. Round 0
+        exchanges with lane^16 via v_permlane16_swap_b32, round 1 with lane^32 via
+        v_permlane32_swap_b32: the swap places the partner lane's value in the dst
+        register while the src copy keeps this lane's own value, so dst+src is the
+        pair reduction. Pure VALU -- no ds_bpermute, no s_waitcnt.
         """
-        module.addComment0("intra-wave row-group XOR butterfly over ssqAcc (no LDS).")
+        module.addComment0("intra-wave row-group XOR butterfly over ssqAcc (permlane, no LDS).")
         vgprPool = self.writer.vgprPool
         numRounds = int(math.log2(self.waveSize // self.mfmaN))
-        # Precompute the two partner byte-addresses (independent of n).
-        addrs = []
-        for r in range(numRounds):
-            xorVal = self.mfmaN << r
-            a = vgprPool.checkOut(1, tag=f"rms_bpAddr{r}")
-            module.add(VXorB32(dst=vgpr(a), src0=vgpr(self.laneV), src1=xorVal,
-                               comment=f"partner = lane ^ {xorVal}."))
-            module.add(VLShiftLeftB32(dst=vgpr(a), shiftHex=hex(2), src=vgpr(a),
-                                      comment="byteAddr = partner * 4."))
-            addrs.append(a)
-        tmp = vgprPool.checkOut(1, tag="rms_bpTmp")
+        assert numRounds == 2, "combine_rowgroups butterfly expects waveSize/mfmaN == 4 (2 rounds)"
+        swaps = [VPermlane16SwapB32, VPermlane32SwapB32]
+        tmp = vgprPool.checkOut(1, tag="rms_combTmp")
         for n in range(self.T_N):
+            s = ssqAccBase + n
             for r in range(numRounds):
-                module.add(DSBPermuteB32(vgpr(tmp), vgpr(addrs[r]), vgpr(ssqAccBase + n),
-                                         comment=f"fetch partner ssqAcc[{n}] (round {r})."))
-                module.add(SWaitCnt(dscnt=0, comment="wait ds_bpermute."))
-                module.add(VAddF32(dst=vgpr(ssqAccBase + n), src0=vgpr(ssqAccBase + n),
-                                   src1=vgpr(tmp), comment=f"ssqAcc[{n}] += partner."))
+                xorW = self.mfmaN << r
+                module.add(VMovB32(dst=vgpr(tmp), src=vgpr(s),
+                                   comment=f"ssqAcc[{n}] own copy (round {r})."))
+                module.add(swaps[r](dst=vgpr(s), src=vgpr(tmp),
+                                    comment=f"ssqAcc[{n}] <- partner^{xorW}; tmp keeps own."))
+                module.add(VAddF32(dst=vgpr(s), src0=vgpr(s), src1=vgpr(tmp),
+                                   comment=f"ssqAcc[{n}] = own + partner^{xorW}."))
         vgprPool.checkIn(tmp)
-        for a in reversed(addrs):
-            vgprPool.checkIn(a)
 
     def _vaddImm(self, module, dst, src, imm, comment):
         """dst = src + imm, materializing imm in a temp VGPR above the inline cap.
