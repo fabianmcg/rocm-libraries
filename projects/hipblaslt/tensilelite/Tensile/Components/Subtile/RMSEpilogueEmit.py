@@ -870,10 +870,12 @@ class RMSEpilogueEmitter:
         program order (no WAR hazard on the ring).
 
         Per-pair vmem = 1 load + 2 stores (residualOut store, then D store). gfx950
-        has a single combined vmcnt (loads+stores, FIFO). The wait is deliberately
-        kept at the conservative constant vmcnt(P-1) in this milestone; over-waiting
-        is always correctness-safe. The tighter vmcnt(P-1+d) schedule that accounts
-        for the extra D store per pair is a later milestone cleanup.
+        has a single combined vmcnt (loads+stores, FIFO). At consume d, load_d must
+        be complete; the VMEM ops issued more recently than load_d that may still be
+        in flight are the (P-1-d) not-yet-consumed prefetch loads plus the 2*d stores
+        from the d earlier consumes in this group, so the wait is vmcnt((P-1-d)+2d)
+        = vmcnt(P-1+d). For P=2 this gives consume0 vmcnt(1) and consume1 vmcnt(2),
+        matching the two-store reference schedule.
         """
         P = self.PREFETCH
         module.addComment0(f"MegaFused body (PREFETCH={P}, isX4={isX4}).")
@@ -894,15 +896,16 @@ class RMSEpilogueEmitter:
                 mp = t // self.T_N
                 module.addComment1(f"prefetch load pair t={t} (mp={mp}, n={n}) -> bank {d}.")
                 self._loadRaw(module, resBanks[d], mp, n, isX4)
-            # Phase 2: consume each, waiting vmcnt(P-1) so the remaining P-1 vmem
-            # ops (loads + this-group stores) stay in flight for overlap.
+            # Phase 2: consume each. At consume d the in-flight VMEM ops newer than
+            # load_d are (P-1-d) remaining prefetch loads + 2*d earlier-consume
+            # stores = P-1+d, so wait vmcnt(P-1+d) (two stores/pair; P=2 -> 1,2).
             for d in range(P):
                 t = grp + d
                 n = t % self.T_N
                 mp = t // self.T_N
                 module.addComment1(f"consume pair t={t} (mp={mp}, n={n}) from bank {d}.")
-                module.add(_SWaitCnt(lgkmcnt=-1, vmcnt=P - 1,
-                                     comment=f"combined vmcnt({P - 1}): keep P-1 vmem ops in flight."))
+                module.add(_SWaitCnt(lgkmcnt=-1, vmcnt=P - 1 + d,
+                                     comment=f"combined vmcnt({P - 1 + d}): (P-1-d) loads + 2d stores in flight."))
                 if isX4:
                     self._pairShuffle(module, resBanks[d])
                 residualF32 = self._residualToF32(module, resBanks[d], isX4)
