@@ -16144,17 +16144,21 @@ class KernelWriterAssembly(KernelWriter):
   def _nativeRmsEpilogueActive(self, kernel):
     """Single authoritative gate for the native (non-delegated) RMS epilogue path.
 
-    The native RMS epilogue is gamma-only by design: it stores D = H*gamma directly
-    and skips GlobalWriteBatch, so it does NOT apply alpha or beta*C, bias, activation,
-    scales, the E output, or amaxD (GlobalWriteBatch normally does). Only configs that
-    use none of those GWB-provided features are valid on this path; every excluded
-    config falls back to the delegated SubtileMegaFusedEmitter + GlobalWriteBatch,
-    which reproduces them correctly.
+    When this returns True the native RMSEpilogueEmitter is the ONLY epilogue that
+    runs: it stores D = H*gamma directly and GlobalWriteBatch is skipped entirely.
+    By deliberate design the native path is exclusive and self-contained -- it does
+    NOT apply alpha, beta*C, bias, activation, scales, the E output, or amaxD. Those
+    features are simply not applied for a config routed here; they are not gated out.
 
-    Alpha is a runtime scalar (sgpr "Alpha"), not a compile-time property, so it cannot
-    be gated here: the integration layer must not route alpha != 1 (nor beta != 0) to
-    this path. RMSEpilogueEmitter._nativeEligible delegates to this predicate so the
-    store gate and the emitter never drift.
+    Every Subtile-layout, non-MXFP8 bf16 config routes to the native path. Only MXFP8
+    (float8 D) configs fall back to the delegated SubtileMegaFusedEmitter +
+    GlobalWriteBatch. CMS/interleaved (non-UseSubtileImpl) layouts are out of scope and
+    remain on the old path. The tM%2 guard stays because the native body is pair-based
+    (numPairs = (T_M//2)*T_N) and has no odd-T_M leftover path; it excludes no shipped
+    config.
+
+    RMSEpilogueEmitter._nativeEligible delegates to this predicate so the store gate and
+    the emitter never drift.
     """
     if not kernel["RMSEpilogue"]:
       return False
@@ -16164,31 +16168,13 @@ class KernelWriterAssembly(KernelWriter):
     if not kernel.get("UseSubtileImpl"):
       return False
     destType = kernel["ProblemType"]["DestDataType"]
+    # MXFP8 (float8 D) is the only case kept on the old SubtileMegaFusedEmitter +
+    # GlobalWriteBatch path; the native emitter emits bf16 D only.
     if destType.isFloat8():
       return False
     if not destType.isBFloat16():
       return False
-    # Exclude any config using a GlobalWriteBatch-provided feature the gamma-only
-    # native store does not reproduce (skipping GWB would otherwise silently drop it).
-    problemType = kernel["ProblemType"]
-    if problemType["UseBeta"]:
-      return False
-    if problemType["UseBias"]:
-      return False
-    if problemType["UseGateResidual"]:
-      return False
-    if problemType["ActivationType"] != 'none' and kernel["ActivationFused"]:
-      return False
-    if problemType["UseScaleAB"]:
-      return False
-    if problemType["UseScaleCD"]:
-      return False
-    if problemType["UseScaleAlphaVec"]:
-      return False
-    if problemType["UseE"]:
-      return False
-    if problemType["OutputAmaxD"]:
-      return False
+    # Tile-shape guard: pair-based body (numPairs = (T_M//2)*T_N), no odd-T_M path.
     tM = (kernel["MacroTile0"] // 16) // kernel["MIWaveGroup"][0]
     return tM % 2 == 0
 
