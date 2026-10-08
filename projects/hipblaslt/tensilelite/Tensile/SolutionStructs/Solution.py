@@ -428,6 +428,21 @@ def _validateRMSEpilogue(state, printRejectionReason):
              "native RMSEpilogue path does not apply alpha; requires "
              "DataInitTypeAlpha == 1 (DataInitName.One)")
       return
+    # RMSEpiloguePrefetchDepth selects the native residual prefetch-ring depth.
+    # -1 (auto, the default) lets the emitter derive the historical depth; an
+    # explicit depth must be in [1, numPairs] -- the ring cannot prefetch more
+    # pairs than exist (numPairs = (tM//2)*tN). Over-budget depths are NOT
+    # rejected here: the generic kernel register/occupancy check drops a kernel
+    # whose ring exceeds the VGPR budget.
+    prefetchDepth = state.get("RMSEpiloguePrefetchDepth", -1)
+    if prefetchDepth != -1:
+      tN = (state["MacroTile1"] // 16) // state["MIWaveGroup"][1]
+      numPairs = (tM // 2) * tN
+      if prefetchDepth < 1 or prefetchDepth > numPairs:
+        reject(state, printRejectionReason,
+               "RMSEpiloguePrefetchDepth (%d) must be -1 (auto) or in [1, numPairs=%d]"
+               % (prefetchDepth, numPairs))
+        return
   if not _resolveRMSGammaType(state, printRejectionReason):
     return
   # Residual-add is always active under RMSEpilogue; validate the type unconditionally.

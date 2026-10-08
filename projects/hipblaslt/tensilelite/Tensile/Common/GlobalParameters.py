@@ -518,6 +518,7 @@ defaultBenchmarkCommonParameters = [
     {"RMSEpilogue": [False]},
     {"RMSEpilogueGammaType": ["b"]},
     {"RMSEpilogueResidualType": ["b"]},
+    {"RMSEpiloguePrefetchDepth": [-1]},
     {"UseDeepseekScaleA": [False]},
     {"UseDeepseekScaleB": [False]},
     {"DeepseekScaleAq0": [128]},

@@ -566,6 +566,7 @@ validParameters = { # we need to make sure this matches develop
     "RMSEpilogue": [False, True],
     "RMSEpilogueGammaType": ["b"],
     "RMSEpilogueResidualType": ["b", "s"],
+    "RMSEpiloguePrefetchDepth": [-1, 1, 2, 3, 4],
     "UseDeepseekScaleA": [False, True],
     "UseDeepseekScaleB": [False, True],
     "DeepseekScaleAq0": list(range(1, 1025)),
