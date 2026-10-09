@@ -409,13 +409,6 @@ def _validateRMSEpilogue(state, printRejectionReason):
            "RMSEpilogue native path requires even tile-M "
            "(tM = (MacroTile0 // 16) // MIWaveGroup[0])")
     return
-  # Native path owns the write and never applies alpha. Reject alpha != 1.
-  # (DataInitName.One == 1). This applies to both bf16 and float8 native paths.
-  if globalParameters.get("DataInitTypeAlpha", 1) != 1:
-    reject(state, printRejectionReason,
-           "native RMSEpilogue path does not apply alpha; requires "
-           "DataInitTypeAlpha == 1 (DataInitName.One)")
-    return
   # RMSEpiloguePrefetchDepth selects the native residual prefetch-ring depth.
   # -1 (auto, the default) lets the emitter derive the historical depth; an
   # explicit depth must be in [1, numPairs] -- the ring cannot prefetch more
