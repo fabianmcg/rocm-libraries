@@ -62,6 +62,7 @@ from rocisa.instruction import (
     VCndMaskB32,
     VCvtBF16toFP32,
     VCvtPkF32toBF16,
+    VFmaF32,
     VLShiftLeftB32,
     VLShiftRightB32,
     VMaxF32,
@@ -74,6 +75,7 @@ from rocisa.instruction import (
     VOrB32,
     VPermlane16SwapB32,
     VPermlane32SwapB32,
+    VRcpF32,
     VReadfirstlaneB32,
     VSubU32,
     VXorB32,
@@ -1576,18 +1578,51 @@ class RMSEpilogueEmitter:
             # 6c. Row-group butterfly: fold all 4 row-groups -> per-column block amax.
             self._rowGroupMaxReduce(module, amaxReg)
             # 6d. Derive e8m0 scale byte and quantMult from amax.
-            # scaleF = amax * (1/448); native path is alpha==1-only (enforced in Solution.py),
-            # so the alpha fold present in the old emitter is omitted.
-            invFp8Bits = struct.unpack('<I', struct.pack('<f', 1.0 / self.fp8E4m3Max))[0]
+            # scaleF = amax / fp8Max computed as a correctly-rounded f32 division so the
+            # e8m0 exponent matches the CPU reference (Reference.cpp e8m0ScaleFromAmax:
+            # scaleF = amax / 448.0f) bit-for-bit. A plain amax*(1/448) reciprocal-multiply
+            # differs by up to 1 ULP and flips the mantissa-nonzero ceil-adjust at
+            # power-of-2 boundaries, giving a scale off by one e8m0 step (2x). Sequence:
+            # rcp + one Newton refinement + Markstein residual correction (correctly
+            # rounded for the normal operands this path produces). native path is
+            # alpha==1-only (enforced in Solution.py), so no alpha fold is applied.
             scaleByteReg = vgprPool.checkOut(1, tag="rms_mxScaleByte")
             quantMultReg = vgprPool.checkOut(1, tag="rms_mxQuantMult")
             c254Reg = vgprPool.checkOut(1, tag="rms_mxC254")
             module.add(VMovB32(dst=vgpr(c254Reg), src=254, comment="constant 254."))
-            # scaleF = amax * (1/fp8Max) stored temporarily in quantMultReg.
-            module.add(VMovB32(dst=vgpr(quantMultReg), src=hex(invFp8Bits),
-                               comment=f"1/fp8Max = 1/{self.fp8E4m3Max}."))
-            module.add(VMulF32(dst=vgpr(quantMultReg), src0=vgpr(amaxReg), src1=vgpr(quantMultReg),
-                               comment="scaleF = amax * (1/fp8Max)."))
+            fp8MaxBits = struct.unpack('<I', struct.pack('<f', self.fp8E4m3Max))[0]
+            negFp8MaxBits = struct.unpack('<I', struct.pack('<f', -self.fp8E4m3Max))[0]
+            scDivY = vgprPool.checkOut(1, tag="rms_mxDivY")
+            scDivT = vgprPool.checkOut(1, tag="rms_mxDivT")
+            # y0 = rcp(fp8Max): load fp8Max into scDivT, then overwrite with -fp8Max.
+            module.add(VMovB32(dst=vgpr(scDivT), src=hex(fp8MaxBits),
+                               comment=f"fp8Max = {self.fp8E4m3Max}."))
+            module.add(VRcpF32(dst=vgpr(scDivY), src=vgpr(scDivT),
+                               comment="y0 = rcp(fp8Max) ~= 1/fp8Max."))
+            # Load -fp8Max into scDivT for Newton + Markstein steps.
+            module.add(VMovB32(dst=vgpr(scDivT), src=hex(negFp8MaxBits),
+                               comment=f"-fp8Max = {-self.fp8E4m3Max}."))
+            # e = (-fp8Max)*y0 + 1 = 1 - fp8Max*y0 (Newton residual).
+            module.add(VFmaF32(dst=vgpr(scDivT), src0=vgpr(scDivT), src1=vgpr(scDivY), src2=1.0,
+                               comment="e = 1 - fp8Max*y (newton residual)."))
+            # y1 = y0 + y0*e (faithful reciprocal of fp8Max).
+            module.add(VFmaF32(dst=vgpr(scDivY), src0=vgpr(scDivY), src1=vgpr(scDivT),
+                               src2=vgpr(scDivY), comment="y1 = y0 + y0*e (faithful 1/fp8Max)."))
+            # q = amax * y1 (approximate quotient).
+            module.add(VMulF32(dst=vgpr(quantMultReg), src0=vgpr(amaxReg), src1=vgpr(scDivY),
+                               comment="q = amax * y1 (approx scaleF)."))
+            # Reload -fp8Max into scDivT for Markstein residual (e was consumed above).
+            module.add(VMovB32(dst=vgpr(scDivT), src=hex(negFp8MaxBits),
+                               comment=f"-fp8Max for Markstein step."))
+            # r = amax + (-fp8Max)*q = amax - fp8Max*q (exact residual).
+            module.add(VFmaF32(dst=vgpr(scDivT), src0=vgpr(scDivT), src1=vgpr(quantMultReg),
+                               src2=vgpr(amaxReg), comment="r = amax - fp8Max*q (exact residual)."))
+            # scaleF = r*y1 + q (correctly-rounded amax/fp8Max).
+            module.add(VFmaF32(dst=vgpr(quantMultReg), src0=vgpr(scDivT), src1=vgpr(scDivY),
+                               src2=vgpr(quantMultReg),
+                               comment="scaleF = r*y1 + q (correctly-rounded amax/fp8Max)."))
+            vgprPool.checkIn(scDivY)
+            vgprPool.checkIn(scDivT)
             # mantissa ceil-adjust: adj = (scaleF mantissa != 0) ? 1 : 0.
             mantV = vgprPool.checkOut(1, tag="rms_mxMant")
             module.add(VLShiftLeftB32(dst=vgpr(mantV), shiftHex=hex(9), src=vgpr(quantMultReg),
