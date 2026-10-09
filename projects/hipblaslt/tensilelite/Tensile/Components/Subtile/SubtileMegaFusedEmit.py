@@ -89,6 +89,7 @@ from rocisa.instruction import (
     VXorB32,
 )
 from Tensile.Common.DataType import DataType
+from .SubtileCommon import _isPackPair
 
 
 # Maximum inline-literal integer for VOP encodings; larger immediates must be
@@ -293,11 +294,6 @@ class RMSEpilogueGeometry:
 # GROUP A: no geometry parameter needed.
 # GROUP B: accept geom (RMSEpilogueGeometry) as the last positional argument.
 # ---------------------------------------------------------------------------
-
-def _isPackPair(a, b):
-    """True when a,b are a consecutive even-aligned VGPR pair for packed VALU."""
-    return (a % 2 == 0) and (b == a + 1)
-
 
 def _issueSideLoad(module, dstVgpr: int, addrVgpr: int, srd: int,
                    comment: str, dtype) -> None:

@@ -11,6 +11,7 @@ native path; MXFP8 (float8 D) configs delegate to SubtileMegaFusedEmitter instea
 
 import math
 
+from .SubtileCommon import _isPackPair
 from rocisa.code import Label, Module
 from rocisa.container import EXEC, DSModifiers, MUBUFModifiers, accvgpr, mgpr, sgpr, vgpr
 from rocisa.instruction import (
@@ -102,14 +103,7 @@ class RMSEpilogueEmitter:
         self.autoPrefetch = max(1, min(4, self.numPairs))
         requested = kernel.get("RMSEpiloguePrefetchDepth", -1)
         self.PREFETCH = self.autoPrefetch if requested == -1 else int(requested)
-
-        # MXFP8 dynamic quant is derived: RMSEpilogue active and D output is F8.
-        self.useMxfp8 = (bool(kernel.get("RMSEpilogue", False))
-                         and kernel["ProblemType"]["DestDataType"].isFloat8())
-        # Subtile uses a wave-contiguous layout; CMS kernels are wave-interleaved.
-        self.interleaved = not bool(kernel.get("UseSubtileImpl"))
-        # Residual stream is bf16 in/out.
-        self.residualBytes = 2
+        assert self.PREFETCH >= 1, "rms epilogue prefetch depth must be >= 1"
 
         self.laneSGPRCount = writer.states.laneSGPRCount
 
@@ -164,7 +158,6 @@ class RMSEpilogueEmitter:
         module.add(SWaitCnt(vlcnt=0, comment="drain GEMM loads before epilogue."))
         self._emitSetup(module)
         self._computeAddrConstants(module)
-        self._computeGammaReadBase(module)
         # Top-level is_x4 = (rowExtent % 8 == 0) branch (MLIR:552-554).
         narrowLabel = Label(self.writer.labels.getNameInc("rms_narrow"),
                             "narrow (rowExtent%8 != 0) arm.")
@@ -179,12 +172,16 @@ class RMSEpilogueEmitter:
         # Wide arm: DTL gamma + barrier + dwordx4 body.
         module.addComment0("Wide arm (rowExtent%8==0): dwordx4 coalesced.")
         self._emitGammaPrefetchDTL(module)
+        # _computeGammaReadBase must follow the prefetch so gammaLdsBase is already set.
+        self._computeGammaReadBase(module)
         self._emitBody(module, vgprTiles, isX4=True)
         module.add(SBranch(labelName=endLabel.getLabelName(), comment="wide done; skip narrow."))
         # Narrow arm: software gamma + barrier + scalar body.
         module.add(narrowLabel)
         module.addComment0("Narrow arm (rowExtent%8!=0): scalar bf16.")
         self._emitGammaPrefetch(module)
+        # _computeGammaReadBase must follow the prefetch so gammaLdsBase is already set.
+        self._computeGammaReadBase(module)
         self._emitBody(module, vgprTiles, isX4=False)
         module.add(endLabel)
         self._emitTeardown(module)
@@ -412,7 +409,9 @@ class RMSEpilogueEmitter:
         module.add(BufferLoadD16B16(vgpr(gvalV), vgpr(growV), sgpr(self.gammaSrd, 4), 0,
                                     MUBUFModifiers(offen=True),
                                     comment="gval = gamma[grow] (buffer OOB -> 0)."))
-        module.add(SWaitCnt(vlcnt=0, comment="wait gamma load (vmcnt 0)."))
+        # Conservative full drain before the ds_write; this serializes each pass
+        # but avoids cross-pass WAW complexity when numPasses > 1.
+        module.add(SWaitCnt(vlcnt=0, comment="wait gamma load before ds_write (vmcnt 0)."))
         # LDS byte offset = gammaLdsBase + idx*2.
         module.add(VLShiftLeftB32(dst=vgpr(ldsOffV), shiftHex=hex(1), src=vgpr(idxV),
                                   comment="lds byte offset = idx * 2 (bf16)."))
@@ -441,8 +440,6 @@ class RMSEpilogueEmitter:
         ``soffB = chunkBase*2``, per-lane vaddr ``voff = lane*4``, and per-wave LDS
         base ``M0 = gammaLdsBase + w*256`` bytes. Waves >= loaderWaves skip the load
         (narrowed exec) but still reach the publish barrier.
-
-        Dead code pending wiring (F2b); emit() still delegates.
         """
         vgprPool = self.writer.vgprPool
         sgprPool = self.writer.sgprPool
@@ -715,7 +712,8 @@ class RMSEpilogueEmitter:
         body (F4) adds the m*32 tile term per pair. Freed in the final teardown.
         """
         vgprPool = self.writer.vgprPool
-        self.gammaReadBaseV = vgprPool.checkOut(1, tag="rms_gammaReadBase")
+        if self.gammaReadBaseV is None:
+            self.gammaReadBaseV = vgprPool.checkOut(1, tag="rms_gammaReadBase")
         module.addComment1("gamma read base = (waveM*(T_M*16) + g*4) * 2 (bf16 LDS byte offset).")
         rwSpanM = self.T_M * 16
         # waveMTerm = waveM * (T_M*16): shift when power of two, else materialized mul.
@@ -977,6 +975,11 @@ class RMSEpilogueEmitter:
         a temp VGPR. The temp is independent of src, so this is safe in place
         (dst == src).
         """
+        if imm == 0:
+            if dst == src:
+                return
+            module.add(VMovB32(dst=vgpr(dst), src=vgpr(src), comment=comment))
+            return
         if imm <= 64:
             module.add(VAddU32(vgpr(dst), vgpr(src), imm, comment=comment))
             return
@@ -1142,10 +1145,6 @@ class RMSEpilogueEmitter:
         sgprPool.checkIn(writerMask)
         sgprPool.checkIn(partialSrd)
 
-    def _isPackPair(self, a, b):
-        """True iff (a, b) is an even-aligned consecutive VGPR pair (packable)."""
-        return (a % 2 == 0) and (b == a + 1)
-
     def _pkMulPairs(self, module, dstBase, aBase, bBase, comment):
         """Emit dst = a * b over 8 contiguous f32, packing even-aligned pairs.
 
@@ -1156,8 +1155,8 @@ class RMSEpilogueEmitter:
             d0 = dstBase + 2 * p
             a0 = aBase + 2 * p
             b0 = bBase + 2 * p
-            if (self._isPackPair(d0, d0 + 1) and self._isPackPair(a0, a0 + 1)
-                    and self._isPackPair(b0, b0 + 1)):
+            if (_isPackPair(d0, d0 + 1) and _isPackPair(a0, a0 + 1)
+                    and _isPackPair(b0, b0 + 1)):
                 module.add(VMulPKF32(dst=vgpr(d0, 2), src0=vgpr(a0, 2), src1=vgpr(b0, 2),
                                      comment=f"{comment} (packed {2 * p},{2 * p + 1})."))
                 continue
@@ -1178,8 +1177,8 @@ class RMSEpilogueEmitter:
             d0 = dstBase + 2 * p
             a0, a1 = aRegs[2 * p], aRegs[2 * p + 1]
             b0, b1 = bRegs[2 * p], bRegs[2 * p + 1]
-            if (self._isPackPair(d0, d0 + 1) and self._isPackPair(a0, a1)
-                    and self._isPackPair(b0, b1)):
+            if (_isPackPair(d0, d0 + 1) and _isPackPair(a0, a1)
+                    and _isPackPair(b0, b1)):
                 module.add(VAddPKF32(dst=vgpr(d0, 2), src0=vgpr(a0, 2), src1=vgpr(b0, 2),
                                      comment=f"{comment} (packed {2 * p},{2 * p + 1})."))
                 continue
@@ -1241,17 +1240,17 @@ class RMSEpilogueEmitter:
                            comment=f"ssqAcc[{n}] += s."))
         vgprPool.checkIn(sq)
 
-        # ---- Step 5: gamma read (MLIR 353-371), before the stores ----
+        # ---- Step 4: gamma read (MLIR 353-371), before the stores ----
         self._readGammaLds(module, g8Bank, mp)
 
-        # ---- Step 6: D = H8 * gamma into a SEPARATE bank (MLIR 372). Computing out
+        # ---- Step 5: D = H8 * gamma into a SEPARATE bank (MLIR 372). Computing out
         # of place keeps residualF32 = H8 live so the residual store below still
         # writes H (the reference keeps %native and %Dout both live).
         dBank = vgprPool.checkOutAligned(8, 2, tag="rms_dBank")
         self._pkMulPairs(module, dBank, residualF32[0], g8Bank, "Dout = H8 * gamma")
 
-        # ---- Steps 4 + 6b: both stores issued back-to-back after H*gamma (residual
-        # H8 first, then D), matching the @mega_fused_body schedule (MLIR 389-392). ----
+        # ---- Step 6: both stores issued back-to-back after H*gamma (residual H8
+        # first, then D), matching the @mega_fused_body schedule (MLIR 389-392). ----
         self._storeResidualOut(module, residualF32, mp, n, isX4,
                                self.residualOutSrd, "SizesFree+0", self.colBaseV)
         # WAR hazard: the residual store's dwordx4 reads its bf16 pack registers, and
