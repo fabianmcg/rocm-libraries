@@ -2,14 +2,21 @@
 # SPDX-License-Identifier: MIT
 """RMSEpilogueEmitter: faithful from-scratch RMS epilogue emitter (Subtile gfx950).
 
-Mirrors the reference kernel mega_fused_epilogue.mlir (@mega_fused_epilogue). The
-native path stores D = H*gamma directly and is exclusive: when it is active it is the
-only epilogue (GlobalWriteBatch is skipped) and it does not apply alpha, beta*C, bias,
-activation, scales, E, or amaxD. Every Subtile-layout, non-MXFP8 bf16 config takes the
-native path; MXFP8 (float8 D) configs delegate to SubtileMegaFusedEmitter instead.
+Mirrors the reference kernel mega_fused_epilogue.mlir (@mega_fused_epilogue). Both
+bf16 and MXFP8 (float8 D) Subtile configs take the native path.
+
+bf16 path: stores D directly; GlobalWriteBatch (GWB) is skipped.
+
+MXFP8 path: computes amax per 32-row block, derives e8m0 scale, writes quantized
+f32 values back into the accumulator register file, and stores ResidualOut (bf16) and
+MXScale bytes itself. GWB then runs and converts the quantized f32 acc values to fp8
+for the D store. GWB is NOT skipped for the native MXFP8 path.
+
+Neither path applies alpha, beta*C, bias, activation, scales, E, or amaxD.
 """
 
 import math
+import struct
 
 from .SubtileCommon import _isPackPair
 from rocisa.code import Label, Module
@@ -18,6 +25,7 @@ from rocisa.instruction import (
     BufferLoadB32,
     BufferLoadB128,
     BufferLoadD16B16,
+    BufferStoreB8,
     BufferStoreB16,
     BufferStoreB32,
     BufferStoreB128,
@@ -28,6 +36,7 @@ from rocisa.instruction import (
     DSStoreB32,
     SAddU32,
     SAndB32,
+    SAndB64,
     SAndSaveExecB64,
     SBranch,
     SCBranchSCC0,
@@ -42,10 +51,12 @@ from rocisa.instruction import (
     SSubU32,
     SWaitCnt,
     VAccvgprReadB32,
+    VAccvgprWriteB32,
     VAddF32,
     VAddPKF32,
     VAddU32,
     VAndB32,
+    VCmpEQF32,
     VCmpEQU32,
     VCmpLtU32,
     VCndMaskB32,
@@ -53,6 +64,8 @@ from rocisa.instruction import (
     VCvtPkF32toBF16,
     VLShiftLeftB32,
     VLShiftRightB32,
+    VMaxF32,
+    VMed3I32,
     VMovB32,
     VMulF32,
     VMulLOU32,
@@ -62,6 +75,7 @@ from rocisa.instruction import (
     VPermlane16SwapB32,
     VPermlane32SwapB32,
     VReadfirstlaneB32,
+    VSubU32,
     VXorB32,
     _SWaitCnt,
 )
@@ -135,29 +149,46 @@ class RMSEpilogueEmitter:
         # Per-lane gamma LDS read base byte offset (set in _computeGammaReadBase).
         self.gammaReadBaseV = None
 
+        # ---- MXFP8 config (set when destType is float8) ----
+        self.destType = kernel["ProblemType"]["DestDataType"]
+        self.useMxfp8 = bool(kernel["RMSEpilogue"]) and self.destType.isFloat8()
+        # D output element size used by the native D store (bf16 only; MXFP8 D goes via GWB).
+        self.dElemBytes = 2
+        self.fp8E4m3Max = 448.0
+        # Persistent MXFP8 registers (allocated in _emitMxScaleSetup; freed in teardown).
+        self.mxSrd = None
+        self._scTotalFree = None
+        self._scTotalKBlocks = None
+        self._scFreeBase = None
+        self._scKblkBase = None
+        self._scStrideV = None
+
     def _nativeEligible(self):
-        # The native RMS epilogue is exclusive and self-contained: when active it is
-        # the only epilogue, it stores D = H*gamma directly, and GlobalWriteBatch is
-        # skipped. By design it does NOT apply alpha, beta*C, bias, activation, scales,
-        # E, or amaxD -- those features are simply not applied for a config routed here.
-        # Delegate to the writer's authoritative gate so the store-skip predicate and
+        # The native RMS epilogue does not apply alpha, beta*C, bias, activation,
+        # scales, E, or amaxD. For bf16, it stores D directly and GWB is skipped.
+        # For MXFP8, it writes quantized acc values and stores ResidualOut/MXScale;
+        # GWB runs afterward to convert acc to fp8 and store D.
+        # Delegate to the writer's authoritative gate so the routing predicate and
         # this emitter never drift (rowsPerLane is the only emitter-local extra check).
         return self.rowsPerLane == 4 and self.writer._nativeRmsEpilogueActive(self.kernel)
 
     def emit(self, vgprTiles):
-        if self._nativeEligible():
-            return self._emitNative(vgprTiles)
-        from .SubtileMegaFusedEmit import SubtileMegaFusedEmitter
-        return SubtileMegaFusedEmitter(self.writer, self.kernel).emit(vgprTiles)
+        # Every RMSEpilogue config that passes Solution validation is native-eligible
+        # (bf16 or MXFP8 Subtile); non-eligible configs are rejected there, never reach here.
+        assert self._nativeEligible(), \
+            "RMSEpilogue reached a non-native config; Solution validation must reject these"
+        return self._emitNative(vgprTiles)
 
     def _emitNative(self, vgprTiles):
         module = Module("RMSEpilogue native (faithful MLIR paired-permlane).")
-        assert self.kernel["ProblemType"]["DestDataType"].isBFloat16(), \
-            "native RMS epilogue emits bf16 D only; non-bf16 dest must route to the old path"
+        assert self.destType.isBFloat16() or self.destType.isFloat8(), \
+            "native RMS epilogue emits bf16 or mxfp8 D only"
         # Drain GEMM vector memory before reusing AGPRs/LDS (epilogue entry).
         module.add(SWaitCnt(vlcnt=0, comment="drain GEMM loads before epilogue."))
         self._emitSetup(module)
         self._computeAddrConstants(module)
+        if self.useMxfp8:
+            self._emitMxScaleSetup(module)
         # Top-level is_x4 = (rowExtent % 8 == 0) branch (MLIR:552-554).
         narrowLabel = Label(self.writer.labels.getNameInc("rms_narrow"),
                             "narrow (rowExtent%8 != 0) arm.")
@@ -205,6 +236,14 @@ class RMSEpilogueEmitter:
         for attr in ("resSrd", "gammaSrd"):
             sgprPool.checkIn(getattr(self, attr))
             setattr(self, attr, None)
+        if self.useMxfp8:
+            module.addComment1("RMS teardown: free MXFP8 persistent registers.")
+            sgprPool.checkIn(self.mxSrd)
+            self.mxSrd = None
+            for attr in ("_scTotalFree", "_scTotalKBlocks", "_scFreeBase",
+                         "_scKblkBase", "_scStrideV"):
+                vgprPool.checkIn(getattr(self, attr))
+                setattr(self, attr, None)
 
     def _emitSetup(self, module):
         """Emit the kernel prologue: lane decode, row/col origins, buffer SRDs.
@@ -283,7 +322,9 @@ class RMSEpilogueEmitter:
         # D output SRD is already built (batch offset folded) and live here; reuse it.
         self.dOutSrd = self.writer.sgprs["SrdD"]
         self.dStrideSgpr = "StrideD" + self.writer.states.indexChars[self.kernel["PackedC1IndicesX"][0]]
-        self._boundDOutSrdRecords(module)
+        # MXFP8: GWB owns the D store; do not clobber SrdD's numRecords here.
+        if not self.useMxfp8:
+            self._boundDOutSrdRecords(module)
         self._buildResidualSrd(module, self.resSrd, "ResidualBuf", "residual")
         self._buildResidualSrd(module, self.residualOutSrd, "AddressResidualOut", "residualOut")
         self._buildGammaSrd(module, self.gammaSrd)
@@ -307,6 +348,8 @@ class RMSEpilogueEmitter:
         (column-major: validCols * rowExtent * bpe) so overflow stores are dropped.
         """
         module.addComment1("bound D SRD numRecords to valid columns (SrdD base folds WG1*MT1).")
+        # Shift by log2(dElemBytes): 1 for bf16 (2 bytes), 0 for fp8 (1 byte).
+        log2dElem = 1 if self.dElemBytes == 2 else 0
         with self.writer.allocTmpSgpr(1, tag="rms_dRecords") as t:
             module.add(SMulI32(dst=sgpr(t.idx), src0=self.MT1, src1=sgpr("WorkGroup1"),
                                comment="colFolded = WorkGroup1 * MT1 (already in SrdD base)."))
@@ -314,8 +357,9 @@ class RMSEpilogueEmitter:
                                comment="validCols = SizesFree1 - colFolded."))
             module.add(SMulI32(dst=sgpr(t.idx), src0=sgpr(t.idx), src1=sgpr("SizesFree+0"),
                                comment="records = validCols * rowExtent."))
-            module.add(SLShiftLeftB32(dst=sgpr(self.dOutSrd + 2), src=sgpr(t.idx), shiftHex=hex(1),
-                                      comment="SrdD numRecords = records * 2 (bf16)."))
+            module.add(SLShiftLeftB32(dst=sgpr(self.dOutSrd + 2), src=sgpr(t.idx),
+                                      shiftHex=hex(log2dElem),
+                                      comment=f"SrdD numRecords = records * {self.dElemBytes} (dElemBytes)."))
 
     def _buildGammaSrd(self, module, srd):
         """Build the gamma SRD: numRecords = SizesFree0 * 2 (bf16, one per row)."""
@@ -324,6 +368,118 @@ class RMSEpilogueEmitter:
         module.add(SLShiftLeftB32(dst=sgpr(srd + 2), src=sgpr("SizesFree+0"), shiftHex=hex(1),
                                   comment="numRecords = SizesFree0 * 2 (bf16)."))
         module.add(SMovB32(dst=sgpr(srd + 3), src="Srd127_96", comment="gamma SRD flags."))
+
+    def _buildMxScaleSrd(self, module):
+        """Build the MXScale buffer SRD from the MXScale kernarg (OOB limit)."""
+        sgprPool = self.writer.sgprPool
+        self.mxSrd = sgprPool.checkOutAligned(4, 4, tag="rms_mxSrd", preventOverflow=False)
+        module.addComment1("build MXScale SRD (OOB limit, base from MXScale kernarg).")
+        module.add(SMovB64(dst=sgpr(self.mxSrd, 2), src=sgpr("MXScale", 2),
+                           comment="mxScale SRD base."))
+        module.add(SMovB32(dst=sgpr(self.mxSrd + 2), src="BufferOOB",
+                           comment="mxScale SRD limit (OOB)."))
+        module.add(SMovB32(dst=sgpr(self.mxSrd + 3), src="Srd127_96",
+                           comment="mxScale SRD flags."))
+
+    def _emitMxScaleSetup(self, module):
+        """Precompute MXScale SRD and base indices for the MXFP8 quant store.
+
+        Ported from the former SubtileMegaFusedEmitter (since removed). Computes
+        the per-wave invariant indices used by _storeMxScale in each pair. The native
+        path is alpha==1-only (enforced in Solution.py), so alpha folds are omitted.
+        """
+        vgprPool = self.writer.vgprPool
+        module.addComment1("MXFP8: build MXScale SRD and compute swizzle base indices.")
+        self._buildMxScaleSrd(module)
+
+        # q0=32, q1=1 (MXFP8 block shape 32x1).
+        q0 = 32
+        q1 = 1
+        # nQTilesM = number of 32-row quant blocks a wave owns in M = T_M / 2 = numPairs / T_N.
+        nQTilesM = self.T_M // 2  # == numPairs // T_N
+
+        # totalFree = ceil(N / q1) = SizesFree+1 (since q1=1).
+        self._scTotalFree = vgprPool.checkOut(1, tag="rms_scTotalFree")
+        module.addComment1("totalFree = SizesFree+1 (q1=1, so ceil(N/1)=N).")
+        with self.writer.allocTmpSgpr(1, tag="rms_scTFsS") as s:
+            # q1=1 so no divide needed; just copy the scalar.
+            module.add(SMovB32(dst=sgpr(s.idx), src=sgpr("SizesFree+1"),
+                               comment="totalFree = SizesFree+1 (q1=1)."))
+            module.add(VMovB32(dst=vgpr(self._scTotalFree), src=sgpr(s.idx),
+                               comment="totalFree into VGPR."))
+
+        # totalKBlocks = ceil(nHidden / q0) = ceil(SizesFree+0 / 32).
+        self._scTotalKBlocks = vgprPool.checkOut(1, tag="rms_scTotalKBlks")
+        module.addComment1("totalKBlocks = ceil(SizesFree+0 / 32).")
+        with self.writer.allocTmpSgpr(1, tag="rms_scTKsS") as s:
+            module.add(SAddU32(dst=sgpr(s.idx), src0=sgpr("SizesFree+0"), src1=q0 - 1,
+                               comment=f"SizesFree+0 + {q0}-1."))
+            module.add(SLShiftRightB32(dst=sgpr(s.idx), shiftHex=hex(int(math.log2(q0))),
+                                       src=sgpr(s.idx),
+                                       comment=f"totalKBlocks = ceil(N_hidden/q0={q0})."))
+            module.add(VMovB32(dst=vgpr(self._scTotalKBlocks), src=sgpr(s.idx),
+                               comment="totalKBlocks into VGPR."))
+
+        # freeBase = WorkGroup1*MT1 + waveN*(T_N*16): global quant-column base for this wave.
+        self._scFreeBase = vgprPool.checkOut(1, tag="rms_scFreeBase")
+        module.addComment1("freeBase = WG1*MT1 + waveN*(T_N*16).")
+        with self.writer.allocTmpSgpr(1, tag="rms_scFBsS") as s:
+            module.add(SMulI32(dst=sgpr(s.idx), src0=sgpr("WorkGroup1"), src1=self.MT1,
+                               comment="WG1 * MT1."))
+            module.add(VMovB32(dst=vgpr(self._scFreeBase), src=sgpr(s.idx),
+                               comment="freeBase = WG1*MT1."))
+        waveSpanN = self.T_N * 16
+        tmpFB = vgprPool.checkOut(1, tag="rms_scFBtmp")
+        if waveSpanN & (waveSpanN - 1) == 0:
+            module.add(VLShiftLeftB32(dst=vgpr(tmpFB),
+                                      shiftHex=hex(int(math.log2(waveSpanN))),
+                                      src=vgpr(self.waveNV),
+                                      comment=f"waveN * waveSpanN({waveSpanN})."))
+        else:
+            module.add(VMovB32(dst=vgpr(tmpFB), src=waveSpanN,
+                               comment=f"waveSpanN={waveSpanN}."))
+            module.add(VMulLOU32(dst=vgpr(tmpFB), src0=vgpr(tmpFB), src1=vgpr(self.waveNV),
+                                 comment="waveN * waveSpanN."))
+        module.add(VAddU32(vgpr(self._scFreeBase), vgpr(self._scFreeBase), vgpr(tmpFB),
+                           comment="freeBase += waveN*waveSpanN."))
+        vgprPool.checkIn(tmpFB)
+
+        # kblkBase = WorkGroup0*(nQTilesM*wgM) + waveM*nQTilesM: 32-row block base for this wave.
+        self._scKblkBase = vgprPool.checkOut(1, tag="rms_scKblkBase")
+        nQTilesMPerWG = nQTilesM * self.wgM
+        module.addComment1(f"kblkBase = WG0*{nQTilesMPerWG} + waveM*{nQTilesM}.")
+        with self.writer.allocTmpSgpr(1, tag="rms_scKBsS") as s:
+            module.add(SMulI32(dst=sgpr(s.idx), src0=sgpr("WorkGroup0"), src1=nQTilesMPerWG,
+                               comment=f"WG0 * {nQTilesMPerWG}."))
+            module.add(VMovB32(dst=vgpr(self._scKblkBase), src=sgpr(s.idx),
+                               comment="kblkBase = WG0 * nQTilesM*wgM."))
+        if nQTilesM > 0:
+            tmpKB = vgprPool.checkOut(1, tag="rms_scKBtmp")
+            if nQTilesM & (nQTilesM - 1) == 0 and nQTilesM > 1:
+                module.add(VLShiftLeftB32(dst=vgpr(tmpKB),
+                                          shiftHex=hex(int(math.log2(nQTilesM))),
+                                          src=vgpr(self.waveMV),
+                                          comment=f"waveM * nQTilesM({nQTilesM})."))
+            else:
+                module.add(VMovB32(dst=vgpr(tmpKB), src=nQTilesM,
+                                   comment=f"nQTilesM={nQTilesM}."))
+                module.add(VMulLOU32(dst=vgpr(tmpKB), src0=vgpr(tmpKB), src1=vgpr(self.waveMV),
+                                     comment="waveM * nQTilesM."))
+            module.add(VAddU32(vgpr(self._scKblkBase), vgpr(self._scKblkBase), vgpr(tmpKB),
+                               comment="kblkBase += waveM*nQTilesM."))
+            vgprPool.checkIn(tmpKB)
+
+        # strideV = ceil(totalKBlocks/8)*256 (swizzle d0 stride; uses totalKBlocks VGPR).
+        self._scStrideV = vgprPool.checkOut(1, tag="rms_scStrideV")
+        module.addComment1("strideV = ceil(totalKBlocks/8)*256.")
+        module.add(VAddU32(vgpr(self._scStrideV), vgpr(self._scTotalKBlocks), 7,
+                           comment="totalKBlocks + 7."))
+        module.add(VLShiftRightB32(dst=vgpr(self._scStrideV), shiftHex=hex(3),
+                                   src=vgpr(self._scStrideV),
+                                   comment="colBlocks = ceil(totalKBlocks/8)."))
+        module.add(VLShiftLeftB32(dst=vgpr(self._scStrideV), shiftHex=hex(8),
+                                  src=vgpr(self._scStrideV),
+                                  comment="strideV = colBlocks * 256."))
 
     def _emitGammaPrefetch(self, module):
         """Prefetch this block's MT0 gamma rows into a flat workgroup LDS buffer.
@@ -765,17 +921,14 @@ class RMSEpilogueEmitter:
         vgprPool.checkIn(gldsAddr)
 
     def _storeResidualOut(self, module, hRegs, mp, n, isX4, srd, colStride, colBase):
-        """Store bf16(H) for pair ``mp``, column-tile ``n`` to the given SRD.
+        """Store bf16 D for pair ``mp``, column-tile ``n`` to the given SRD.
 
         Faithful port of @store_data (MLIR 166-218). ``hRegs`` lists the 8
         native-order f32 H VGPRs. WIDE packs, pair-shuffles, and issues one
         dwordx4; NARROW issues eight per-row clamped bf16 stores. Addressing
         mirrors the residual load (@load_raw). ``srd`` is the SGPR name for the
         4-sgpr buffer descriptor; ``colStride`` is the SGPR name for the column
-        leading-dimension stride (use "SizesFree+0" for the residual stream,
-        self.dStrideSgpr for the D stream). ``colBase`` is the column-base VGPR:
-        the GLOBAL self.colBaseV for the residual stream, the tile-relative
-        self.colBaseDV for the D stream (SrdD already folds WG1*MT1).
+        leading-dimension stride; ``colBase`` is the column-base VGPR.
         """
         if isX4:
             self._storeResidualOutWide(module, hRegs, mp, n, srd, colStride, colBase)
@@ -793,11 +946,8 @@ class RMSEpilogueEmitter:
             module.add(VCvtPkF32toBF16(dst=vgpr(vPack + p), src0=vgpr(hRegs[2 * p]),
                                        src1=vgpr(hRegs[2 * p + 1]),
                                        comment=f"pack f32 pair ({2 * p},{2 * p + 1}) -> bf16 dword {p}."))
-        # gfx950 hazard: a VALU write (v_cvt_pk above) to a VGPR that a following
-        # v_permlane*_swap reads requires >= 2 wait states; _pairShuffle reads the
-        # just-packed vPack dwords, so fence here (hand-written asm is not auto-fixed).
+        # gfx950 hazard: VALU write (v_cvt_pk) -> v_permlane read needs 2 wait states.
         module.add(SNop(waitState=1, comment="gfx950 hazard: VALU write (v_cvt_pk) -> v_permlane read needs 2 wait states"))
-        # native -> tile-contiguous (involutive) before the coalesced store.
         self._pairShuffle(module, vPack)
         rowBaseP = vgprPool.checkOut(1, tag="rms_resStoreRow")
         col      = vgprPool.checkOut(1, tag="rms_resStoreCol")
@@ -807,10 +957,10 @@ class RMSEpilogueEmitter:
         self._vaddImm(module, rowBaseP, rowBaseP, m * 16, f"rowBaseP += m*16 (m={m}).")
         self._vaddImm(module, col, colBase, n * 16, f"col = colBase + n*16 (n={n}).")
         module.add(VMulLOU32(dst=vgpr(addr), src0=sgpr(colStride), src1=vgpr(col),
-                             comment="addr = column * rowExtent."))
+                             comment="addr = column * stride."))
         module.add(VAddU32(vgpr(addr), vgpr(addr), vgpr(rowBaseP), comment="addr += rowBaseP."))
         module.add(VLShiftLeftB32(dst=vgpr(addr), shiftHex=hex(1), src=vgpr(addr),
-                                  comment="addr *= 2 (bf16 bytes)."))
+                                  comment="addr *= 2 bytes (bf16)."))
         mask = sgprPool.checkOutAligned(lsc, lsc, tag="rms_resStoreMask", preventOverflow=False)
         module.add(VCmpLtU32(dst=sgpr(mask, lsc), src0=vgpr(rowBaseP), src1=sgpr("SizesFree+0"),
                              comment="inRange = rowBaseP < rowExtent."))
@@ -831,8 +981,9 @@ class RMSEpilogueEmitter:
         self._storeResidualOutNarrowTile(module, hRegs, 0, 2 * mp, n, srd, colStride, colBase)
         self._storeResidualOutNarrowTile(module, hRegs, 4, 2 * mp + 1, n, srd, colStride, colBase)
 
-    def _storeResidualOutNarrowTile(self, module, hRegs, slotBase, ti, n, srd, colStride, colBase):
-        """Store one native tile's four bf16 H rows, per-row clamped."""
+    def _storeResidualOutNarrowTile(self, module, hRegs, slotBase, ti, n, srd, colStride,
+                                    colBase):
+        """Store one native tile's four H rows, per-row clamped bf16."""
         vgprPool = self.writer.vgprPool
         sgprPool = self.writer.sgprPool
         lsc = self.laneSGPRCount
@@ -854,7 +1005,7 @@ class RMSEpilogueEmitter:
                                  comment="addr = column * colStride."))
             module.add(VAddU32(vgpr(addr), vgpr(addr), vgpr(row), comment="addr += row."))
             module.add(VLShiftLeftB32(dst=vgpr(addr), shiftHex=hex(1), src=vgpr(addr),
-                                      comment="addr *= 2 (bf16 bytes)."))
+                                      comment="addr *= 2 bytes (bf16)."))
             module.add(VCndMaskB32(dst=vgpr(addr), src0=vgpr(self.oobV), src1=vgpr(addr),
                                    src2=sgpr(mask, lsc), comment="OOB addr when row >= rowExtent."))
             module.add(VCvtPkF32toBF16(dst=vgpr(val), src0=vgpr(hRegs[slotBase + k]),
@@ -863,7 +1014,7 @@ class RMSEpilogueEmitter:
             module.add(BufferStoreB16(src=vgpr(val), vaddr=vgpr(addr),
                                       saddr=sgpr(srd, 4), soffset=0,
                                       mubuf=MUBUFModifiers(offen=True),
-                                      comment=f"store bf16 = residualOut[row {k}]."))
+                                      comment=f"store bf16 = output[row {k}]."))
             sgprPool.checkIn(mask)
         vgprPool.checkIn(rowBaseT)
         vgprPool.checkIn(col)
@@ -881,7 +1032,7 @@ class RMSEpilogueEmitter:
         cannot overwrite a bank until every consume of this group has finished in
         program order (no WAR hazard on the ring).
 
-        Per-pair vmem = 1 load + 2 stores (residualOut store, then D store). gfx950
+        Per-pair vmem = 1 load + 2 stores (residualOut, then D for bf16 / MXScale for mxfp8). gfx950
         has a single combined vmcnt (loads+stores, FIFO). At consume d, load_d must
         be complete; the VMEM ops issued more recently than load_d that may still be
         in flight are the (P-1-d) not-yet-consumed prefetch loads plus the 2*d stores
@@ -966,6 +1117,145 @@ class RMSEpilogueEmitter:
                 module.add(VAddF32(dst=vgpr(s), src0=vgpr(s), src1=vgpr(tmp),
                                    comment=f"ssqAcc[{n}] = own + partner^{xorW}."))
         vgprPool.checkIn(tmp)
+
+    def _rowGroupMaxReduce(self, module, regV):
+        """Intra-wave row-group butterfly max over regV (2 rounds, VMax).
+
+        Mirrors _combineRowGroups but for a single VMax-fold instead of VAddF32.
+        Round 0: VPermlane16SwapB32 (exchange with lane^16).
+        Round 1: VPermlane32SwapB32 (exchange with lane^32).
+        After both rounds regV holds the per-column block amax across all 4 row-groups.
+        """
+        vgprPool = self.writer.vgprPool
+        tmp = vgprPool.checkOut(1, tag="rms_mxMaxTmp")
+        for r, SwapCls in enumerate([VPermlane16SwapB32, VPermlane32SwapB32]):
+            module.add(VMovB32(dst=vgpr(tmp), src=vgpr(regV),
+                               comment=f"own copy for row-group max round {r}."))
+            # gfx950 hazard: VALU write (v_mov) -> v_permlane read needs 2 wait states.
+            module.add(SNop(waitState=1, comment="gfx950 hazard: VALU write (v_mov) -> v_permlane read needs 2 wait states."))
+            module.add(SwapCls(dst=vgpr(regV), src=vgpr(tmp),
+                               comment=f"swap with partner^{16 << r}; tmp keeps own."))
+            module.add(VMaxF32(dst=vgpr(regV), src0=vgpr(regV), src1=vgpr(tmp),
+                               comment=f"blockAmax = max(own, partner^{16 << r})."))
+        vgprPool.checkIn(tmp)
+
+    def _storeMxScale(self, module, scaleByteReg, mp, n):
+        """Store the e8m0 scale byte for the 32-row quant block (pair mp, col-tile n).
+
+        Ported from the former SubtileMegaFusedEmitter (since removed). The swizzled byte
+        offset replicates the GFX950 pre-swizzled MXScale layout exactly. Only
+        row-group 0 (gV==0) lanes AND lanes with kblkV<totalKBlocks AND
+        freeV<totalFree write; exec is narrowed and restored via SAndSaveExecB64.
+
+        In the new emitter each lane owns column c=self.cV, so the per-column loop
+        from the old emitter collapses to a single implicit store (the lane writes
+        its own column's byte, gated by exec).
+        """
+        vgprPool = self.writer.vgprPool
+        sgprPool = self.writer.sgprPool
+        lsc = self.laneSGPRCount
+
+        # kblkV = kblkBase + mp (pair index == 32-row block index for this wave).
+        kblkV = vgprPool.checkOut(1, tag="rms_mxKblkV")
+        if mp == 0:
+            module.add(VMovB32(dst=vgpr(kblkV), src=vgpr(self._scKblkBase),
+                               comment="kblkV = kblkBase + mp=0."))
+        else:
+            self._vaddImm(module, kblkV, self._scKblkBase, mp,
+                          f"kblkV = kblkBase + mp={mp}.")
+
+        # freeV = freeBase + col + n*mfmaN (global quant column index).
+        freeV = vgprPool.checkOut(1, tag="rms_mxFreeV")
+        nOff = n * self.mfmaN
+        module.add(VAddU32(vgpr(freeV), vgpr(self._scFreeBase), vgpr(self.cV),
+                           comment="freeV = freeBase + col (per-lane)."))
+        if nOff > 0:
+            self._vaddImm(module, freeV, freeV, nOff, f"freeV += n*mfmaN={nOff}.")
+
+        # Write mask: rowGroup==0 AND kblkV<totalKBlocks AND freeV<totalFree.
+        rgCond = sgprPool.checkOutAligned(lsc, lsc, tag="rms_mxRgCond", preventOverflow=False)
+        kblkCond = sgprPool.checkOutAligned(lsc, lsc, tag="rms_mxKblkIR", preventOverflow=False)
+        freeCond = sgprPool.checkOutAligned(lsc, lsc, tag="rms_mxFreeIR", preventOverflow=False)
+        groupMask = sgprPool.checkOutAligned(lsc, lsc, tag="rms_mxGroupMask", preventOverflow=False)
+        savedExec = sgprPool.checkOutAligned(lsc, lsc, tag="rms_mxSavedExec", preventOverflow=False)
+        module.add(VCmpEQU32(dst=sgpr(rgCond, lsc), src0=0, src1=vgpr(self.gV),
+                             comment="rowGroup == 0?."))
+        module.add(VCmpLtU32(dst=sgpr(kblkCond, lsc), src0=vgpr(kblkV),
+                             src1=vgpr(self._scTotalKBlocks), comment="kblkV < totalKBlocks?."))
+        module.add(SAndB64(dst=sgpr(groupMask, lsc), src0=sgpr(rgCond, lsc),
+                           src1=sgpr(kblkCond, lsc),
+                           comment="groupMask = rowGroup==0 AND kblk in range."))
+        module.add(VCmpLtU32(dst=sgpr(freeCond, lsc), src0=vgpr(freeV),
+                             src1=vgpr(self._scTotalFree), comment="freeV < totalFree?."))
+        module.add(SAndB64(dst=sgpr(groupMask, lsc), src0=sgpr(groupMask, lsc),
+                           src1=sgpr(freeCond, lsc),
+                           comment="mask &= freeV in range."))
+        sgprPool.checkIn(rgCond)
+        sgprPool.checkIn(kblkCond)
+        sgprPool.checkIn(freeCond)
+        module.add(SAndSaveExecB64(dst=sgpr(savedExec, lsc), src=sgpr(groupMask, lsc),
+                                   comment="save exec; narrow to write-lane mask."))
+        sgprPool.checkIn(groupMask)
+
+        # Pre-swizzled MXScale byte offset (ported from the former SubtileMegaFusedEmitter).
+        # byteOff = d0*strideV + lowBits, where:
+        #   d0 = freeV >> 5
+        #   lowBits = (freeV&0xF)<<2 | ((freeV>>4)&1) | colLowBits(kblkV)
+        # colLowBits(kblkV) = (kblkV&3)<<6 | ((kblkV>>2)&1)<<1 | (kblkV>>3)<<8
+        sLow = vgprPool.checkOut(1, tag="rms_mxSwzLow")
+        sTmp = vgprPool.checkOut(1, tag="rms_mxSwzTmp")
+        byteOffV = freeV  # reuse freeV as byteOff after it's consumed.
+
+        # d0*strideV (sTmp -> d0, reuse sLow for d0Prod before being computed below).
+        d0Prod = vgprPool.checkOut(1, tag="rms_mxD0Prod")
+        module.add(VLShiftRightB32(dst=vgpr(sTmp), shiftHex=hex(5), src=vgpr(freeV),
+                                   comment="d0 = freeV >> 5."))
+        module.add(VMulLOU32(dst=vgpr(d0Prod), src0=vgpr(sTmp), src1=vgpr(self._scStrideV),
+                             comment="d0 * strideV."))
+
+        # low bits: d2=(freeV&0xF)<<2, d1=((freeV>>4)&1).
+        module.add(VAndB32(dst=vgpr(sLow), src0=vgpr(freeV), src1=0xF, comment="d2 = freeV & 0xF."))
+        module.add(VLShiftLeftB32(dst=vgpr(sLow), shiftHex=hex(2), src=vgpr(sLow),
+                                  comment="d2 << 2."))
+        module.add(VLShiftRightB32(dst=vgpr(sTmp), shiftHex=hex(4), src=vgpr(freeV),
+                                   comment="freeV >> 4."))
+        module.add(VAndB32(dst=vgpr(sTmp), src0=vgpr(sTmp), src1=1, comment="d1 = (freeV>>4)&1."))
+        module.add(VOrB32(dst=vgpr(sLow), src0=vgpr(sLow), src1=vgpr(sTmp), comment="lowV |= d1."))
+
+        # colLowBits(kblkV): OR d5<<6 | d4<<1 | d3<<8 into sLow (port of _swizzleColBits).
+        module.addComment1("OR swizzle column bits d3/d4/d5 (kblkV) into lowV.")
+        module.add(VAndB32(dst=vgpr(sTmp), src0=vgpr(kblkV), src1=3, comment="d5 = kblkV & 3."))
+        module.add(VLShiftLeftB32(dst=vgpr(sTmp), shiftHex=hex(6), src=vgpr(sTmp),
+                                  comment="d5 << 6."))
+        module.add(VOrB32(dst=vgpr(sLow), src0=vgpr(sLow), src1=vgpr(sTmp), comment="lowV |= d5<<6."))
+        module.add(VLShiftRightB32(dst=vgpr(sTmp), shiftHex=hex(2), src=vgpr(kblkV),
+                                   comment="kblkV >> 2."))
+        module.add(VAndB32(dst=vgpr(sTmp), src0=vgpr(sTmp), src1=1, comment="d4 = (kblkV>>2)&1."))
+        module.add(VLShiftLeftB32(dst=vgpr(sTmp), shiftHex=hex(1), src=vgpr(sTmp),
+                                  comment="d4 << 1."))
+        module.add(VOrB32(dst=vgpr(sLow), src0=vgpr(sLow), src1=vgpr(sTmp), comment="lowV |= d4<<1."))
+        module.add(VLShiftRightB32(dst=vgpr(sTmp), shiftHex=hex(3), src=vgpr(kblkV),
+                                   comment="d3 = kblkV >> 3."))
+        module.add(VLShiftLeftB32(dst=vgpr(sTmp), shiftHex=hex(8), src=vgpr(sTmp),
+                                  comment="d3 << 8."))
+        module.add(VOrB32(dst=vgpr(sLow), src0=vgpr(sLow), src1=vgpr(sTmp), comment="lowV |= d3<<8."))
+
+        # byteOff = d0Prod + sLow.
+        module.add(VAddU32(vgpr(byteOffV), vgpr(d0Prod), vgpr(sLow),
+                           comment="swizzled byteOff = d0*strideV + lowBits."))
+        vgprPool.checkIn(d0Prod)
+        vgprPool.checkIn(sTmp)
+        vgprPool.checkIn(sLow)
+
+        module.add(BufferStoreB8(src=vgpr(scaleByteReg), vaddr=vgpr(byteOffV),
+                                 saddr=sgpr(self.mxSrd, 4), soffset=0,
+                                 mubuf=MUBUFModifiers(offen=True),
+                                 comment=f"MXScale byte store (mp={mp}, n={n})."))
+        module.add(SMovB64(dst=EXEC(), src=sgpr(savedExec, lsc),
+                           comment="restore exec after MXScale store."))
+        sgprPool.checkIn(savedExec)
+        vgprPool.checkIn(freeV)
+        vgprPool.checkIn(kblkV)
 
     def _vaddImm(self, module, dst, src, imm, comment):
         """dst = src + imm, materializing imm in a temp VGPR above the inline cap.
@@ -1202,6 +1492,8 @@ class RMSEpilogueEmitter:
         reference uses H = residual directly.
         """
         vgprPool = self.writer.vgprPool
+        sgprPool = self.writer.sgprPool
+        lsc = self.laneSGPRCount
         # ---- Step 1: read the accumulator into native-order accRegs ----
         accRegs = []
         slot = 0
@@ -1249,18 +1541,119 @@ class RMSEpilogueEmitter:
         dBank = vgprPool.checkOutAligned(8, 2, tag="rms_dBank")
         self._pkMulPairs(module, dBank, residualF32[0], g8Bank, "Dout = H8 * gamma")
 
-        # ---- Step 6: both stores issued back-to-back after H*gamma (residual H8
-        # first, then D), matching the @mega_fused_body schedule (MLIR 389-392). ----
-        self._storeResidualOut(module, residualF32, mp, n, isX4,
-                               self.residualOutSrd, "SizesFree+0", self.colBaseV)
-        # WAR hazard: the residual store's dwordx4 reads its bf16 pack registers, and
-        # the D store reuses the same pack bank. Let the store's source read drain
-        # before the D pack overwrites it (the reference spaces these with two nops).
-        module.add(VNop(2, comment="WAR: drain residual store pack read before D pack reuses it."))
-        self._storeResidualOut(module, [dBank + j for j in range(8)], mp, n, isX4,
-                               self.dOutSrd, self.dStrideSgpr, self.colBaseDV)
+        # ---- Step 6: stores and MXFP8 quant (if applicable) ----
+        if not self.useMxfp8:
+            # bf16 path: residualOut (H8 bf16) then D (H*gamma bf16), matching MLIR 389-392.
+            self._storeResidualOut(module, residualF32, mp, n, isX4,
+                                   self.residualOutSrd, "SizesFree+0", self.colBaseV)
+            # WAR hazard: the residual store's dwordx4 reads its bf16 pack registers, and
+            # the D store reuses the same pack bank. Fence with two nops (MLIR ref).
+            module.add(VNop(2, comment="WAR: drain residual store pack read before D pack reuses it."))
+            self._storeResidualOut(module, [dBank + j for j in range(8)], mp, n, isX4,
+                                   self.dOutSrd, self.dStrideSgpr, self.colBaseDV)
+        else:
+            # MXFP8 path:
+            # 6a. Store residualOut as bf16 (ResidualOut is always bf16).
+            self._storeResidualOut(module, residualF32, mp, n, isX4,
+                                   self.residualOutSrd, "SizesFree+0", self.colBaseV)
+            # WAR: residual store reads vPack; D pack reuses it. Drain before reuse.
+            module.add(VNop(2, comment="WAR: drain residual store pack read before D pack reuses it."))
+            # 6b. Compute per-lane block amax = max(|dBank[0]|..|dBank[7]|).
+            # 0x7FFFFFFF exceeds the VALU inline literal range; materialize it first.
+            absMask = vgprPool.checkOut(1, tag="rms_mxAbsMask")
+            module.add(VMovB32(dst=vgpr(absMask), src=hex(0x7FFFFFFF),
+                               comment="abs mask = 0x7FFFFFFF."))
+            amaxReg = vgprPool.checkOut(1, tag="rms_mxAmax")
+            module.add(VMovB32(dst=vgpr(amaxReg), src=0, comment="amaxReg = 0."))
+            tmpAbs = vgprPool.checkOut(1, tag="rms_mxAbsTmp")
+            for j in range(8):
+                module.add(VAndB32(dst=vgpr(tmpAbs), src0=vgpr(dBank + j),
+                                   src1=vgpr(absMask), comment=f"|dBank[{j}]|."))
+                module.add(VMaxF32(dst=vgpr(amaxReg), src0=vgpr(amaxReg), src1=vgpr(tmpAbs),
+                                   comment=f"amaxReg = max(amaxReg, |dBank[{j}]|)."))
+            vgprPool.checkIn(tmpAbs)
+            vgprPool.checkIn(absMask)
+            # 6c. Row-group butterfly: fold all 4 row-groups -> per-column block amax.
+            self._rowGroupMaxReduce(module, amaxReg)
+            # 6d. Derive e8m0 scale byte and quantMult from amax.
+            # scaleF = amax * (1/448); native path is alpha==1-only (enforced in Solution.py),
+            # so the alpha fold present in the old emitter is omitted.
+            invFp8Bits = struct.unpack('<I', struct.pack('<f', 1.0 / self.fp8E4m3Max))[0]
+            scaleByteReg = vgprPool.checkOut(1, tag="rms_mxScaleByte")
+            quantMultReg = vgprPool.checkOut(1, tag="rms_mxQuantMult")
+            c254Reg = vgprPool.checkOut(1, tag="rms_mxC254")
+            module.add(VMovB32(dst=vgpr(c254Reg), src=254, comment="constant 254."))
+            # scaleF = amax * (1/fp8Max) stored temporarily in quantMultReg.
+            module.add(VMovB32(dst=vgpr(quantMultReg), src=hex(invFp8Bits),
+                               comment=f"1/fp8Max = 1/{self.fp8E4m3Max}."))
+            module.add(VMulF32(dst=vgpr(quantMultReg), src0=vgpr(amaxReg), src1=vgpr(quantMultReg),
+                               comment="scaleF = amax * (1/fp8Max)."))
+            # mantissa ceil-adjust: adj = (scaleF mantissa != 0) ? 1 : 0.
+            mantV = vgprPool.checkOut(1, tag="rms_mxMant")
+            module.add(VLShiftLeftB32(dst=vgpr(mantV), shiftHex=hex(9), src=vgpr(quantMultReg),
+                                      comment="mantV = scaleF << 9 (non-zero iff mantissa != 0)."))
+            adjV = vgprPool.checkOut(1, tag="rms_mxAdj")
+            zmcMask = sgprPool.checkOutAligned(lsc, lsc, tag="rms_mxZmc", preventOverflow=False)
+            module.add(VCmpEQU32(dst=sgpr(zmcMask, lsc), src0=0, src1=vgpr(mantV),
+                                 comment="mant == 0?."))
+            module.add(VCndMaskB32(dst=vgpr(adjV), src0=1, src1=0, src2=sgpr(zmcMask, lsc),
+                                   comment="adj = (mant!=0) ? 1 : 0."))
+            sgprPool.checkIn(zmcMask)
+            vgprPool.checkIn(mantV)
+            # expByte = scaleF >> 23; scaleByte = expByte + adj; clamp(0, 254).
+            module.add(VLShiftRightB32(dst=vgpr(quantMultReg), shiftHex=hex(23),
+                                       src=vgpr(quantMultReg),
+                                       comment="expByte = scaleF >> 23."))
+            module.add(VAddU32(vgpr(quantMultReg), vgpr(quantMultReg), vgpr(adjV),
+                               comment="scaleByte = expByte + adj."))
+            vgprPool.checkIn(adjV)
+            module.add(VMed3I32(dst=vgpr(scaleByteReg), src0=0,
+                                src1=vgpr(quantMultReg), src2=vgpr(c254Reg),
+                                comment="scaleByte = clamp(scaleByte, 0, 254)."))
+            # quantMult = bitcast<f32>(clamp(254-scaleByte, 1, 254) << 23).
+            module.add(VSubU32(vgpr(quantMultReg), vgpr(c254Reg), vgpr(scaleByteReg),
+                               comment="qExpField = 254 - scaleByte."))
+            module.add(VMed3I32(dst=vgpr(quantMultReg), src0=1,
+                                src1=vgpr(quantMultReg), src2=vgpr(c254Reg),
+                                comment="qExpField = clamp(qExpField, 1, 254)."))
+            module.add(VLShiftLeftB32(dst=vgpr(quantMultReg), shiftHex=hex(23),
+                                      src=vgpr(quantMultReg),
+                                      comment="quantMult = bitcast<f32>(qExpField << 23)."))
+            # amax==0 override: quantMult = 0.
+            zeroMask = sgprPool.checkOutAligned(lsc, lsc, tag="rms_mxZeroMask", preventOverflow=False)
+            module.add(VCmpEQF32(dst=sgpr(zeroMask, lsc), src0=0, src1=vgpr(amaxReg),
+                                 comment="amax == 0?."))
+            module.add(VCndMaskB32(dst=vgpr(quantMultReg), src0=vgpr(quantMultReg),
+                                   src1=0, src2=sgpr(zeroMask, lsc),
+                                   comment="quantMult = 0 if amax==0."))
+            sgprPool.checkIn(zeroMask)
+            vgprPool.checkIn(c254Reg)
+            vgprPool.checkIn(amaxReg)
+            # 6e. Quantize: multiply each dBank[j] by quantMult in place.
+            for j in range(8):
+                module.add(VMulF32(dst=vgpr(dBank + j), src0=vgpr(dBank + j),
+                                   src1=vgpr(quantMultReg),
+                                   comment=f"dBank[{j}] *= quantMult."))
+            vgprPool.checkIn(quantMultReg)
+            # 6f. Write quantized f32 values back to accumulator so GWB stores fp8 D.
+            # Mirrors the writeback pattern from the former SubtileMegaFusedEmitter;
+            # GWB later reads these registers and converts them to fp8.
+            for j in range(8):
+                tileIdx = 2 * mp if j < 4 else 2 * mp + 1
+                k = j % 4
+                tile = vgprTiles[n * self.T_M + tileIdx]
+                reg = tile.regList.indices[k]
+                if tile.regList.pool == self.writer.vgprPool:
+                    module.add(VMovB32(dst=vgpr(reg), src=vgpr(dBank + j),
+                                       comment=f"writeback quantized D to VGPR (mp={mp},n={n},j={j})."))
+                else:
+                    module.add(VAccvgprWriteB32(dst=accvgpr(reg), src=vgpr(dBank + j),
+                                                comment=f"writeback quantized D to AGPR (mp={mp},n={n},j={j})."))
+            # 6g. Store the MXScale byte.
+            self._storeMxScale(module, scaleByteReg, mp, n)
+            vgprPool.checkIn(scaleByteReg)
         vgprPool.checkIn(dBank)
 
-        # D is stored directly to SrdD in Step 6b and GlobalWriteBatch is skipped on
-        # the native path, so there is no downstream accumulator reader: the former
-        # Step 7 writeback of D into the acc/C-tile registers is dead and removed.
+        # bf16: D is stored directly to SrdD in Step 6; GWB is skipped on the native
+        # bf16 path. MXFP8: Step 6f above wrote quantized f32 values back to the acc
+        # registers; GWB reads them and converts to fp8 for the D store.

@@ -16145,17 +16145,17 @@ class KernelWriterAssembly(KernelWriter):
     """Single authoritative gate for the native (non-delegated) RMS epilogue path.
 
     When this returns True the native RMSEpilogueEmitter is the ONLY epilogue that
-    runs: it stores D = H*gamma directly and GlobalWriteBatch is skipped entirely.
+    runs: it stores D directly (bf16 or fp8) and GlobalWriteBatch is skipped entirely.
     By deliberate design the native path is exclusive and self-contained -- it does
     NOT apply alpha, beta*C, bias, activation, scales, the E output, or amaxD. Those
     features are simply not applied for a config routed here; they are not gated out.
 
-    Every Subtile-layout, non-MXFP8 bf16 config routes to the native path. Only MXFP8
-    (float8 D) configs fall back to the delegated SubtileMegaFusedEmitter +
-    GlobalWriteBatch. CMS/interleaved (non-UseSubtileImpl) layouts are out of scope and
-    remain on the old path. The tM%2 guard stays because the native body is pair-based
-    (numPairs = (T_M//2)*T_N) and has no odd-T_M leftover path; it excludes no shipped
-    config.
+    Both bf16 and MXFP8 (float8 D) Subtile configs route to the native path. The
+    MXFP8 native path also emits amax/quantMult/MXScale byte stores in-epilogue.
+    CMS/interleaved (non-UseSubtileImpl) RMSEpilogue configs are rejected by
+    Solution._validateRMSEpilogue and never reach codegen; there is no fallback path.
+    The tM%2 guard stays because the native body is pair-based
+    (numPairs = (T_M//2)*T_N) and has no odd-T_M leftover path.
 
     RMSEpilogueEmitter._nativeEligible delegates to this predicate so the store gate and
     the emitter never drift.
@@ -16168,11 +16168,9 @@ class KernelWriterAssembly(KernelWriter):
     if not kernel.get("UseSubtileImpl"):
       return False
     destType = kernel["ProblemType"]["DestDataType"]
-    # MXFP8 (float8 D) is the only case kept on the old SubtileMegaFusedEmitter +
-    # GlobalWriteBatch path; the native emitter emits bf16 D only.
-    if destType.isFloat8():
-      return False
-    if not destType.isBFloat16():
+    # Both bf16 and float8 (MXFP8) route to the native emitter; all other dtypes
+    # are rejected by Solution._validateRMSEpilogue and never reach here.
+    if not destType.isBFloat16() and not destType.isFloat8():
       return False
     # Tile-shape guard: pair-based body (numPairs = (T_M//2)*T_N), no odd-T_M path.
     tM = (kernel["MacroTile0"] // 16) // kernel["MIWaveGroup"][0]
@@ -17506,7 +17504,11 @@ class KernelWriterAssembly(KernelWriter):
             # Primer uses the next real row jump; boundary delta may be 0 (mid-row).
             _next_firing_rowInc = next_firing_per_batch[batchIdx]
             _direct_next_rowInc = next_rowInc_per_batch[batchIdx] if batchIdx < numBatches else 0
-            if not self._nativeRmsEpilogueActive(kernel):
+            # Skip GWB only for the native bf16 path (which stores D itself).
+            # Native MXFP8 writes quantized f32 back to acc and relies on GWB for fp8 D.
+            _skipGwb = (self._nativeRmsEpilogueActive(kernel)
+                        and not kernel["ProblemType"]["DestDataType"].isFloat8())
+            if not _skipGwb:
               m.add(self.globalWriteBatch(kernel, tPA, tPB, activation, ss, batchIdx, \
                   applyAlpha, beta, edge, atomic, gwvw, atomicW, \
                   elementsThisBatch, self.vgprs.addrE, self.vgprs.addrD, self.vgprs.addrC, self.vgprs.addrBias, \

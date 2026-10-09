@@ -388,61 +388,49 @@ def _validateRMSEpilogue(state, printRejectionReason):
     return
   if not _validateSubtileEpiloguePrereqs(state, printRejectionReason, "RMSEpilogue"):
     return
-  # Non-subtile (CMS/interleaved) RMSEpilogue is unsupported: these configs would
-  # fall through to the old SubtileMegaFused path, which miscomputes the residual
-  # at lone-leftover tile corners (last partial row AND last partial column). Reject
-  # outright rather than silently generate a known-broken kernel.
+  # Non-subtile (CMS/interleaved) RMSEpilogue is unsupported: the native emitter
+  # is Subtile-only and there is no fallback path. Reject outright.
   if not state["UseSubtileImpl"]:
     reject(state, printRejectionReason,
            "RMSEpilogue requires UseSubtileImpl=True; non-subtile (CMS) RMSEpilogue is not supported")
     return
-  # The native RMSEpilogueEmitter is the ONLY supported epilogue for non-float8 (bf16)
-  # output. The old SubtileMegaFusedEmitter + GlobalWriteBatch path is reachable only for
-  # MXFP8 (float8) dest; it is confirmed unsafe for bf16 (it miscomputes the lone-leftover
-  # corner of a %8==1 problem, e.g. 521x521, intermittently). So any bf16 Subtile config
-  # that is not native-eligible must be rejected here, never silently delegated to the old
-  # emitter. Native eligibility mirrors KernelWriterAssembly._nativeRmsEpilogueActive;
-  # UseSubtileImpl, MI 16x16, and megaFusedEpilogueCompatible are already enforced above,
-  # so the remaining conditions are bf16 dest and even tile-M
-  # (tM = (MacroTile0 // 16) // MIWaveGroup[0]).
+  # The native RMSEpilogueEmitter supports bf16 and MXFP8 (float8) output.
+  # All other dest types are unsupported; reject them.
   destType = state["ProblemType"]["DestDataType"]
-  if not destType.isFloat8():
-    if not destType.isBFloat16():
+  if not destType.isBFloat16() and not destType.isFloat8():
+    reject(state, printRejectionReason,
+           "RMSEpilogue supports bf16 or float8 output only; a non-bf16, non-float8 dest "
+           "is not supported")
+    return
+  # Native-path even tile-M guard: pair-based body has no odd-T_M leftover path.
+  tM = (state["MacroTile0"] // 16) // state["MIWaveGroup"][0]
+  if tM % 2 != 0:
+    reject(state, printRejectionReason,
+           "RMSEpilogue native path requires even tile-M "
+           "(tM = (MacroTile0 // 16) // MIWaveGroup[0])")
+    return
+  # Native path owns the write and never applies alpha. Reject alpha != 1.
+  # (DataInitName.One == 1). This applies to both bf16 and float8 native paths.
+  if globalParameters.get("DataInitTypeAlpha", 1) != 1:
+    reject(state, printRejectionReason,
+           "native RMSEpilogue path does not apply alpha; requires "
+           "DataInitTypeAlpha == 1 (DataInitName.One)")
+    return
+  # RMSEpiloguePrefetchDepth selects the native residual prefetch-ring depth.
+  # -1 (auto, the default) lets the emitter derive the historical depth; an
+  # explicit depth must be in [1, numPairs] -- the ring cannot prefetch more
+  # pairs than exist (numPairs = (tM//2)*tN). Over-budget depths are NOT
+  # rejected here: the generic kernel register/occupancy check drops a kernel
+  # whose ring exceeds the VGPR budget.
+  prefetchDepth = state.get("RMSEpiloguePrefetchDepth", -1)
+  if prefetchDepth != -1:
+    tN = (state["MacroTile1"] // 16) // state["MIWaveGroup"][1]
+    numPairs = (tM // 2) * tN
+    if prefetchDepth < 1 or prefetchDepth > numPairs:
       reject(state, printRejectionReason,
-             "RMSEpilogue supports bf16 or float8 output only; a non-bf16, non-float8 dest "
-             "would fall back to the old SubtileMegaFusedEmitter, which is not supported")
+             "RMSEpiloguePrefetchDepth (%d) must be -1 (auto) or in [1, numPairs=%d]"
+             % (prefetchDepth, numPairs))
       return
-    tM = (state["MacroTile0"] // 16) // state["MIWaveGroup"][0]
-    if tM % 2 != 0:
-      reject(state, printRejectionReason,
-             "RMSEpilogue bf16 native path requires even tile-M "
-             "(tM = (MacroTile0 // 16) // MIWaveGroup[0]); odd tile-M would fall back to the "
-             "old SubtileMegaFusedEmitter, which miscomputes the lone-leftover corner and is "
-             "not supported for bf16")
-      return
-    # Native path owns the write and never applies alpha, but the validation reference
-    # does, so a native config is only correct at alpha == 1. Reject otherwise
-    # (DataInitName.One == 1). MXFP8/float8 configs use the old path, which applies alpha.
-    if globalParameters.get("DataInitTypeAlpha", 1) != 1:
-      reject(state, printRejectionReason,
-             "native RMSEpilogue path does not apply alpha; requires "
-             "DataInitTypeAlpha == 1 (DataInitName.One)")
-      return
-    # RMSEpiloguePrefetchDepth selects the native residual prefetch-ring depth.
-    # -1 (auto, the default) lets the emitter derive the historical depth; an
-    # explicit depth must be in [1, numPairs] -- the ring cannot prefetch more
-    # pairs than exist (numPairs = (tM//2)*tN). Over-budget depths are NOT
-    # rejected here: the generic kernel register/occupancy check drops a kernel
-    # whose ring exceeds the VGPR budget.
-    prefetchDepth = state.get("RMSEpiloguePrefetchDepth", -1)
-    if prefetchDepth != -1:
-      tN = (state["MacroTile1"] // 16) // state["MIWaveGroup"][1]
-      numPairs = (tM // 2) * tN
-      if prefetchDepth < 1 or prefetchDepth > numPairs:
-        reject(state, printRejectionReason,
-               "RMSEpiloguePrefetchDepth (%d) must be -1 (auto) or in [1, numPairs=%d]"
-               % (prefetchDepth, numPairs))
-        return
   if not _resolveRMSGammaType(state, printRejectionReason):
     return
   # Residual-add is always active under RMSEpilogue; validate the type unconditionally.
