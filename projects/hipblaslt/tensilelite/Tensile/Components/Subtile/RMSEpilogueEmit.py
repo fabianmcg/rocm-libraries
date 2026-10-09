@@ -893,14 +893,10 @@ class RMSEpilogueEmitter:
             module.add(VAddU32(vgpr(self.gammaReadBaseV), vgpr(self.gammaReadBaseV), self.gammaLdsBase,
                                comment=f"+= gammaLdsBase({self.gammaLdsBase})."))
 
-    def _readGammaLds(self, module, g8Bank, mp):
-        """Read this pair's two native gamma tiles from flat gamma LDS into g8Bank.
-
-        Faithful port of the gamma LDS read in @mega_fused_body (MLIR 353-371):
-        tile m -> g8Bank[0..3], tile m+1 -> g8Bank[4..7], native f32 order. The
-        two tiles are 16 rows (32 bf16 bytes) apart in LDS. ``g8Bank`` is an
-        8-wide VGPR block owned by the caller.
-        """
+    def _issueGammaLds(self, module, g8Bank, mp):
+        """Issue the pair's two gamma DS reads early; latency is hidden by the
+        accumulator-stage, residual-cvt, H8 add, and ssq tree that follow before
+        the matching wait in _waitConvertGammaLds."""
         vgprPool = self.writer.vgprPool
         m = 2 * mp
         gldsAddr = vgprPool.checkOut(1, tag="rms_gldsAddr")
@@ -910,6 +906,10 @@ class RMSEpilogueEmitter:
                              ds=DSModifiers(offset=0), comment="tile m gamma: 4 bf16 (2 dwords)."))
         module.add(DSLoadB64(dst=vgpr(g8Bank + 4, 2), src=vgpr(gldsAddr),
                              ds=DSModifiers(offset=32), comment="tile m+1 gamma: 4 bf16 (+16 rows)."))
+        vgprPool.checkIn(gldsAddr)
+
+    def _waitConvertGammaLds(self, module, g8Bank):
+        """Wait for the early-issued gamma DS reads, then expand bf16 -> f32 in place."""
         module.add(SWaitCnt(dscnt=0, comment="wait gamma ds_reads (lgkmcnt 0)."))
         # Expand each 2-dword half to 4 f32, high-index first (in place).
         for i in range(3, -1, -1):
@@ -918,7 +918,6 @@ class RMSEpilogueEmitter:
         for i in range(3, -1, -1):
             module.add(VCvtBF16toFP32(vgpr(g8Bank + 4 + i), vgpr(g8Bank + 4 + i // 2), None, i % 2,
                                       comment=f"tile m+1 gamma f32[{i}] = extf(dword {i // 2}, half {i % 2})."))
-        vgprPool.checkIn(gldsAddr)
 
     def _storeResidualOut(self, module, hRegs, mp, n, isX4, srd, colStride, colBase):
         """Store bf16 D for pair ``mp``, column-tile ``n`` to the given SRD.
@@ -1074,8 +1073,7 @@ class RMSEpilogueEmitter:
                                      comment=f"combined vmcnt({groupSize - 1 + d}): (groupSize-1-d) loads + 2d stores in flight."))
                 if isX4:
                     self._pairShuffle(module, resBanks[d])
-                residualF32 = self._residualToF32(module, resBanks[d], isX4)
-                self._computePair(module, vgprTiles, residualF32, accStage, g8Bank, ssqAcc, mp, n, isX4)
+                self._computePair(module, vgprTiles, resBanks[d], accStage, g8Bank, ssqAcc, mp, n, isX4)
         vgprPool.checkIn(g8Bank)
         vgprPool.checkIn(accStage)
         for b in reversed(resBanks):
@@ -1477,16 +1475,18 @@ class RMSEpilogueEmitter:
             module.add(VAddF32(dst=vgpr(d0 + 1), src0=vgpr(a1), src1=vgpr(b1),
                                comment=f"{comment} ({2 * p + 1})."))
 
-    def _computePair(self, module, vgprTiles, residualF32, accStage, g8Bank,
+    def _computePair(self, module, vgprTiles, resBank, accStage, g8Bank,
                      ssqAccBase, mp, n, isX4):
         """Per-pair compute: H = residual + acc, ssq partial, residualOut, D = H*gamma.
 
         Faithful port of @mega_fused_body (MLIR 352-396) for pair ``mp``,
-        column-tile ``n``. ``residualF32`` is an 8-wide caller-owned bank holding
-        the native f32 residual on entry; it holds H8 after the add and Dout after
-        the gamma multiply. ``accStage`` stages AGPR accumulator reads, ``g8Bank``
-        receives the pair's native gamma, and ``ssqAccBase`` is the T_N-wide f32
-        column partial array (caller zero-inits before the pair loop).
+        column-tile ``n``. ``resBank`` is an 8-wide caller-owned bank holding the
+        raw bf16 residual on entry (WIDE: packed dwords; NARROW: lo16 bf16); it
+        is expanded to f32 in place inside this method and holds H8 after the add
+        and Dout after the gamma multiply. ``accStage`` stages AGPR accumulator
+        reads, ``g8Bank`` receives the pair's native gamma, and ``ssqAccBase`` is
+        the T_N-wide f32 column partial array (caller zero-inits before the pair
+        loop).
 
         The one sanctioned deviation from MLIR is H = extf(native) + acc; the
         reference uses H = residual directly.
@@ -1494,6 +1494,10 @@ class RMSEpilogueEmitter:
         vgprPool = self.writer.vgprPool
         sgprPool = self.writer.sgprPool
         lsc = self.laneSGPRCount
+        # ---- Step 0: issue gamma LDS reads first; Steps 1-3 below hide the read
+        # latency. The matching wait stays at Step 4 (gamma data must land before
+        # D = H8*gamma). ----
+        self._issueGammaLds(module, g8Bank, mp)
         # ---- Step 1: read the accumulator into native-order accRegs ----
         accRegs = []
         slot = 0
@@ -1509,8 +1513,10 @@ class RMSEpilogueEmitter:
                                        comment=f"stage acc (mp={mp},n={n},j={j})."))
             accRegs.append(accStage + slot)
             slot += 1
-        if slot > 0:
-            module.add(SNop(waitState=1, comment="accvgpr_read->VALU hazard (gfx950)"))
+        # Expand raw bf16 residual to 8 native-order f32. These 8 independent v_cvt
+        # sit between the accvgpr reads above and the v_pk_add consumer below, providing
+        # >=2 wait states, so the gfx950 accvgpr_read->VALU hazard needs no s_nop.
+        residualF32 = self._residualToF32(module, resBank, isX4)
 
         # ---- Step 2: H8 = residual + acc (in place, MLIR 352 + acc deviation) ----
         # residualF32 is a contiguous even-aligned bank (packable); accRegs packs
@@ -1532,8 +1538,8 @@ class RMSEpilogueEmitter:
                            comment=f"ssqAcc[{n}] += s."))
         vgprPool.checkIn(sq)
 
-        # ---- Step 4: gamma read (MLIR 353-371), before the stores ----
-        self._readGammaLds(module, g8Bank, mp)
+        # ---- Step 4: wait for the early-issued gamma LDS reads and convert bf16->f32 ----
+        self._waitConvertGammaLds(module, g8Bank)
 
         # ---- Step 5: D = H8 * gamma into a SEPARATE bank (MLIR 372). Computing out
         # of place keeps residualF32 = H8 live so the residual store below still
