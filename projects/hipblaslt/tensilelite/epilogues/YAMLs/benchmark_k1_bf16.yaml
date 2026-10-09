@@ -121,14 +121,11 @@ BenchmarkProblems:
         - GlobalReadVectorWidthB: [-1]
         - PreloadKernArgs: [False, True]
         - 1LDSBuffer: [0]
+        - RMSEpiloguePrefetchDepth: [1, 2, 4]
       BenchmarkJoinParameters:
       BenchmarkFinalParameters:
         - ProblemSizes:
-            - Exact: [2048, 2048, 1, 2048]
-            - Exact: [640, 640, 1, 640]   # M=640, 640%8==0 -> WIDE
-            - Exact: [768, 640, 1, 512]   # M=768, 768%8==0 -> WIDE
-            - Exact: [521, 521, 1, 521]   # M=521, 521%8==1 -> NARROW
-            - Exact: [532, 64, 1, 64]     # M=532, 532%8==4 -> NARROW
+            - Exact: [2048, 16384, 1, 2048]
 
 LibraryLogic:
   ScheduleName: "epilogues_rms_bf16_k1"
