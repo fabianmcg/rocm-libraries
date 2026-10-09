@@ -163,6 +163,11 @@ class RMSEpilogueEmitter:
         self._scKblkBase = None
         self._scStrideV = None
 
+        # One-shot flag: set only by the WIDE arm so _emitBody emits the deferred DTL
+        # gamma publish (barrier) before the first gamma LDS read. The narrow arm's
+        # _emitGammaPrefetch publishes internally, so it leaves this False.
+        self._pendingGammaDTLPublish = False
+
     def _nativeEligible(self):
         # The native RMS epilogue does not apply alpha, beta*C, bias, activation,
         # scales, E, or amaxD. For bf16, it stores D directly and GWB is skipped.
@@ -205,6 +210,11 @@ class RMSEpilogueEmitter:
         self._emitGammaPrefetchDTL(module)
         # _computeGammaReadBase must follow the prefetch so gammaLdsBase is already set.
         self._computeGammaReadBase(module)
+        # Fire the deferred DTL publish inside _emitBody (inside the phase-2 consume loop,
+        # grp=0, d=0, after the first group's residual loads and before their first gamma
+        # LDS read); _computeGammaReadBase, ssqAcc init, and the first group's loads now
+        # all overlap the DTL load.
+        self._pendingGammaDTLPublish = True
         self._emitBody(module, vgprTiles, isX4=True)
         module.add(SBranch(labelName=endLabel.getLabelName(), comment="wide done; skip narrow."))
         # Narrow arm: software gamma + barrier + scalar body.
@@ -682,7 +692,19 @@ class RMSEpilogueEmitter:
         sgprPool.checkIn(soffBS)
         sgprPool.checkIn(rowWaveBaseS)
 
-        # Publish: drain the DTL writes, then barrier so the body reads full LDS.
+        # Publish (DTL drain + workgroup barrier) is deferred to _publishGammaDTL,
+        # emitted right before the first gamma LDS read (inside the phase-2 consume
+        # loop, grp=0, d=0) so the DTL load latency overlaps the gamma-read-base
+        # compute, ssqAcc init, AND the first group's residual prefetch loads.
+        # The vlcnt=0 drains the first group's ring once -- an accepted, bounded cost.
+
+    def _publishGammaDTL(self, module):
+        """Deferred DTL publish: drain the direct-to-LDS gamma write and barrier so the
+        body reads fully populated LDS. Split out of _emitGammaPrefetchDTL and fired
+        right before the first gamma LDS read (grp=0, d=0 in _emitBody's phase-2 loop)
+        so the DTL global-load latency overlaps the gamma-read-base compute, ssqAcc init,
+        AND the first group's residual prefetch loads. The vlcnt=0 drains the first
+        group's prefetch ring once -- an accepted, bounded, one-time cost."""
         module.add(SWaitCnt(vlcnt=0, dscnt=0, comment="wait gamma DTL loads (vmcnt0 lgkmcnt0)."))
         module.add(self.writer._syncThreads(self.kernel,
                                             "gamma DTL prefetch: LDS fully populated before body reads."))
@@ -1073,6 +1095,14 @@ class RMSEpilogueEmitter:
                                      comment=f"combined vmcnt({groupSize - 1 + d}): (groupSize-1-d) loads + 2d stores in flight."))
                 if isX4:
                     self._pairShuffle(module, resBanks[d])
+                # Deferred DTL gamma publish (WIDE arm only): fire once, right before the
+                # first gamma LDS read. The DTL load latency now overlaps the gamma-read-base
+                # compute, ssqAcc init, AND this group's residual prefetch loads. The vlcnt=0
+                # here drains the first group's prefetch ring once -- an accepted, bounded,
+                # one-time cost for hiding the long DTL global-load latency.
+                if self._pendingGammaDTLPublish:
+                    self._publishGammaDTL(module)
+                    self._pendingGammaDTLPublish = False
                 self._computePair(module, vgprTiles, resBanks[d], accStage, g8Bank, ssqAcc, mp, n, isX4)
         vgprPool.checkIn(g8Bank)
         vgprPool.checkIn(accStage)
