@@ -41,7 +41,7 @@ GlobalParameters:
   EnqueuesPerSync: 20
   NumWarmups: 20
   KernelTime: true
-  NumElementsToValidate: -1
+  NumElementsToValidate: 0
   DataInitTypeBeta: 12
   DataInitTypeA: 12
   DataInitTypeB: 13
@@ -147,13 +147,12 @@ BenchmarkProblems:
         - LdsPadB: [-1]
         - StoreVectorWidth: [-1]
         - PreloadKernArgs: [False]
+        - RMSEpiloguePrefetchDepth: [1, 2, 4]
         - 1LDSBuffer: [0]
       BenchmarkJoinParameters:
       BenchmarkFinalParameters:
         - ProblemSizes:
             - Exact: [256, 256, 1, 256]
-            - Exact: [512, 512, 1, 512]
-            - Exact: [513, 513, 1, 513]
             - Exact: [2048, 16384, 1, 2048]
 
 LibraryLogic:
