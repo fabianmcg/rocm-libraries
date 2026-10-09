@@ -705,7 +705,7 @@ class RMSEpilogueEmitter:
         so the DTL global-load latency overlaps the gamma-read-base compute, ssqAcc init,
         AND the first group's residual prefetch loads. The vlcnt=0 drains the first
         group's prefetch ring once -- an accepted, bounded, one-time cost."""
-        module.add(SWaitCnt(vlcnt=0, dscnt=0, comment="wait gamma DTL loads (vmcnt0 lgkmcnt0)."))
+        module.add(SWaitCnt(vlcnt=-1, dscnt=0, comment="wait gamma DTL loads (vmcnt0 lgkmcnt0)."))
         module.add(self.writer._syncThreads(self.kernel,
                                             "gamma DTL prefetch: LDS fully populated before body reads."))
 
